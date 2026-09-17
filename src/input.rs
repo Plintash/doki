@@ -2183,9 +2183,18 @@ impl EntityInputHandler for TextInput {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let layout = self.last_layout.as_ref()?;
+        // `last_layout` is the previous frame's, so text the IME marked since
+        // that frame reaches past it — the candidate-window query arrives
+        // before the layout catches up. Clamp to what was laid out instead of
+        // letting `position_for_index` answer `None`: macOS reads a missing
+        // rect as "no insertion point" and pins the candidate window to the
+        // bottom-left corner of the screen for the rest of the composition.
+        // The clamp lands on the pre-edit caret, which is the anchor the
+        // candidates belong to anyway.
+        let laid_out = layout.len();
         let range = self.range_from_utf16(&range_utf16);
-        let start = layout.position_for_index(range.start)?;
-        let end = layout.position_for_index(range.end)?;
+        let start = layout.position_for_index(range.start.min(laid_out))?;
+        let end = layout.position_for_index(range.end.min(laid_out))?;
         let line_height = layout.line_height();
         if start.y == end.y {
             Some(Bounds::from_corners(
@@ -3100,9 +3109,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use gpui::{
-        ClipboardEntry, ClipboardItem, Context, Entity, EntityInputHandler, ExternalPaths, Image,
-        ImageFormat, Pixels, Render, TestAppContext, TextRun, Window, div, font, hsla, prelude::*,
-        px,
+        Bounds, ClipboardEntry, ClipboardItem, Context, Entity, EntityInputHandler, ExternalPaths,
+        Image, ImageFormat, Pixels, Render, TestAppContext, TextRun, Window, div, font, hsla,
+        point, prelude::*, px, size,
     };
 
     use super::TokenClass;
@@ -3905,6 +3914,38 @@ mod tests {
             assert_eq!(input.marked_range, Some(3..4));
             assert_eq!(input.selected_range, 4..4);
         });
+    }
+
+    /// macOS asks where the candidate window goes immediately after marking
+    /// text, before the next frame has laid that text out. The requested range
+    /// therefore reaches past the layout, and answering `None` parks the
+    /// candidate window in the bottom-left corner of the screen for the rest of
+    /// the composition — the pre-edit anchor has to come back instead.
+    #[gpui::test]
+    fn ime_bounds_answer_for_text_marked_since_the_last_frame(cx: &mut TestAppContext) {
+        let (input, cx) = setup_input(cx, "", px(300.));
+        let bounds = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(300.), px(40.)),
+        };
+
+        let (marked, caret) = cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.replace_and_mark_text_in_range(None, "ww", Some(2..2), window, cx);
+                (
+                    input.bounds_for_range(0..2, bounds, window, cx),
+                    input.bounds_for_range(0..0, bounds, window, cx),
+                )
+            })
+        });
+
+        // Clamped to the laid-out text, the marked range anchors exactly where
+        // the composition started — the pre-edit caret.
+        assert_eq!(marked, caret);
+        assert!(
+            marked.is_some(),
+            "the range that outran the layout still has a rect"
+        );
     }
 
     #[test]
