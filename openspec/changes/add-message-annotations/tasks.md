@@ -5,10 +5,10 @@ rebuild or replace the installed `Doki.app` while the user is working in it.
 
 ## 1. Protocol and storage
 
-- [ ] 1.1 Add the `MessageAnnotation` record and an additive, optional `annotations` list on `Message` in `crates/waku-protocol/src/model.rs`; verify `cargo test -p waku-protocol` passes and older payloads without the field still deserialize
-- [ ] 1.2 Carry staged annotations on the composer draft payload in `crates/waku-protocol/src/protocol.rs` and persist them in `crates/waku-core/src/persistence.rs`; verify a save/load round-trip test restores staged annotations
-- [ ] 1.3 Add one additive migration under `db/migrations/` for the message column, include annotations in the message fingerprint input; verify an existing-database migration test opens, migrates, and reloads a message with annotations
-- [ ] 1.4 Regenerate TS bindings into `packages/waku-client/src/generated/`; verify `apps/web` and `apps/mobile` typecheck unchanged with the field ignored
+- [x] 1.1 Add the `MessageAnnotation` record and an additive, optional `annotations` list on `Message` in `crates/waku-protocol/src/model.rs`; verify `cargo test -p waku-protocol` passes and older payloads without the field still deserialize
+- [x] 1.2 Carry staged annotations on the composer draft payload in `crates/waku-protocol/src/protocol.rs` and persist them in `crates/waku-core/src/persistence.rs`; verify a save/load round-trip test restores staged annotations
+- [x] 1.3 Add one additive migration under `db/migrations/` for the message column, include annotations in the message fingerprint input; verify an existing-database migration test opens, migrates, and reloads a message with annotations
+- [x] 1.4 Regenerate TS bindings into `packages/waku-client/src/generated/`; verify `apps/web` and `apps/mobile` typecheck unchanged with the field ignored
 
 ## 2. Anchor resolution
 
