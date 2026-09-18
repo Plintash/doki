@@ -4,15 +4,6 @@ Doki is a fast, native desktop app for working with local coding agents. It is
 built in Rust with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)
 and keeps projects, sessions, transcripts on your machine.
 
-## Credit
-
-Doki is a renamed fork of **[Waku](https://github.com/egoist/waku)** by
-[@egoist](https://github.com/egoist) and the Waku contributors. Nearly all of
-this app — its code, design, and provider integrations — is their work, and all
-credit belongs upstream: go there for the original app, its installers, its
-issues, and its sponsorship. Doki is an independent fork and is not affiliated
-with or endorsed by the upstream project.
-
 ## Install
 
 Doki does not publish its own installers yet, so it is built from source. You
@@ -132,6 +123,15 @@ diffs, file editing, and the terminal run natively on Linux and Windows.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and checks.
 Release maintainers should also read [RELEASING.md](RELEASING.md).
+
+## Credit
+
+Doki is a renamed fork of **[Waku](https://github.com/egoist/waku)** by
+[@egoist](https://github.com/egoist) and the Waku contributors. Nearly all of
+this app — its code, design, and provider integrations — is their work, and all
+credit belongs upstream: go there for the original app, its installers, its
+issues, and its sponsorship. Doki is an independent fork and is not affiliated
+with or endorsed by the upstream project.
 
 ## License
 
