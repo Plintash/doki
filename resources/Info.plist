@@ -24,12 +24,13 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
-    <!-- Sparkle auto-update configuration. The appcast feed lives in the
-         waku-releases Cloudflare R2 bucket behind releases.waku.sh, and the
-         private half of SUPublicEDKey signs each archive from the login
-         keychain during `bun run release` (see RELEASING.md). -->
-    <key>SUFeedURL</key>
-    <string>https://releases.waku.sh/appcast.xml</string>
+    <!-- Sparkle auto-update configuration. `SUPublicEDKey` is republished by
+         build.rs as the EdDSA key every native updater verifies against.
+         `SUFeedURL` is deliberately absent: Doki is its own product, so a
+         build must not offer to replace itself with the upstream Waku
+         release. Without a feed Sparkle refuses to start and the app hides
+         the "Check for Updates" item. Add a Doki feed (and the public half of
+         a Doki signing key) when there are Doki releases to serve. -->
     <key>SUPublicEDKey</key>
     <string>gv9GLMPjH5yMQkZMFXnoNfHOyL8/7KGzl/jzAqlzZZY=</string>
 	<key>NSHighResolutionCapable</key>
