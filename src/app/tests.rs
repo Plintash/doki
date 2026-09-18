@@ -2,6 +2,7 @@ use super::composer::{
     ComposerSubmitAction, composer_submit_action, dropped_file_mention, merged_submission,
     next_picker_highlight, visible_branch_entries,
 };
+use super::ComposerSubmission;
 use super::runtime::{merge_remote_session_catalog, session_has_active_provider_turn};
 use super::settings::visible_settings_pages;
 use super::{
@@ -24,9 +25,10 @@ use super::{
 };
 use crate::git_branch::BranchEntry;
 use crate::model::{
-    ActivityItem, ActivityKind, AgentSession, Checkpoint, CheckpointFile, CheckpointStatus,
-    DriverEvent, Message, MessageRole, ProviderKind, ReasoningBlock, RuntimeEventCursor,
-    SessionStatus, TranscriptBlock, TurnStatus, UserInputOption, UserInputQuestion,
+    ActivityItem, ActivityKind, AgentSession, AnnotationTarget, Checkpoint, CheckpointFile,
+    CheckpointStatus, DriverEvent, Message, MessageAnnotation, MessageRole, ProviderKind,
+    ReasoningBlock, RuntimeEventCursor, SessionStatus, TextSpan, TranscriptBlock, TurnStatus,
+    UserInputOption, UserInputQuestion,
 };
 
 #[test]
@@ -289,6 +291,37 @@ fn submissions_append_attachment_mentions_after_the_prompt() {
     );
     assert_eq!(merged_submission(" plain ", &[]).as_deref(), Some("plain"));
     assert_eq!(merged_submission("   ", &[]), None);
+}
+
+#[test]
+fn a_queued_submission_replays_its_projected_prompt_unchanged() {
+    // Projection happens once, when the submission is created. A queued or
+    // steered message replays that exact text, so the annotation block must
+    // not be projected a second time on the way out.
+    let annotation = MessageAnnotation {
+        id: Uuid::new_v4(),
+        target: AnnotationTarget::MessageSpan {
+            message_id: Uuid::new_v4(),
+            ordinal: 1 << 16,
+            span: TextSpan { start: 0, end: 5 },
+            quote: "wrong".to_owned(),
+            block: "wrong".to_owned(),
+        },
+        comment: Some("say the opposite".to_owned()),
+    };
+    let submission = ComposerSubmission {
+        prompt: "fix this\n\nAnnotations on your earlier replies".to_owned(),
+        display_content: Some("fix this".to_owned()),
+        attachments: Vec::new(),
+        annotations: vec![annotation.clone()],
+    };
+
+    let queued = submission.clone().into_queued_message();
+    let replayed = ComposerSubmission::from_queued_message(queued);
+
+    assert_eq!(replayed.prompt, submission.prompt);
+    assert_eq!(replayed.display_content, submission.display_content);
+    assert_eq!(replayed.annotations, vec![annotation]);
 }
 
 #[test]

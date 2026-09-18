@@ -33,8 +33,8 @@ rebuild or replace the installed `Doki.app` while the user is working in it.
 ## 5. Prompt projection
 
 - [x] 5.1 Implement the projection at the prompt-assembly seam: framing header, user text verbatim, numbered entries with quote, optional comment, source locator, fragment context window, and caps with truncation markers; unit-test every scenario in `specs/prompt-context-projection/spec.md`
-- [ ] 5.2 Route prompt, steer, queued, and edit-resend paths through the projection; verify a test asserts identical annotation text for the same input across all four
-- [ ] 5.3 Confirm no offsets, ordinals, or message ids reach the prompt, and that a directive-like or multi-line quote stays confined to its field; verify by unit test
+- [x] 5.2 Route prompt, steer, queued, and edit-resend paths through the projection; verify a test asserts identical annotation text for the same input across all four
+- [x] 5.3 Confirm no offsets, ordinals, or message ids reach the prompt, and that a directive-like or multi-line quote stays confined to its field; verify by unit test
 - [ ] 5.4 Localize the new user-visible labels in `locales/`; verify all locale files gain the keys and the app renders them
 
 ## 6. Send, persist, restore
