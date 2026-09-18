@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
-use crate::model::{AgentSession, MessageRole};
+use crate::model::{AgentSession, MessageAnnotation, MessageRole};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct ComposerDraftAttachment {
@@ -25,11 +25,16 @@ pub struct ComposerDraft {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ComposerDraftAttachment>,
+    /// Annotations staged for the next message, in creation order. Their
+    /// position here is the number the composer, the transcript badge and the
+    /// prompt all show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<MessageAnnotation>,
 }
 
 impl ComposerDraft {
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.attachments.is_empty()
+        self.text.is_empty() && self.attachments.is_empty() && self.annotations.is_empty()
     }
 }
 

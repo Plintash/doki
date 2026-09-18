@@ -1679,6 +1679,57 @@ pub struct MessageAttachment {
     pub blob_reference: Option<String>,
 }
 
+/// Byte range inside one rendered text element.
+///
+/// Offsets address the flattened text the transcript paints, not the raw
+/// Markdown source: a selection, a find highlight and an annotation all have to
+/// agree on one coordinate system, and the painted text is the one they share.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct TextSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// What a [`MessageAnnotation`] points at.
+///
+/// One arm today. The tag exists so a later target kind — a file span, a diff
+/// hunk — can join without turning the payload into free text that the prompt
+/// projection could not label and the UI could not re-anchor.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum AnnotationTarget {
+    MessageSpan {
+        /// The assistant message the span belongs to.
+        message_id: Uuid,
+        /// Element ordinal inside that message, in the renderer's own order.
+        ordinal: usize,
+        span: TextSpan,
+        /// Snapshot of the annotated text. Kept so the annotation survives a
+        /// re-render that moves the span, and so a prompt still carries the
+        /// quote when the anchor can no longer be resolved.
+        quote: String,
+        /// Snapshot of the block containing the quote, used to give a fragment
+        /// selection some context in the prompt.
+        block: String,
+    },
+}
+
+/// One span of an assistant reply the user pointed at, with an optional
+/// instruction about it.
+///
+/// The anchor is client-side state: it rides along with the message so the
+/// transcript can mark the span again after a reload, while the provider only
+/// ever sees the quote as plain prompt text.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct MessageAnnotation {
+    pub id: Uuid,
+    pub target: AnnotationTarget,
+    /// A bare annotation is a pointer with nothing said about it, so the field
+    /// is absent rather than empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct Message {
     pub id: Uuid,
@@ -1692,6 +1743,9 @@ pub struct Message {
     pub display_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachment>,
+    /// Spans of this message the user annotated to send with a later message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<MessageAnnotation>,
     pub created_at: u64,
     pub streaming: bool,
 }
@@ -1705,6 +1759,7 @@ impl Message {
             content: content.into(),
             display_content: None,
             attachments: Vec::new(),
+            annotations: Vec::new(),
             created_at: unix_time(),
             streaming: false,
         }
@@ -3576,6 +3631,66 @@ mod tests {
         assert_eq!(message.content, "compare this @/tmp/reference.png");
         assert_eq!(message.visible_content(), "compare this");
         assert_eq!(message.attachments, vec![attachment]);
+    }
+
+    #[test]
+    fn annotations_keep_their_anchor_and_tolerate_legacy_messages() {
+        let message_id = Uuid::from_u128(3);
+        let mut message = Message::new(MessageRole::Assistant, "the retry helper returns Ok(())");
+        message.id = message_id;
+        message.annotations = vec![
+            MessageAnnotation {
+                id: Uuid::from_u128(9),
+                target: AnnotationTarget::MessageSpan {
+                    message_id,
+                    ordinal: 1 << 16,
+                    span: TextSpan { start: 4, end: 11 },
+                    quote: "retry helper".to_owned(),
+                    block: "the retry helper returns Ok(())".to_owned(),
+                },
+                comment: Some("this drops the error".to_owned()),
+            },
+            MessageAnnotation {
+                id: Uuid::from_u128(10),
+                target: AnnotationTarget::MessageSpan {
+                    message_id,
+                    ordinal: 0,
+                    span: TextSpan { start: 0, end: 3 },
+                    quote: "the".to_owned(),
+                    block: "the retry helper returns Ok(())".to_owned(),
+                },
+                comment: None,
+            },
+        ];
+
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["annotations"][0]["target"]["type"], "messageSpan");
+        assert_eq!(
+            json["annotations"][0]["target"]["message_id"],
+            serde_json::json!(message_id)
+        );
+        assert_eq!(json["annotations"][0]["target"]["ordinal"], 1 << 16);
+        assert_eq!(json["annotations"][0]["target"]["span"]["start"], 4);
+        assert_eq!(json["annotations"][0]["target"]["span"]["end"], 11);
+        assert_eq!(json["annotations"][0]["comment"], "this drops the error");
+        // A bare annotation is a pointer, so the field is absent rather than
+        // an empty string the projection would have to filter out.
+        assert!(json["annotations"][1].get("comment").is_none());
+
+        let restored: Message = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.annotations, message.annotations);
+
+        // Rows written before annotations existed carry no field at all.
+        let legacy: Message = serde_json::from_value(serde_json::json!({
+            "id": message_id,
+            "turn_id": null,
+            "role": "assistant",
+            "content": "plain",
+            "created_at": 1,
+            "streaming": false,
+        }))
+        .unwrap();
+        assert!(legacy.annotations.is_empty());
     }
 
     #[test]

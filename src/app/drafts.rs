@@ -79,6 +79,7 @@ impl Waku {
                 .iter()
                 .map(crate::persistence::ComposerDraftAttachment::from)
                 .collect(),
+            annotations: Vec::new(),
         }
     }
 

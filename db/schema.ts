@@ -71,6 +71,8 @@ export const messages = sqliteTable(
     displayContent: text("display_content"),
     /** JSON-serialized MessageAttachment array. */
     attachments: text("attachments").notNull().default("[]"),
+    /** JSON-serialized MessageAnnotation array. */
+    annotations: text("annotations").notNull().default("[]"),
     createdAt: integer("created_at").notNull(),
     streaming: integer("streaming", { mode: "boolean" }).notNull(),
   },

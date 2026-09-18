@@ -1,0 +1,1 @@
+ALTER TABLE `messages` ADD `annotations` text DEFAULT '[]' NOT NULL;
