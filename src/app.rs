@@ -1622,6 +1622,7 @@ pub struct Waku {
 }
 
 mod activity_diff;
+mod annotation_projection;
 mod autocomplete;
 mod background_work;
 mod branches;
