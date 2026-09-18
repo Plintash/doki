@@ -87,6 +87,17 @@ layout to read a row from, so a stale row can never cost more than the line.
 | `cmd-c` / `cmd-x` / `cmd-v` | copy / cut / paste |
 | `escape` | clears fields that opt in via `clear_on_escape` (the search fields); otherwise propagates. The composer does not opt in: its clear also drops undo history, so Escape stops the turn or dismisses a popup instead |
 
+### Emoji & Symbols
+
+| Chord | Does | AppKit selector |
+| --- | --- | --- |
+| `fn-e` | opens the system Emoji & Symbols palette, and inserts what it picks at the caret | `orderFrontCharacterPalette:` |
+
+The system spells this chord with the function modifier alone, which no native
+view binds in the key table above — it is handled at the responder-chain level
+instead. Waku binds it explicitly and forwards to `NSApp` through
+`Window::show_character_palette()`.
+
 ### Deliberately unbound
 
 | Chord | Why |

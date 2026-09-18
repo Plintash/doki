@@ -66,6 +66,7 @@ actions!(
         Newline,
         SubmitSteer,
         Clear,
+        ShowCharacterPalette,
     ]
 );
 
@@ -194,6 +195,11 @@ pub fn init(cx: &mut App) {
         // ctrl-shift is the Windows and Linux convention, bound below.
         KeyBinding::new("ctrl-shift-left", SelectToLineStart, Some("TextInput")),
         KeyBinding::new("ctrl-shift-right", SelectToLineEnd, Some("TextInput")),
+        // Fn-E is the system's other spelling of Emoji & Symbols. macOS hands
+        // the chord to the app as a key equivalent carrying only the function
+        // modifier and expects the field to answer it; GPUI matches modifiers
+        // exactly, so without this binding the keystroke dies unhandled.
+        KeyBinding::new("fn-e", ShowCharacterPalette, Some("TextInput")),
     ]);
 
     // The chords Windows and the Linux desktops share: word motion on ctrl,
@@ -1697,6 +1703,15 @@ impl TextInput {
         self.replace_text_in_range(None, "\n", window, cx);
     }
 
+    fn show_character_palette(
+        &mut self,
+        _: &ShowCharacterPalette,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        window.show_character_palette();
+    }
+
     fn clear_field(&mut self, _: &Clear, _: &mut Window, cx: &mut Context<Self>) {
         if !self.clear_on_escape || self.content.is_empty() {
             cx.propagate();
@@ -2821,6 +2836,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::submit_steer))
             .on_action(cx.listener(Self::clear_field))
+            .on_action(cx.listener(Self::show_character_palette))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_context_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
