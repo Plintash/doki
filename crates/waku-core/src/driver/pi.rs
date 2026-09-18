@@ -898,9 +898,23 @@ fn send_prompt(
     // OMP built-ins can hold the prompt response until compaction or another
     // command finishes. Do not apply the short control-RPC timeout or block
     // the writer from sending abort while waiting for that response.
+    //
+    // Pi rejects a prompt outright while it is still streaming — "Agent is
+    // already processing. Specify streamingBehavior ('steer' or 'followUp') to
+    // queue the message." — and Waku can prompt into that state: stopping a
+    // turn settles it here immediately, while Pi keeps streaming until its
+    // own abort finishes unwinding. `followUp` makes Pi queue the message on
+    // the settling run instead (it is ignored while Pi is idle), so a
+    // submission that races the tail of the previous turn is delivered rather
+    // than failed into the transcript.
     if let Err(error) = write_json_line(
         stdin,
-        &json!({"id": id, "type": "prompt", "message": prompt}),
+        &json!({
+            "id": id,
+            "type": "prompt",
+            "message": prompt,
+            "streamingBehavior": "followUp",
+        }),
     ) {
         pending.lock().remove(&id);
         return Err(format!("transport write failed: {error}"));
@@ -1657,6 +1671,24 @@ mod tests {
             matches!(event_rx.recv().unwrap(), DriverEvent::AvailableCommands(commands) if commands.is_empty())
         );
         assert!(!state.run_started);
+    }
+
+    #[test]
+    fn prompt_requests_carry_a_streaming_behavior() {
+        // Pi refuses a prompt that arrives while it is still streaming unless
+        // the request says how to queue it, and Waku can prompt into exactly
+        // that window: stopping a turn settles it here at once, while Pi keeps
+        // streaming until its own abort finishes unwinding. Always asking for
+        // `followUp` — ignored while Pi is idle — queues such a submission
+        // instead of failing it into the transcript as an assistant reply.
+        let (pending, _commands, _command_rx, _state) = harness();
+        let mut wire = Vec::new();
+        send_prompt(&mut wire, &pending, &mut 0, "hello").unwrap();
+
+        let request: Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(request["type"], "prompt");
+        assert_eq!(request["message"], "hello");
+        assert_eq!(request["streamingBehavior"], "followUp");
     }
 
     #[test]
