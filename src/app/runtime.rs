@@ -2178,8 +2178,36 @@ impl Waku {
             .iter()
             .map(|attachment| attachment.mention.clone())
             .collect::<Vec<_>>();
-        let provider_prompt = composer::merged_submission(&prompt, &mentions)
-            .expect("edited text or retained attachments always form a submission");
+        // The rewind drops the messages after this one, so the annotation block
+        // is built against the conversation the model will actually see.
+        let entries = if edit.annotations.is_empty() {
+            Vec::new()
+        } else {
+            let sender = self
+                .selected_session()
+                .and_then(|session| {
+                    session
+                        .messages
+                        .iter()
+                        .position(|message| message.id == edit.message_id)
+                });
+            self.projected_annotations(&edit.annotations, sender)
+        };
+        let provider_prompt = match (composer::merged_submission(&prompt, &mentions), entries.is_empty())
+        {
+            (Some(merged), true) => merged,
+            (Some(merged), false) => {
+                super::annotation_projection::project_annotations(&merged, &entries)
+            }
+            (None, false) => {
+                super::annotation_projection::project_annotations("", &entries)
+            }
+            (None, true) => {
+                self.show_toast(tr!("session.edited_message_empty"));
+                cx.notify();
+                return;
+            }
+        };
         let display_content =
             (!edit.attachments.is_empty() || !edit.annotations.is_empty()).then_some(prompt);
         self.start_message_rewind(

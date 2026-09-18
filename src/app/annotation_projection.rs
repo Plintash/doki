@@ -118,6 +118,19 @@ pub(super) fn project_annotations(text: &str, annotations: &[ProjectedAnnotation
     }
 }
 
+/// How the prompt names the reply a quote came from.
+///
+/// The distance is the one a model can resolve on its own — it can count back
+/// through the conversation it was given — so the locator stays honest even
+/// when the quoted reply has left the context window and the quote is all that
+/// survives of it. English on purpose: this text is prompt, not UI.
+pub(super) fn source_locator(messages_between: usize) -> String {
+    match messages_between {
+        0 => "your reply immediately before this message".to_owned(),
+        between => format!("your reply, {} messages back", between + 1),
+    }
+}
+
 /// A captured value on one line: JSON quoting is the cheapest delimiter that
 /// the quoted text itself cannot escape.
 fn quote_value(value: &str) -> String {
@@ -405,6 +418,18 @@ mod tests {
         assert!(window.starts_with('…') && window.ends_with('…'));
         assert!(window.contains(quote));
         assert!(window.chars().count() <= CONTEXT_MAX_CHARS);
+    }
+
+    /// The locator is the one thing the app supplies, so it is pinned here:
+    /// the model counts back through the conversation it was given.
+    #[test]
+    fn the_source_locator_names_the_distance_the_model_can_count() {
+        assert_eq!(
+            source_locator(0),
+            "your reply immediately before this message"
+        );
+        assert_eq!(source_locator(1), "your reply, 2 messages back");
+        assert_eq!(source_locator(4), "your reply, 5 messages back");
     }
 
     #[test]

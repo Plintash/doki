@@ -2175,7 +2175,22 @@ impl Waku {
             .iter()
             .map(|attachment| attachment.mention.clone())
             .collect::<Vec<_>>();
-        let submission = merged_submission(prompt, &mentions)?;
+        // The projection is the last thing that happens to the prompt: it keeps
+        // `@` mentions beside the words they belong to and puts the annotation
+        // block after them. Nothing downstream may append to it again, which is
+        // why the queued-message replay never re-projects.
+        let entries = self.projected_annotations(&annotations, None);
+        let submission = match (merged_submission(prompt, &mentions), entries.is_empty()) {
+            (Some(merged), true) => merged,
+            (Some(merged), false) => {
+                annotation_projection::project_annotations(&merged, &entries)
+            }
+            // Annotations with nothing typed still carry a message: the quotes
+            // are the user's whole ask, and inventing an instruction for them
+            // would be putting words in their mouth.
+            (None, false) => annotation_projection::project_annotations("", &entries),
+            (None, true) => return None,
+        };
         let display_content =
             (!attachments.is_empty() || !annotations.is_empty()).then(|| prompt.trim().to_owned());
         self.discard_current_composer_draft(cx);
@@ -2185,6 +2200,42 @@ impl Waku {
             attachments,
             annotations,
         })
+    }
+
+    /// The staged annotations as prompt entries, in creation order — the order
+    /// the user sees and the numbers the entries carry.
+    ///
+    /// The locator is computed here because only the app knows where the quoted
+    /// reply sits in the conversation: `sender` is the index the message being
+    /// sent will occupy (`None` appends it), so a rewind measures the distance
+    /// the model will actually see. Caps, quoting and the context window all
+    /// belong to the projection module.
+    pub(super) fn projected_annotations(
+        &self,
+        annotations: &[MessageAnnotation],
+        sender: Option<usize>,
+    ) -> Vec<annotation_projection::ProjectedAnnotation> {
+        let messages = self.selected_session().map(|session| &session.messages);
+        annotations
+            .iter()
+            .map(|annotation| {
+                let AnnotationTarget::MessageSpan { message_id, .. } = &annotation.target;
+                let source = messages
+                    .and_then(|messages| {
+                        messages
+                            .iter()
+                            .position(|message| message.id == *message_id)
+                            .map(|index| {
+                                let sent_from = sender.unwrap_or(messages.len());
+                                annotation_projection::source_locator(
+                                    sent_from.saturating_sub(1).saturating_sub(index),
+                                )
+                            })
+                    })
+                    .unwrap_or_else(|| "your earlier reply".to_owned());
+                annotation_projection::ProjectedAnnotation::new(annotation, source)
+            })
+            .collect()
     }
 
     pub(super) fn execute_local_composer_command(
