@@ -30,13 +30,14 @@ use crate::git_branch::BranchSnapshot;
 use crate::input::{ComposerAttachmentPaste, ComposerEvent, ComposerInput, InputEvent, TextInput};
 use crate::md;
 use crate::model::{
-    ActivityItem, ActivityKind, AgentSession, BackgroundWorkEvent, BackgroundWorkItem,
-    BackgroundWorkKey, BackgroundWorkKind, BackgroundWorkStatus, Checkpoint, CheckpointStatus,
-    ContextUsage, DriverEvent, FavoriteModel, Message, MessageAnnotation, MessageAttachment,
-    MessageRole, PendingPermission, Project, ProviderKind, ProviderModel, ProviderProbe,
-    ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary, QueuedMessage,
-    ReasoningBlock, RuntimeMode, SessionStatus, SessionWorkspace, TranscriptBlock, TurnStatus,
-    UserInputAnswer, UserInputQuestion, compact_path, unix_time, unix_time_millis,
+    ActivityItem, ActivityKind, AgentSession, AnnotationTarget, BackgroundWorkEvent,
+    BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind, BackgroundWorkStatus, Checkpoint,
+    CheckpointStatus, ContextUsage, DriverEvent, FavoriteModel, Message, MessageAnnotation,
+    MessageAttachment, MessageRole, PendingPermission, Project, ProviderKind, ProviderModel,
+    ProviderProbe, ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary,
+    QueuedMessage, ReasoningBlock, RuntimeMode, SessionStatus, SessionWorkspace, TextSpan,
+    TranscriptBlock, TurnStatus, UserInputAnswer, UserInputQuestion, compact_path, unix_time,
+    unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -62,16 +63,18 @@ use crate::terminal::TerminalView;
 use crate::theme::{Theme, ThemePreference, sp};
 use crate::ui::text_field::TextField;
 use crate::ui::{
-    MenuChip, ProjectNameSelector, activity_icon, activity_noun, contain_scroll, file_icon, icon,
-    icon_button, motion, provider_color, provider_mark, status_color, toggle_switch,
+    ActivationExt, MenuChip, ProjectNameSelector, activity_icon, activity_noun, contain_scroll,
+    file_icon, icon, icon_button, motion, provider_color, provider_mark, status_color,
+    toggle_switch,
 };
 use crate::{
-    CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch, CopySelection,
-    FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward, NewProject, NewSession,
-    OpenFind, OpenFindReplace, OpenResumePicker, OpenSettings, ReplaceAllMatches, SaveFile,
-    SelectFirstTask, SelectLastTask, SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette,
-    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
-    ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
+    AnnotateSelection, CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch,
+    CopySelection, FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward,
+    NewProject, NewSession, OpenFind, OpenFindReplace, OpenResumePicker, OpenSettings,
+    ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask, SwitchTaskBackward,
+    SwitchTaskForward, ToggleCommandPalette, ToggleFindCaseSensitive, ToggleFindRegex,
+    ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
+    ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]
@@ -1272,6 +1275,16 @@ pub struct Waku {
     /// label above the attachment chips, drained into the next submission, and
     /// saved with the draft so a session switch does not lose them.
     composer_annotations: Vec<MessageAnnotation>,
+    /// Whether the annotation list is showing its cards. Creating one expands
+    /// it, because that is where its comment gets written.
+    composer_annotations_expanded: bool,
+    /// The card the composer should draw attention to, set when a duplicate
+    /// selection reveals an annotation that is already staged.
+    focused_annotation: Option<Uuid>,
+    /// Focus for the annotation label. Each card gets its own handle from the
+    /// map below, created on demand because the composer renders from `&self`.
+    annotations_focus: FocusHandle,
+    annotation_card_focus: RefCell<HashMap<Uuid, FocusHandle>>,
     /// Window-modal expansion of an image attachment. The path is already
     /// cached attachment metadata; render never probes the filesystem.
     image_preview: Option<image_preview::ImagePreviewState>,
@@ -2830,6 +2843,10 @@ impl Waku {
                 composer_autocomplete: autocomplete::AutocompleteUi::new(),
                 composer_attachments,
                 composer_annotations,
+                composer_annotations_expanded: false,
+                focused_annotation: None,
+                annotations_focus: cx.focus_handle(),
+                annotation_card_focus: RefCell::new(HashMap::new()),
                 image_preview: None,
                 image_preview_generation: 0,
                 remote_images: RefCell::new(HashMap::new()),

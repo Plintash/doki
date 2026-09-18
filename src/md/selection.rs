@@ -139,6 +139,12 @@ impl Selection {
         (!self.is_empty()).then(|| self.text())
     }
 
+    /// The resolved spans, in document order. An annotation anchor is one
+    /// element's span, so callers need the ranges rather than joined text.
+    pub fn spans(&self) -> &[Span] {
+        &self.spans
+    }
+
     /// The full selected text, spans joined in document order.
     pub fn text(&self) -> String {
         let mut out = String::new();

@@ -26,11 +26,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Font, FontStyle,
-    FontWeight, Hsla, InteractiveText, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, SharedString, StrikethroughStyle,
-    StyledText, TextLayout, TextRun, UnderlineStyle, Window, canvas, div, font, img, point,
-    prelude::*, px, quad, relative, size,
+    AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Font,
+    FontStyle, FontWeight, Hsla, InteractiveText, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, SharedString,
+    StrikethroughStyle, StyledText, TextAlign, TextLayout, TextRun, UnderlineStyle, Window, canvas,
+    div, font, img, point, prelude::*, px, quad, relative, size,
 };
 use regex::Regex;
 
@@ -312,6 +312,47 @@ pub struct TextSearchMatch {
 pub struct SearchHighlights {
     pub matches: Rc<Vec<TextSearchMatch>>,
     pub active: Option<TextSearchMatch>,
+}
+
+/// One staged annotation's mark inside a message.
+///
+/// `range` addresses the same flattened rendered text a search hit does, and
+/// `number` is the annotation's position in the composer list — the number the
+/// user reads on the card, so a mark and a card can be matched by eye.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnnotationMark {
+    pub ordinal: usize,
+    pub range: Range<usize>,
+    pub number: usize,
+}
+
+/// This message's staged marks and the treatment they paint with.
+#[derive(Clone)]
+pub struct AnnotationMarks {
+    pub marks: Rc<Vec<AnnotationMark>>,
+    pub style: AnnotationStyle,
+}
+
+/// Colors for annotation marks. The badge digit paints in the page color over
+/// the accent fill, so one pair of colors reads on both themes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnnotationStyle {
+    pub wash: Hsla,
+    pub fill: Hsla,
+    pub digit: Hsla,
+    /// Side of the numbered badge, sized off the body text at render time.
+    pub badge: Pixels,
+}
+
+impl AnnotationStyle {
+    pub fn from_palette(palette: &Palette, text_size: f32) -> Self {
+        Self {
+            wash: palette.accent.opacity(0.16),
+            fill: palette.accent,
+            digit: palette.inset,
+            badge: px((text_size * 0.7).clamp(9.0, 13.0)),
+        }
+    }
 }
 
 /// Flatten inline runs for shaping. Pure given the palette and base weight.
@@ -598,6 +639,7 @@ pub struct Ctx<'a> {
     metrics: Metrics,
     selection: TranscriptSelection,
     search: Option<SearchHighlights>,
+    annotations: Option<AnnotationMarks>,
     link_handler: Option<LinkHandler>,
     /// Cross-frame flatten cache, when this render has one to consult.
     cache: Option<&'a MarkdownView>,
@@ -624,6 +666,7 @@ impl<'a> Ctx<'a> {
             metrics,
             selection,
             search: None,
+            annotations: None,
             link_handler: None,
             cache: None,
             next_ordinal: Cell::new(0),
@@ -647,6 +690,13 @@ impl<'a> Ctx<'a> {
 
     pub fn with_search_highlights(mut self, highlights: SearchHighlights) -> Self {
         self.search = Some(highlights);
+        self
+    }
+
+    /// Mark this row's staged annotations. Painted like a search hit, so the
+    /// two treatments share one geometry pass and one paint order.
+    pub fn with_annotations(mut self, marks: AnnotationMarks) -> Self {
+        self.annotations = Some(marks);
         self
     }
 
@@ -681,6 +731,7 @@ impl<'a> Ctx<'a> {
             metrics: self.metrics,
             selection: self.selection.clone(),
             search: self.search.clone(),
+            annotations: self.annotations.clone(),
             link_handler: self.link_handler.clone(),
             cache: Some(view),
             next_ordinal: Cell::new(self.next_ordinal.get()),
@@ -728,6 +779,7 @@ fn text_element_with_selection(
     key: TextKey,
     selection: TranscriptSelection,
     search: Option<SearchHighlights>,
+    annotations: Option<AnnotationMarks>,
     link_handler: Option<LinkHandler>,
     code_wash: Hsla,
     selection_wash: Hsla,
@@ -761,7 +813,7 @@ fn text_element_with_selection(
         let code_ranges = flat.code_ranges.clone();
         let layout = layout.clone();
         let key = key.clone();
-        move |_, _, window, _| {
+        move |_, _, window, cx| {
             for range in &code_ranges {
                 for rect in range_rects(&layout, range, CODE_WASH_PAD_X, CODE_WASH_INSET_Y) {
                     window.paint_quad(quad(
@@ -796,6 +848,41 @@ fn text_element_with_selection(
                             gpui::transparent_black(),
                             BorderStyle::default(),
                         ));
+                    }
+                }
+            }
+            if let Some(annotations) = &annotations {
+                let first = annotations
+                    .marks
+                    .partition_point(|mark| mark.ordinal < key.index);
+                for mark in annotations.marks[first..]
+                    .iter()
+                    .take_while(|mark| mark.ordinal == key.index)
+                {
+                    let rects = range_rects(
+                        &layout,
+                        &mark.range,
+                        ANNOTATION_WASH_PAD_X,
+                        ANNOTATION_WASH_INSET_Y,
+                    );
+                    for rect in &rects {
+                        window.paint_quad(quad(
+                            rect.clone(),
+                            px(ANNOTATION_WASH_RADIUS),
+                            annotations.style.wash,
+                            px(0.0),
+                            gpui::transparent_black(),
+                            BorderStyle::default(),
+                        ));
+                    }
+                    if let Some(first_line) = rects.first() {
+                        paint_annotation_badge(
+                            window,
+                            cx,
+                            first_line,
+                            mark.number,
+                            annotations.style,
+                        );
                     }
                 }
             }
@@ -834,6 +921,55 @@ fn text_element_with_selection(
         .into_any_element()
 }
 
+/// How far a mark's wash extends around the glyphs it covers.
+const ANNOTATION_WASH_PAD_X: f32 = 1.0;
+const ANNOTATION_WASH_INSET_Y: f32 = 1.0;
+const ANNOTATION_WASH_RADIUS: f32 = 2.0;
+
+/// Paint one numbered badge in the leading above a mark's first line.
+///
+/// The badge is painted rather than rendered as an element on purpose:
+/// inserting a glyph into the text would reflow the paragraph and move the very
+/// byte range the mark addresses. A line box is taller than the glyphs inside
+/// it, so the leading above the first line holds the number without covering
+/// any text.
+fn paint_annotation_badge(
+    window: &mut Window,
+    cx: &mut App,
+    first_line: &Bounds<Pixels>,
+    number: usize,
+    style: AnnotationStyle,
+) {
+    let side = style.badge;
+    let origin = point(first_line.left(), first_line.top() + px(1.0));
+    window.paint_quad(quad(
+        Bounds::new(origin, size(side, side)),
+        side / 2.0,
+        style.fill,
+        px(0.0),
+        gpui::transparent_black(),
+        BorderStyle::default(),
+    ));
+    let text = SharedString::from(number.to_string());
+    let run = TextRun {
+        len: text.len(),
+        font: Font {
+            weight: FontWeight::SEMIBOLD,
+            ..font(MONO_FAMILY)
+        },
+        color: style.digit,
+        ..Default::default()
+    };
+    let line = window
+        .text_system()
+        .shape_line(text, side * 0.78, &[run], None);
+    let text_origin = point(
+        origin.x + (side - line.width) / 2.0,
+        origin.y + (side - px(f32::from(line.ascent + line.descent))) / 2.0,
+    );
+    let _ = line.paint(text_origin, side, TextAlign::Left, None, window, cx);
+}
+
 fn text_element(flat: &Rc<FlatText>, key: TextKey, ctx: &Ctx) -> AnyElement {
     if ctx.math_enabled && flat.math.is_some() {
         return math_text::element(flat.clone(), key, ctx);
@@ -857,6 +993,7 @@ fn text_element(flat: &Rc<FlatText>, key: TextKey, ctx: &Ctx) -> AnyElement {
         key,
         ctx.selection.clone(),
         ctx.search.clone(),
+        ctx.annotations.clone(),
         ctx.link_handler.clone(),
         ctx.palette.code_wash,
         ctx.palette.selection,
@@ -885,6 +1022,7 @@ pub fn selectable_flat_text(
         flat.runs.clone(),
         key,
         selection,
+        None,
         None,
         None,
         code_wash,

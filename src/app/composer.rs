@@ -2330,6 +2330,204 @@ impl Waku {
     /// The staged-attachment chips above the input: a thumbnail tile per
     /// image, a file-type icon and basename for everything else, each with a
     /// floating remove button — T3 Code's attachment row in graphite.
+    /// The staged annotations, drawn above the attachment chips.
+    ///
+    /// The label names the count; the cards carry the numbers the transcript
+    /// marks use, so a mark and its card can be matched by eye. The list starts
+    /// collapsed and expands the moment an annotation is created, because that
+    /// is where its comment is written.
+    fn render_composer_annotations(&self, cx: &mut Context<Self>) -> Div {
+        let theme = Theme::current(cx);
+        let count = self.composer_annotations.len();
+        let label = if count == 1 {
+            tr!("annotation.count_one", count = count)
+        } else {
+            tr!("annotation.count_other", count = count)
+        };
+        let expanded = self.composer_annotations_expanded;
+        let mut list = div()
+            .px(px(14.0))
+            .pt(px(2.0))
+            .pb(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("composer-annotations-label")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(if expanded { theme.accent } else { theme.border })
+                            .bg(theme.inset)
+                            .cursor_default()
+                            .track_focus(&self.annotations_focus)
+                            .tab_index(0)
+                            .focus_visible(|style| style.border_color(theme.accent))
+                            .tooltip(Tooltip::text(if expanded {
+                                tr!("annotation.collapse")
+                            } else {
+                                tr!("annotation.expand")
+                            }))
+                            .child(icon("icons/compose.svg", 12.5, theme.text_secondary))
+                            .child(
+                                div()
+                                    .text_size(sp(12.0))
+                                    .line_height(sp(15.0))
+                                    .text_color(theme.text_secondary)
+                                    .child(label),
+                            )
+                            .child(icon(
+                                if expanded {
+                                    "icons/chevron-up.svg"
+                                } else {
+                                    "icons/chevron-down.svg"
+                                },
+                                12.0,
+                                theme.text_tertiary,
+                            ))
+                            .on_activation(cx, |this, _, cx| {
+                                this.composer_annotations_expanded =
+                                    !this.composer_annotations_expanded;
+                                cx.notify();
+                            }),
+                    )
+                    .child(
+                        icon_button("composer-annotations-clear", "icons/x.svg", theme.clone())
+                            .tooltip(Tooltip::text(tr!("annotation.remove_all")))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.composer_annotations.clear();
+                                this.composer_annotations_expanded = false;
+                                this.focused_annotation = None;
+                                this.capture_and_save_current_composer_draft(cx);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        if expanded {
+            for index in 0..self.composer_annotations.len() {
+                list = list.child(self.render_annotation_card(index, cx));
+            }
+        }
+        list
+    }
+
+    /// One annotation card: what it quotes, which number it carries, and the
+    /// controls that remove it.
+    fn render_annotation_card(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::current(cx);
+        let Some(annotation) = self.composer_annotations.get(index) else {
+            return div().into_any_element();
+        };
+        let id = annotation.id;
+        let (quote, comment) = match &annotation.target {
+            AnnotationTarget::MessageSpan { quote, .. } => {
+                (quote.as_str(), annotation.comment.as_deref())
+            }
+        };
+        let focused = self.focused_annotation == Some(id);
+        let focus = self
+            .annotation_card_focus
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| cx.focus_handle())
+            .clone();
+        div()
+            .id(SharedString::from(format!("annotation-card-{index}")))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(if focused { theme.accent } else { theme.border })
+            .bg(theme.inset)
+            .track_focus(&focus)
+            .tab_index(0)
+            .focus_visible(|style| style.border_color(theme.accent))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(15.0))
+                            .rounded_full()
+                            .bg(theme.accent)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(sp(9.5))
+                                    .line_height(sp(11.0))
+                                    .text_color(theme.inset)
+                                    .child((index + 1).to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(sp(12.0))
+                            .line_height(sp(16.0))
+                            .text_color(theme.text_secondary)
+                            .child(tr!("annotation.selected_text")),
+                    )
+                    .child(
+                        icon_button(
+                            SharedString::from(format!("annotation-remove-{index}")),
+                            "icons/trash.svg",
+                            theme.clone(),
+                        )
+                        .tooltip(Tooltip::text(tr!("annotation.remove")))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if index < this.composer_annotations.len() {
+                                this.composer_annotations.remove(index);
+                            }
+                            if this.composer_annotations.is_empty() {
+                                this.composer_annotations_expanded = false;
+                            }
+                            this.focused_annotation = None;
+                            this.capture_and_save_current_composer_draft(cx);
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .pl(px(21.0))
+                    .text_size(sp(12.0))
+                    .line_height(sp(16.0))
+                    .text_color(theme.text)
+                    .line_clamp(2)
+                    .child(SharedString::from(quote.to_owned())),
+            )
+            .when_some(comment, |card, comment| {
+                card.child(
+                    div()
+                        .pl(px(21.0))
+                        .text_size(sp(12.0))
+                        .line_height(sp(16.0))
+                        .text_color(theme.text_tertiary)
+                        .child(SharedString::from(comment.to_owned())),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_composer_attachments(&self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
         let mut row = div()
@@ -2794,6 +2992,9 @@ impl Waku {
                         }))
                 })
                 .children(autocomplete)
+                .when(!self.composer_annotations.is_empty(), |card| {
+                    card.child(self.render_composer_annotations(cx))
+                })
                 .when(!self.composer_attachments.is_empty(), |card| {
                     card.child(self.render_composer_attachments(cx))
                 })
