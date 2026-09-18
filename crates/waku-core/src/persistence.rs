@@ -2397,6 +2397,7 @@ mod tests {
             "compare @/tmp/reference.png",
             Some("compare".to_owned()),
             vec![attachment.clone()],
+            Vec::new(),
         );
         store.save(&mut state).unwrap();
 

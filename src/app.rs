@@ -32,11 +32,11 @@ use crate::md;
 use crate::model::{
     ActivityItem, ActivityKind, AgentSession, BackgroundWorkEvent, BackgroundWorkItem,
     BackgroundWorkKey, BackgroundWorkKind, BackgroundWorkStatus, Checkpoint, CheckpointStatus,
-    ContextUsage, DriverEvent, FavoriteModel, Message, MessageAttachment, MessageRole,
-    PendingPermission, Project, ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode,
-    SessionStatus, SessionWorkspace, TranscriptBlock, TurnStatus, UserInputAnswer,
-    UserInputQuestion, compact_path, unix_time, unix_time_millis,
+    ContextUsage, DriverEvent, FavoriteModel, Message, MessageAnnotation, MessageAttachment,
+    MessageRole, PendingPermission, Project, ProviderKind, ProviderModel, ProviderProbe,
+    ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary, QueuedMessage,
+    ReasoningBlock, RuntimeMode, SessionStatus, SessionWorkspace, TranscriptBlock, TurnStatus,
+    UserInputAnswer, UserInputQuestion, compact_path, unix_time, unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -329,6 +329,10 @@ struct ComposerSubmission {
     prompt: String,
     display_content: Option<String>,
     attachments: Vec<MessageAttachment>,
+    /// Annotations staged with this submission. Presentation and context only:
+    /// `prompt` already carries their projected text, and these ride along so
+    /// the sent message can mark its spans and show its cards again.
+    annotations: Vec<MessageAnnotation>,
 }
 
 impl ComposerSubmission {
@@ -337,11 +341,13 @@ impl ComposerSubmission {
             prompt,
             display_content: None,
             attachments: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 
     fn into_queued_message(self) -> QueuedMessage {
         QueuedMessage::with_presentation(self.prompt, self.display_content, self.attachments)
+            .with_annotations(self.annotations)
     }
 
     fn from_queued_message(message: QueuedMessage) -> Self {
@@ -349,6 +355,7 @@ impl ComposerSubmission {
             prompt: message.content,
             display_content: message.display_content,
             attachments: message.attachments,
+            annotations: message.annotations,
         }
     }
 
@@ -836,6 +843,9 @@ struct MessageEdit {
     turn_count: usize,
     input: Entity<ComposerInput>,
     attachments: Vec<MessageAttachment>,
+    /// The annotations the message carried, restored so resubmitting it sends
+    /// the same context and keeps its marks.
+    annotations: Vec<MessageAnnotation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1258,6 +1268,10 @@ pub struct Waku {
     /// Files dropped onto the composer, drawn as chips above the input and
     /// drained into the next submission.
     composer_attachments: Vec<ComposerAttachment>,
+    /// Spans of earlier replies the user annotated while composing. Drawn as a
+    /// label above the attachment chips, drained into the next submission, and
+    /// saved with the draft so a session switch does not lose them.
+    composer_annotations: Vec<MessageAnnotation>,
     /// Window-modal expansion of an image attachment. The path is already
     /// cached attachment metadata; render never probes the filesystem.
     image_preview: Option<image_preview::ImagePreviewState>,
@@ -2150,7 +2164,7 @@ impl Waku {
         let crate::persistence::ComposerDraft {
             text: initial_composer_text,
             attachments: initial_composer_attachments,
-            annotations: _,
+            annotations: composer_annotations,
         } = initial_composer_draft;
         if !initial_composer_text.is_empty() {
             composer.update(cx, |input, cx| input.set_content(initial_composer_text, cx));
@@ -2814,6 +2828,7 @@ impl Waku {
                 composer_sources_stale: false,
                 composer_autocomplete: autocomplete::AutocompleteUi::new(),
                 composer_attachments,
+                composer_annotations,
                 image_preview: None,
                 image_preview_generation: 0,
                 remote_images: RefCell::new(HashMap::new()),

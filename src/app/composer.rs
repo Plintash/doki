@@ -2170,17 +2170,20 @@ impl Waku {
             .drain(..)
             .map(MessageAttachment::from)
             .collect::<Vec<_>>();
+        let annotations = std::mem::take(&mut self.composer_annotations);
         let mentions = attachments
             .iter()
             .map(|attachment| attachment.mention.clone())
             .collect::<Vec<_>>();
         let submission = merged_submission(prompt, &mentions)?;
-        let display_content = (!attachments.is_empty()).then(|| prompt.trim().to_owned());
+        let display_content =
+            (!attachments.is_empty() || !annotations.is_empty()).then(|| prompt.trim().to_owned());
         self.discard_current_composer_draft(cx);
         Some(ComposerSubmission {
             prompt: submission,
             display_content,
             attachments,
+            annotations,
         })
     }
 

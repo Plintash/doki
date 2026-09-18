@@ -725,6 +725,11 @@ pub struct QueuedMessage {
     pub display_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachment>,
+    /// Spans of earlier replies the user annotated while composing this
+    /// message. Presentation, not transport: the prompt already carries their
+    /// projected text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<MessageAnnotation>,
     pub created_at: u64,
 }
 
@@ -735,6 +740,7 @@ impl QueuedMessage {
             content: content.into(),
             display_content: None,
             attachments: Vec::new(),
+            annotations: Vec::new(),
             created_at: unix_time(),
         }
     }
@@ -749,6 +755,11 @@ impl QueuedMessage {
             attachments,
             ..Self::new(content)
         }
+    }
+
+    pub fn with_annotations(mut self, annotations: Vec<MessageAnnotation>) -> Self {
+        self.annotations = annotations;
+        self
     }
 
     pub fn visible_content(&self) -> &str {
@@ -1330,7 +1341,7 @@ impl AgentSession {
 
     #[doc(hidden)]
     pub fn begin_turn(&mut self, prompt: impl Into<String>) -> Uuid {
-        self.begin_turn_with_presentation(prompt, None, Vec::new())
+        self.begin_turn_with_presentation(prompt, None, Vec::new(), Vec::new())
     }
 
     pub fn begin_turn_with_presentation(
@@ -1338,6 +1349,7 @@ impl AgentSession {
         prompt: impl Into<String>,
         display_content: Option<String>,
         attachments: Vec<MessageAttachment>,
+        annotations: Vec<MessageAnnotation>,
     ) -> Uuid {
         let id = Uuid::new_v4();
         let now = unix_time();
@@ -1353,7 +1365,8 @@ impl AgentSession {
         });
         self.messages.push(
             Message::new_for_turn(MessageRole::User, prompt, id)
-                .with_presentation(display_content, attachments),
+                .with_presentation(display_content, attachments)
+                .with_annotations(annotations),
         );
         self.last_reply_at = Some(now);
         id
@@ -1536,12 +1549,14 @@ impl AgentSession {
         content: impl Into<String>,
         display_content: Option<String>,
         attachments: Vec<MessageAttachment>,
+        annotations: Vec<MessageAnnotation>,
     ) -> Uuid {
         let message = match self.active_turn_id() {
             Some(turn_id) => Message::new_for_turn(MessageRole::User, content, turn_id),
             None => Message::new(MessageRole::User, content),
         }
-        .with_presentation(display_content, attachments);
+        .with_presentation(display_content, attachments)
+        .with_annotations(annotations);
         let id = message.id;
         self.messages.push(message);
         id
@@ -1779,6 +1794,14 @@ impl Message {
     ) -> Self {
         self.display_content = display_content;
         self.attachments = attachments;
+        self
+    }
+
+    /// Attach the annotations the user staged with this message. They are
+    /// client-side presentation: the prompt already carries their projected
+    /// text, and the transcript marks their spans again from here.
+    pub fn with_annotations(mut self, annotations: Vec<MessageAnnotation>) -> Self {
+        self.annotations = annotations;
         self
     }
 
@@ -3625,6 +3648,7 @@ mod tests {
             "compare this @/tmp/reference.png",
             Some("compare this".to_owned()),
             vec![attachment.clone()],
+            Vec::new(),
         );
 
         let message = &session.messages[0];

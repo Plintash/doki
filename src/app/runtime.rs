@@ -2050,7 +2050,7 @@ impl Waku {
             message_id,
             turn_count,
         } = action;
-        let Some((message_index, initial_message, attachments)) = self
+        let Some((message_index, initial_message, attachments, annotations)) = self
             .state
             .sessions
             .iter()
@@ -2077,6 +2077,7 @@ impl Waku {
                                     index,
                                     message.visible_content().to_owned(),
                                     message.attachments.clone(),
+                                    message.annotations.clone(),
                                 )
                             })
                     })
@@ -2113,6 +2114,7 @@ impl Waku {
             turn_count,
             input: input.clone(),
             attachments,
+            annotations,
         });
         self.hide_toast();
         self.remeasure_transcript_message(message_index);
@@ -2166,7 +2168,7 @@ impl Waku {
         // Use the event's captured value rather than rereading the field; the
         // button path enters here with its own pre-clear content as well.
         let prompt = prompt.trim().to_owned();
-        if prompt.is_empty() && edit.attachments.is_empty() {
+        if prompt.is_empty() && edit.attachments.is_empty() && edit.annotations.is_empty() {
             self.show_toast(tr!("session.edited_message_empty"));
             cx.notify();
             return;
@@ -2178,13 +2180,15 @@ impl Waku {
             .collect::<Vec<_>>();
         let provider_prompt = composer::merged_submission(&prompt, &mentions)
             .expect("edited text or retained attachments always form a submission");
-        let display_content = (!edit.attachments.is_empty()).then_some(prompt);
+        let display_content =
+            (!edit.attachments.is_empty() || !edit.annotations.is_empty()).then_some(prompt);
         self.start_message_rewind(
             edit.clone(),
             ComposerSubmission {
                 prompt: provider_prompt,
                 display_content,
                 attachments: edit.attachments,
+                annotations: edit.annotations,
             },
             cx,
         );
@@ -2355,6 +2359,7 @@ impl Waku {
             message.content = submission.prompt.clone();
             message.display_content = submission.display_content.clone();
             message.attachments = submission.attachments.clone();
+            message.annotations = submission.annotations.clone();
             session.status = SessionStatus::Connecting;
             session.updated_at = unix_time();
             Some(original)
@@ -3260,6 +3265,7 @@ impl Waku {
                 &prompt,
                 submission.display_content.clone(),
                 submission.attachments.clone(),
+                submission.annotations.clone(),
             );
             session.status = SessionStatus::Connecting;
             session.updated_at = unix_time();

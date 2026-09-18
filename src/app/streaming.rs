@@ -493,6 +493,7 @@ impl Waku {
                         message,
                         submission.display_content,
                         submission.attachments,
+                        submission.annotations,
                     );
                     session.updated_at = unix_time();
                 }
