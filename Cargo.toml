@@ -33,10 +33,6 @@ gpui_platform = { git = "https://github.com/egoist/zed", branch = "waku-webview"
   "font-kit",
   "wayland",
   "x11",
-  # TEMPORARY (local only, not for commit): builds gpui_macos' shaders with
-  # `metal` at run time instead of `xcrun metal` at build time, so the app can
-  # be built on a machine that only has CommandLineTools and no Xcode.
-  "runtime_shaders",
 ] }
 parking_lot = "0.12"
 rquickjs = "0.12.2"
