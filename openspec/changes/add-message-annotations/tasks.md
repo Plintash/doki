@@ -12,27 +12,27 @@ rebuild or replace the installed `Doki.app` while the user is working in it.
 
 ## 2. Anchor resolution
 
-- [ ] 2.1 Add a pure resolution module: verify the range when it still matches the quote, otherwise search the message, and prefer the hit nearest the previous offset; unit-test duplicates, ambiguous quotes, multi-byte boundaries, and a quote that is gone entirely
-- [ ] 2.2 Implement overlap extension and exact re-selection reveal; unit-test union of overlapping spans and the no-op duplicate case
+- [x] 2.1 Add a pure resolution module: verify the range when it still matches the quote, otherwise search the message, and prefer the hit nearest the previous offset; unit-test duplicates, ambiguous quotes, multi-byte boundaries, and a quote that is gone entirely
+- [x] 2.2 Implement overlap extension and exact re-selection reveal; unit-test union of overlapping spans and the no-op duplicate case
 - [ ] 2.3 Keep resolution off the frame path: resolve once per message content version in a background pass with a generation guard; verify no resolution work runs per frame while typing and streaming
 
 ## 3. Creation and composer staging
 
-- [ ] 3.1 Add the create action on a non-empty assistant-message selection, reachable from the message context menu and a keyboard shortcut, and refused while the reply streams; verify the refusal predicate in a test and the happy path in the debug app
-- [ ] 3.2 Add the composer label row above the attachment tiles with expand, collapse, and remove; verify visually in the debug app with both annotations and an image attachment staged
+- [x] 3.1 Add the create action on a non-empty assistant-message selection, reachable from the message context menu and a keyboard shortcut, and refused while the reply streams; verify the refusal predicate in a test and the happy path in the debug app
+- [x] 3.2 Add the composer label row above the attachment tiles with expand, collapse, and remove; verify visually in the debug app with both annotations and an image attachment staged
 - [ ] 3.3 Add the stacked card list with `Selected text:` and an optional `User comment:` field, editing the record on change; verify in the debug app and by asserting the stored record
 - [ ] 3.4 Add the read-only hover preview with no interactive controls inside it; verify by hover in the debug app
 - [ ] 3.5 Persist staged annotations with the draft; verify by switching sessions and by restarting the debug app
 
 ## 4. Transcript marks
 
-- [ ] 4.1 Paint the wash plus a numbered gutter badge from staged records, reusing the existing highlight paint path and the element ordinal contract; verify visually in the debug app and that selection and find still behave
-- [ ] 4.2 Keep marks in sync on remove and on extend; verify in the debug app
+- [x] 4.1 Paint the wash plus a numbered badge from staged records, reusing the existing highlight paint path and the element ordinal contract; verify visually in the debug app and that selection and find still behave
+- [x] 4.2 Keep marks in sync on remove and on extend; verify in the debug app
 - [ ] 4.3 Confirm badges are never inline and never colour-only; verify by rendering a staged annotation over a wrapped paragraph
 
 ## 5. Prompt projection
 
-- [ ] 5.1 Implement the projection at the prompt-assembly seam: framing header, user text verbatim, numbered entries with quote, optional comment, source locator, fragment context window, and caps with truncation markers; unit-test every scenario in `specs/prompt-context-projection/spec.md`
+- [x] 5.1 Implement the projection at the prompt-assembly seam: framing header, user text verbatim, numbered entries with quote, optional comment, source locator, fragment context window, and caps with truncation markers; unit-test every scenario in `specs/prompt-context-projection/spec.md`
 - [ ] 5.2 Route prompt, steer, queued, and edit-resend paths through the projection; verify a test asserts identical annotation text for the same input across all four
 - [ ] 5.3 Confirm no offsets, ordinals, or message ids reach the prompt, and that a directive-like or multi-line quote stays confined to its field; verify by unit test
 - [ ] 5.4 Localize the new user-visible labels in `locales/`; verify all locale files gain the keys and the app renders them
