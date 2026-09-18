@@ -1,3 +1,4 @@
+pub mod annotation;
 pub mod highlight;
 mod math;
 pub mod mend;
