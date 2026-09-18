@@ -1104,3 +1104,15 @@ usage_error.curl_did_not_finish: curl がリクエストを完了しませんで
 usage_error.curl_failed: "curl に失敗しました：%{error}"
 usage_error.unknown_error: 不明なエラー
 usage_error.curl_no_status: curl から HTTP ステータス行が返されませんでした
+
+annotation.count_one: "注釈 %{count} 件"
+annotation.count_other: "注釈 %{count} 件"
+annotation.expand: 注釈を表示
+annotation.collapse: 注釈を隠す
+annotation.remove: 注釈を削除
+annotation.remove_all: 注釈をすべて削除
+annotation.selected_text: "引用したテキスト："
+annotation.reply_only: 注釈はアシスタントの返信にのみ付けられます
+annotation.select_reply: 返信の中のテキストを選択してください
+annotation.select_one_reply: 注釈は 1 つの返信にしか付けられません
+annotation.wait_for_reply: 返信が終わってから注釈を付けられます

@@ -2176,3 +2176,26 @@ usage_error.unknown_error:
   en: unknown error
 usage_error.curl_no_status:
   en: curl returned no HTTP status line
+
+annotation.count_one:
+  en: "%{count} annotation"
+annotation.count_other:
+  en: "%{count} annotations"
+annotation.expand:
+  en: Show annotations
+annotation.collapse:
+  en: Hide annotations
+annotation.remove:
+  en: Remove annotation
+annotation.remove_all:
+  en: Remove all annotations
+annotation.selected_text:
+  en: "Selected text:"
+annotation.reply_only:
+  en: Annotations point at the assistant's replies
+annotation.select_reply:
+  en: Select text inside a reply to annotate it
+annotation.select_one_reply:
+  en: An annotation covers one reply; select within a single reply
+annotation.wait_for_reply:
+  en: The reply has to finish before you can annotate it

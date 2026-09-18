@@ -2170,18 +2170,72 @@ impl Waku {
             .drain(..)
             .map(MessageAttachment::from)
             .collect::<Vec<_>>();
+        let annotations = std::mem::take(&mut self.composer_annotations);
         let mentions = attachments
             .iter()
             .map(|attachment| attachment.mention.clone())
             .collect::<Vec<_>>();
-        let submission = merged_submission(prompt, &mentions)?;
-        let display_content = (!attachments.is_empty()).then(|| prompt.trim().to_owned());
+        // The projection is the last thing that happens to the prompt: it keeps
+        // `@` mentions beside the words they belong to and puts the annotation
+        // block after them. Nothing downstream may append to it again, which is
+        // why the queued-message replay never re-projects.
+        let entries = self.projected_annotations(&annotations, None);
+        let submission = match (merged_submission(prompt, &mentions), entries.is_empty()) {
+            (Some(merged), true) => merged,
+            (Some(merged), false) => {
+                annotation_projection::project_annotations(&merged, &entries)
+            }
+            // Annotations with nothing typed still carry a message: the quotes
+            // are the user's whole ask, and inventing an instruction for them
+            // would be putting words in their mouth.
+            (None, false) => annotation_projection::project_annotations("", &entries),
+            (None, true) => return None,
+        };
+        let display_content =
+            (!attachments.is_empty() || !annotations.is_empty()).then(|| prompt.trim().to_owned());
         self.discard_current_composer_draft(cx);
         Some(ComposerSubmission {
             prompt: submission,
             display_content,
             attachments,
+            annotations,
         })
+    }
+
+    /// The staged annotations as prompt entries, in creation order — the order
+    /// the user sees and the numbers the entries carry.
+    ///
+    /// The locator is computed here because only the app knows where the quoted
+    /// reply sits in the conversation: `sender` is the index the message being
+    /// sent will occupy (`None` appends it), so a rewind measures the distance
+    /// the model will actually see. Caps, quoting and the context window all
+    /// belong to the projection module.
+    pub(super) fn projected_annotations(
+        &self,
+        annotations: &[MessageAnnotation],
+        sender: Option<usize>,
+    ) -> Vec<annotation_projection::ProjectedAnnotation> {
+        let messages = self.selected_session().map(|session| &session.messages);
+        annotations
+            .iter()
+            .map(|annotation| {
+                let AnnotationTarget::MessageSpan { message_id, .. } = &annotation.target;
+                let source = messages
+                    .and_then(|messages| {
+                        messages
+                            .iter()
+                            .position(|message| message.id == *message_id)
+                            .map(|index| {
+                                let sent_from = sender.unwrap_or(messages.len());
+                                annotation_projection::source_locator(
+                                    sent_from.saturating_sub(1).saturating_sub(index),
+                                )
+                            })
+                    })
+                    .unwrap_or_else(|| "your earlier reply".to_owned());
+                annotation_projection::ProjectedAnnotation::new(annotation, source)
+            })
+            .collect()
     }
 
     pub(super) fn execute_local_composer_command(
@@ -2327,6 +2381,204 @@ impl Waku {
     /// The staged-attachment chips above the input: a thumbnail tile per
     /// image, a file-type icon and basename for everything else, each with a
     /// floating remove button — T3 Code's attachment row in graphite.
+    /// The staged annotations, drawn above the attachment chips.
+    ///
+    /// The label names the count; the cards carry the numbers the transcript
+    /// marks use, so a mark and its card can be matched by eye. The list starts
+    /// collapsed and expands the moment an annotation is created, because that
+    /// is where its comment is written.
+    fn render_composer_annotations(&self, cx: &mut Context<Self>) -> Div {
+        let theme = Theme::current(cx);
+        let count = self.composer_annotations.len();
+        let label = if count == 1 {
+            tr!("annotation.count_one", count = count)
+        } else {
+            tr!("annotation.count_other", count = count)
+        };
+        let expanded = self.composer_annotations_expanded;
+        let mut list = div()
+            .px(px(14.0))
+            .pt(px(2.0))
+            .pb(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("composer-annotations-label")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(if expanded { theme.accent } else { theme.border })
+                            .bg(theme.inset)
+                            .cursor_default()
+                            .track_focus(&self.annotations_focus)
+                            .tab_index(0)
+                            .focus_visible(|style| style.border_color(theme.accent))
+                            .tooltip(Tooltip::text(if expanded {
+                                tr!("annotation.collapse")
+                            } else {
+                                tr!("annotation.expand")
+                            }))
+                            .child(icon("icons/compose.svg", 12.5, theme.text_secondary))
+                            .child(
+                                div()
+                                    .text_size(sp(12.0))
+                                    .line_height(sp(15.0))
+                                    .text_color(theme.text_secondary)
+                                    .child(label),
+                            )
+                            .child(icon(
+                                if expanded {
+                                    "icons/chevron-up.svg"
+                                } else {
+                                    "icons/chevron-down.svg"
+                                },
+                                12.0,
+                                theme.text_tertiary,
+                            ))
+                            .on_activation(cx, |this, _, cx| {
+                                this.composer_annotations_expanded =
+                                    !this.composer_annotations_expanded;
+                                cx.notify();
+                            }),
+                    )
+                    .child(
+                        icon_button("composer-annotations-clear", "icons/x.svg", theme.clone())
+                            .tooltip(Tooltip::text(tr!("annotation.remove_all")))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.composer_annotations.clear();
+                                this.composer_annotations_expanded = false;
+                                this.focused_annotation = None;
+                                this.capture_and_save_current_composer_draft(cx);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        if expanded {
+            for index in 0..self.composer_annotations.len() {
+                list = list.child(self.render_annotation_card(index, cx));
+            }
+        }
+        list
+    }
+
+    /// One annotation card: what it quotes, which number it carries, and the
+    /// controls that remove it.
+    fn render_annotation_card(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::current(cx);
+        let Some(annotation) = self.composer_annotations.get(index) else {
+            return div().into_any_element();
+        };
+        let id = annotation.id;
+        let (quote, comment) = match &annotation.target {
+            AnnotationTarget::MessageSpan { quote, .. } => {
+                (quote.as_str(), annotation.comment.as_deref())
+            }
+        };
+        let focused = self.focused_annotation == Some(id);
+        let focus = self
+            .annotation_card_focus
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| cx.focus_handle())
+            .clone();
+        div()
+            .id(SharedString::from(format!("annotation-card-{index}")))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(if focused { theme.accent } else { theme.border })
+            .bg(theme.inset)
+            .track_focus(&focus)
+            .tab_index(0)
+            .focus_visible(|style| style.border_color(theme.accent))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(15.0))
+                            .rounded_full()
+                            .bg(theme.accent)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(sp(9.5))
+                                    .line_height(sp(11.0))
+                                    .text_color(theme.inset)
+                                    .child((index + 1).to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(sp(12.0))
+                            .line_height(sp(16.0))
+                            .text_color(theme.text_secondary)
+                            .child(tr!("annotation.selected_text")),
+                    )
+                    .child(
+                        icon_button(
+                            SharedString::from(format!("annotation-remove-{index}")),
+                            "icons/trash.svg",
+                            theme.clone(),
+                        )
+                        .tooltip(Tooltip::text(tr!("annotation.remove")))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if index < this.composer_annotations.len() {
+                                this.composer_annotations.remove(index);
+                            }
+                            if this.composer_annotations.is_empty() {
+                                this.composer_annotations_expanded = false;
+                            }
+                            this.focused_annotation = None;
+                            this.capture_and_save_current_composer_draft(cx);
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .pl(px(21.0))
+                    .text_size(sp(12.0))
+                    .line_height(sp(16.0))
+                    .text_color(theme.text)
+                    .line_clamp(2)
+                    .child(SharedString::from(quote.to_owned())),
+            )
+            .when_some(comment, |card, comment| {
+                card.child(
+                    div()
+                        .pl(px(21.0))
+                        .text_size(sp(12.0))
+                        .line_height(sp(16.0))
+                        .text_color(theme.text_tertiary)
+                        .child(SharedString::from(comment.to_owned())),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_composer_attachments(&self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
         let mut row = div()
@@ -2791,6 +3043,9 @@ impl Waku {
                         }))
                 })
                 .children(autocomplete)
+                .when(!self.composer_annotations.is_empty(), |card| {
+                    card.child(self.render_composer_annotations(cx))
+                })
                 .when(!self.composer_attachments.is_empty(), |card| {
                     card.child(self.render_composer_attachments(cx))
                 })

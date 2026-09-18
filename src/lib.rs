@@ -85,6 +85,7 @@ actions!(
         SaveFile,
         CancelTurn,
         CopySelection,
+        AnnotateSelection,
         OpenFind,
         OpenFindReplace,
         CloseFind,
@@ -259,6 +260,10 @@ pub fn run() {
                 KeyBinding::new("secondary-s", SaveFile, None),
                 KeyBinding::new("escape", CancelTurn, Some("Waku")),
                 KeyBinding::new("secondary-c", CopySelection, Some("Waku")),
+                // The transcript note action. It shares the composer's focus
+                // fallback with copy, so an active selection anywhere in the
+                // transcript is enough to annotate it.
+                KeyBinding::new("secondary-alt-a", AnnotateSelection, Some("Waku")),
                 // Find and replace in the right panel's file editor, on the
                 // conventional VS Code bindings. The primary shortcut + G cycles matches from
                 // the editor without moving focus to the bar.

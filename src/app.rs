@@ -30,13 +30,14 @@ use crate::git_branch::BranchSnapshot;
 use crate::input::{ComposerAttachmentPaste, ComposerEvent, ComposerInput, InputEvent, TextInput};
 use crate::md;
 use crate::model::{
-    ActivityItem, ActivityKind, AgentSession, BackgroundWorkEvent, BackgroundWorkItem,
-    BackgroundWorkKey, BackgroundWorkKind, BackgroundWorkStatus, Checkpoint, CheckpointStatus,
-    ContextUsage, DriverEvent, FavoriteModel, Message, MessageAttachment, MessageRole,
-    PendingPermission, Project, ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode,
-    SessionStatus, SessionWorkspace, TranscriptBlock, TurnStatus, UserInputAnswer,
-    UserInputQuestion, compact_path, unix_time, unix_time_millis,
+    ActivityItem, ActivityKind, AgentSession, AnnotationTarget, BackgroundWorkEvent,
+    BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind, BackgroundWorkStatus, Checkpoint,
+    CheckpointStatus, ContextUsage, DriverEvent, FavoriteModel, Message, MessageAnnotation,
+    MessageAttachment, MessageRole, PendingPermission, Project, ProviderKind, ProviderModel,
+    ProviderProbe, ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary,
+    QueuedMessage, ReasoningBlock, RuntimeMode, SessionStatus, SessionWorkspace, TextSpan,
+    TranscriptBlock, TurnStatus, UserInputAnswer, UserInputQuestion, compact_path, unix_time,
+    unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -62,16 +63,18 @@ use crate::terminal::TerminalView;
 use crate::theme::{Theme, ThemePreference, sp};
 use crate::ui::text_field::TextField;
 use crate::ui::{
-    MenuChip, ProjectNameSelector, activity_icon, activity_noun, contain_scroll, file_icon, icon,
-    icon_button, motion, provider_color, provider_mark, status_color, toggle_switch,
+    ActivationExt, MenuChip, ProjectNameSelector, activity_icon, activity_noun, contain_scroll,
+    file_icon, icon, icon_button, motion, provider_color, provider_mark, status_color,
+    toggle_switch,
 };
 use crate::{
-    CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch, CopySelection,
-    FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward, NewProject, NewSession,
-    OpenFind, OpenFindReplace, OpenResumePicker, OpenSettings, ReplaceAllMatches, SaveFile,
-    SelectFirstTask, SelectLastTask, SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette,
-    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
-    ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
+    AnnotateSelection, CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch,
+    CopySelection, FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward,
+    NewProject, NewSession, OpenFind, OpenFindReplace, OpenResumePicker, OpenSettings,
+    ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask, SwitchTaskBackward,
+    SwitchTaskForward, ToggleCommandPalette, ToggleFindCaseSensitive, ToggleFindRegex,
+    ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
+    ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]
@@ -329,6 +332,10 @@ struct ComposerSubmission {
     prompt: String,
     display_content: Option<String>,
     attachments: Vec<MessageAttachment>,
+    /// Annotations staged with this submission. Presentation and context only:
+    /// `prompt` already carries their projected text, and these ride along so
+    /// the sent message can mark its spans and show its cards again.
+    annotations: Vec<MessageAnnotation>,
 }
 
 impl ComposerSubmission {
@@ -337,11 +344,13 @@ impl ComposerSubmission {
             prompt,
             display_content: None,
             attachments: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 
     fn into_queued_message(self) -> QueuedMessage {
         QueuedMessage::with_presentation(self.prompt, self.display_content, self.attachments)
+            .with_annotations(self.annotations)
     }
 
     fn from_queued_message(message: QueuedMessage) -> Self {
@@ -349,6 +358,7 @@ impl ComposerSubmission {
             prompt: message.content,
             display_content: message.display_content,
             attachments: message.attachments,
+            annotations: message.annotations,
         }
     }
 
@@ -836,6 +846,9 @@ struct MessageEdit {
     turn_count: usize,
     input: Entity<ComposerInput>,
     attachments: Vec<MessageAttachment>,
+    /// The annotations the message carried, restored so resubmitting it sends
+    /// the same context and keeps its marks.
+    annotations: Vec<MessageAnnotation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1258,6 +1271,20 @@ pub struct Waku {
     /// Files dropped onto the composer, drawn as chips above the input and
     /// drained into the next submission.
     composer_attachments: Vec<ComposerAttachment>,
+    /// Spans of earlier replies the user annotated while composing. Drawn as a
+    /// label above the attachment chips, drained into the next submission, and
+    /// saved with the draft so a session switch does not lose them.
+    composer_annotations: Vec<MessageAnnotation>,
+    /// Whether the annotation list is showing its cards. Creating one expands
+    /// it, because that is where its comment gets written.
+    composer_annotations_expanded: bool,
+    /// The card the composer should draw attention to, set when a duplicate
+    /// selection reveals an annotation that is already staged.
+    focused_annotation: Option<Uuid>,
+    /// Focus for the annotation label. Each card gets its own handle from the
+    /// map below, created on demand because the composer renders from `&self`.
+    annotations_focus: FocusHandle,
+    annotation_card_focus: RefCell<HashMap<Uuid, FocusHandle>>,
     /// Window-modal expansion of an image attachment. The path is already
     /// cached attachment metadata; render never probes the filesystem.
     image_preview: Option<image_preview::ImagePreviewState>,
@@ -1608,6 +1635,7 @@ pub struct Waku {
 }
 
 mod activity_diff;
+mod annotation_projection;
 mod autocomplete;
 mod background_work;
 mod branches;
@@ -2150,6 +2178,7 @@ impl Waku {
         let crate::persistence::ComposerDraft {
             text: initial_composer_text,
             attachments: initial_composer_attachments,
+            annotations: composer_annotations,
         } = initial_composer_draft;
         if !initial_composer_text.is_empty() {
             composer.update(cx, |input, cx| input.set_content(initial_composer_text, cx));
@@ -2813,6 +2842,11 @@ impl Waku {
                 composer_sources_stale: false,
                 composer_autocomplete: autocomplete::AutocompleteUi::new(),
                 composer_attachments,
+                composer_annotations,
+                composer_annotations_expanded: false,
+                focused_annotation: None,
+                annotations_focus: cx.focus_handle(),
+                annotation_card_focus: RefCell::new(HashMap::new()),
                 image_preview: None,
                 image_preview_generation: 0,
                 remote_images: RefCell::new(HashMap::new()),

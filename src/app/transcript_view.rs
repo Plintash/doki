@@ -403,33 +403,24 @@ impl Waku {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let reviewing_diff = self.right_panel_visible
-            && self
-                .right_panel_active_surface
-                .and_then(|index| self.right_panel_surfaces.get(index))
-                .is_some_and(|surface| matches!(surface, RightPanelSurface::Diff));
-        let reviewing_background_work = self.right_panel_visible
-            && self
-                .right_panel_active_surface
-                .and_then(|index| self.right_panel_surfaces.get(index))
-                .is_some_and(|surface| matches!(surface, RightPanelSurface::BackgroundWork { .. }));
-        let selected = reviewing_diff
+        let selected = self
+            .right_panel_visible
             .then(|| {
-                self.right_panel_diff_selection
+                self.right_panel_active_surface
+                    .and_then(|index| self.right_panel_surfaces.get(index))
+            })
+            .and_then(|surface| match surface {
+                Some(RightPanelSurface::Diff) => self
+                    .right_panel_diff_selection
                     .selection
                     .borrow()
-                    .selected_text()
-            })
-            .flatten()
-            .or_else(|| {
-                reviewing_background_work
-                    .then(|| {
-                        self.state
-                            .selected_session
-                            .and_then(|session_id| self.background_work.get(&session_id))
-                            .and_then(BackgroundWorkRegistry::selected_text)
-                    })
-                    .flatten()
+                    .selected_text(),
+                Some(RightPanelSurface::BackgroundWork { .. }) => self
+                    .state
+                    .selected_session
+                    .and_then(|session_id| self.background_work.get(&session_id))
+                    .and_then(BackgroundWorkRegistry::selected_text),
+                _ => None,
             })
             .or_else(|| self.toast_selection.selection.borrow().selected_text())
             .or_else(|| self.skills_selection.selection.borrow().selected_text())
@@ -438,6 +429,172 @@ impl Waku {
             Some(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             None => cx.propagate(),
         }
+    }
+
+    /// Stage an annotation for the transcript selection.
+    ///
+    /// The selection registry already resolved the drag into per-element spans,
+    /// so an anchor is the span itself: the element ordinal plus the byte range
+    /// inside that element's rendered text, with the quote and its enclosing
+    /// block snapshotted beside it. Nothing is resolved here — the anchor is
+    /// born exact and only needs re-resolution after a reload.
+    pub(super) fn annotate_selection_action(
+        &mut self,
+        _: &AnnotateSelection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let spans = self
+            .transcript_selection
+            .selection
+            .borrow()
+            .spans()
+            .to_vec();
+        if spans.is_empty() {
+            return;
+        }
+        // Every span has to belong to one assistant reply: an annotation is
+        // anchored to one message, and a reply that is still streaming is still
+        // moving under the anchor.
+        let mut source = None;
+        for span in &spans {
+            let Some(message_id) = message_id_from_row(&span.key.row) else {
+                self.show_annotation_refusal(tr!("annotation.select_reply"));
+                return;
+            };
+            match source {
+                Some(source) if source != message_id => {
+                    self.show_annotation_refusal(tr!("annotation.select_one_reply"));
+                    return;
+                }
+                None => source = Some(message_id),
+                _ => {}
+            }
+        }
+        let Some(message_id) = source else {
+            return;
+        };
+        let Some(message) = self.selected_session().and_then(|session| {
+            session
+                .messages
+                .iter()
+                .find(|message| message.id == message_id)
+        }) else {
+            return;
+        };
+        if message.role != MessageRole::Assistant {
+            self.show_annotation_refusal(tr!("annotation.reply_only"));
+            return;
+        }
+        if message.streaming {
+            self.show_annotation_refusal(tr!("annotation.wait_for_reply"));
+            return;
+        }
+
+        let mut staged = false;
+        for span in spans {
+            let quote = span.text[span.range.clone()].to_string();
+            if quote.trim().is_empty() {
+                continue;
+            }
+            let anchor = md::annotation::Anchor {
+                ordinal: span.key.index,
+                range: span.range.clone(),
+            };
+            // The merge decision indexes the staged slice, so keep the ids in
+            // the same order and translate back through it.
+            let staged_here = self
+                .composer_annotations
+                .iter()
+                .filter_map(|annotation| {
+                    annotation_anchor(annotation, message_id).map(|anchor| (annotation.id, anchor))
+                })
+                .collect::<Vec<_>>();
+            let anchors = staged_here
+                .iter()
+                .map(|(_, anchor)| anchor.clone())
+                .collect::<Vec<_>>();
+            match md::annotation::merge(&anchor, &anchors) {
+                md::annotation::MergeDecision::Duplicate { index } => {
+                    if let Some((id, _)) = staged_here.get(index) {
+                        self.reveal_annotation_card(*id, cx);
+                    }
+                    continue;
+                }
+                md::annotation::MergeDecision::Extend {
+                    index,
+                    absorbed,
+                    range,
+                } => {
+                    let Some((id, _)) = staged_here.get(index) else {
+                        continue;
+                    };
+                    let id = *id;
+                    let absorbed = absorbed
+                        .iter()
+                        .filter_map(|absorbed| staged_here.get(*absorbed))
+                        .map(|(id, _)| *id)
+                        .filter(|absorbed| *absorbed != id)
+                        .collect::<Vec<_>>();
+                    let union_quote = span.text[range.clone()].to_string();
+                    self.composer_annotations
+                        .retain(|annotation| !absorbed.contains(&annotation.id));
+                    if let Some(annotation) = self
+                        .composer_annotations
+                        .iter_mut()
+                        .find(|annotation| annotation.id == id)
+                        && let AnnotationTarget::MessageSpan {
+                            span: anchor,
+                            quote,
+                            block,
+                            ..
+                        } = &mut annotation.target
+                    {
+                        *anchor = TextSpan {
+                            start: range.start,
+                            end: range.end,
+                        };
+                        *quote = union_quote;
+                        *block = span.text.to_string();
+                    }
+                    staged = true;
+                }
+                md::annotation::MergeDecision::New => {
+                    self.composer_annotations.push(MessageAnnotation {
+                        id: Uuid::new_v4(),
+                        target: AnnotationTarget::MessageSpan {
+                            message_id,
+                            ordinal: span.key.index,
+                            span: TextSpan {
+                                start: span.range.start,
+                                end: span.range.end,
+                            },
+                            quote,
+                            block: span.text.to_string(),
+                        },
+                        comment: None,
+                    });
+                    staged = true;
+                }
+            }
+        }
+        if !staged {
+            return;
+        }
+        self.composer_annotations_expanded = true;
+        self.transcript_selection.selection.borrow_mut().clear();
+        self.capture_and_save_current_composer_draft(cx);
+        cx.notify();
+    }
+
+    fn show_annotation_refusal(&mut self, message: impl Into<String>) {
+        self.show_toast(message);
+    }
+
+    fn reveal_annotation_card(&mut self, annotation: Uuid, cx: &mut Context<Self>) {
+        self.composer_annotations_expanded = true;
+        self.focused_annotation = Some(annotation);
+        cx.notify();
     }
 
     /// A zero-size canvas that installs the frame's selection mouse listeners.
@@ -463,6 +620,35 @@ impl Waku {
         .absolute()
         .w(px(0.0))
         .h(px(0.0))
+    }
+}
+
+/// The message a registered text element belongs to.
+///
+/// Transcript text keys are `message-<id>`; anything else (a diff line, a
+/// standalone surface) is not annotatable.
+fn message_id_from_row(row: &str) -> Option<Uuid> {
+    row.strip_prefix("message-")
+        .and_then(|id| Uuid::parse_str(id).ok())
+}
+
+/// The anchor a staged annotation carries for `message_id`, if it belongs to
+/// that reply.
+fn annotation_anchor(
+    annotation: &MessageAnnotation,
+    message_id: Uuid,
+) -> Option<md::annotation::Anchor> {
+    match &annotation.target {
+        AnnotationTarget::MessageSpan {
+            message_id: source,
+            ordinal,
+            span,
+            ..
+        } if *source == message_id => Some(md::annotation::Anchor {
+            ordinal: *ordinal,
+            range: span.start..span.end,
+        }),
+        _ => None,
     }
 }
 
@@ -1315,6 +1501,9 @@ impl Waku {
                             animate_streaming,
                         )
                         .with_context_menu(menu.clone());
+                    if let Some(marks) = self.staged_annotation_marks(message.id, &theme, metrics) {
+                        ctx = ctx.with_annotations(marks);
+                    }
                     if let Some(highlights) = self.transcript_search_highlights(message_index) {
                         ctx = ctx.with_search_highlights(highlights);
                     }
@@ -1421,6 +1610,46 @@ impl Waku {
             }));
         }
         row.into_any_element()
+    }
+
+    /// The marks this reply's staged annotations paint.
+    ///
+    /// Staged anchors were created against this frame's own render, so no
+    /// re-resolution happens here: the stored ordinal and range are exact, and
+    /// the number is the annotation's position in the composer list — the one
+    /// the card shows. `None` when this reply has none, which is the common
+    /// case and costs nothing.
+    fn staged_annotation_marks(
+        &self,
+        message_id: Uuid,
+        theme: &Theme,
+        metrics: MarkdownMetrics,
+    ) -> Option<md::render::AnnotationMarks> {
+        let marks = self
+            .composer_annotations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, annotation)| match &annotation.target {
+                AnnotationTarget::MessageSpan {
+                    message_id: source,
+                    ordinal,
+                    span,
+                    ..
+                } if *source == message_id => Some(md::render::AnnotationMark {
+                    ordinal: *ordinal,
+                    range: span.start..span.end,
+                    number: index + 1,
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        (!marks.is_empty()).then(|| md::render::AnnotationMarks {
+            marks: Rc::new(marks),
+            style: md::render::AnnotationStyle::from_palette(
+                &MarkdownPalette::from_theme(theme),
+                metrics.text_size,
+            ),
+        })
     }
 
     fn render_response_footer_row(
