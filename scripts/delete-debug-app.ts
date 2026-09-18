@@ -8,7 +8,10 @@ import { createInterface } from "node:readline/promises";
 const projectRoot = resolve(import.meta.dir, "..");
 const userHome = homedir();
 const library = join(userHome, "Library");
-const debugBundleIdentifiers = ["sh.waku.dev", "codes.waku.dev"];
+const debugBundleIdentifiers = ["sh.doki.dev", "sh.waku.dev", "codes.waku.dev"];
+// The debug app was called "Waku Debug" before the Doki rename; both names are
+// cleaned so a stale bundle from before the rename cannot linger.
+const debugAppNames = ["Doki Debug", "Waku Debug"];
 
 type Target = {
   path: string;
@@ -22,7 +25,7 @@ function addCandidate(path: string): void {
 }
 
 function isDebugDiagnostic(name: string): boolean {
-  return /^Waku Debug(?: Computer Use)?[-_.]/.test(name);
+  return /^(?:Doki|Waku) Debug(?: Computer Use)?[-_.]/.test(name);
 }
 
 async function addMatchingChildren(
@@ -65,24 +68,39 @@ async function existingTargets(): Promise<Target[]> {
 // Checkout-local state and build artifacts. Keep the release cache intact.
 addCandidate(join(projectRoot, "temp"));
 addCandidate(join(projectRoot, ".waku-cache", "computer-use", "debug"));
-addCandidate(join(projectRoot, "target", "debug", "Waku Debug.app"));
 
-if (process.env.CARGO_TARGET_DIR) {
-  addCandidate(
-    join(
-      resolve(projectRoot, process.env.CARGO_TARGET_DIR),
-      "debug",
-      "Waku Debug.app",
-    ),
-  );
+for (const appName of debugAppNames) {
+  addCandidate(join(projectRoot, "target", "debug", `${appName}.app`));
+
+  if (process.env.CARGO_TARGET_DIR) {
+    addCandidate(
+      join(
+        resolve(projectRoot, process.env.CARGO_TARGET_DIR),
+        "debug",
+        `${appName}.app`,
+      ),
+    );
+  }
+
+  // Debug app bundles that may have been copied outside the checkout.
+  addCandidate(join(userHome, "Applications", `${appName}.app`));
+  addCandidate(`/Applications/${appName}.app`);
+
+  // Debug-only app data. The release app uses Doki/sh.doki and is not included.
+  addCandidate(join(library, "Application Support", appName));
+  addCandidate(join(library, "Caches", appName));
+  addCandidate(join(library, "Logs", appName));
 }
 
-// Debug app bundles that may have been copied outside the checkout.
-addCandidate(join(userHome, "Applications", "Waku Debug.app"));
-addCandidate("/Applications/Waku Debug.app");
-
-// Debug-only app data. The release app uses Waku/sh.waku and is not included.
-addCandidate(join(library, "Application Support", "Waku Debug"));
+addCandidate(
+  join(
+    library,
+    "Application Support",
+    "Doki",
+    "Computer Use",
+    "Doki Debug Computer Use.app",
+  ),
+);
 addCandidate(
   join(
     library,
@@ -92,10 +110,8 @@ addCandidate(
     "Waku Debug Computer Use.app",
   ),
 );
-addCandidate(join(library, "Caches", "Waku Debug"));
-addCandidate(join(library, "Logs", "Waku Debug"));
 
-// codes.waku.dev was Waku Debug's bundle ID before sh.waku.dev.
+// codes.waku.dev was the debug bundle ID before sh.waku.dev.
 for (const bundleIdentifier of debugBundleIdentifiers) {
   for (const path of [
     join(library, "Application Support", bundleIdentifier),
@@ -137,18 +153,18 @@ await addMatchingChildren(
 
 const targets = await existingTargets();
 if (targets.length === 0) {
-  console.log("No Waku Debug files or directories found.");
+  console.log("No Doki Debug files or directories found.");
   process.exit(0);
 }
 
 console.log(
-  "The following Waku Debug paths, including directory contents, will be permanently deleted:\n",
+  "The following Doki Debug paths, including directory contents, will be permanently deleted:\n",
 );
 for (const target of targets) {
   console.log(`  [${target.kind}] ${target.path}`);
 }
 
-const runningProcesses = ["Waku Debug", "Waku Debug Computer Use"].filter(
+const runningProcesses = ["Doki Debug", "Doki Debug Computer Use", "Waku Debug", "Waku Debug Computer Use"].filter(
   (name) =>
     Bun.spawnSync(["/usr/bin/pgrep", "-x", name], {
       stdout: "ignore",

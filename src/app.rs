@@ -1054,7 +1054,6 @@ pub struct Waku {
     /// Selection is committed only after this target's transcript arrives, so
     /// the currently visible task stays intact during daemon latency.
     pending_session_activation: Option<PendingSessionActivation>,
-    analytics: crate::analytics::Analytics,
     state: PersistedState,
     store: StateStore,
     /// Cached before rendering so path labels can abbreviate the home prefix
@@ -1958,24 +1957,6 @@ impl Waku {
         window.set_rem_size(px(waku_client::persistence::sanitized_ui_font_size(
             state.ui_font_size,
         )));
-        let analytics = crate::analytics::Analytics::new(
-            state.language.locale(),
-            state.analytics_id,
-            state.analytics_enabled,
-        );
-        analytics.track(crate::analytics::Event::AppLaunched {
-            task_count: state
-                .sessions
-                .iter()
-                .filter(|session| session.has_started())
-                .count(),
-            project_count: state
-                .projects
-                .iter()
-                .filter(|project| !project.is_projectless())
-                .count(),
-        });
-
         let composer = cx.new(|cx| ComposerInput::new(window, cx).padding_x(px(14.0), cx));
         let user_input_answer = cx
             .new(|cx| TextInput::new(window, cx).placeholder(tr!("user_input.other_placeholder")));
@@ -2719,7 +2700,6 @@ impl Waku {
                 daemon_hostname,
                 session_hydrations: HashSet::new(),
                 pending_session_activation: None,
-                analytics,
                 state,
                 store,
                 home_directory,

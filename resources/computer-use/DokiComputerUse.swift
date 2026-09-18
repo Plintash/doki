@@ -5,14 +5,14 @@ import Foundation
 import ScreenCaptureKit
 
 // A thin, signed macOS host. Cua owns app discovery, accessibility, capture,
-// input delivery, sessions, and native authorization. Waku owns TCC onboarding
+// input delivery, sessions, and native authorization. Doki owns TCC onboarding
 // and the private connection to its JavaScript REPL.
 private let helperDisplayName =
     (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
-    ?? "Waku Computer Use"
+    ?? "Doki Computer Use"
 
 @main
-struct WakuComputerUse {
+struct DokiComputerUse {
     @MainActor
     static func main() {
         if CommandLine.arguments.contains("mcp-child") {
@@ -149,7 +149,7 @@ struct WakuComputerUse {
                     switch method {
                     case "initialize":
                         result = ["protocolVersion": "2025-06-18", "capabilities": ["tools": [:]],
-                                  "serverInfo": ["name": "Waku Cua Driver", "version": "0.28.0"]]
+                                  "serverInfo": ["name": "Doki Cua Driver", "version": "0.28.0"]]
                     case "tools/list": result = try driver.listTools()
                     case "tools/call":
                         guard let params = request["params"] as? [String: Any], let name = params["name"] as? String else {
@@ -273,7 +273,7 @@ private func readExactly(_ count: Int, from input: FileHandle) throws -> Data? {
             if data.isEmpty {
                 return nil
             }
-            throw CuaError("the Waku connection closed mid-message")
+            throw CuaError("the Doki connection closed mid-message")
         }
         data.append(chunk)
     }
@@ -425,7 +425,7 @@ private func connectedChannel(at path: String) throws -> (FileHandle, pid_t) {
         var peerPID: pid_t = 0
         var peerPIDSize = socklen_t(MemoryLayout.size(ofValue: peerPID))
         guard getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERPID, &peerPID, &peerPIDSize) == 0 else {
-            throw CuaError("could not identify the Waku process")
+            throw CuaError("could not identify the Doki process")
         }
         return (FileHandle(fileDescriptor: descriptor, closeOnDealloc: true), peerPID)
     } catch {

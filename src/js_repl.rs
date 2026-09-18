@@ -241,17 +241,17 @@ impl ReplHost {
                     .and_then(JsonValue::as_str)
                     .filter(|session| !session.is_empty() && session.len() <= 160)
                     .ok_or_else(|| {
-                        anyhow!("OpenCode session metadata is required for Waku Computer Use")
+                        anyhow!("OpenCode session metadata is required for Doki Computer Use")
                     })?;
                 kernels.retain(|id, _| session_config_path(directory, id).is_file());
                 let config_path = session_config_path(directory, session);
                 let bytes = fs::read(&config_path)
                     .context("Computer Use is not enabled for this OpenCode session")?;
                 let config: SessionConfig = serde_json::from_slice(&bytes)
-                    .context("invalid Waku Computer Use session registration")?;
+                    .context("invalid Doki Computer Use session registration")?;
                 if !config.process_directory.is_dir() {
                     kernels.remove(session);
-                    bail!("this Waku Computer Use session has ended");
+                    bail!("this Doki Computer Use session has ended");
                 }
                 // A reattached Waku runtime gets a fresh process directory.
                 // Reset only that session, leaving other tasks' bindings intact.
@@ -971,7 +971,7 @@ impl HelperConnection {
         // run it. Refusing here means a release build never reaches the SDK
         // even when WAKU_COMPUTER_USE_SERVER is set by hand.
         if !waku_protocol::computer_use::is_available() {
-            bail!("Waku Computer Use is not available in this build");
+            bail!("Doki Computer Use is not available in this build");
         }
         let command = config
             .map(|config| config.server_path.clone())
@@ -1021,7 +1021,7 @@ impl HelperConnection {
                 .name("waku-js-repl-computer-use-stderr".into())
                 .spawn(move || {
                     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                        eprintln!("Waku Computer Use: {line}");
+                        eprintln!("Doki Computer Use: {line}");
                     }
                 })?;
         }

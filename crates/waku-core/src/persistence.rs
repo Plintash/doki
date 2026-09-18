@@ -62,10 +62,6 @@ fn default_computer_use_enabled() -> bool {
     false
 }
 
-fn default_analytics_enabled() -> bool {
-    true
-}
-
 fn default_provider() -> ProviderKind {
     ProviderKind::Codex
 }
@@ -187,7 +183,6 @@ impl ComposerDraftStore {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppSettings {
-    pub analytics_enabled: bool,
     pub favorite_models: Vec<FavoriteModel>,
     pub theme: ThemePreference,
     pub language: AppLanguage,
@@ -196,7 +191,6 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            analytics_enabled: default_analytics_enabled(),
             favorite_models: Vec::new(),
             theme: ThemePreference::System,
             language: AppLanguage::default(),
@@ -208,10 +202,6 @@ impl Default for AppSettings {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AppState {
     app_state_version: u32,
-    /// Random installation-scoped analytics identity. It is deliberately
-    /// unrelated to provider accounts, projects, or session content.
-    #[serde(default = "Uuid::new_v4")]
-    analytics_id: Uuid,
     #[serde(default)]
     selected_project: Option<Uuid>,
     #[serde(default)]
@@ -242,11 +232,6 @@ struct AppState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PersistedState {
     pub version: u32,
-    /// Random installation-scoped analytics identity. See [`AppState`].
-    #[serde(default = "Uuid::new_v4")]
-    pub analytics_id: Uuid,
-    #[serde(default = "default_analytics_enabled")]
-    pub analytics_enabled: bool,
     pub projects: Vec<Project>,
     pub sessions: Vec<AgentSession>,
     pub selected_project: Option<Uuid>,
@@ -368,8 +353,6 @@ impl PersistedState {
     pub fn empty() -> Self {
         Self {
             version: STATE_VERSION,
-            analytics_id: Uuid::new_v4(),
-            analytics_enabled: true,
             projects: Vec::new(),
             sessions: Vec::new(),
             selected_project: None,
@@ -475,7 +458,6 @@ impl PersistedState {
 
     fn app_settings(&self) -> AppSettings {
         AppSettings {
-            analytics_enabled: self.analytics_enabled,
             favorite_models: self.favorite_models.clone(),
             theme: self.theme,
             language: self.language,
@@ -495,7 +477,6 @@ impl PersistedState {
     fn app_state(&self) -> AppState {
         AppState {
             app_state_version: APP_STATE_VERSION,
-            analytics_id: self.analytics_id,
             selected_project: self.selected_project,
             selected_session: self.persistable_selected_session(),
             last_provider: self.last_provider,
@@ -512,7 +493,6 @@ impl PersistedState {
     }
 
     fn apply_app_settings(&mut self, settings: AppSettings) {
-        self.analytics_enabled = settings.analytics_enabled;
         self.favorite_models = settings.favorite_models;
         self.theme = settings.theme;
         self.language = settings.language;
@@ -527,7 +507,6 @@ impl PersistedState {
     }
 
     fn apply_app_state(&mut self, app_state: AppState) {
-        self.analytics_id = app_state.analytics_id;
         self.selected_project = app_state.selected_project;
         self.selected_session = app_state.selected_session;
         self.last_provider = app_state.last_provider;
@@ -1187,8 +1166,9 @@ impl StateStore {
         let app_state_is_saved = if !self.desktop_files {
             true
         } else if app_state_missing {
-            // Persist the random installation ID before the first analytics
-            // event is sent. Failure must not discard valid database state.
+            // Persist app-managed state (the selected project and session, the
+            // panel layout) on first load. Failure must not discard valid
+            // database state.
             self.write_app_state(&app_state).is_ok()
         } else {
             true
@@ -1871,42 +1851,19 @@ mod tests {
     }
 
     #[test]
-    fn analytics_preference_and_identity_use_their_respective_files() {
-        let mut state = PersistedState::empty();
-        state.analytics_enabled = false;
-        let analytics_id = state.analytics_id;
-        let mut settings = serde_json::to_value(state.app_settings()).unwrap();
-
-        let restored: AppSettings = serde_json::from_value(settings.clone()).unwrap();
-        assert!(!restored.analytics_enabled);
-        assert!(settings.get("analytics_id").is_none());
-
-        let app_state: AppState =
-            serde_json::from_value(serde_json::to_value(state.app_state()).unwrap()).unwrap();
-        assert_eq!(app_state.analytics_id, analytics_id);
-
-        settings
-            .as_object_mut()
-            .unwrap()
-            .remove("analytics_enabled");
-        let backfilled: AppSettings = serde_json::from_value(settings).unwrap();
-        assert!(backfilled.analytics_enabled);
-    }
-
-    #[test]
     fn missing_settings_and_app_state_are_created_during_load() {
         let directory = temporary_directory();
         let store = store_in(&directory);
-        let restored = store.load().unwrap();
+        store.load().unwrap();
         let settings_path = directory.join("app.json");
         let settings: serde_json::Value =
             serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
         let app_state: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.join("state.json")).unwrap()).unwrap();
 
-        assert_eq!(settings["analytics_enabled"], true);
+        assert_eq!(settings["theme"], "system");
         assert!(settings.get("analytics_id").is_none());
-        assert_eq!(app_state["analytics_id"], restored.analytics_id.to_string());
+        assert!(app_state.get("analytics_id").is_none());
         assert!(app_state.get("analytics_enabled").is_none());
 
         fs::remove_dir_all(directory).ok();
@@ -1919,7 +1876,6 @@ mod tests {
         let legacy_path = directory.join("settings.json");
         let legacy = r#"{
             "theme": "dark",
-            "analytics_enabled": false,
             "computer_use_enabled": true,
             "disabled_providers": ["claude"]
         }"#;
@@ -1927,7 +1883,6 @@ mod tests {
 
         let restored = store_in(&directory).load().unwrap();
         assert_eq!(restored.theme, ThemePreference::Dark);
-        assert!(!restored.analytics_enabled);
 
         let app: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.join("app.json")).unwrap()).unwrap();
@@ -1960,7 +1915,6 @@ mod tests {
 
         assert_eq!(settings.theme, ThemePreference::Dark);
         assert_eq!(settings.language, AppLanguage::System);
-        assert!(settings.analytics_enabled);
     }
 
     #[test]
@@ -2843,7 +2797,6 @@ mod tests {
         for app_managed_key in [
             "version",
             "app_state_version",
-            "analytics_id",
             "selected_project",
             "selected_session",
             "last_provider",
@@ -2868,7 +2821,6 @@ mod tests {
         assert_eq!(app_state["sidebar_width"], 301.0);
         assert_eq!(app_state["app_state_version"], APP_STATE_VERSION);
         for setting_key in [
-            "analytics_enabled",
             "favorite_models",
             "theme",
             "language",

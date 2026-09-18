@@ -52,7 +52,7 @@ fn attach_driver(
         supports_steer,
     } = response
     else {
-        anyhow::bail!("Waku daemon returned an invalid runtime attachment response");
+        anyhow::bail!("Doki daemon returned an invalid runtime attachment response");
     };
     let Some(runtime_id) = runtime_id else {
         return Ok(None);
@@ -84,7 +84,7 @@ fn load_remote_task_state(
         ..
     } = response
     else {
-        anyhow::bail!("Waku daemon returned an invalid task-state response");
+        anyhow::bail!("Doki daemon returned an invalid task-state response");
     };
     for session in &mut sessions {
         session.detail_loaded = false;
@@ -1295,55 +1295,14 @@ impl Waku {
         self.state.sessions.iter().find(|session| session.id == id)
     }
 
-    fn active_turn_finished_event(
-        &self,
-        session_id: Uuid,
-        outcome: crate::analytics::TurnOutcome,
-    ) -> Option<crate::analytics::Event> {
-        let session = self
-            .state
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)?;
-        let turn = session
-            .turns
-            .last()
-            .filter(|turn| turn.status == TurnStatus::Running)?;
-        Some(crate::analytics::Event::TurnFinished {
-            provider: session.provider.id(),
-            turn_number: turn.turn_count,
-            outcome,
-            duration_seconds: unix_time().saturating_sub(turn.started_at),
-        })
-    }
-
-    /// Completes a persisted turn and emits its anonymous outcome exactly
-    /// once. All production turn-settlement paths go through this seam.
-    pub(super) fn finish_active_turn_with_analytics(
+    /// Completes a persisted turn exactly once. All production turn-settlement
+    /// paths go through this seam.
+    pub(super) fn finish_active_turn(
         &mut self,
         session_id: Uuid,
         status: TurnStatus,
-        outcome: crate::analytics::TurnOutcome,
     ) -> Option<(Uuid, usize)> {
-        let event = self.active_turn_finished_event(session_id, outcome);
-        let result = self
-            .state
-            .session_mut(session_id)?
-            .finish_active_turn(status);
-        if result.is_some()
-            && let Some(event) = event
-        {
-            self.analytics.track(event);
-        }
-        result
-    }
-
-    /// Records a failed submission that is about to be unwound and therefore
-    /// will not remain as a persisted turn.
-    fn track_active_turn_outcome(&self, session_id: Uuid, outcome: crate::analytics::TurnOutcome) {
-        if let Some(event) = self.active_turn_finished_event(session_id, outcome) {
-            self.analytics.track(event);
-        }
+        self.state.session_mut(session_id)?.finish_active_turn(status)
     }
 
     /// The directory every filesystem and provider operation for `session`
@@ -2042,11 +2001,6 @@ impl Waku {
 
         let fork_id = forked.id;
         self.state.push_session(forked);
-        self.analytics
-            .track(crate::analytics::Event::ResponseForked {
-                provider: provider.id(),
-                turn_number: turn_count,
-            });
         self.select_session(fork_id, cx);
         self.drain_queued_message(session_id, cx);
         match checkpoint_warning {
@@ -2493,18 +2447,13 @@ impl Waku {
             cleanup_error,
         } = prepared;
         let retained_turn_count = turn_count.saturating_sub(1);
-        let provider_and_removed_turns = self
+        let Some(provider) = self
             .state
             .sessions
             .iter()
             .find(|session| session.id == session_id)
-            .map(|session| {
-                (
-                    session.provider,
-                    session.turns.len().saturating_sub(retained_turn_count),
-                )
-            });
-        let Some((provider, removed_turns)) = provider_and_removed_turns else {
+            .map(|session| session.provider)
+        else {
             return;
         };
         if selected {
@@ -2598,11 +2547,6 @@ impl Waku {
                 ),
             });
         }
-        self.analytics
-            .track(crate::analytics::Event::ConversationRolledBack {
-                provider: provider.id(),
-                turns: removed_turns,
-            });
         cx.notify();
         self.submit_submission_for_session(session_id, submission, cx);
     }
@@ -3269,24 +3213,7 @@ impl Waku {
         }
         let prompt = submission.prompt.clone();
         let human_prompt = submission.human_prompt();
-        let has_input = !submission
-            .display_content
-            .as_deref()
-            .unwrap_or(&submission.prompt)
-            .trim()
-            .is_empty();
         let next_turn_count = session.turns.len() + 1;
-        let provider = session.provider.id();
-        let model = self
-            .session_options(session)
-            .model
-            .unwrap_or_else(|| "default".into());
-        let workspace_kind = if session.workspace.is_worktree() {
-            "worktree"
-        } else {
-            "local"
-        };
-        let attachment_count = submission.attachments.len();
         let project_id = session.project_id;
         let workspace = session.workspace.clone();
         let driver_start = (!self.runtimes.contains_key(&session_id)).then(|| {
@@ -3310,7 +3237,6 @@ impl Waku {
             cx.notify();
             return;
         };
-        let projectless = project.is_projectless();
         // Busy is visible before any Git work begins. The separate transient
         // set keeps this non-cancellable phase visually distinct from a
         // connecting provider, whose runtime already has a working Stop path.
@@ -3344,16 +3270,6 @@ impl Waku {
         } else {
             None
         };
-        self.analytics
-            .track(crate::analytics::Event::TurnSubmitted {
-                provider,
-                model,
-                turn_number: next_turn_count,
-                workspace: workspace_kind,
-                projectless,
-                attachment_count,
-                has_input,
-            });
         self.submission_preparations.insert(session_id);
         if selected {
             self.activities_expanded.clear();
@@ -3421,10 +3337,6 @@ impl Waku {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.submission_preparations.remove(&session_id);
-                self.track_active_turn_outcome(
-                    session_id,
-                    crate::analytics::TurnOutcome::PreparationFailed,
-                );
                 if selected {
                     self.sync_transcript_rows();
                 }
@@ -3558,11 +3470,7 @@ impl Waku {
                     session.status = SessionStatus::Failed;
                     session.push_message(MessageRole::Assistant, message);
                 }
-                self.finish_active_turn_with_analytics(
-                    session_id,
-                    TurnStatus::Failed,
-                    crate::analytics::TurnOutcome::StartFailed,
-                );
+                self.finish_active_turn(session_id, TurnStatus::Failed);
             }
         }
         // From this point onward `cancel_turn` has either a live driver to

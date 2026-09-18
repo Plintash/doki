@@ -38,15 +38,15 @@ else
 fi
 case "$profile" in
   debug)
-    app_name="Waku Debug"
-    helper_name="Waku Debug Computer Use"
-    bundle_identifier="sh.waku.dev"
+    app_name="Doki Debug"
+    helper_name="Doki Debug Computer Use"
+    bundle_identifier="sh.doki.dev"
     icon_file="AppIconDev.icns"
     ;;
   release)
-    app_name="Waku"
-    helper_name="Waku Computer Use"
-    bundle_identifier="sh.waku"
+    app_name="Doki"
+    helper_name="Doki Computer Use"
+    bundle_identifier="sh.doki"
     icon_file="AppIcon.icns"
     ;;
   *)
@@ -73,7 +73,7 @@ helper_bundle="$contents/Helpers/$helper_name.app"
 repl_executable="$contents/Resources/waku_js_repl"
 daemon_executable="$contents/MacOS/waku-daemon"
 swift_module_cache="$cargo_target_dir/$profile/swift-module-cache"
-helper_source="resources/computer-use/WakuComputerUse.swift"
+helper_source="resources/computer-use/DokiComputerUse.swift"
 helper_sdk_source="resources/computer-use/CuaDriver.swift"
 cua_sdk_directory=$(bun scripts/cua-host.ts)
 cua_sdk_library="$cua_sdk_directory/libcua_driver_sdk.dylib"
@@ -96,9 +96,9 @@ cached_helper_bundle="$helper_cache_entry/$helper_name.app"
 # Keep compiled helpers outside target so `cargo clean` does not force an
 # unnecessary Swift rebuild. The fingerprint includes the signing identity so
 # switching certificates can never reuse a helper signed as different code.
-# The cached app is copied into Waku's standard Helpers directory as the
-# canonical packaged service. Waku refreshes a stable standalone runtime copy
-# from it so Screen Recording is attributed to the helper rather than Waku.
+# The cached app is copied into Doki's standard Helpers directory as the
+# canonical packaged service. Doki refreshes a stable standalone runtime copy
+# from it so Screen Recording is attributed to the helper rather than Doki.
 
 if [ ! -d "$cached_helper_bundle" ]; then
   helper_cache_staging="$helper_cache_root/.staging-$helper_fingerprint-$$"
@@ -178,7 +178,7 @@ frameworks_directory="$contents/Frameworks"
 sparkle_framework="$frameworks_directory/Sparkle.framework"
 mkdir -p "$frameworks_directory"
 cp -R "$sparkle_framework_source" "$sparkle_framework"
-# Waku is not sandboxed, so Sparkle's XPC services never run; drop them along
+# Doki is not sandboxed, so Sparkle's XPC services never run; drop them along
 # with the header and module folders so the shipped framework carries no dev
 # artifacts and no unsigned nested code.
 for sparkle_extra in XPCServices Headers PrivateHeaders Modules; do
