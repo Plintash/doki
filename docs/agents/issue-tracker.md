@@ -4,15 +4,8 @@ Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all o
 
 ## Which repo
 
-`Plintash/doki`. This clone is a fork: `origin` is `Plintash/doki`, `upstream` is
-`egoist/waku`, and `gh` resolves a bare invocation to the **upstream** parent by
-default. Never let it.
-
-- Preferred: `gh repo set-default Plintash/doki` once per clone, then bare
-  `gh issue …` is safe.
-- Otherwise pass `--repo Plintash/doki` on every command.
-- You have pull-only access to `egoist/waku`. A stray unqualified `gh issue create`
-  files into that repo by accident and cannot be labelled or closed from here.
+`Plintash/doki`. Infer it from `git remote -v`; `gh` does this automatically
+when run inside a clone.
 
 ## Conventions
 
