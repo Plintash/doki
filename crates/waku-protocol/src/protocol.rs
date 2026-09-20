@@ -606,6 +606,7 @@ mod tests {
                 draft: Some(crate::persistence::ComposerDraft {
                     text: "unfinished".into(),
                     attachments: Vec::new(),
+                    annotations: Vec::new(),
                 }),
             }],
         };
@@ -618,5 +619,77 @@ mod tests {
             project_id.to_string()
         );
         assert_eq!(json["changes"][0]["draft"]["text"], "unfinished");
+    }
+
+    #[test]
+    fn staged_annotations_round_trip_through_the_draft_payload() {
+        use crate::model::{AnnotationSpan, AnnotationTarget, MessageAnnotation, TextSpan};
+
+        let message_id = Uuid::from_u128(11);
+        let annotation = MessageAnnotation {
+            id: Uuid::from_u128(12),
+            target: AnnotationTarget::MessageSpan {
+                message_id,
+                spans: vec![AnnotationSpan {
+                    ordinal: 2,
+                    span: TextSpan { start: 7, end: 19 },
+                    quote: "still fine".to_owned(),
+                }],
+                quote: "still fine".to_owned(),
+                block: "the body is still fine here".to_owned(),
+            },
+            comment: None,
+        };
+        let command = Command::ApplyComposerDraftChanges {
+            changes: vec![ComposerDraftChange {
+                target: crate::persistence::ComposerDraftTarget::Session {
+                    session_id: Uuid::from_u128(13),
+                },
+                draft: Some(crate::persistence::ComposerDraft {
+                    text: String::new(),
+                    attachments: Vec::new(),
+                    annotations: vec![annotation.clone()],
+                }),
+            }],
+        };
+
+        let json = serde_json::to_value(&command).unwrap();
+        let staged = &json["changes"][0]["draft"]["annotations"][0];
+        assert_eq!(staged["target"]["type"], "messageSpan");
+        assert_eq!(
+            staged["target"]["message_id"],
+            serde_json::json!(message_id)
+        );
+        assert_eq!(staged["target"]["spans"][0]["span"]["start"], 7);
+        assert_eq!(staged["target"]["quote"], "still fine");
+        assert!(staged.get("comment").is_none());
+
+        let Command::ApplyComposerDraftChanges { changes } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(
+            changes[0].draft.as_ref().unwrap().annotations,
+            vec![annotation.clone()]
+        );
+
+        // A draft saved before annotations existed still loads.
+        let legacy: ComposerDraftChange = serde_json::from_value(serde_json::json!({
+            "target": { "type": "session", "sessionId": Uuid::from_u128(13) },
+            "draft": { "text": "half a thought", "attachments": [] },
+        }))
+        .unwrap();
+        let legacy = legacy.draft.unwrap();
+        assert!(legacy.annotations.is_empty());
+        assert_eq!(legacy.text, "half a thought");
+        assert!(!legacy.is_empty());
+
+        // Annotations alone keep a draft worth storing.
+        let staged_only = crate::persistence::ComposerDraft {
+            text: String::new(),
+            attachments: Vec::new(),
+            annotations: vec![annotation.clone()],
+        };
+        assert!(!staged_only.is_empty());
     }
 }

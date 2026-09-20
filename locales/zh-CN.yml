@@ -278,6 +278,7 @@ common.copy_to_composer: 复制到输入框
 common.copy_code: 复制代码
 common.copy_expression: 复制表达式
 common.cancel: 取消
+common.save: 保存
 common.send: 发送
 session.fork_task: 从此处派生任务
 session.fork_task_title: 从此处派生任务
@@ -1053,3 +1054,20 @@ usage_error.curl_did_not_finish: curl 未能完成请求
 usage_error.curl_failed: "curl 失败：%{error}"
 usage_error.unknown_error: 未知错误
 usage_error.curl_no_status: curl 未返回 HTTP 状态行
+
+annotation.count_one: "%{count} 条标注"
+annotation.count_other: "%{count} 条标注"
+annotation.expand: 展开标注
+annotation.collapse: 收起标注
+annotation.remove: 删除标注
+annotation.edit: 编辑评论
+annotation.remove_all: 删除全部标注
+annotation.selected_text: "引用文字："
+annotation.add_to_chat: 添加到对话
+annotation.comment_placeholder: 添加可选评论…
+annotation.create: 标注所选文字
+annotation.user_comment: "用户评论："
+annotation.reply_only: 标注只能指向助手的回复
+annotation.select_reply: 请在一条回复内选择要标注的文字
+annotation.select_one_reply: 一条标注只能落在同一条回复里，请重新选择
+annotation.wait_for_reply: 回复结束后才能标注

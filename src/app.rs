@@ -12,10 +12,10 @@ use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, Context, Div,
     Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, IntoElement, KeyDownEvent,
     ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, NavigationDirection, ObjectFit, PathPromptOptions, Pixels, Render, ScrollHandle,
-    SharedString, Stateful, StyleRefinement, TextRun, WeakEntity, Window, WindowBounds, canvas,
-    div, ease_out_quint, fill, font, img, linear_color_stop, linear_gradient, list, point,
-    prelude::*, pulsating_between, px, rgb,
+    MouseUpEvent, NavigationDirection, ObjectFit, PathPromptOptions, Pixels, Point, Render,
+    ScrollHandle, SharedString, Stateful, StyleRefinement, TextRun, WeakEntity, Window,
+    WindowBounds, canvas, div, ease_out_quint, fill, font, img, linear_color_stop, linear_gradient,
+    list, point, prelude::*, pulsating_between, px, rgb,
 };
 use uuid::Uuid;
 
@@ -30,13 +30,14 @@ use crate::git_branch::BranchSnapshot;
 use crate::input::{ComposerAttachmentPaste, ComposerEvent, ComposerInput, InputEvent, TextInput};
 use crate::md;
 use crate::model::{
-    ActivityItem, ActivityKind, AgentSession, BackgroundWorkEvent, BackgroundWorkItem,
-    BackgroundWorkKey, BackgroundWorkKind, BackgroundWorkStatus, Checkpoint, CheckpointStatus,
-    ContextUsage, DriverEvent, FavoriteModel, Message, MessageAttachment, MessageRole,
-    PendingPermission, Project, ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode,
-    SessionStatus, SessionWorkspace, TranscriptBlock, TurnStatus, UserInputAnswer,
-    UserInputQuestion, compact_path, unix_time, unix_time_millis,
+    ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget,
+    BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind,
+    BackgroundWorkStatus, Checkpoint, CheckpointStatus, ContextUsage, DriverEvent, FavoriteModel,
+    Message, MessageAnnotation, MessageAttachment, MessageRole, PendingPermission, Project,
+    ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor, ProviderSessionHistory,
+    ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode, SessionStatus,
+    SessionWorkspace, TextSpan, TranscriptBlock, TurnStatus, UserInputAnswer, UserInputQuestion,
+    compact_path, unix_time, unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -66,12 +67,13 @@ use crate::ui::{
     icon_button, motion, provider_color, provider_mark, status_color, toggle_switch,
 };
 use crate::{
-    CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch, CopySelection,
-    FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward, NewProject, NewSession,
-    OpenFind, OpenFindReplace, OpenResumePicker, OpenSettings, ReplaceAllMatches, SaveFile,
-    SelectFirstTask, SelectLastTask, SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette,
-    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
-    ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
+    AnnotateSelection, CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch,
+    CopySelection, DismissAnnotationEditor, FindNext, FindPrevious, FocusComposer, FocusNext,
+    FocusPrev, NavigateBack, NavigateForward, NewProject, NewSession, OpenFind, OpenFindReplace,
+    OpenResumePicker, OpenSettings, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask,
+    SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette, ToggleFindCaseSensitive,
+    ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel,
+    ToggleSidebar, ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]
@@ -329,6 +331,10 @@ struct ComposerSubmission {
     prompt: String,
     display_content: Option<String>,
     attachments: Vec<MessageAttachment>,
+    /// Annotations staged with this submission. Presentation and context only:
+    /// `prompt` already carries their projected text, and these ride along so
+    /// the sent message can mark its spans and show its cards again.
+    annotations: Vec<MessageAnnotation>,
 }
 
 impl ComposerSubmission {
@@ -337,11 +343,13 @@ impl ComposerSubmission {
             prompt,
             display_content: None,
             attachments: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 
     fn into_queued_message(self) -> QueuedMessage {
         QueuedMessage::with_presentation(self.prompt, self.display_content, self.attachments)
+            .with_annotations(self.annotations)
     }
 
     fn from_queued_message(message: QueuedMessage) -> Self {
@@ -349,6 +357,7 @@ impl ComposerSubmission {
             prompt: message.content,
             display_content: message.display_content,
             attachments: message.attachments,
+            annotations: message.annotations,
         }
     }
 
@@ -836,6 +845,62 @@ struct MessageEdit {
     turn_count: usize,
     input: Entity<ComposerInput>,
     attachments: Vec<MessageAttachment>,
+    /// The composer's staged annotations before this edit opened, put back on
+    /// cancel so opening a past message never discards an unsent review.
+    previous_annotations: Vec<MessageAnnotation>,
+}
+
+/// A pending request to scroll the transcript to one annotation's span.
+///
+/// Activating a composer card reveals a range inside a reply that may be off
+/// screen or taller than the viewport, so the request is applied on the frame
+/// after the row is mounted, exactly like a find-bar reveal.
+struct AnnotationReveal {
+    message_id: Uuid,
+    ordinal: usize,
+    range: Range<usize>,
+}
+
+/// One validated annotation candidate captured from the transcript selection:
+/// a single assistant reply's selected element ranges, in document order, with
+/// the whole selected text and the block it starts in.
+#[derive(Clone)]
+pub(super) struct SelectionAnnotation {
+    pub(super) message_id: Uuid,
+    pub(super) parts: Vec<AnnotationSpan>,
+    pub(super) quote: String,
+    pub(super) block: String,
+}
+
+/// The floating action the transcript selection shows.
+///
+/// The selection is captured while it is live: a click on the toolbar itself
+/// lands outside every painted text element, and the transcript's global
+/// mouse-down handler clears the selection before the click handler runs.
+struct SelectionToolbar {
+    anchor: Point<Pixels>,
+    annotation: SelectionAnnotation,
+    /// Whether "Add to chat" has opened the comment field.
+    comment_open: bool,
+}
+
+/// The floating editor a clicked annotation badge opens: the annotation's
+/// comment, with delete, cancel and save. `anchor` is just right of the badge.
+struct AnnotationEditor {
+    id: Uuid,
+    anchor: Point<Pixels>,
+}
+
+/// The transient highlight a card activation leaves on its span. The paint
+/// fades it from `started`; a lease on the pulse clock keeps redrawing until it
+/// lapses. Never created under reduce motion.
+#[derive(Clone, Copy)]
+struct AnnotationFlashState {
+    message_id: Uuid,
+    ordinal: usize,
+    start: usize,
+    end: usize,
+    started: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1258,6 +1323,60 @@ pub struct Waku {
     /// Files dropped onto the composer, drawn as chips above the input and
     /// drained into the next submission.
     composer_attachments: Vec<ComposerAttachment>,
+    /// Spans of earlier replies the user annotated while composing. Drawn as a
+    /// label above the attachment chips, drained into the next submission, and
+    /// saved with the draft so a session switch does not lose them.
+    composer_annotations: Vec<MessageAnnotation>,
+    /// Sent annotations re-anchored against the reply each points at. Filled by
+    /// one background pass per session signature, never resolved on a frame;
+    /// a render reads only these ranges.
+    sent_annotation_resolution: RefCell<annotation_resolution::SentAnnotationResolution>,
+    /// Sent user messages whose annotation indicator is expanded. Keyed by
+    /// message id; collapsed is the default so the transcript stays quiet.
+    expanded_sent_annotations: HashSet<Uuid>,
+    /// Focus for a sent message's annotation indicator, one per message,
+    /// created on demand because the row renders from `&self`.
+    sent_annotation_focus: RefCell<HashMap<Uuid, FocusHandle>>,
+    /// A jump from a composer card waiting for its row to be revealed.
+    pending_annotation_reveal: Option<AnnotationReveal>,
+    /// The span a recent jump is briefly highlighting, if any.
+    annotation_flash: Cell<Option<AnnotationFlashState>>,
+    /// The floating selection action, and its comment field once opened.
+    selection_toolbar: RefCell<Option<SelectionToolbar>>,
+    /// The one comment field the selection toolbar's "Add to chat" opens.
+    annotation_prompt_input: RefCell<Option<Entity<TextInput>>>,
+    /// The annotation whose spans are highlighted and whose editor is open.
+    /// Nothing is highlighted while this is `None`.
+    active_annotation: Cell<Option<Uuid>>,
+    /// The floating comment editor a badge click opened.
+    annotation_editor: RefCell<Option<AnnotationEditor>>,
+    /// The comment field the badge editor edits.
+    annotation_editor_input: RefCell<Option<Entity<TextInput>>>,
+    /// How many of the annotation label and its hover preview the pointer is
+    /// inside. A count rather than a flag, so a pointer moving from the label
+    /// into the preview cannot land the leave after the enter and blink it shut.
+    annotation_preview_hover: Cell<u32>,
+    /// Whether the hover panel is showing. It survives the pointer leaving the
+    /// label and panel for a short grace period, so a fast move across the seam
+    /// does not dismiss it.
+    annotation_preview_visible: Cell<bool>,
+    /// Guards the grace timer: a later enter cancels an earlier pending close.
+    annotation_preview_close_generation: Cell<u64>,
+    /// Scroll position of the annotation hover panel's card list.
+    annotation_preview_scroll: ScrollHandle,
+    /// Focus for the composer annotation chip.
+    annotations_focus: FocusHandle,
+    /// Focus for the chip's clear button.
+    annotation_clear_focus: FocusHandle,
+    /// Focus for the panel's per-annotation controls, keyed by a stable role +
+    /// annotation id.
+    annotation_card_focus: RefCell<HashMap<String, FocusHandle>>,
+    /// True while the panel is held open from the keyboard, so the hover
+    /// grace period cannot close it out from under a tabbing user.
+    annotation_panel_pinned: Cell<bool>,
+    /// Screen bounds of the annotation label, recorded by a paint-time probe so
+    /// the hover preview can anchor above it. Read on the hovered frame only.
+    annotation_label_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Window-modal expansion of an image attachment. The path is already
     /// cached attachment metadata; render never probes the filesystem.
     image_preview: Option<image_preview::ImagePreviewState>,
@@ -1608,6 +1727,8 @@ pub struct Waku {
 }
 
 mod activity_diff;
+mod annotation_projection;
+mod annotation_resolution;
 mod autocomplete;
 mod background_work;
 mod branches;
@@ -2150,6 +2271,7 @@ impl Waku {
         let crate::persistence::ComposerDraft {
             text: initial_composer_text,
             attachments: initial_composer_attachments,
+            annotations: composer_annotations,
         } = initial_composer_draft;
         if !initial_composer_text.is_empty() {
             composer.update(cx, |input, cx| input.set_content(initial_composer_text, cx));
@@ -2813,6 +2935,28 @@ impl Waku {
                 composer_sources_stale: false,
                 composer_autocomplete: autocomplete::AutocompleteUi::new(),
                 composer_attachments,
+                composer_annotations,
+                sent_annotation_resolution: RefCell::new(
+                    annotation_resolution::SentAnnotationResolution::default(),
+                ),
+                expanded_sent_annotations: HashSet::new(),
+                sent_annotation_focus: RefCell::new(HashMap::new()),
+                pending_annotation_reveal: None,
+                annotation_flash: Cell::new(None),
+                selection_toolbar: RefCell::new(None),
+                annotation_prompt_input: RefCell::new(None),
+                active_annotation: Cell::new(None),
+                annotation_editor: RefCell::new(None),
+                annotation_editor_input: RefCell::new(None),
+                annotation_preview_hover: Cell::new(0),
+                annotation_preview_visible: Cell::new(false),
+                annotation_preview_close_generation: Cell::new(0),
+                annotation_preview_scroll: ScrollHandle::new(),
+                annotations_focus: cx.focus_handle(),
+                annotation_clear_focus: cx.focus_handle(),
+                annotation_card_focus: RefCell::new(HashMap::new()),
+                annotation_panel_pinned: Cell::new(false),
+                annotation_label_bounds: Rc::new(Cell::new(None)),
                 image_preview: None,
                 image_preview_generation: 0,
                 remote_images: RefCell::new(HashMap::new()),

@@ -340,7 +340,7 @@ impl Waku {
             })
     }
 
-    fn detach_transcript_search_from_tail(&self) {
+    pub(super) fn detach_transcript_search_from_tail(&self) {
         self.transcript_anchor_following.set(false);
         self.transcript_tail_recheck.set(false);
         self.transcript_is_scrolled.set(true);

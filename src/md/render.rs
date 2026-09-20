@@ -38,7 +38,7 @@ use super::highlight::{self, Lang, TokenClass};
 use super::mend::PENDING_LINK_URL;
 use super::parser::{Block, IncrementalParser, InlineRun, ListItem, TableAlign, TopBlock};
 use super::selection::{
-    RegisteredText, SelectionRegistry, SelectionState, TextKey, line_range, word_range,
+    RegisteredText, Selection, SelectionRegistry, SelectionState, TextKey, line_range, word_range,
 };
 use super::veil::{RowVeil, apply_veil};
 use crate::theme::Theme;
@@ -55,7 +55,9 @@ pub enum TextGeometry {
 }
 
 impl TextGeometry {
-    fn bounds(&self) -> Bounds<Pixels> {
+    /// The element's painted bounds, used to place annotation badges against
+    /// the text column's own right edge.
+    pub fn bounds(&self) -> Bounds<Pixels> {
         match self {
             Self::Text(layout) => layout.bounds(),
             Self::Math(layout) => layout.bounds(),
@@ -312,6 +314,57 @@ pub struct TextSearchMatch {
 pub struct SearchHighlights {
     pub matches: Rc<Vec<TextSearchMatch>>,
     pub active: Option<TextSearchMatch>,
+}
+
+/// One annotation's mark inside a message.
+///
+/// `range` addresses the same flattened rendered text a search hit does, and
+/// `number` is the annotation's position in the composer list — the number the
+/// user reads on the card, so a mark and a card can be matched by eye. A mark
+/// for a *sent* annotation has no draft number: the badge is dropped and only
+/// the wash remains, because the number was draft vocabulary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnnotationMark {
+    /// The annotation the mark belongs to, so a badge can jump back to it.
+    pub id: uuid::Uuid,
+    pub ordinal: usize,
+    pub range: Range<usize>,
+    pub number: Option<usize>,
+}
+
+/// This message's marks and the treatment they paint with.
+#[derive(Clone)]
+pub struct AnnotationMarks {
+    pub marks: Rc<Vec<AnnotationMark>>,
+    pub style: AnnotationStyle,
+    /// A span a card activation is briefly flashing. Painted over its mark, on
+    /// the same underlay, so the flash needs no element of its own.
+    pub flash: Option<AnnotationFlash>,
+}
+
+/// The transient highlight a card activation leaves on its span. The wash is
+/// resolved by the caller from the shared pulse clock, so it fades without the
+/// paint path knowing anything about motion.
+#[derive(Clone)]
+pub struct AnnotationFlash {
+    pub ordinal: usize,
+    pub range: Range<usize>,
+    pub wash: Hsla,
+}
+
+/// Colors for annotation marks. The numbered badge is an element in the
+/// transcript's right gutter now, so only the wash is painted here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnnotationStyle {
+    pub wash: Hsla,
+}
+
+impl AnnotationStyle {
+    pub fn from_palette(palette: &Palette) -> Self {
+        Self {
+            wash: palette.accent.opacity(0.20),
+        }
+    }
 }
 
 /// Flatten inline runs for shaping. Pure given the palette and base weight.
@@ -598,6 +651,7 @@ pub struct Ctx<'a> {
     metrics: Metrics,
     selection: TranscriptSelection,
     search: Option<SearchHighlights>,
+    annotations: Option<AnnotationMarks>,
     link_handler: Option<LinkHandler>,
     /// Cross-frame flatten cache, when this render has one to consult.
     cache: Option<&'a MarkdownView>,
@@ -624,6 +678,7 @@ impl<'a> Ctx<'a> {
             metrics,
             selection,
             search: None,
+            annotations: None,
             link_handler: None,
             cache: None,
             next_ordinal: Cell::new(0),
@@ -647,6 +702,13 @@ impl<'a> Ctx<'a> {
 
     pub fn with_search_highlights(mut self, highlights: SearchHighlights) -> Self {
         self.search = Some(highlights);
+        self
+    }
+
+    /// Mark this row's staged annotations. Painted like a search hit, so the
+    /// two treatments share one geometry pass and one paint order.
+    pub fn with_annotations(mut self, marks: AnnotationMarks) -> Self {
+        self.annotations = Some(marks);
         self
     }
 
@@ -681,6 +743,7 @@ impl<'a> Ctx<'a> {
             metrics: self.metrics,
             selection: self.selection.clone(),
             search: self.search.clone(),
+            annotations: self.annotations.clone(),
             link_handler: self.link_handler.clone(),
             cache: Some(view),
             next_ordinal: Cell::new(self.next_ordinal.get()),
@@ -728,6 +791,7 @@ fn text_element_with_selection(
     key: TextKey,
     selection: TranscriptSelection,
     search: Option<SearchHighlights>,
+    annotations: Option<AnnotationMarks>,
     link_handler: Option<LinkHandler>,
     code_wash: Hsla,
     selection_wash: Hsla,
@@ -799,6 +863,52 @@ fn text_element_with_selection(
                     }
                 }
             }
+            if let Some(annotations) = &annotations {
+                let first = annotations
+                    .marks
+                    .partition_point(|mark| mark.ordinal < key.index);
+                for mark in annotations.marks[first..]
+                    .iter()
+                    .take_while(|mark| mark.ordinal == key.index)
+                {
+                    let rects = range_rects(
+                        &layout,
+                        &mark.range,
+                        ANNOTATION_WASH_PAD_X,
+                        ANNOTATION_WASH_INSET_Y,
+                    );
+                    for rect in &rects {
+                        window.paint_quad(quad(
+                            rect.clone(),
+                            px(ANNOTATION_WASH_RADIUS),
+                            annotations.style.wash,
+                            px(0.0),
+                            gpui::transparent_black(),
+                            BorderStyle::default(),
+                        ));
+                    }
+                }
+            }
+            if let Some(marks) = &annotations
+                && let Some(flash) = &marks.flash
+                && flash.ordinal == key.index
+            {
+                for rect in range_rects(
+                    &layout,
+                    &flash.range,
+                    ANNOTATION_WASH_PAD_X,
+                    ANNOTATION_WASH_INSET_Y,
+                ) {
+                    window.paint_quad(quad(
+                        rect,
+                        px(ANNOTATION_WASH_RADIUS),
+                        flash.wash,
+                        px(0.0),
+                        gpui::transparent_black(),
+                        BorderStyle::default(),
+                    ));
+                }
+            }
             if let Some(range) = selection.selection.borrow().wash_range(&key) {
                 for rect in range_rects(&layout, &range, 0.0, 0.0) {
                     window.paint_quad(quad(
@@ -834,6 +944,11 @@ fn text_element_with_selection(
         .into_any_element()
 }
 
+/// How far a mark's wash extends around the glyphs it covers.
+const ANNOTATION_WASH_PAD_X: f32 = 1.0;
+const ANNOTATION_WASH_INSET_Y: f32 = 1.0;
+const ANNOTATION_WASH_RADIUS: f32 = 2.0;
+
 fn text_element(flat: &Rc<FlatText>, key: TextKey, ctx: &Ctx) -> AnyElement {
     if ctx.math_enabled && flat.math.is_some() {
         return math_text::element(flat.clone(), key, ctx);
@@ -857,6 +972,7 @@ fn text_element(flat: &Rc<FlatText>, key: TextKey, ctx: &Ctx) -> AnyElement {
         key,
         ctx.selection.clone(),
         ctx.search.clone(),
+        ctx.annotations.clone(),
         ctx.link_handler.clone(),
         ctx.palette.code_wash,
         ctx.palette.selection,
@@ -885,6 +1001,7 @@ pub fn selectable_flat_text(
         flat.runs.clone(),
         key,
         selection,
+        None,
         None,
         None,
         code_wash,
@@ -1049,6 +1166,37 @@ fn registry_point(
     Some((index, offset))
 }
 
+/// One end of the current selection: where it sits in document order (registry
+/// index, byte offset), and the key/offset needed to re-anchor a drag there.
+struct SelectionEnd {
+    position: (usize, usize),
+    key: TextKey,
+    offset: usize,
+}
+
+/// The document extent of the current selection, from its first span to its
+/// last, used to decide which end a shift-click grows.
+fn selection_extent(
+    selection: &Selection,
+    registry: &SelectionRegistry<TextGeometry>,
+) -> Option<(SelectionEnd, SelectionEnd)> {
+    let spans = selection.spans();
+    let first = spans.first()?;
+    let last = spans.last()?;
+    Some((
+        SelectionEnd {
+            position: (registry.position(&first.key)?, first.range.start),
+            key: first.key.clone(),
+            offset: first.range.start,
+        },
+        SelectionEnd {
+            position: (registry.position(&last.key)?, last.range.end),
+            key: last.key.clone(),
+            offset: last.range.end,
+        },
+    ))
+}
+
 /// Install the frame's selection mouse listeners.
 ///
 /// These live once per frame at the transcript root rather than once per
@@ -1067,6 +1215,34 @@ pub fn install_selection_input(window: &mut Window, state: &TranscriptSelection)
                 !entry.geometry.is_missing() && entry.geometry.bounds().contains(&event.position)
             });
             let mut selection = state.selection.borrow_mut();
+            // Shift-click grows the selection from the end the click is beyond:
+            // a click past the current end keeps the start and moves the end, a
+            // click before the start keeps the end and moves the start. The
+            // click never shrinks it, the way Codex behaves.
+            if event.modifiers.shift
+                && let Some(head) = registry_point(&registry, event.position)
+                && let Some((start, end)) = selection_extent(&selection, &registry)
+            {
+                let spans = if head >= end.position {
+                    registry.resolve(start.position, head)
+                } else if head <= start.position {
+                    registry.resolve(end.position, head)
+                } else {
+                    // Inside the selection: leave it alone.
+                    drop(selection);
+                    drop(registry);
+                    return;
+                };
+                let pivot = if head >= end.position { start } else { end };
+                selection.extend_from(pivot.key, pivot.offset);
+                let changed = selection.set_spans(spans);
+                drop(selection);
+                drop(registry);
+                if changed {
+                    window.refresh();
+                }
+                return;
+            }
             match hit {
                 Some((_, entry)) => {
                     let offset = match entry.geometry.index_for_position(event.position) {
@@ -1135,13 +1311,19 @@ pub fn install_selection_input(window: &mut Window, state: &TranscriptSelection)
 
     window.on_mouse_event({
         let state = state.clone();
-        move |_: &MouseUpEvent, phase, _, _| {
+        move |_: &MouseUpEvent, phase, window, _| {
             if phase != DispatchPhase::Bubble {
                 return;
             }
+            let was_dragging = state.selection.borrow().is_dragging();
             let key = state.selection.borrow().anchor().cloned();
             if let Some(key) = key {
                 state.selection.borrow_mut().end_drag(&key);
+            }
+            // The selection toolbar appears on release, so this frame has to
+            // happen even though the pointer stopped moving.
+            if was_dragging {
+                window.refresh();
             }
         }
     });
@@ -1192,6 +1374,66 @@ pub fn plain_search_matches(
     let mut matches = Vec::new();
     let limited = search_text(text, ordinal, regex, cap, &mut matches);
     (matches, limited)
+}
+
+/// Flatten every shaped text element of a markdown source into the ordinal the
+/// renderer assigns it, in paint order.
+///
+/// Deliberately the same block shapes and ordinal advance as
+/// [`markdown_search_matches`] — the find bar's canonical walk — so an anchor
+/// re-resolved here points at the exact glyph range the renderer will paint.
+/// Pure and gpui-free, so the annotation re-anchor pass can run it on the
+/// background executor instead of against a live [`MarkdownView`].
+pub fn markdown_element_texts(source: &str) -> Vec<(usize, String)> {
+    let tree = super::parser::parse(source);
+    let mut texts = Vec::new();
+    for (block_ix, top) in tree.blocks.iter().enumerate() {
+        let mut ordinal = block_ordinal_base(block_ix);
+        collect_block_texts(&top.block, &mut ordinal, &mut texts);
+    }
+    texts
+}
+
+fn collect_block_texts(block: &Block, ordinal: &mut usize, texts: &mut Vec<(usize, String)>) {
+    match block {
+        Block::Paragraph { runs } | Block::Heading { runs, .. } => {
+            let text = runs.iter().map(|run| run.text.as_str()).collect::<String>();
+            let current = *ordinal;
+            *ordinal += 1;
+            texts.push((current, text));
+        }
+        Block::CodeBlock { code, .. } | Block::DisplayMath { latex: code } => {
+            let current = *ordinal;
+            *ordinal += 1;
+            texts.push((current, code.clone()));
+        }
+        Block::Image { .. } => {
+            // The renderer consumes an ordinal for the image id, but the alt
+            // caption is not a shaped text element.
+            *ordinal += 1;
+        }
+        Block::BlockQuote { children } => {
+            for child in children {
+                collect_block_texts(child, ordinal, texts);
+            }
+        }
+        Block::List { items, .. } => {
+            for item in items {
+                for child in &item.blocks {
+                    collect_block_texts(child, ordinal, texts);
+                }
+            }
+        }
+        Block::Table { header, rows, .. } => {
+            for cell in header.iter().chain(rows.iter().flat_map(|row| row.iter())) {
+                let text = cell.iter().map(|run| run.text.as_str()).collect::<String>();
+                let current = *ordinal;
+                *ordinal += 1;
+                texts.push((current, text));
+            }
+        }
+        Block::Rule => {}
+    }
 }
 
 fn search_block(
@@ -1999,6 +2241,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 7..10), (1 << 16, 0..3), ((2 << 16) + 1, 0..3)]
         );
+    }
+
+    /// The re-anchor pass flattens a reply's text elements itself, on the
+    /// background executor, so it must land on exactly the ordinals the
+    /// renderer and the find bar use. Checked against the search walk's hits,
+    /// which are the same address space a mark paints in.
+    #[test]
+    fn markdown_element_texts_agrees_with_the_search_walk() {
+        let source = "first\n\n> quoted *needle*\n\n```txt\nneedle\n```";
+        let (matches, limited) =
+            markdown_search_matches(source, &Regex::new("needle").unwrap(), 20);
+        assert!(!limited);
+        assert_eq!(matches.len(), 2);
+        let texts = markdown_element_texts(source);
+        for found in &matches {
+            let (_, text) = texts
+                .iter()
+                .find(|(ordinal, _)| *ordinal == found.ordinal)
+                .expect("every search ordinal has an element");
+            assert_eq!(&text[found.range.clone()], "needle");
+        }
+        // Card markers, images and rules consume ordinals without a shaped
+        // element; the walk still has to leave the gap so later blocks agree.
+        assert!(texts.iter().any(|(ordinal, _)| *ordinal == 2 << 16));
     }
 
     fn runs_of(source: &str) -> Vec<InlineRun> {

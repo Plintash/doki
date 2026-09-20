@@ -30,8 +30,8 @@ use crate::computer_use::ComputerAppGrant;
 use crate::i18n::AppLanguage;
 use crate::identity::DATA_DIRECTORY_NAME;
 use crate::model::{
-    AgentSession, FavoriteModel, Message, MessageAttachment, MessageRole, Project, ProviderKind,
-    RuntimeMode, SessionWorkspace,
+    AgentSession, AnnotationSpan, AnnotationTarget, FavoriteModel, Message, MessageAnnotation,
+    MessageAttachment, MessageRole, Project, ProviderKind, RuntimeMode, SessionWorkspace,
 };
 use crate::theme::ThemePreference;
 pub use waku_protocol::persistence::{
@@ -1246,7 +1246,7 @@ impl StateStore {
 
         let mut statement = connection
             .prepare(
-                "SELECT id, turn_id, role, content, display_content, attachments,
+                "SELECT id, turn_id, role, content, display_content, attachments, annotations,
                         created_at, streaming
                  FROM messages WHERE session_id = ?1 ORDER BY position",
             )
@@ -1260,8 +1260,9 @@ impl StateStore {
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             })
             .map_err(to_io_error)?
@@ -1550,12 +1551,23 @@ type MessageColumns = (
     String,
     Option<String>,
     String,
+    String,
     i64,
     i64,
 );
 
 fn message_from_row(row: MessageColumns) -> Option<Message> {
-    let (id, turn_id, role, content, display_content, attachments, created_at, streaming) = row;
+    let (
+        id,
+        turn_id,
+        role,
+        content,
+        display_content,
+        attachments,
+        annotations,
+        created_at,
+        streaming,
+    ) = row;
     Some(Message {
         id: Uuid::parse_str(&id).ok()?,
         turn_id: turn_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()),
@@ -1563,6 +1575,8 @@ fn message_from_row(row: MessageColumns) -> Option<Message> {
         content,
         display_content,
         attachments: serde_json::from_str::<Vec<MessageAttachment>>(&attachments)
+            .unwrap_or_default(),
+        annotations: serde_json::from_str::<Vec<MessageAnnotation>>(&annotations)
             .unwrap_or_default(),
         created_at: created_at as u64,
         streaming: streaming != 0,
@@ -1583,8 +1597,8 @@ fn session_data(session: &AgentSession) -> io::Result<String> {
 
 const UPSERT_MESSAGE: &str = "INSERT INTO messages(
          id, session_id, turn_id, position, role, content, display_content,
-         attachments, created_at, streaming
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         attachments, annotations, created_at, streaming
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
      ON CONFLICT(id) DO UPDATE SET
          session_id = excluded.session_id,
          turn_id    = excluded.turn_id,
@@ -1593,6 +1607,7 @@ const UPSERT_MESSAGE: &str = "INSERT INTO messages(
          content    = excluded.content,
          display_content = excluded.display_content,
          attachments = excluded.attachments,
+         annotations = excluded.annotations,
          created_at = excluded.created_at,
          streaming  = excluded.streaming";
 
@@ -1631,6 +1646,11 @@ fn write_messages(
         } else {
             serde_json::to_string(&message.attachments).map_err(to_io_error)?
         };
+        let annotations = if message.annotations.is_empty() {
+            "[]".to_owned()
+        } else {
+            serde_json::to_string(&message.annotations).map_err(to_io_error)?
+        };
         transaction
             .execute(
                 UPSERT_MESSAGE,
@@ -1648,6 +1668,7 @@ fn write_messages(
                         .clone()
                         .map_or(Value::Null, Value::Text),
                     Value::Text(attachments),
+                    Value::Text(annotations),
                     Value::Integer(message.created_at as i64),
                     Value::Integer(i64::from(message.streaming)),
                 ]),
@@ -1728,6 +1749,42 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
             fold(fingerprint(reference));
         } else {
             fold(0);
+        }
+    }
+    fold(message.annotations.len() as u64);
+    for annotation in &message.annotations {
+        let (high, low) = annotation.id.as_u64_pair();
+        fold(high);
+        fold(low);
+        match &annotation.target {
+            AnnotationTarget::MessageSpan {
+                message_id,
+                spans,
+                quote,
+                block,
+            } => {
+                // The kind, so a later target kind cannot collide with this one.
+                fold(1);
+                let (high, low) = message_id.as_u64_pair();
+                fold(high);
+                fold(low);
+                fold(spans.len() as u64);
+                for part in spans {
+                    fold(part.ordinal as u64);
+                    fold(part.span.start as u64);
+                    fold(part.span.end as u64);
+                    fold(fingerprint(&part.quote));
+                }
+                fold(fingerprint(quote));
+                fold(fingerprint(block));
+            }
+        }
+        match &annotation.comment {
+            Some(comment) => {
+                fold(1);
+                fold(fingerprint(comment));
+            }
+            None => fold(0),
         }
     }
     hash
@@ -1831,6 +1888,7 @@ mod tests {
         ComposerDraft {
             text: text.to_owned(),
             attachments: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 
@@ -2010,6 +2068,7 @@ mod tests {
                 is_image: true,
                 blob_reference: None,
             }],
+            annotations: Vec::new(),
         };
         let mut drafts = ComposerDrafts::default();
         drafts.set(ComposerDraftKey::NewSession(project_id), draft.clone());
@@ -2020,6 +2079,114 @@ mod tests {
             restored.get(ComposerDraftKey::NewSession(project_id)),
             Some(&draft)
         );
+    }
+
+    #[test]
+    fn composer_drafts_round_trip_staged_annotations() {
+        let directory = temporary_directory();
+        let store = ComposerDraftStore::for_state_path(&directory.join("app.db"));
+        let project_id = Uuid::new_v4();
+        let annotation = sample_annotation(Uuid::new_v4(), Some("this drops the error"));
+        // Annotations alone are a real draft: nothing typed, nothing attached,
+        // and still worth keeping across a restart.
+        let draft = ComposerDraft {
+            text: String::new(),
+            attachments: Vec::new(),
+            annotations: vec![annotation.clone()],
+        };
+        assert!(!draft.is_empty());
+
+        let mut drafts = ComposerDrafts::default();
+        assert!(drafts.set(ComposerDraftKey::NewSession(project_id), draft.clone()));
+
+        store.save(drafts.clone(), 1).unwrap();
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .get(ComposerDraftKey::NewSession(project_id)),
+            Some(&draft)
+        );
+
+        // A draft stored before annotations existed still loads, and keeps only
+        // what it had.
+        let legacy = ComposerDrafts {
+            new_sessions: std::iter::once((
+                project_id,
+                ComposerDraft {
+                    text: "half a thought".to_owned(),
+                    attachments: Vec::new(),
+                    annotations: Vec::new(),
+                },
+            ))
+            .collect(),
+            sessions: Default::default(),
+        };
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        assert!(!legacy_json.contains("annotations"));
+        assert_eq!(
+            serde_json::from_str::<ComposerDrafts>(&legacy_json).unwrap(),
+            legacy
+        );
+
+        // Removing the last annotation empties the draft, which the store drops.
+        drafts.set(
+            ComposerDraftKey::NewSession(project_id),
+            ComposerDraft::default(),
+        );
+        store.save(drafts, 2).unwrap();
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .get(ComposerDraftKey::NewSession(project_id)),
+            None
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn switching_sessions_keeps_each_sessions_staged_annotations() {
+        // Switching sessions is capture(current) -> restore(next) against this
+        // store, so the behaviour to pin is two sessions holding different
+        // staged sets at once, with the first one coming back intact.
+        let first_session = Uuid::new_v4();
+        let second_session = Uuid::new_v4();
+        let staged = vec![
+            sample_annotation(Uuid::new_v4(), Some("this drops the error")),
+            sample_annotation(Uuid::new_v4(), None),
+        ];
+        let mut drafts = ComposerDrafts::default();
+        drafts.set(
+            ComposerDraftKey::Session(first_session),
+            ComposerDraft {
+                text: String::new(),
+                attachments: Vec::new(),
+                annotations: staged.clone(),
+            },
+        );
+        // A draft staged on the other session must not merge into the first.
+        drafts.set(
+            ComposerDraftKey::Session(second_session),
+            ComposerDraft {
+                text: "a note on the other task".to_owned(),
+                attachments: Vec::new(),
+                annotations: Vec::new(),
+            },
+        );
+
+        let restored = drafts
+            .get(ComposerDraftKey::Session(first_session))
+            .expect("the first session's draft is still stored");
+        assert_eq!(restored.annotations, staged);
+        assert_eq!(
+            restored.annotations[0].comment.as_deref(),
+            Some("this drops the error")
+        );
+        assert_eq!(restored.annotations[1].comment, None);
+        let AnnotationTarget::MessageSpan { quote, spans, .. } = &restored.annotations[0].target;
+        assert_eq!(quote, "retry helper");
+        assert_eq!((spans[0].span.start, spans[0].span.end), (4, 16));
     }
 
     #[test]
@@ -2277,6 +2444,7 @@ mod tests {
             "compare @/tmp/reference.png",
             Some("compare".to_owned()),
             vec![attachment.clone()],
+            Vec::new(),
         );
         store.save(&mut state).unwrap();
 
@@ -2472,6 +2640,7 @@ mod tests {
                     is_image: true,
                     blob_reference: Some(reference),
                 }],
+                annotations: Vec::new(),
             },
         );
         ComposerDraftStore::for_state_path(&directory.join("app.db"))
@@ -3126,6 +3295,125 @@ mod tests {
                 .messages
                 .len(),
             1
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    /// One annotated span of `message_id`, with or without a comment.
+    fn sample_annotation(message_id: Uuid, comment: Option<&str>) -> MessageAnnotation {
+        MessageAnnotation {
+            id: Uuid::new_v4(),
+            target: AnnotationTarget::MessageSpan {
+                message_id,
+                spans: vec![AnnotationSpan {
+                    ordinal: 1 << 16,
+                    span: crate::model::TextSpan { start: 4, end: 16 },
+                    quote: "retry helper".to_owned(),
+                }],
+                quote: "retry helper".to_owned(),
+                block: "the retry helper returns Ok(())".to_owned(),
+            },
+            comment: comment.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn message_annotations_round_trip_and_a_comment_edit_is_written() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        state.sessions[0].begin_turn("Ask");
+        state.sessions[0].push_message(MessageRole::Assistant, "the retry helper returns Ok(())");
+        state.sessions[0].finish_active_turn(crate::model::TurnStatus::Completed);
+        let session_id = state.sessions[0].id;
+        let message_id = state.sessions[0].messages[0].id;
+        // A bare pointer and a commented one, so both shapes survive the row.
+        let bare = sample_annotation(message_id, None);
+        let commented = sample_annotation(Uuid::new_v4(), Some("this drops the error"));
+        state.session_mut(session_id).unwrap().messages[0].annotations =
+            vec![bare.clone(), commented.clone()];
+        store.save(&mut state).unwrap();
+
+        assert_eq!(
+            load_hydrated(&store_in(&directory)).sessions[0].messages[0].annotations,
+            vec![bare, commented]
+        );
+
+        // Only the comment changes. The message row still has to be rewritten,
+        // which is the fingerprint's job to notice.
+        state.session_mut(session_id).unwrap().messages[0].annotations[1].comment =
+            Some("say which error was dropped".to_owned());
+        store.save(&mut state).unwrap();
+
+        assert_eq!(
+            load_hydrated(&store_in(&directory)).sessions[0].messages[0].annotations[1]
+                .comment
+                .as_deref(),
+            Some("say which error was dropped")
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn annotations_column_is_added_to_a_database_that_predates_it() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        state.sessions[0].begin_turn("Ask");
+        state.sessions[0].push_message(MessageRole::Assistant, "the retry helper returns Ok(())");
+        state.sessions[0].finish_active_turn(crate::model::TurnStatus::Completed);
+        let message_id = state.sessions[0].messages[0].id;
+        store.save(&mut state).unwrap();
+
+        // Rewind the file to the release before annotations: the column is gone
+        // and the migration is no longer recorded, which is what an upgrade
+        // from that build finds. Every other column and row stays in place.
+        let (annotation_migration, annotation_sql) =
+            *MIGRATIONS.last().expect("at least one migration");
+        assert!(
+            annotation_sql.contains("annotations"),
+            "this fixture rewinds the newest migration, which must be the one adding the \
+             annotations column: {annotation_sql}"
+        );
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        connection
+            .execute(
+                "DELETE FROM migrations WHERE tag = ?1",
+                params![annotation_migration],
+            )
+            .unwrap();
+        connection
+            .execute_batch("ALTER TABLE messages DROP COLUMN annotations")
+            .unwrap();
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('messages')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            !columns.iter().any(|name| name == "annotations"),
+            "the fixture really is the older database: {columns:?}"
+        );
+        drop(connection);
+
+        // Opening applies the missing migration, and the row written before it
+        // loads with nothing annotated.
+        let reopened = store_in(&directory);
+        let mut restored = load_hydrated(&reopened);
+        assert!(restored.sessions[0].messages[0].annotations.is_empty());
+
+        // The added column then takes the new payload.
+        let session_id = restored.sessions[0].id;
+        let annotation = sample_annotation(message_id, Some("this drops the error"));
+        restored.session_mut(session_id).unwrap().messages[0].annotations =
+            vec![annotation.clone()];
+        reopened.save(&mut restored).unwrap();
+
+        assert_eq!(
+            load_hydrated(&store_in(&directory)).sessions[0].messages[0].annotations,
+            vec![annotation]
         );
         fs::remove_dir_all(directory).ok();
     }

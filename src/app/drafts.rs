@@ -79,6 +79,7 @@ impl Waku {
                 .iter()
                 .map(crate::persistence::ComposerDraftAttachment::from)
                 .collect(),
+            annotations: self.composer_annotations.clone(),
         }
     }
 
@@ -170,6 +171,9 @@ impl Waku {
             .into_iter()
             .map(ComposerAttachment::from)
             .collect();
+        self.composer_annotations = draft.annotations;
+        // The label in the outgoing draft never sent a leave event.
+        self.reset_annotation_preview_hover();
         self.composer
             .update(cx, |input, cx| input.set_content(draft.text, cx));
         cx.notify();

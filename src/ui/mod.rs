@@ -539,6 +539,7 @@ mod tests {
         use gpui::AssetSource;
 
         let mut paths = vec![
+            "icons/annotation.svg",
             "icons/panel-left.svg",
             "icons/plus.svg",
             "icons/arrow-left.svg",

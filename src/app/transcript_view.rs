@@ -1,5 +1,6 @@
 use super::right_panel::{DiffRowStyle, render_diff_code_row};
 use super::*;
+use crate::ui::ActivationExt;
 use base64::Engine as _;
 
 const CHANGED_FILES_PREVIEW_LIMIT: usize = 3;
@@ -13,6 +14,22 @@ const ACTIVITY_DIFF_MAX_HEIGHT: f32 = 400.0;
 /// Aligns a hunk separator with the line numbers in the rows below it; see
 /// `DiffRowStyle::ACTIVITY`.
 const ACTIVITY_DIFF_GUTTER_WIDTH: f32 = 52.0;
+
+/// Height of the soft fade at the top and bottom of the transcript, so content
+/// dissolves into the header and the composer instead of stopping at a hard
+/// edge.
+const TRANSCRIPT_FADE_HEIGHT: f32 = 26.0;
+
+/// How long a jump from a composer card highlights its span before settling to
+/// the resting annotation wash.
+const ANNOTATION_FLASH_DURATION: Duration = Duration::from_millis(650);
+/// Peak opacity of that highlight; it fades to zero over the duration.
+const ANNOTATION_FLASH_ALPHA: f32 = 0.42;
+
+/// Sizes of the floating annotation editor, used to keep it inside the safe
+/// region before it has been measured.
+const EDITOR_WIDTH: f32 = 340.0;
+const EDITOR_HEIGHT: f32 = 96.0;
 
 #[derive(Clone, Debug)]
 struct ConversationNavigationRailSnapshot {
@@ -172,9 +189,13 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.prefetch_checkpoint_refs(cx);
+        let theme = Theme::current(cx);
+        self.sync_sent_annotation_resolution(cx);
+        self.sync_selection_toolbar();
         self.sync_transcript_rows();
         self.sync_transcript_layout_width(window);
         self.apply_pending_transcript_search_reveal(window, cx);
+        self.apply_pending_annotation_reveal(window, cx);
         let search_bar = self.render_transcript_search_bar(chat_viewport_width, cx);
         let transcript_rows = self.active_transcript_rows().clone();
         // A scrollbar drag owns the position for as long as it lasts, and the
@@ -361,6 +382,36 @@ impl Waku {
                 .size_full()
                 .pb(anchor_end_space),
             )
+            // Soft fades so rows dissolve into the header above and the composer
+            // below rather than ending at a hard edge. Painted before the
+            // scrollbar and the other overlays so those stay crisp on top of
+            // the mask. Plain divs: no hitbox, so selection passes through.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w_full()
+                    .h(px(TRANSCRIPT_FADE_HEIGHT))
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(theme.surface, 0.0),
+                        linear_color_stop(theme.surface.opacity(0.0), 1.0),
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .w_full()
+                    .h(px(TRANSCRIPT_FADE_HEIGHT))
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(theme.surface.opacity(0.0), 0.0),
+                        linear_color_stop(theme.surface, 1.0),
+                    )),
+            )
             .children(navigation_rail)
             .children(scroll_to_bottom)
             .child(scrollbar::vertical(
@@ -369,6 +420,9 @@ impl Waku {
             ))
             .child(self.transcript_selection_input())
             .children(search_bar)
+            .children(self.render_selection_toolbar(cx))
+            .children(self.render_annotation_badges(cx))
+            .children(self.render_annotation_editor(cx))
             .into_any_element()
     }
 
@@ -403,33 +457,24 @@ impl Waku {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let reviewing_diff = self.right_panel_visible
-            && self
-                .right_panel_active_surface
-                .and_then(|index| self.right_panel_surfaces.get(index))
-                .is_some_and(|surface| matches!(surface, RightPanelSurface::Diff));
-        let reviewing_background_work = self.right_panel_visible
-            && self
-                .right_panel_active_surface
-                .and_then(|index| self.right_panel_surfaces.get(index))
-                .is_some_and(|surface| matches!(surface, RightPanelSurface::BackgroundWork { .. }));
-        let selected = reviewing_diff
+        let selected = self
+            .right_panel_visible
             .then(|| {
-                self.right_panel_diff_selection
+                self.right_panel_active_surface
+                    .and_then(|index| self.right_panel_surfaces.get(index))
+            })
+            .and_then(|surface| match surface {
+                Some(RightPanelSurface::Diff) => self
+                    .right_panel_diff_selection
                     .selection
                     .borrow()
-                    .selected_text()
-            })
-            .flatten()
-            .or_else(|| {
-                reviewing_background_work
-                    .then(|| {
-                        self.state
-                            .selected_session
-                            .and_then(|session_id| self.background_work.get(&session_id))
-                            .and_then(BackgroundWorkRegistry::selected_text)
-                    })
-                    .flatten()
+                    .selected_text(),
+                Some(RightPanelSurface::BackgroundWork { .. }) => self
+                    .state
+                    .selected_session
+                    .and_then(|session_id| self.background_work.get(&session_id))
+                    .and_then(BackgroundWorkRegistry::selected_text),
+                _ => None,
             })
             .or_else(|| self.toast_selection.selection.borrow().selected_text())
             .or_else(|| self.skills_selection.selection.borrow().selected_text())
@@ -437,6 +482,1049 @@ impl Waku {
         match selected {
             Some(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             None => cx.propagate(),
+        }
+    }
+
+    /// Keep the selection toolbar in step with the live transcript selection.
+    ///
+    /// The toolbar follows the selection while no comment field is open; once
+    /// one is, the captured selection stays put and the pointer can move into
+    /// the field without dismissing it. A cleared selection removes a toolbar
+    /// that has captured nothing.
+    fn sync_selection_toolbar(&self) {
+        let mut toolbar = self.selection_toolbar.borrow_mut();
+        if toolbar.as_ref().is_some_and(|toolbar| toolbar.comment_open) {
+            return;
+        }
+        // Wait for the pointer to be released: the toolbar belongs at the end
+        // of the selection, not trailing it through the drag.
+        if self.transcript_selection.selection.borrow().is_dragging() {
+            *toolbar = None;
+            return;
+        }
+        // Capture while the selection is still live. Clicking the toolbar
+        // itself lands outside every painted element, so the transcript's
+        // global mouse-down handler clears the selection before the click
+        // handler runs; the stored copy is what gets staged.
+        let Ok(annotation) = self.capture_selection_annotation() else {
+            *toolbar = None;
+            return;
+        };
+        let spans = self
+            .transcript_selection
+            .selection
+            .borrow()
+            .spans()
+            .to_vec();
+        *toolbar = self
+            .selection_toolbar_bounds(&spans)
+            .map(|bounds| SelectionToolbar {
+                anchor: point(bounds.left(), bounds.top()),
+                annotation,
+                comment_open: false,
+            });
+    }
+
+    /// The top-left of the selection's first line, in window coordinates, so
+    /// the toolbar sits above the selection rather than over it.
+    fn selection_toolbar_bounds(&self, spans: &[md::selection::Span]) -> Option<Bounds<Pixels>> {
+        let first = spans.first()?;
+        let registry = self.transcript_selection.registry.borrow();
+        let entry = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.key == first.key)?;
+        md::render::text_range_bounds(&entry.geometry, &first.range)
+            .into_iter()
+            .next()
+    }
+
+    /// The floating action beside the selection, and its comment field once
+    /// "Add to chat" opened one. Both stop the mouse-down from reaching the
+    /// transcript so the selection highlight survives the click.
+    fn render_selection_toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let toolbar = self.selection_toolbar.borrow();
+        let toolbar = toolbar.as_ref()?;
+        let theme = Theme::current(cx);
+        let position = point(toolbar.anchor.x, toolbar.anchor.y - px(46.0));
+        let card: AnyElement = if toolbar.comment_open {
+            let input = self.annotation_prompt_input.borrow().clone()?;
+            div()
+                .id("annotation-comment-field")
+                .w(px(360.0))
+                .h(px(36.0))
+                .px(px(14.0))
+                .flex()
+                .items_center()
+                .rounded(px(18.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .bg(theme.raised)
+                .shadow_md()
+                .occlude()
+                .key_context("AnnotationEditor")
+                .on_action(cx.listener(|this, _: &DismissAnnotationEditor, _, cx| {
+                    this.dismiss_annotation_overlays(cx);
+                }))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.dismiss_annotation_overlays(cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                )
+                .child(div().flex_1().min_w_0().child(input))
+                .into_any_element()
+        } else {
+            div()
+                .p(px(4.0))
+                .flex()
+                .items_center()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .bg(theme.raised)
+                .shadow_md()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                )
+                .child(
+                    div()
+                        .id("selection-add-to-chat")
+                        .h(px(28.0))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .rounded(px(7.0))
+                        .cursor_default()
+                        .hover(|style| style.bg(theme.overlay))
+                        .child(icon("icons/annotation.svg", 12.0, theme.text_secondary))
+                        .child(
+                            div()
+                                .text_size(sp(12.5))
+                                .line_height(sp(16.0))
+                                .text_color(theme.text)
+                                .child(tr!("annotation.add_to_chat")),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.begin_annotation_comment(window, cx);
+                        })),
+                )
+                .into_any_element()
+        };
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(position)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(card),
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// The numbered badges in the transcript's right gutter, Codex-style.
+    ///
+    /// One per annotation whose first span is painted this frame — staged and
+    /// sent alike — and each is a jump target. Positions come from the selection
+    /// registry, which only holds what was painted, so off-screen replies cost
+    /// nothing, and a badge that would land on the previous one is nudged down.
+    fn render_annotation_badges(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut badges: HashMap<(Uuid, usize), (Uuid, usize, Range<usize>)> = HashMap::new();
+        for (index, annotation) in self.composer_annotations.iter().enumerate() {
+            if let Some(part) = annotation.target.spans().first() {
+                badges.insert(
+                    (annotation.target.message_id(), part.ordinal),
+                    (annotation.id, index + 1, part.span.start..part.span.end),
+                );
+            }
+        }
+        if let Some(session) = self.selected_session() {
+            for message in &session.messages {
+                let Some(marks) = self.sent_annotation_resolution.borrow().marks(message.id) else {
+                    continue;
+                };
+                for mark in marks.iter() {
+                    if let Some(number) = mark.number {
+                        badges.entry((message.id, mark.ordinal)).or_insert((
+                            mark.id,
+                            number,
+                            mark.range.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        if badges.is_empty() {
+            return Vec::new();
+        }
+        let theme = Theme::current(cx);
+        // Keep badges inside the transcript viewport: a line scrolled past the
+        // top or under the composer must not float a badge over the header or
+        // the composer card.
+        let safe = self.annotation_safe_bounds();
+        let registry = self.transcript_selection.registry.borrow();
+        let mut pushed: Vec<f32> = Vec::new();
+        let mut chips = Vec::new();
+        for entry in registry.entries() {
+            let Some(message_id) = message_id_from_row(&entry.key.row) else {
+                continue;
+            };
+            let Some((id, number, range)) = badges.get(&(message_id, entry.key.index)) else {
+                continue;
+            };
+            let Some(bounds) = md::render::text_range_bounds(&entry.geometry, range)
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            if let Some(safe) = safe
+                && (bounds.top() < safe.top() || bounds.bottom() > safe.bottom())
+            {
+                continue;
+            }
+            let mut top = bounds.top().as_f32();
+            while pushed.iter().any(|pushed| (pushed - top).abs() < 20.0) {
+                top += 20.0;
+            }
+            pushed.push(top);
+            let id = *id;
+            let number = *number;
+            // Anchor to the text column's own right edge, not the pane's, so
+            // the badge sits beside the text and the pane margin stays free.
+            let element_right = entry.geometry.bounds().right();
+            let mut badge_x = element_right + px(6.0);
+            if let Some(safe) = safe {
+                badge_x = badge_x.min(safe.right() - px(18.0)).max(safe.left());
+            }
+            let badge = point(badge_x, px(top));
+            let editor = point(badge_x + px(24.0), px(top));
+            chips.push(
+                gpui::deferred(
+                    gpui::anchored()
+                        .position(badge)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("annotation-badge-{id}")))
+                                .size(px(18.0))
+                                .rounded_full()
+                                .bg(theme.accent)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_default()
+                                .occlude()
+                                .child(
+                                    div()
+                                        .text_size(sp(10.5))
+                                        .line_height(sp(12.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.on_inverse)
+                                        .child(number.to_string()),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_annotation_editor(id, editor, window, cx);
+                                })),
+                        ),
+                )
+                .into_any_element(),
+            );
+        }
+        chips
+    }
+
+    /// The comment on an annotation, staged or sent.
+    fn annotation_comment(&self, id: Uuid) -> Option<String> {
+        self.find_annotation(id)
+            .and_then(|annotation| annotation.comment.clone())
+    }
+
+    /// Find an annotation by id: staged first, then among the session's sent
+    /// records.
+    fn find_annotation(&self, id: Uuid) -> Option<&MessageAnnotation> {
+        if let Some(staged) = self
+            .composer_annotations
+            .iter()
+            .find(|record| record.id == id)
+        {
+            return Some(staged);
+        }
+        self.selected_session()?
+            .messages
+            .iter()
+            .flat_map(|message| message.annotations.iter())
+            .find(|record| record.id == id)
+    }
+
+    /// Open the floating editor for an annotation badge, highlight its spans,
+    /// and jump to them. The editor opens just right of the badge.
+    pub(super) fn open_annotation_editor(
+        &mut self,
+        id: Uuid,
+        fallback: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Anchor the editor to the mark itself when it is painted; the caller's
+        // point is only the fallback for a mark that is off screen.
+        let anchor = self.annotation_mark_anchor(id).unwrap_or(fallback);
+        let comment = self.annotation_comment(id).unwrap_or_default();
+        let input = self.annotation_editor_input(window, cx);
+        input.update(cx, |input, cx| input.set_content(comment, cx));
+        self.active_annotation.set(Some(id));
+        *self.annotation_editor.borrow_mut() = Some(AnnotationEditor { id, anchor });
+        self.reveal_annotation_from_card(id, cx);
+        let focus = input.read(cx).focus();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Just past the annotated span's first line, in window coordinates, when
+    /// that span is painted this frame.
+    fn annotation_mark_anchor(&self, id: Uuid) -> Option<Point<Pixels>> {
+        let (message_id, ordinal, range) = self.annotation_span(id)?;
+        let row = format!("message-{message_id}");
+        let registry = self.transcript_selection.registry.borrow();
+        let entry = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.key.index == ordinal && entry.key.row.as_ref() == row)?;
+        let bounds = md::render::text_range_bounds(&entry.geometry, &range)
+            .into_iter()
+            .next()?;
+        Some(point(bounds.right() + px(10.0), bounds.top()))
+    }
+
+    /// The comfortable region for floating annotation surfaces: the transcript
+    /// list's viewport, which already sits below the header and above the
+    /// composer. Keeping overlays inside it stops them covering the chrome or
+    /// landing inside the composer.
+    pub(super) fn annotation_safe_bounds(&self) -> Option<Bounds<Pixels>> {
+        let viewport = self.active_transcript_rows().viewport_bounds();
+        (viewport.size.height > px(0.0) && viewport.size.width > px(0.0)).then_some(viewport)
+    }
+
+    /// Keep the annotation editor fully inside the safe region, clearing the
+    /// scroll-to-bottom button that sits at the bottom centre of the list.
+    pub(super) fn clamp_annotation_editor(&self, anchor: Point<Pixels>) -> Point<Pixels> {
+        let Some(safe) = self.annotation_safe_bounds() else {
+            return anchor;
+        };
+        let margin = px(8.0);
+        let x = anchor
+            .x
+            .min(safe.right() - px(EDITOR_WIDTH) - margin)
+            .max(safe.left() + margin);
+        // The editor is about this tall, and the bottom lip keeps it above the
+        // 32px scroll-to-bottom button and its 8px inset.
+        let y = anchor
+            .y
+            .min(safe.bottom() - px(EDITOR_HEIGHT) - px(48.0))
+            .max(safe.top() + margin);
+        point(x, y)
+    }
+
+    /// Close the editor and drop the highlight.
+    pub(super) fn close_annotation_editor(&mut self, cx: &mut Context<Self>) {
+        if self.annotation_editor.borrow().is_none() && self.active_annotation.get().is_none() {
+            return;
+        }
+        *self.annotation_editor.borrow_mut() = None;
+        self.active_annotation.set(None);
+        cx.notify();
+    }
+
+    /// Close whichever floating annotation surface is open.
+    pub(super) fn dismiss_annotation_overlays(&mut self, cx: &mut Context<Self>) {
+        *self.selection_toolbar.borrow_mut() = None;
+        self.annotation_panel_pinned.set(false);
+        self.annotation_preview_visible.set(false);
+        self.close_annotation_editor(cx);
+    }
+
+    /// Write the editor's comment onto its annotation and persist.
+    pub(super) fn save_annotation_comment(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .annotation_editor
+            .borrow()
+            .as_ref()
+            .map(|editor| editor.id)
+        else {
+            return;
+        };
+        let comment = self
+            .annotation_editor_input
+            .borrow()
+            .as_ref()
+            .map(|input| input.read(cx).content().to_owned())
+            .unwrap_or_default();
+        let comment = super::composer::annotation_comment_value(&comment);
+        self.set_annotation_comment(id, comment, cx);
+        self.close_annotation_editor(cx);
+    }
+
+    /// Remove an annotation, staged or sent, and persist.
+    pub(super) fn delete_annotation(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let staged = self
+            .composer_annotations
+            .iter()
+            .any(|record| record.id == id);
+        if staged {
+            let before = self.composer_annotations.len();
+            self.composer_annotations.retain(|record| record.id != id);
+            if self.composer_annotations.len() != before {
+                self.reset_annotation_preview_hover();
+                self.capture_and_save_current_composer_draft(cx);
+            }
+        } else {
+            let mut changed = false;
+            for session in &mut self.state.sessions {
+                for message in &mut session.messages {
+                    let before = message.annotations.len();
+                    message.annotations.retain(|record| record.id != id);
+                    changed |= message.annotations.len() != before;
+                }
+            }
+            if changed {
+                self.save();
+            }
+        }
+        self.close_annotation_editor(cx);
+    }
+
+    /// Store a comment on a staged or sent annotation.
+    fn set_annotation_comment(
+        &mut self,
+        id: Uuid,
+        comment: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(staged) = self
+            .composer_annotations
+            .iter_mut()
+            .find(|record| record.id == id)
+        {
+            staged.comment = comment;
+            self.capture_and_save_current_composer_draft(cx);
+            return;
+        }
+        let mut changed = false;
+        for session in &mut self.state.sessions {
+            for message in &mut session.messages {
+                if let Some(record) = message
+                    .annotations
+                    .iter_mut()
+                    .find(|record| record.id == id)
+                {
+                    record.comment = comment.clone();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.save();
+        }
+    }
+
+    /// The comment field the badge editor edits, created on first use.
+    fn annotation_editor_input(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextInput> {
+        if let Some(input) = self.annotation_editor_input.borrow().clone() {
+            return input;
+        }
+        let input = cx.new(|cx| {
+            TextInput::new(window, cx).placeholder(tr!("annotation.comment_placeholder"))
+        });
+        self.annotation_editor_input
+            .borrow_mut()
+            .replace(input.clone());
+        input
+    }
+
+    /// The floating editor a badge click opens: the comment, delete, cancel,
+    /// save. Escape or a click outside dismisses it without saving.
+    fn render_annotation_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let editor = self.annotation_editor.borrow();
+        let editor = editor.as_ref()?;
+        let theme = Theme::current(cx);
+        let input = self.annotation_editor_input.borrow().clone()?;
+        let id = editor.id;
+        // Follow the mark each frame, so an off-screen editor lands on its span
+        // once the reveal scroll has mounted it; the stored point is only the
+        // fallback until then.
+        let anchor =
+            self.clamp_annotation_editor(self.annotation_mark_anchor(id).unwrap_or(editor.anchor));
+        let body = div()
+            .id("annotation-editor")
+            .w(px(340.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .p(px(10.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.raised)
+            .shadow_md()
+            .occlude()
+            .key_context("AnnotationEditor")
+            .on_action(cx.listener(|this, _: &DismissAnnotationEditor, _, cx| {
+                this.dismiss_annotation_overlays(cx);
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.dismiss_annotation_overlays(cx);
+            }))
+            .child(div().min_h(px(26.0)).child(input))
+            .child({
+                let delete_focus = self.annotation_control_focus("editor-delete", cx);
+                let cancel_focus = self.annotation_control_focus("editor-cancel", cx);
+                let save_focus = self.annotation_control_focus("editor-save", cx);
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        icon_button("annotation-editor-delete", "icons/trash.svg", theme.clone())
+                            .track_focus(&delete_focus)
+                            .tab_index(0)
+                            .focus_visible(|style| style.bg(theme.overlay_strong))
+                            .tooltip(Tooltip::text(tr!("annotation.remove")))
+                            .on_activation(cx, move |this, _, cx| {
+                                this.delete_annotation(id, cx);
+                            }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("annotation-editor-cancel")
+                            .h(px(26.0))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(theme.border_strong)
+                            .text_size(sp(12.0))
+                            .text_color(theme.text)
+                            .cursor_default()
+                            .track_focus(&cancel_focus)
+                            .tab_index(0)
+                            .focus_visible(|style| style.border_color(theme.accent))
+                            .hover(|style| style.bg(theme.overlay))
+                            .child(tr!("common.cancel"))
+                            .on_activation(cx, |this, _, cx| {
+                                this.close_annotation_editor(cx);
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("annotation-editor-save")
+                            .h(px(26.0))
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(7.0))
+                            // The annotation feature's own accent, matching the
+                            // badges, rather than the black inverse surface the
+                            // send button uses: a text pill reads heavier than a
+                            // small icon there. `on_inverse` is the readable
+                            // ink on the accent in both themes.
+                            .bg(theme.accent)
+                            .text_size(sp(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.on_inverse)
+                            .cursor_default()
+                            .track_focus(&save_focus)
+                            .tab_index(0)
+                            .focus_visible(|style| style.border_1().border_color(theme.text))
+                            .hover(|style| style.opacity(0.9))
+                            .child(tr!("common.save"))
+                            .on_activation(cx, |this, _, cx| {
+                                this.save_annotation_comment(cx);
+                            }),
+                    )
+            })
+            .into_any_element();
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(anchor)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(body),
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// Open the comment field over the selection the toolbar captured.
+    pub(super) fn begin_annotation_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.annotation_prompt_input(window, cx);
+        input.update(cx, |input, cx| input.set_content("", cx));
+        {
+            let mut guard = self.selection_toolbar.borrow_mut();
+            let Some(toolbar) = guard.as_mut() else {
+                return;
+            };
+            toolbar.comment_open = true;
+        }
+        let focus = input.read(cx).focus();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// The one comment field the toolbar opens, created on first use.
+    fn annotation_prompt_input(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextInput> {
+        if let Some(input) = self.annotation_prompt_input.borrow().clone() {
+            return input;
+        }
+        let input = cx.new(|cx| {
+            TextInput::new(window, cx).placeholder(tr!("annotation.comment_placeholder"))
+        });
+        self.annotation_prompt_input
+            .borrow_mut()
+            .replace(input.clone());
+        cx.subscribe(&input, |this, input, event, cx| {
+            if !matches!(event, InputEvent::Submit(_)) {
+                return;
+            }
+            let comment = input.read(cx).content().to_owned();
+            let selection = this
+                .selection_toolbar
+                .borrow()
+                .as_ref()
+                .map(|toolbar| toolbar.annotation.clone());
+            let Some(selection) = selection else {
+                return;
+            };
+            let comment = super::composer::annotation_comment_value(&comment);
+            let changed = this.stage_selection_annotation(selection, comment, cx);
+            *this.selection_toolbar.borrow_mut() = None;
+            if changed {
+                this.transcript_selection.selection.borrow_mut().clear();
+                this.capture_and_save_current_composer_draft(cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        input
+    }
+
+    /// Stage an annotation for the transcript selection.
+    ///
+    /// The keyboard shortcut creates one immediately, with no comment; the
+    /// selection toolbar opens a comment field and stages on submit. Both go
+    /// through the same capture, so a drag across several elements becomes one
+    /// annotation either way.
+    pub(super) fn annotate_selection_action(
+        &mut self,
+        _: &AnnotateSelection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selection = match self.capture_selection_annotation() {
+            Ok(selection) => selection,
+            Err(refusal) => {
+                self.show_annotation_refusal(refusal);
+                return;
+            }
+        };
+        if self.stage_selection_annotation(selection, None, cx) {
+            self.transcript_selection.selection.borrow_mut().clear();
+            self.capture_and_save_current_composer_draft(cx);
+            cx.notify();
+        }
+    }
+
+    /// Validate the current transcript selection as one annotatable candidate.
+    ///
+    /// Every span has to belong to one assistant reply: an annotation is
+    /// anchored to one message, and a reply that is still streaming is still
+    /// moving under the anchor. The parts share the selection's document order,
+    /// so a drag across paragraphs stays one annotation.
+    pub(super) fn capture_selection_annotation(&self) -> Result<SelectionAnnotation, String> {
+        let spans = self
+            .transcript_selection
+            .selection
+            .borrow()
+            .spans()
+            .to_vec();
+        let mut message_id = None;
+        let mut parts = Vec::new();
+        let mut quote = String::new();
+        let mut block = String::new();
+        for span in spans {
+            let Some(id) = message_id_from_row(&span.key.row) else {
+                return Err(tr!("annotation.select_reply"));
+            };
+            match message_id {
+                Some(existing) if existing != id => {
+                    return Err(tr!("annotation.select_one_reply"));
+                }
+                None => message_id = Some(id),
+                _ => {}
+            }
+            let text = span.text[span.range.clone()].to_string();
+            if text.trim().is_empty() {
+                continue;
+            }
+            if block.is_empty() {
+                block = span.text.to_string();
+            } else if span.block_break {
+                quote.push('\n');
+            }
+            quote.push_str(&text);
+            parts.push(AnnotationSpan {
+                ordinal: span.key.index,
+                span: TextSpan {
+                    start: span.range.start,
+                    end: span.range.end,
+                },
+                quote: text,
+            });
+        }
+        let Some(message_id) = message_id else {
+            return Err(tr!("annotation.select_reply"));
+        };
+        if parts.is_empty() {
+            return Err(tr!("annotation.select_reply"));
+        }
+        let Some(message) = self.selected_session().and_then(|session| {
+            session
+                .messages
+                .iter()
+                .find(|message| message.id == message_id)
+        }) else {
+            return Err(tr!("annotation.select_reply"));
+        };
+        if message.role != MessageRole::Assistant {
+            return Err(tr!("annotation.reply_only"));
+        }
+        if message.streaming {
+            return Err(tr!("annotation.wait_for_reply"));
+        }
+        Ok(SelectionAnnotation {
+            message_id,
+            parts,
+            quote,
+            block,
+        })
+    }
+
+    /// Stage `selection` as one annotation, merging it into an overlapping
+    /// staged annotation or revealing one the selection matches exactly.
+    /// Returns whether the staged set changed.
+    pub(super) fn stage_selection_annotation(
+        &mut self,
+        selection: SelectionAnnotation,
+        comment: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let SelectionAnnotation {
+            message_id,
+            parts,
+            quote,
+            block,
+        } = selection;
+        let anchors = parts
+            .iter()
+            .map(|part| md::annotation::Anchor {
+                ordinal: part.ordinal,
+                range: part.span.start..part.span.end,
+            })
+            .collect::<Vec<_>>();
+        // The merge decision indexes the staged slice, so keep the ids in the
+        // same order and translate back through it.
+        let staged_here = self
+            .composer_annotations
+            .iter()
+            .filter_map(|annotation| {
+                annotation_anchor(annotation, message_id).map(|anchors| (annotation.id, anchors))
+            })
+            .collect::<Vec<_>>();
+        let staged_sets = staged_here
+            .iter()
+            .map(|(_, anchors)| anchors.clone())
+            .collect::<Vec<_>>();
+        match md::annotation::merge(&anchors, &staged_sets) {
+            md::annotation::MergeDecision::Duplicate { index } => {
+                if let Some((id, _)) = staged_here.get(index) {
+                    // Re-selecting an annotated span reveals it instead of
+                    // stacking a second annotation on the same passage.
+                    self.reveal_annotation_from_card(*id, cx);
+                }
+                false
+            }
+            md::annotation::MergeDecision::Extend {
+                index,
+                absorbed,
+                parts: union,
+            } => {
+                let Some((id, _)) = staged_here.get(index) else {
+                    return false;
+                };
+                let id = *id;
+                let absorbed = absorbed
+                    .iter()
+                    .filter_map(|absorbed| staged_here.get(*absorbed))
+                    .map(|(id, _)| *id)
+                    .filter(|absorbed| *absorbed != id)
+                    .collect::<Vec<_>>();
+                let union_parts = self.annotation_parts_for(message_id, &union, &parts);
+                let union_quote = union_parts
+                    .iter()
+                    .map(|part| part.quote.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.composer_annotations
+                    .retain(|annotation| !absorbed.contains(&annotation.id));
+                if let Some(annotation) = self
+                    .composer_annotations
+                    .iter_mut()
+                    .find(|annotation| annotation.id == id)
+                    && let AnnotationTarget::MessageSpan {
+                        spans,
+                        quote,
+                        block,
+                        ..
+                    } = &mut annotation.target
+                {
+                    *spans = union_parts;
+                    *quote = union_quote;
+                    if !block.is_empty() {
+                        *block = block.clone();
+                    }
+                }
+                true
+            }
+            md::annotation::MergeDecision::New => {
+                self.composer_annotations.push(MessageAnnotation {
+                    id: Uuid::new_v4(),
+                    target: AnnotationTarget::MessageSpan {
+                        message_id,
+                        spans: parts,
+                        quote,
+                        block,
+                    },
+                    comment,
+                });
+                true
+            }
+        }
+    }
+
+    /// Rebuild the union ranges as annotation parts, slicing each element's
+    /// current text so an extended part carries the right quote. Falls back to
+    /// a part's own stored quote when the element is no longer in the registry.
+    fn annotation_parts_for(
+        &self,
+        message_id: Uuid,
+        anchors: &[md::annotation::Anchor],
+        known: &[AnnotationSpan],
+    ) -> Vec<AnnotationSpan> {
+        let row = format!("message-{message_id}");
+        let registry = self.transcript_selection.registry.borrow();
+        anchors
+            .iter()
+            .map(|anchor| {
+                let element = registry
+                    .entries()
+                    .iter()
+                    .find(|entry| {
+                        entry.key.index == anchor.ordinal && entry.key.row.as_ref() == row
+                    })
+                    .map(|entry| entry.text.clone());
+                let quote = element
+                    .as_deref()
+                    .and_then(|text| text.get(anchor.range.clone()))
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        known
+                            .iter()
+                            .find(|part| part.ordinal == anchor.ordinal)
+                            .map(|part| part.quote.clone())
+                    })
+                    .unwrap_or_default();
+                AnnotationSpan {
+                    ordinal: anchor.ordinal,
+                    span: TextSpan {
+                        start: anchor.range.start,
+                        end: anchor.range.end,
+                    },
+                    quote,
+                }
+            })
+            .collect()
+    }
+
+    fn show_annotation_refusal(&mut self, message: impl Into<String>) {
+        self.show_toast(message);
+    }
+
+    /// Jump to the span an annotation quotes.
+    ///
+    /// Works for a staged card and for a sent annotation's badge. The scroll is
+    /// the signal, so it happens even under reduce motion; only the decorative
+    /// flash is suppressed there. The request is applied through the same
+    /// mount-then-reveal path the find bar uses, because the reply may be off
+    /// screen or taller than the viewport.
+    pub(super) fn reveal_annotation_from_card(&mut self, annotation: Uuid, cx: &mut Context<Self>) {
+        let Some((message_id, ordinal, range)) = self.annotation_span(annotation) else {
+            return;
+        };
+        if !cx.reduce_motion() {
+            self.annotation_flash.set(Some(AnnotationFlashState {
+                message_id,
+                ordinal,
+                start: range.start,
+                end: range.end,
+                started: Instant::now(),
+            }));
+        }
+        self.pending_annotation_reveal = Some(AnnotationReveal {
+            message_id,
+            ordinal,
+            range,
+        });
+        cx.notify();
+    }
+
+    /// The message, element ordinal and current range an annotation points at.
+    ///
+    /// A staged record is exact. A sent one uses its resolved range once the
+    /// background pass has landed, so the jump lands where the mark is drawn,
+    /// and falls back to the stored anchor otherwise.
+    fn annotation_span(&self, annotation: Uuid) -> Option<(Uuid, usize, Range<usize>)> {
+        if let Some(staged) = self
+            .composer_annotations
+            .iter()
+            .find(|record| record.id == annotation)
+        {
+            return first_annotation_part(staged);
+        }
+        let session = self.selected_session()?;
+        for message in &session.messages {
+            let Some(record) = message
+                .annotations
+                .iter()
+                .find(|record| record.id == annotation)
+            else {
+                continue;
+            };
+            let message_id = record.target.message_id();
+            if let Some(marks) = self.sent_annotation_resolution.borrow().marks(message_id)
+                && let Some(mark) = marks.iter().find(|mark| mark.id == annotation)
+            {
+                return Some((message_id, mark.ordinal, mark.range.clone()));
+            }
+            return first_annotation_part(record);
+        }
+        None
+    }
+
+    /// Apply a pending card jump once its row exists, then retry on the next
+    /// frame for a row that had to be mounted first. Mirrors the find-bar
+    /// reveal so a reply taller than the viewport lands on the span, not the
+    /// top of the message.
+    pub(super) fn apply_pending_annotation_reveal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(reveal) = self.pending_annotation_reveal.take() else {
+            return;
+        };
+        let Some(message_index) = self.selected_session().and_then(|session| {
+            session
+                .messages
+                .iter()
+                .position(|message| message.id == reveal.message_id)
+        }) else {
+            return;
+        };
+        let Some(row_index) = self.transcript_row_kinds.borrow().iter().position(
+            |kind| matches!(kind, TranscriptRowKind::Message(index) if *index == message_index),
+        ) else {
+            return;
+        };
+        let key =
+            md::selection::TextKey::new(format!("message-{}", reveal.message_id), reveal.ordinal);
+        if self.annotation_match_bounds(&key, &reveal.range).is_some() {
+            self.reveal_annotation_geometry(&key, &reveal.range, 1, window, cx);
+            return;
+        }
+        self.detach_transcript_search_from_tail();
+        self.active_transcript_rows()
+            .scroll_to_reveal_item(row_index);
+        cx.on_next_frame(window, move |this, window, cx| {
+            this.reveal_annotation_geometry(&key, &reveal.range, 0, window, cx)
+        });
+    }
+
+    fn annotation_match_bounds(
+        &self,
+        key: &md::selection::TextKey,
+        range: &Range<usize>,
+    ) -> Option<Bounds<Pixels>> {
+        let registry = self.transcript_selection.registry.borrow();
+        registry
+            .entries()
+            .iter()
+            .find(|entry| entry.key == *key)
+            .and_then(|entry| {
+                md::render::text_range_bounds(&entry.geometry, range)
+                    .into_iter()
+                    .next()
+            })
+    }
+
+    fn reveal_annotation_geometry(
+        &mut self,
+        key: &md::selection::TextKey,
+        range: &Range<usize>,
+        attempt: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.annotation_match_bounds(key, range) else {
+            if attempt < 1 {
+                let key = key.clone();
+                let range = range.clone();
+                cx.on_next_frame(window, move |this, window, cx| {
+                    this.reveal_annotation_geometry(&key, &range, attempt + 1, window, cx)
+                });
+            }
+            return;
+        };
+        let rows = self.active_transcript_rows();
+        let viewport = rows.viewport_bounds();
+        if viewport.size.height <= Pixels::ZERO {
+            return;
+        }
+        let margin = px(24.0);
+        if bounds.top() >= viewport.top() + margin && bounds.bottom() <= viewport.bottom() - margin
+        {
+            return;
+        }
+        let target_y = viewport.top() + viewport.size.height * 0.35;
+        let current = rows.scroll_px_offset_for_scrollbar().y;
+        let max_offset = rows.max_offset_for_scrollbar().y;
+        let next = (current + (target_y - bounds.top())).clamp(-max_offset, Pixels::ZERO);
+        if next != current {
+            self.detach_transcript_search_from_tail();
+            rows.set_offset_from_scrollbar(point(Pixels::ZERO, next));
+            cx.notify();
         }
     }
 
@@ -464,6 +1552,48 @@ impl Waku {
         .w(px(0.0))
         .h(px(0.0))
     }
+}
+
+/// The message a registered text element belongs to.
+///
+/// Transcript text keys are `message-<id>`; anything else (a diff line, a
+/// standalone surface) is not annotatable.
+fn message_id_from_row(row: &str) -> Option<Uuid> {
+    row.strip_prefix("message-")
+        .and_then(|id| Uuid::parse_str(id).ok())
+}
+
+/// The anchor a staged annotation carries for `message_id`, if it belongs to
+/// that reply.
+fn annotation_anchor(
+    annotation: &MessageAnnotation,
+    message_id: Uuid,
+) -> Option<Vec<md::annotation::Anchor>> {
+    if annotation.target.message_id() != message_id {
+        return None;
+    }
+    Some(
+        annotation
+            .target
+            .spans()
+            .iter()
+            .map(|part| md::annotation::Anchor {
+                ordinal: part.ordinal,
+                range: part.span.start..part.span.end,
+            })
+            .collect(),
+    )
+}
+
+/// The first element range of an annotation, used to place and jump to its
+/// badge.
+fn first_annotation_part(annotation: &MessageAnnotation) -> Option<(Uuid, usize, Range<usize>)> {
+    let message_id = annotation.target.message_id();
+    annotation
+        .target
+        .spans()
+        .first()
+        .map(|part| (message_id, part.ordinal, part.span.start..part.span.end))
 }
 
 impl Render for ConversationNavigationRail {
@@ -1050,6 +2180,59 @@ impl Waku {
             .set(self.checkpoint_ref_generation.get().wrapping_add(1));
     }
 
+    /// Re-anchor the annotations sent messages carry, once per session
+    /// signature.
+    ///
+    /// A sent annotation stores the element ordinal and byte range it was
+    /// taken from, and its reply is reparsed on every load, so those ranges
+    /// must be verified against the current rendering. That verification is a
+    /// markdown parse per reply and must never run on a frame: this compares a
+    /// cheap signature once per frame, hands the parses to the background
+    /// executor, and a render reads only the cache the pass fills in. A
+    /// superseded pass cannot overwrite newer state, because a result is only
+    /// stored while the signature that produced it still holds.
+    fn sync_sent_annotation_resolution(&self, cx: &mut Context<Self>) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        let signature = annotation_resolution::sent_annotation_signature(session);
+        if self.sent_annotation_resolution.borrow().signature() == Some(signature) {
+            return;
+        }
+        let jobs = annotation_resolution::resolution_jobs(session);
+        self.sent_annotation_resolution
+            .borrow_mut()
+            .reset(signature);
+        if jobs.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let resolved = cx
+                .background_executor()
+                .spawn(async move {
+                    jobs.into_iter()
+                        .map(|(message_id, content, anchors)| {
+                            (
+                                message_id,
+                                annotation_resolution::resolve_sent_annotations(&content, &anchors),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                {
+                    let mut cache = this.sent_annotation_resolution.borrow_mut();
+                    for (message_id, marks) in resolved {
+                        cache.insert(signature, message_id, marks);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Resolve the selected session's checkpoint refs on the background
     /// executor — one `git for-each-ref` per session per invalidation — and
     /// cache which retained turn counts have one. The rewind affordance
@@ -1315,6 +2498,9 @@ impl Waku {
                             animate_streaming,
                         )
                         .with_context_menu(menu.clone());
+                    if let Some(marks) = self.annotation_marks(message.id, &theme, window, cx) {
+                        ctx = ctx.with_annotations(marks);
+                    }
                     if let Some(highlights) = self.transcript_search_highlights(message_index) {
                         ctx = ctx.with_search_highlights(highlights);
                     }
@@ -1328,10 +2514,12 @@ impl Waku {
                             view.set_text(message.visible_content(), message.streaming);
                             &*view
                         });
+                    let sent_annotations = self.sent_annotation_indicator(&message, cx);
                     let rendered = render_message(
                         MessageRender {
                             theme: &theme,
                             message: &message,
+                            sent_annotations,
                             assistant_footer_copy_content,
                             assistant_footer_time,
                             copied,
@@ -1421,6 +2609,172 @@ impl Waku {
             }));
         }
         row.into_any_element()
+    }
+
+    /// The marks this reply's annotations paint.
+    ///
+    /// Staged anchors were created against this frame's own render, so their
+    /// ordinal and range are exact and their number is the composer card's;
+    /// no re-resolution happens here. Sent anchors come from the background
+    /// resolution cache, never from a parse on this path, and are unnumbered —
+    /// the draft's vocabulary is released once the message is sent. `None`
+    /// when this reply has neither, which is the common case and costs
+    /// nothing.
+    fn annotation_marks(
+        &self,
+        message_id: Uuid,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<md::render::AnnotationMarks> {
+        let palette = MarkdownPalette::from_theme(theme);
+        let mut marks = self
+            .composer_annotations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, annotation)| match &annotation.target {
+                AnnotationTarget::MessageSpan {
+                    message_id: source,
+                    spans,
+                    ..
+                } if *source == message_id => Some((index, annotation.id, spans)),
+                _ => None,
+            })
+            .flat_map(|(index, id, spans)| {
+                spans.iter().enumerate().map(move |(part_ix, part)| {
+                    md::render::AnnotationMark {
+                        id,
+                        ordinal: part.ordinal,
+                        range: part.span.start..part.span.end,
+                        // The number marks the annotation, once: only its
+                        // first element carries the badge, the rest the wash.
+                        number: (part_ix == 0).then_some(index + 1),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Some(sent) = self.sent_annotation_resolution.borrow().marks(message_id) {
+            // An annotation is staged *and* still recorded on the message while
+            // that message is being edited. Its staged copy already paints the
+            // span; drop the sent duplicate so the wash is not drawn twice.
+            let staged = marks
+                .iter()
+                .map(|mark| (mark.ordinal, mark.range.clone()))
+                .collect::<Vec<_>>();
+            marks.extend(
+                sent.iter()
+                    .filter(|sent_mark| {
+                        !staged.iter().any(|(ordinal, range)| {
+                            *ordinal == sent_mark.ordinal && *range == sent_mark.range
+                        })
+                    })
+                    .cloned(),
+            );
+        }
+        // The painter scans ascending ordinals, and creation order need not be
+        // document order.
+        marks.sort_by_key(|mark| (mark.ordinal, mark.range.start));
+        // Only the annotation the user opened stays washed; the badges carry
+        // the rest, and an ordinary frame paints no annotation at all.
+        match self.active_annotation.get() {
+            Some(active) => marks.retain(|mark| mark.id == active),
+            None => marks.clear(),
+        }
+        // A jump flashes through the shared pulse clock, not a per-element
+        // animation: one lease keeps the pane redrawing while the wash fades.
+        // Reduce motion never reaches here — the jump does not set a flash.
+        let flash = self.annotation_flash.get().and_then(|flash| {
+            if flash.message_id != message_id {
+                return None;
+            }
+            let elapsed = flash.started.elapsed();
+            if elapsed >= ANNOTATION_FLASH_DURATION {
+                return None;
+            }
+            let progress = elapsed.as_secs_f32() / ANNOTATION_FLASH_DURATION.as_secs_f32();
+            motion::pulse_lease(window.current_view(), cx);
+            Some(md::render::AnnotationFlash {
+                ordinal: flash.ordinal,
+                range: flash.start..flash.end,
+                wash: palette
+                    .accent
+                    .opacity(ANNOTATION_FLASH_ALPHA * (1.0 - progress)),
+            })
+        });
+        if marks.is_empty() && flash.is_none() {
+            return None;
+        }
+        Some(md::render::AnnotationMarks {
+            marks: Rc::new(marks),
+            style: md::render::AnnotationStyle::from_palette(&palette),
+            flash,
+        })
+    }
+
+    /// What a sent message's annotation indicator needs, or `None` when it
+    /// carries none. Entries are cloned only while the detail is showing, so a
+    /// collapsed indicator costs a count and a focus handle.
+    fn sent_annotation_indicator(
+        &self,
+        message: &Message,
+        cx: &mut Context<Self>,
+    ) -> Option<SentAnnotationIndicator> {
+        if message.annotations.is_empty() {
+            return None;
+        }
+        // While this message is open for editing its records are staged as
+        // composer cards, which are the thing to read and change; the sent
+        // indicator would be a second, frozen copy of the same list.
+        if self
+            .message_edit
+            .as_ref()
+            .is_some_and(|edit| edit.message_id == message.id)
+        {
+            return None;
+        }
+        let focus = self
+            .sent_annotation_focus
+            .borrow_mut()
+            .entry(message.id)
+            .or_insert_with(|| cx.focus_handle())
+            .clone();
+        let expanded = self.expanded_sent_annotations.contains(&message.id);
+        let entries = if expanded {
+            message
+                .annotations
+                .iter()
+                .map(|annotation| SentAnnotationEntry {
+                    quote: annotation.target.quote().to_owned(),
+                    comment: annotation.comment.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(SentAnnotationIndicator {
+            count: message.annotations.len(),
+            expanded,
+            focus,
+            entries,
+        })
+    }
+
+    /// Open or close one sent message's annotation detail. The row's height
+    /// changes, so it is remeasured in the same frame the virtualized list
+    /// would otherwise keep the old size.
+    pub(super) fn toggle_sent_annotations(&mut self, message_id: Uuid, cx: &mut Context<Self>) {
+        if !self.expanded_sent_annotations.insert(message_id) {
+            self.expanded_sent_annotations.remove(&message_id);
+        }
+        if let Some(index) = self.selected_session().and_then(|session| {
+            session
+                .messages
+                .iter()
+                .position(|message| message.id == message_id)
+        }) {
+            self.remeasure_transcript_message(index);
+        }
+        cx.notify();
     }
 
     fn render_response_footer_row(
@@ -3088,5 +4442,36 @@ mod live_reasoning_window_tests {
     fn window_below_the_threshold_keeps_the_cached_start() {
         let content = "a".repeat(LIVE_REASONING_WINDOW_MAX);
         assert_eq!(live_reasoning_window_anchor(7, &content), 7);
+    }
+}
+
+#[cfg(test)]
+mod annotation_frame_path_tests {
+    /// A render must never re-anchor anything: it reads the cache the
+    /// background pass filled. Encoding that as a source guard keeps a later
+    /// edit from quietly moving the parse back onto the frame, where it would
+    /// run for every visible annotated reply on every frame — including every
+    /// stream commit while a reply is still typing.
+    #[test]
+    fn the_render_path_reads_the_cache_and_never_resolves() {
+        let source = include_str!("transcript_view.rs");
+        let start = source
+            .find("\n    fn annotation_marks(")
+            .expect("annotation_marks");
+        let body = &source[start + 1..];
+        let end = body
+            .find("\n    /// What a sent message's annotation indicator needs")
+            .expect("sent_annotation_indicator");
+        let body = &body[..end];
+        for forbidden in [
+            "resolve_sent_annotations",
+            "markdown_element_texts",
+            "parser::parse",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "annotation_marks must read only the resolution cache; found `{forbidden}`",
+            );
+        }
     }
 }

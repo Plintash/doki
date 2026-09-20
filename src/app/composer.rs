@@ -3,10 +3,17 @@ use super::*;
 use anyhow::Context as _;
 use base64::Engine as _;
 
+use crate::ui::ActivationExt;
+
 const COMPUTER_USE_PREVIEW_WIDTH: f32 = 304.0;
 const COMPUTER_USE_PREVIEW_HEIGHT: f32 = 172.0;
 const COMPUTER_USE_PREVIEW_RADIUS: f32 = 12.0;
 const COMPUTER_USE_PREVIEW_INNER_RADIUS: f32 = COMPUTER_USE_PREVIEW_RADIUS - 1.0;
+
+/// How long the annotation hover panel survives the pointer leaving the label
+/// and the panel, so a fast move across the seam between them does not dismiss
+/// it before the pointer arrives.
+const ANNOTATION_PREVIEW_GRACE: Duration = Duration::from_millis(140);
 
 struct ComputerUsePreviewDrag {
     cursor_offset: Cell<gpui::Point<Pixels>>,
@@ -47,6 +54,25 @@ pub(super) fn composer_submit_action(
     } else {
         ComposerSubmitAction::Send
     }
+}
+
+/// The stored form of a comment field's text. A blank field is the absence of a
+/// comment, not an empty string: the projection omits the field entirely and
+/// the card stops showing an empty note.
+pub(super) fn annotation_comment_value(text: &str) -> Option<String> {
+    (!text.trim().is_empty()).then(|| text.to_owned())
+}
+
+/// Records the annotation label's screen bounds for the hover preview's anchor.
+/// `inset_0` inside the label's own relative box reports the label rather than
+/// the composer card, so the preview sits above the chip the pointer is on.
+fn annotation_label_bounds_probe(bounds: Rc<Cell<Option<Bounds<Pixels>>>>) -> impl IntoElement {
+    canvas(
+        move |recorded: Bounds<Pixels>, _, _| bounds.set(Some(recorded)),
+        |_, _, _, _| (),
+    )
+    .absolute()
+    .inset_0()
 }
 
 impl Waku {
@@ -2170,18 +2196,71 @@ impl Waku {
             .drain(..)
             .map(MessageAttachment::from)
             .collect::<Vec<_>>();
+        let annotations = std::mem::take(&mut self.composer_annotations);
+        self.reset_annotation_preview_hover();
         let mentions = attachments
             .iter()
             .map(|attachment| attachment.mention.clone())
             .collect::<Vec<_>>();
-        let submission = merged_submission(prompt, &mentions)?;
-        let display_content = (!attachments.is_empty()).then(|| prompt.trim().to_owned());
+        // The projection is the last thing that happens to the prompt: it keeps
+        // `@` mentions beside the words they belong to and puts the annotation
+        // block after them. Nothing downstream may append to it again, which is
+        // why the queued-message replay never re-projects.
+        let entries = self.projected_annotations(&annotations, None);
+        let submission = match (merged_submission(prompt, &mentions), entries.is_empty()) {
+            (Some(merged), true) => merged,
+            (Some(merged), false) => annotation_projection::project_annotations(&merged, &entries),
+            // Annotations with nothing typed still carry a message: the quotes
+            // are the user's whole ask, and inventing an instruction for them
+            // would be putting words in their mouth.
+            (None, false) => annotation_projection::project_annotations("", &entries),
+            (None, true) => return None,
+        };
+        let display_content =
+            (!attachments.is_empty() || !annotations.is_empty()).then(|| prompt.trim().to_owned());
         self.discard_current_composer_draft(cx);
         Some(ComposerSubmission {
             prompt: submission,
             display_content,
             attachments,
+            annotations,
         })
+    }
+
+    /// The staged annotations as prompt entries, in creation order — the order
+    /// the user sees and the numbers the entries carry.
+    ///
+    /// The locator is computed here because only the app knows where the quoted
+    /// reply sits in the conversation: `sender` is the index the message being
+    /// sent will occupy (`None` appends it), so a rewind measures the distance
+    /// the model will actually see. Caps, quoting and the context window all
+    /// belong to the projection module.
+    pub(super) fn projected_annotations(
+        &self,
+        annotations: &[MessageAnnotation],
+        sender: Option<usize>,
+    ) -> Vec<annotation_projection::ProjectedAnnotation> {
+        let messages = self.selected_session().map(|session| &session.messages);
+        annotations
+            .iter()
+            .map(|annotation| {
+                let message_id = annotation.target.message_id();
+                let source = messages
+                    .and_then(|messages| {
+                        messages
+                            .iter()
+                            .position(|message| message.id == message_id)
+                            .map(|index| {
+                                let sent_from = sender.unwrap_or(messages.len());
+                                annotation_projection::source_locator(
+                                    sent_from.saturating_sub(1).saturating_sub(index),
+                                )
+                            })
+                    })
+                    .unwrap_or_else(|| "your earlier reply".to_owned());
+                annotation_projection::ProjectedAnnotation::new(annotation, source)
+            })
+            .collect()
     }
 
     pub(super) fn execute_local_composer_command(
@@ -2317,6 +2396,11 @@ impl Waku {
             .into_iter()
             .map(ComposerAttachment::from)
             .collect();
+        // A restored submission takes its annotations back too: editing a
+        // queued message or retrying a failed send must replay the same
+        // projection, not silently drop the block.
+        self.composer_annotations = submission.annotations;
+        self.reset_annotation_preview_hover();
         let content = submission.display_content.unwrap_or(submission.prompt);
         self.composer
             .update(cx, |input, cx| input.set_content(content, cx));
@@ -2324,9 +2408,433 @@ impl Waku {
         cx.notify();
     }
 
-    /// The staged-attachment chips above the input: a thumbnail tile per
-    /// image, a file-type icon and basename for everything else, each with a
-    /// floating remove button — T3 Code's attachment row in graphite.
+    /// The staged annotations, drawn above the attachment chips.
+    ///
+    /// The chip names the count and opens the hover panel with the annotations
+    /// themselves; there is no inline list any more, so the composer stays
+    /// short. The clear button empties the staged set.
+    fn render_composer_annotations(&self, cx: &mut Context<Self>) -> Div {
+        let theme = Theme::current(cx);
+        let count = self.composer_annotations.len();
+        let label = if count == 1 {
+            tr!("annotation.count_one", count = count)
+        } else {
+            tr!("annotation.count_other", count = count)
+        };
+        let preview_open =
+            self.annotation_preview_visible.get() || self.annotation_panel_pinned.get();
+        // The clear button is a hover reveal; a keyboard-opened panel keeps it
+        // in reach too.
+        let chip_hovered =
+            self.annotation_preview_hover.get() > 0 || self.annotation_panel_pinned.get();
+        let mut list = div()
+            .px(px(14.0))
+            .pt(px(2.0))
+            .pb(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                // One bordered pill holds the icon, the count and the clear
+                // button; hovering anywhere in it lays a soft scrim under all
+                // three, the way the transcript fades soften their edges.
+                div()
+                    .id("composer-annotations-label")
+                    .relative()
+                    .flex()
+                    .self_start()
+                    .items_center()
+                    .gap(px(6.0))
+                    .pl(px(8.0))
+                    .pr(px(4.0))
+                    .py(px(5.0))
+                    .rounded(px(9.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .cursor_default()
+                    .track_focus(&self.annotations_focus)
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_color(theme.accent))
+                    .hover(|style| style.bg(theme.overlay))
+                    .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
+                        this.set_annotation_preview_hover(*hovering, cx);
+                    }))
+                    // Enter or space on the focused chip pins the panel open for
+                    // the keyboard, and closes it again.
+                    .on_activation(cx, |this, _, cx| {
+                        let pinned = !this.annotation_panel_pinned.get();
+                        this.annotation_panel_pinned.set(pinned);
+                        if pinned {
+                            this.annotation_preview_visible.set(true);
+                        } else if this.annotation_preview_hover.get() == 0 {
+                            this.annotation_preview_visible.set(false);
+                            this.annotation_preview_close_generation.set(
+                                this.annotation_preview_close_generation
+                                    .get()
+                                    .wrapping_add(1),
+                            );
+                        }
+                        cx.notify();
+                    })
+                    .child(annotation_label_bounds_probe(
+                        self.annotation_label_bounds.clone(),
+                    ))
+                    .child(icon("icons/annotation.svg", 12.5, theme.text_secondary))
+                    .child(
+                        div()
+                            .text_size(sp(12.0))
+                            .line_height(sp(15.0))
+                            .text_color(theme.text)
+                            .child(label),
+                    )
+                    // No reserved slot: on hover the clear button lands at the
+                    // far right over the count. A soft band fades the count
+                    // into the button, and a solid strip under the button keeps
+                    // the text from showing through it.
+                    .when(chip_hovered, |chip| {
+                        let band = theme.composer.blend(theme.overlay);
+                        chip.child(
+                            div()
+                                .id("composer-annotations-clear")
+                                .absolute()
+                                .right(px(0.0))
+                                .top_0()
+                                .bottom_0()
+                                .w(px(44.0))
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .pr(px(5.0))
+                                .cursor_default()
+                                .track_focus(&self.annotation_clear_focus)
+                                .tab_index(0)
+                                .focus_visible(|style| style.border_color(theme.accent))
+                                .child(div().absolute().left_0().top_0().bottom_0().w(px(22.0)).bg(
+                                    linear_gradient(
+                                        90.0,
+                                        linear_color_stop(band.opacity(0.0), 0.0),
+                                        linear_color_stop(band, 1.0),
+                                    ),
+                                ))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .right_0()
+                                        .top_0()
+                                        .bottom_0()
+                                        .w(px(22.0))
+                                        .rounded_tr(px(9.0))
+                                        .rounded_br(px(9.0))
+                                        .bg(band),
+                                )
+                                .child(
+                                    div()
+                                        .size(px(20.0))
+                                        .rounded_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .hover(|style| style.bg(theme.overlay_strong))
+                                        .child(icon("icons/x.svg", 12.0, theme.text_secondary)),
+                                )
+                                .on_activation(cx, |this, _, cx| {
+                                    this.composer_annotations.clear();
+                                    this.reset_annotation_preview_hover();
+                                    this.capture_and_save_current_composer_draft(cx);
+                                    cx.notify();
+                                }),
+                        )
+                    }),
+            );
+        // The panel lives in the deferred layer, so the composer card cannot
+        // clip it, and it abuts the label so the pointer never crosses a dead
+        // gap on its way up.
+        if preview_open && let Some(bounds) = self.annotation_label_bounds.get() {
+            // Cap the panel to the space between the label and the transcript
+            // viewport's top, so a long list scrolls instead of climbing over
+            // the header.
+            let max_height = self
+                .annotation_safe_bounds()
+                .map(|safe| (bounds.top() - safe.top() - px(16.0)).max(px(140.0)))
+                .unwrap_or(px(360.0));
+            list = list.child(
+                gpui::deferred(
+                    gpui::anchored()
+                        // A small gap above the chip; the hover grace period keeps
+                        // the panel open while the pointer crosses it.
+                        .position(point(bounds.origin.x, bounds.origin.y - px(6.0)))
+                        .anchor(gpui::Anchor::BottomLeft)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(self.render_annotation_preview(
+                            &theme,
+                            point(bounds.right() + px(8.0), bounds.top()),
+                            max_height,
+                            cx,
+                        )),
+                )
+                .with_priority(1),
+            );
+        }
+        list
+    }
+
+    /// Forget the label's hover tracking. The counters only ever step down on a
+    /// leave event, and a label that disappears under the pointer never sends
+    /// one, so whatever drops the staged set has to clear them or a later
+    /// staging would show the preview with no pointer on the label.
+    pub(super) fn reset_annotation_preview_hover(&self) {
+        self.annotation_preview_hover.set(0);
+        self.annotation_preview_visible.set(false);
+        self.annotation_panel_pinned.set(false);
+        self.annotation_preview_close_generation.set(
+            self.annotation_preview_close_generation
+                .get()
+                .wrapping_add(1),
+        );
+    }
+
+    /// Track the annotation label and its panel as one hover region. Leaving
+    /// one and entering the other lands both events in the same frame's
+    /// dispatch, and a count keeps the order from mattering. A short grace
+    /// period after the count reaches zero covers a fast pointer crossing the
+    /// seam before it is over the panel.
+    fn set_annotation_preview_hover(&mut self, hovering: bool, cx: &mut Context<Self>) {
+        let count = self.annotation_preview_hover.get();
+        let next = if hovering {
+            count.saturating_add(1)
+        } else {
+            count.saturating_sub(1)
+        };
+        if next == count {
+            return;
+        }
+        self.annotation_preview_hover.set(next);
+        self.annotation_preview_close_generation.set(
+            self.annotation_preview_close_generation
+                .get()
+                .wrapping_add(1),
+        );
+        if next > 0 {
+            self.annotation_preview_visible.set(true);
+            cx.notify();
+            return;
+        }
+        let generation = self.annotation_preview_close_generation.get();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(ANNOTATION_PREVIEW_GRACE)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.annotation_preview_close_generation.get() == generation
+                    && this.annotation_preview_hover.get() == 0
+                    && !this.annotation_panel_pinned.get()
+                    && this.annotation_preview_visible.get()
+                {
+                    this.annotation_preview_visible.set(false);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The Codex-style hover panel: the annotations themselves, each with its
+    /// number, quote and comment, plus pencil and trash. It reads the staged
+    /// records already in memory, so hovering never parses or does IO, and it
+    /// stays open while the pointer is inside it.
+    /// The panel's controls are keyboard reachable too: tab into the card to
+    /// jump, or onto its pencil and trash; escape closes the panel.
+    fn render_annotation_preview(
+        &self,
+        theme: &Theme,
+        editor_anchor: Point<Pixels>,
+        max_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let count = self.composer_annotations.len();
+        let header = if count == 1 {
+            tr!("annotation.count_one", count = count)
+        } else {
+            tr!("annotation.count_other", count = count)
+        };
+        let panel = div()
+            .id("composer-annotation-preview")
+            .w(px(340.0))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .px(px(8.0))
+            .py(px(8.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.raised)
+            .shadow_lg()
+            .occlude()
+            .key_context("AnnotationEditor")
+            .on_action(cx.listener(|this, _: &DismissAnnotationEditor, _, cx| {
+                this.dismiss_annotation_overlays(cx);
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.dismiss_annotation_overlays(cx);
+            }))
+            .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
+                this.set_annotation_preview_hover(*hovering, cx);
+            }))
+            .child(
+                div()
+                    .px(px(4.0))
+                    .text_size(sp(11.0))
+                    .line_height(sp(14.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_tertiary)
+                    .child(header),
+            );
+        // A long list caps here and scrolls instead of growing past the window.
+        let mut list = div()
+            .id("composer-annotation-preview-list")
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .max_h(max_height)
+            .overflow_y_scroll()
+            .track_scroll(&self.annotation_preview_scroll);
+        for (index, annotation) in self.composer_annotations.iter().enumerate() {
+            let id = annotation.id;
+            let quote = annotation.target.quote().to_owned();
+            let comment = annotation.comment.clone();
+            let card_focus = self.annotation_control_focus(format!("panel-card-{id}"), cx);
+            let edit_focus = self.annotation_control_focus(format!("panel-edit-{id}"), cx);
+            let remove_focus = self.annotation_control_focus(format!("panel-remove-{id}"), cx);
+            let mut body = div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(sp(12.0))
+                        .line_height(sp(16.0))
+                        .text_color(theme.text_secondary)
+                        .child(tr!("annotation.selected_text")),
+                )
+                .child(
+                    div()
+                        .text_size(sp(12.0))
+                        .line_height(sp(16.0))
+                        .text_color(theme.text)
+                        .line_clamp(3)
+                        .child(SharedString::from(quote)),
+                );
+            if let Some(comment) = comment {
+                body = body.child(
+                    div()
+                        .text_size(sp(12.0))
+                        .line_height(sp(16.0))
+                        .text_color(theme.text_tertiary)
+                        .line_clamp(2)
+                        .child(SharedString::from(comment)),
+                );
+            }
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("annotation-preview-card-{id}")))
+                    .flex()
+                    .items_start()
+                    .gap(px(7.0))
+                    .px(px(4.0))
+                    .py(px(4.0))
+                    .rounded(px(7.0))
+                    .cursor_default()
+                    .track_focus(&card_focus)
+                    .tab_index(0)
+                    .focus_visible(|style| style.bg(theme.overlay))
+                    .hover(|style| style.bg(theme.overlay))
+                    // Activating a card jumps to its span and flashes it, fading
+                    // out; the icons stop propagation so editing or deleting
+                    // never doubles as a jump.
+                    .on_activation(cx, move |this, _, cx| {
+                        this.reveal_annotation_from_card(id, cx);
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(14.0))
+                            .rounded_full()
+                            .bg(theme.accent)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(sp(9.0))
+                                    .line_height(sp(11.0))
+                                    .text_color(theme.on_inverse)
+                                    .child((index + 1).to_string()),
+                            ),
+                    )
+                    .child(body)
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(1.0))
+                            .child(
+                                icon_button(
+                                    SharedString::from(format!("annotation-preview-edit-{id}")),
+                                    "icons/pencil.svg",
+                                    theme.clone(),
+                                )
+                                .track_focus(&edit_focus)
+                                .tab_index(0)
+                                .focus_visible(|style| style.bg(theme.overlay_strong))
+                                .tooltip(Tooltip::text(tr!("annotation.edit")))
+                                .on_activation(
+                                    cx,
+                                    move |this, window, cx| {
+                                        this.open_annotation_editor(id, editor_anchor, window, cx);
+                                    },
+                                ),
+                            )
+                            .child(
+                                icon_button(
+                                    SharedString::from(format!("annotation-preview-remove-{id}")),
+                                    "icons/trash.svg",
+                                    theme.clone(),
+                                )
+                                .track_focus(&remove_focus)
+                                .tab_index(0)
+                                .focus_visible(|style| style.bg(theme.overlay_strong))
+                                .tooltip(Tooltip::text(tr!("annotation.remove")))
+                                .on_activation(
+                                    cx,
+                                    move |this, _, cx| {
+                                        this.delete_annotation(id, cx);
+                                    },
+                                ),
+                            ),
+                    ),
+            );
+        }
+        panel.child(list)
+    }
+
+    /// One focus handle per annotation control, keyed by role and id, created
+    /// on demand because the panel renders from `&self`.
+    pub(super) fn annotation_control_focus(
+        &self,
+        key: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> FocusHandle {
+        self.annotation_card_focus
+            .borrow_mut()
+            .entry(key.into())
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
     fn render_composer_attachments(&self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
         let mut row = div()
@@ -2709,7 +3217,7 @@ impl Waku {
         )
     }
 
-    pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+    pub(super) fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
         let session = self.selected_session();
         let preparing = session.is_some_and(|session| {
@@ -2746,6 +3254,8 @@ impl Waku {
                 .w_full()
                 .max_w(px(CONTENT_MAX_WIDTH))
                 .mx_auto()
+                .tab_group()
+                .tab_index(1)
                 .rounded(px(13.0))
                 .border_1()
                 .border_color(theme.border)
@@ -2791,6 +3301,9 @@ impl Waku {
                         }))
                 })
                 .children(autocomplete)
+                .when(!self.composer_annotations.is_empty(), |card| {
+                    card.child(self.render_composer_annotations(cx))
+                })
                 .when(!self.composer_attachments.is_empty(), |card| {
                     card.child(self.render_composer_attachments(cx))
                 })

@@ -347,11 +347,28 @@ pub(super) fn render_message_footer(
     footer.into_any_element()
 }
 
+/// What a sent user message's annotation indicator needs: how many the message
+/// carried, whether the detail is showing, the focus handle the row tracks, and
+/// the entries themselves when it is.
+pub(super) struct SentAnnotationIndicator {
+    pub(super) count: usize,
+    pub(super) expanded: bool,
+    pub(super) focus: FocusHandle,
+    pub(super) entries: Vec<SentAnnotationEntry>,
+}
+
+/// One quote and its optional comment, as the sent indicator lists them.
+pub(super) struct SentAnnotationEntry {
+    pub(super) quote: String,
+    pub(super) comment: Option<String>,
+}
+
 /// Everything one transcript message row needs to render itself. Bundled
 /// because these travel together from `transcript_row` and nowhere else.
 pub(super) struct MessageRender<'a> {
     pub(super) theme: &'a Theme,
     pub(super) message: &'a Message,
+    pub(super) sent_annotations: Option<SentAnnotationIndicator>,
     pub(super) assistant_footer_copy_content: Option<SharedString>,
     pub(super) assistant_footer_time: Option<u64>,
     pub(super) copied: bool,
@@ -544,10 +561,154 @@ fn render_markdown_message_body<'a>(
         })
 }
 
+/// The compact annotation indicator under a sent user message: a count the
+/// user can open to read back the quotes and comments that traveled with it.
+///
+/// Always visible, because a transcript mark with no way to read it back is
+/// half the value, and keyboard reachable, like the transcript's other
+/// controls. It carries no draft number: after send the number is not a number
+/// the user can look up anywhere else. Icon plus text, so the meaning never
+/// rests on colour.
+fn render_sent_annotations_indicator(
+    message_id: Uuid,
+    indicator: SentAnnotationIndicator,
+    theme: &Theme,
+    waku: &gpui::WeakEntity<Waku>,
+) -> AnyElement {
+    let SentAnnotationIndicator {
+        count,
+        expanded,
+        focus,
+        entries,
+    } = indicator;
+    let label = if count == 1 {
+        tr!("annotation.count_one", count = count)
+    } else {
+        tr!("annotation.count_other", count = count)
+    };
+    let toggle_waku = waku.clone();
+    let key_waku = waku.clone();
+    let mut column = div()
+        .max_w(px(540.0))
+        .flex()
+        .flex_col()
+        .items_end()
+        .gap(px(4.0));
+    let header = div()
+        .id(SharedString::from(format!(
+            "message-{message_id}-annotations"
+        )))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(8.0))
+        .py(px(3.0))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(if expanded { theme.accent } else { theme.border })
+        .bg(theme.overlay)
+        .cursor_default()
+        .track_focus(&focus)
+        .tab_index(0)
+        .focus_visible(|style| style.border_color(theme.accent))
+        .hover(|style| style.bg(theme.overlay_strong))
+        .tooltip(Tooltip::text(if expanded {
+            tr!("annotation.collapse")
+        } else {
+            tr!("annotation.expand")
+        }))
+        .child(icon("icons/annotation.svg", 12.0, theme.text_tertiary))
+        .child(
+            div()
+                .text_size(sp(12.0))
+                .line_height(sp(15.0))
+                .text_color(theme.text_secondary)
+                .child(label),
+        )
+        .child(icon(
+            if expanded {
+                "icons/chevron-up.svg"
+            } else {
+                "icons/chevron-down.svg"
+            },
+            12.0,
+            theme.text_tertiary,
+        ))
+        .on_click(move |_, _, cx| {
+            let _ = toggle_waku.update(cx, |this, cx| {
+                this.toggle_sent_annotations(message_id, cx);
+            });
+        })
+        .on_key_down(move |event: &KeyDownEvent, _, cx| {
+            // Bare Enter/Space only, matching `ActivationExt::on_activation`:
+            // a modified chord belongs to whatever command owns it.
+            if !event.keystroke.modifiers.modified()
+                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+            {
+                let _ = key_waku.update(cx, |this, cx| {
+                    this.toggle_sent_annotations(message_id, cx);
+                });
+                cx.stop_propagation();
+            }
+        });
+    column = column.child(header);
+    if expanded {
+        let mut list = div().w_full().flex().flex_col().gap(px(4.0));
+        for entry in entries {
+            let mut card = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .px(px(8.0))
+                .py(px(6.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.inset)
+                .child(
+                    div()
+                        .text_size(sp(11.0))
+                        .line_height(sp(14.0))
+                        .text_color(theme.text_secondary)
+                        .child(tr!("annotation.selected_text")),
+                )
+                .child(
+                    div()
+                        .text_size(sp(12.0))
+                        .line_height(sp(16.0))
+                        .text_color(theme.text)
+                        .child(SharedString::from(entry.quote)),
+                );
+            if let Some(comment) = entry.comment {
+                card = card
+                    .child(
+                        div()
+                            .text_size(sp(11.0))
+                            .line_height(sp(14.0))
+                            .text_color(theme.text_secondary)
+                            .child(tr!("annotation.user_comment")),
+                    )
+                    .child(
+                        div()
+                            .text_size(sp(12.0))
+                            .line_height(sp(16.0))
+                            .text_color(theme.text_secondary)
+                            .child(SharedString::from(comment)),
+                    );
+            }
+            list = list.child(card);
+        }
+        column = column.child(list);
+    }
+    column.into_any_element()
+}
+
 pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement {
     let MessageRender {
         theme,
         message,
+        sent_annotations,
         assistant_footer_copy_content,
         assistant_footer_time,
         copied,
@@ -585,6 +746,13 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                 .items_end()
                 .gap(px(3.0))
                 .group(group_name.clone());
+            // Annotations first, then attachments, then the message itself — the
+            // same order the composer stages them in.
+            if let Some(indicator) = sent_annotations {
+                column = column.child(render_sent_annotations_indicator(
+                    message_id, indicator, theme, &waku,
+                ));
+            }
             if let Some(attachments) = render_sent_message_attachments(
                 message_id,
                 &message.attachments,

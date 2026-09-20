@@ -1302,7 +1302,9 @@ impl Waku {
         session_id: Uuid,
         status: TurnStatus,
     ) -> Option<(Uuid, usize)> {
-        self.state.session_mut(session_id)?.finish_active_turn(status)
+        self.state
+            .session_mut(session_id)?
+            .finish_active_turn(status)
     }
 
     /// The directory every filesystem and provider operation for `session`
@@ -2050,7 +2052,7 @@ impl Waku {
             message_id,
             turn_count,
         } = action;
-        let Some((message_index, initial_message, attachments)) = self
+        let Some((message_index, initial_message, attachments, annotations)) = self
             .state
             .sessions
             .iter()
@@ -2077,6 +2079,7 @@ impl Waku {
                                     index,
                                     message.visible_content().to_owned(),
                                     message.attachments.clone(),
+                                    message.annotations.clone(),
                                 )
                             })
                     })
@@ -2089,6 +2092,7 @@ impl Waku {
 
         let input = cx.new(|cx| ComposerInput::new(window, cx).padding_x(px(12.0), cx));
         input.update(cx, |input, cx| input.set_content(initial_message, cx));
+        let previous_annotations = std::mem::take(&mut self.composer_annotations);
         cx.subscribe(
             &input,
             |this: &mut Self, _, event: &ComposerEvent, cx| match event {
@@ -2113,7 +2117,12 @@ impl Waku {
             turn_count,
             input: input.clone(),
             attachments,
+            previous_annotations,
         });
+        // Reopening a sent message restores its annotations as staged records:
+        // the same quotes and comments, shown in the hover panel.
+        self.composer_annotations = annotations;
+        self.reset_annotation_preview_hover();
         self.hide_toast();
         self.remeasure_transcript_message(message_index);
         let focus_handle = input.read(cx).focus();
@@ -2132,6 +2141,10 @@ impl Waku {
         let Some(edit) = self.message_edit.take() else {
             return;
         };
+        // Put the draft's own staged review back exactly as it was before this
+        // message was opened.
+        self.composer_annotations = edit.previous_annotations;
+        self.reset_annotation_preview_hover();
         let message_index = self.selected_session().and_then(|session| {
             session
                 .messages
@@ -2166,7 +2179,8 @@ impl Waku {
         // Use the event's captured value rather than rereading the field; the
         // button path enters here with its own pre-clear content as well.
         let prompt = prompt.trim().to_owned();
-        if prompt.is_empty() && edit.attachments.is_empty() {
+        if prompt.is_empty() && edit.attachments.is_empty() && self.composer_annotations.is_empty()
+        {
             self.show_toast(tr!("session.edited_message_empty"));
             cx.notify();
             return;
@@ -2176,15 +2190,46 @@ impl Waku {
             .iter()
             .map(|attachment| attachment.mention.clone())
             .collect::<Vec<_>>();
-        let provider_prompt = composer::merged_submission(&prompt, &mentions)
-            .expect("edited text or retained attachments always form a submission");
-        let display_content = (!edit.attachments.is_empty()).then_some(prompt);
+        // The rewind drops the messages after this one, so the annotation block
+        // is built against the conversation the model will actually see. The
+        // staged set is the source: it started as the message's own records and
+        // the user may have edited or removed cards while the message was open.
+        let annotations = self.composer_annotations.clone();
+        let entries = if annotations.is_empty() {
+            Vec::new()
+        } else {
+            let sender = self.selected_session().and_then(|session| {
+                session
+                    .messages
+                    .iter()
+                    .position(|message| message.id == edit.message_id)
+            });
+            self.projected_annotations(&annotations, sender)
+        };
+        let provider_prompt = match (
+            composer::merged_submission(&prompt, &mentions),
+            entries.is_empty(),
+        ) {
+            (Some(merged), true) => merged,
+            (Some(merged), false) => {
+                super::annotation_projection::project_annotations(&merged, &entries)
+            }
+            (None, false) => super::annotation_projection::project_annotations("", &entries),
+            (None, true) => {
+                self.show_toast(tr!("session.edited_message_empty"));
+                cx.notify();
+                return;
+            }
+        };
+        let display_content =
+            (!edit.attachments.is_empty() || !annotations.is_empty()).then_some(prompt);
         self.start_message_rewind(
             edit.clone(),
             ComposerSubmission {
                 prompt: provider_prompt,
                 display_content,
                 attachments: edit.attachments,
+                annotations,
             },
             cx,
         );
@@ -2355,6 +2400,7 @@ impl Waku {
             message.content = submission.prompt.clone();
             message.display_content = submission.display_content.clone();
             message.attachments = submission.attachments.clone();
+            message.annotations = submission.annotations.clone();
             session.status = SessionStatus::Connecting;
             session.updated_at = unix_time();
             Some(original)
@@ -2365,6 +2411,10 @@ impl Waku {
             return;
         };
         self.message_edit = None;
+        // The recorded records now live on the message; the staged copies have
+        // done their job and must not linger as a second set of marks.
+        self.composer_annotations.clear();
+        self.reset_annotation_preview_hover();
         self.submission_preparations.insert(session_id);
         self.hide_toast();
         self.remeasure_transcript_message(edited_message_index);
@@ -2423,6 +2473,10 @@ impl Waku {
                 }
                 if selected && self.message_edit.is_none() {
                     self.message_edit = Some(edit.clone());
+                    // The rewind failed, so the message still carries its old
+                    // records: put the staged set back for another attempt.
+                    self.composer_annotations = submission.annotations.clone();
+                    self.reset_annotation_preview_hover();
                 }
                 if selected
                     && let Some(message_index) = self.selected_session().and_then(|session| {
@@ -3260,6 +3314,7 @@ impl Waku {
                 &prompt,
                 submission.display_content.clone(),
                 submission.attachments.clone(),
+                submission.annotations.clone(),
             );
             session.status = SessionStatus::Connecting;
             session.updated_at = unix_time();

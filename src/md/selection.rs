@@ -67,6 +67,12 @@ impl Selection {
         self.spans.iter().all(|span| span.range.is_empty())
     }
 
+    /// Whether a drag is still in flight. The selection toolbar waits for the
+    /// pointer to be released before it appears.
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
     /// Begin a drag anchored at `offset` in `key`.
     pub fn begin(&mut self, key: TextKey, offset: usize) {
         self.anchor = Some(key);
@@ -91,6 +97,16 @@ impl Selection {
     /// The live drag's anchor offset, if `key` owns the drag.
     pub fn drag_anchor(&self, key: &TextKey) -> Option<usize> {
         (self.dragging && self.anchor.as_ref() == Some(key)).then_some(self.anchor_offset)
+    }
+
+    /// Continue the selection from `key`/`offset` instead of from the original
+    /// drag anchor. A shift-click replays the drag from the far end of the
+    /// current selection, so the click always grows it rather than shrinking
+    /// the side it moved past.
+    pub fn extend_from(&mut self, key: TextKey, offset: usize) {
+        self.anchor = Some(key);
+        self.anchor_offset = offset;
+        self.dragging = true;
     }
 
     pub fn anchor(&self) -> Option<&TextKey> {
@@ -137,6 +153,12 @@ impl Selection {
     /// The full selected text, or `None` when nothing is selected.
     pub fn selected_text(&self) -> Option<String> {
         (!self.is_empty()).then(|| self.text())
+    }
+
+    /// The resolved spans, in document order. An annotation anchor is one
+    /// element's span, so callers need the ranges rather than joined text.
+    pub fn spans(&self) -> &[Span] {
+        &self.spans
     }
 
     /// The full selected text, spans joined in document order.

@@ -85,6 +85,8 @@ actions!(
         SaveFile,
         CancelTurn,
         CopySelection,
+        AnnotateSelection,
+        DismissAnnotationEditor,
         OpenFind,
         OpenFindReplace,
         CloseFind,
@@ -105,7 +107,9 @@ actions!(
         WebviewCopy,
         WebviewCut,
         WebviewPaste,
-        WebviewSelectAll
+        WebviewSelectAll,
+        FocusNext,
+        FocusPrev
     ]
 );
 
@@ -258,7 +262,18 @@ pub fn run() {
                 KeyBinding::new("secondary-u", ToggleUsagePanel, None),
                 KeyBinding::new("secondary-s", SaveFile, None),
                 KeyBinding::new("escape", CancelTurn, Some("Waku")),
+                // GPUI's focus_next/focus_prev are not bound by default, so Tab
+                // does nothing without this. Zed binds the same pair.
+                KeyBinding::new("tab", FocusNext, Some("Waku")),
+                KeyBinding::new("shift-tab", FocusPrev, Some("Waku")),
+                // Escape inside the annotation comment field or editor closes
+                // the overlay before it can cancel the turn.
+                KeyBinding::new("escape", DismissAnnotationEditor, Some("AnnotationEditor")),
                 KeyBinding::new("secondary-c", CopySelection, Some("Waku")),
+                // The transcript note action. It shares the composer's focus
+                // fallback with copy, so an active selection anywhere in the
+                // transcript is enough to annotate it.
+                KeyBinding::new("secondary-alt-a", AnnotateSelection, Some("Waku")),
                 // Find and replace in the right panel's file editor, on the
                 // conventional VS Code bindings. The primary shortcut + G cycles matches from
                 // the editor without moving focus to the bar.
