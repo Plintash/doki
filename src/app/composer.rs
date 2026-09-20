@@ -2442,7 +2442,7 @@ impl Waku {
                     .items_center()
                     .gap(px(6.0))
                     .pl(px(8.0))
-                    .pr(px(4.0))
+                    .pr(px(8.0))
                     .py(px(5.0))
                     .rounded(px(9.0))
                     .border_1()
@@ -2463,62 +2463,37 @@ impl Waku {
                             .text_color(theme.text)
                             .child(label),
                     )
-                    // No reserved slot: on hover the clear button lands at the
-                    // far right over the count. A soft band fades the count
-                    // into the button, and a solid strip under the button keeps
-                    // the text from showing through it.
-                    .when(chip_hovered, |chip| {
-                        let band = theme.composer.blend(theme.overlay);
-                        chip.child(
-                            div()
-                                .id("composer-annotations-clear")
-                                .absolute()
-                                .right(px(0.0))
-                                .top_0()
-                                .bottom_0()
-                                .w(px(44.0))
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .pr(px(5.0))
-                                .cursor_default()
-                                .child(div().absolute().left_0().top_0().bottom_0().w(px(22.0)).bg(
-                                    linear_gradient(
-                                        90.0,
-                                        linear_color_stop(band.opacity(0.0), 0.0),
-                                        linear_color_stop(band, 1.0),
-                                    ),
-                                ))
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .right_0()
-                                        .top_0()
-                                        .bottom_0()
-                                        .w(px(22.0))
-                                        .rounded_tr(px(9.0))
-                                        .rounded_br(px(9.0))
-                                        .bg(band),
-                                )
-                                .child(
-                                    div()
-                                        .size(px(20.0))
-                                        .rounded_full()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .hover(|style| style.bg(theme.overlay_strong))
-                                        .child(icon("icons/x.svg", 12.0, theme.text_secondary)),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.composer_annotations.clear();
-                                    this.reset_annotation_preview_hover();
-                                    this.capture_and_save_current_composer_draft(cx);
-                                    cx.notify();
-                                })),
-                        )
-                    }),
+                    .child(
+                        // The clear button owns its own slot, so the count is
+                        // never covered and the pill's two side gaps stay even.
+                        // It sits quiet until the chip is hovered.
+                        div()
+                            .id("composer-annotations-clear")
+                            .flex_none()
+                            .size(px(20.0))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_default()
+                            .hover(|style| style.bg(theme.overlay_strong))
+                            .child(icon(
+                                "icons/x.svg",
+                                12.0,
+                                if chip_hovered {
+                                    theme.text_secondary
+                                } else {
+                                    theme.text_ghost
+                                },
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.composer_annotations.clear();
+                                this.reset_annotation_preview_hover();
+                                this.capture_and_save_current_composer_draft(cx);
+                                cx.notify();
+                            })),
+                    ),
             );
         // The panel lives in the deferred layer, so the composer card cannot
         // clip it, and it abuts the label so the pointer never crosses a dead
