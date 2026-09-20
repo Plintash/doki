@@ -129,13 +129,12 @@ Release maintainers should also read [RELEASING.md](RELEASING.md).
 Doki is a renamed fork of **[Waku](https://github.com/egoist/waku)** by
 [@egoist](https://github.com/egoist) and the Waku contributors. Nearly all of
 this app — its code, design, and provider integrations — is their work, and all
-credit belongs upstream: go there for the original app, its installers, its
-issues, and its sponsorship. Doki is an independent fork and is not affiliated
-with or endorsed by the upstream project.
+credit belongs upstream: go there for the original app, its issues, and its
+sponsorship. Doki is an independent fork and is not affiliated with or endorsed
+by the upstream project.
 
 ## License
 
-Doki is licensed under the [GNU General Public License v3.0 only](LICENSE),
-the same license as the upstream Waku project it is derived from — a fork
-cannot change it. Credit for the original work belongs to the Waku project:
-https://github.com/egoist/waku.
+Doki is licensed under the [GNU General Public License v3.0 only](LICENSE), the
+same license as the upstream [Waku](https://github.com/egoist/waku) project it
+is derived from — a fork cannot change it.
