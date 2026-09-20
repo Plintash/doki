@@ -1,5 +1,6 @@
 use super::right_panel::{DiffRowStyle, render_diff_code_row};
 use super::*;
+use crate::ui::ActivationExt;
 use base64::Engine as _;
 
 const CHANGED_FILES_PREVIEW_LIMIT: usize = 3;
@@ -841,6 +842,8 @@ impl Waku {
     /// Close whichever floating annotation surface is open.
     pub(super) fn dismiss_annotation_overlays(&mut self, cx: &mut Context<Self>) {
         *self.selection_toolbar.borrow_mut() = None;
+        self.annotation_panel_pinned.set(false);
+        self.annotation_preview_visible.set(false);
         self.close_annotation_editor(cx);
     }
 
@@ -980,17 +983,23 @@ impl Waku {
                 this.dismiss_annotation_overlays(cx);
             }))
             .child(div().min_h(px(26.0)).child(input))
-            .child(
+            .child({
+                let delete_focus = self.annotation_control_focus("editor-delete", cx);
+                let cancel_focus = self.annotation_control_focus("editor-cancel", cx);
+                let save_focus = self.annotation_control_focus("editor-save", cx);
                 div()
                     .flex()
                     .items_center()
                     .gap(px(6.0))
                     .child(
                         icon_button("annotation-editor-delete", "icons/trash.svg", theme.clone())
+                            .track_focus(&delete_focus)
+                            .tab_index(0)
+                            .focus_visible(|style| style.bg(theme.overlay_strong))
                             .tooltip(Tooltip::text(tr!("annotation.remove")))
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_activation(cx, move |this, _, cx| {
                                 this.delete_annotation(id, cx);
-                            })),
+                            }),
                     )
                     .child(div().flex_1())
                     .child(
@@ -1006,11 +1015,14 @@ impl Waku {
                             .text_size(sp(12.0))
                             .text_color(theme.text)
                             .cursor_default()
+                            .track_focus(&cancel_focus)
+                            .tab_index(0)
+                            .focus_visible(|style| style.border_color(theme.accent))
                             .hover(|style| style.bg(theme.overlay))
                             .child(tr!("common.cancel"))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_activation(cx, |this, _, cx| {
                                 this.close_annotation_editor(cx);
-                            })),
+                            }),
                     )
                     .child(
                         div()
@@ -1030,13 +1042,16 @@ impl Waku {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme.on_inverse)
                             .cursor_default()
+                            .track_focus(&save_focus)
+                            .tab_index(0)
+                            .focus_visible(|style| style.border_1().border_color(theme.text))
                             .hover(|style| style.opacity(0.9))
                             .child(tr!("common.save"))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_activation(cx, |this, _, cx| {
                                 this.save_annotation_comment(cx);
-                            })),
-                    ),
-            )
+                            }),
+                    )
+            })
             .into_any_element();
         Some(
             gpui::deferred(

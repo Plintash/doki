@@ -3,6 +3,8 @@ use super::*;
 use anyhow::Context as _;
 use base64::Engine as _;
 
+use crate::ui::ActivationExt;
+
 const COMPUTER_USE_PREVIEW_WIDTH: f32 = 304.0;
 const COMPUTER_USE_PREVIEW_HEIGHT: f32 = 172.0;
 const COMPUTER_USE_PREVIEW_RADIUS: f32 = 12.0;
@@ -2419,10 +2421,12 @@ impl Waku {
         } else {
             tr!("annotation.count_other", count = count)
         };
-        let preview_open = self.annotation_preview_visible.get();
-        // The clear button is a hover reveal, so it stays out of the way while
-        // the count is just being read.
-        let chip_hovered = self.annotation_preview_hover.get() > 0;
+        let preview_open =
+            self.annotation_preview_visible.get() || self.annotation_panel_pinned.get();
+        // The clear button is a hover reveal; a keyboard-opened panel keeps it
+        // in reach too.
+        let chip_hovered =
+            self.annotation_preview_hover.get() > 0 || self.annotation_panel_pinned.get();
         let mut list = div()
             .px(px(14.0))
             .pt(px(2.0))
@@ -2448,10 +2452,30 @@ impl Waku {
                     .border_1()
                     .border_color(theme.border)
                     .cursor_default()
+                    .track_focus(&self.annotations_focus)
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_color(theme.accent))
                     .hover(|style| style.bg(theme.overlay))
                     .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
                         this.set_annotation_preview_hover(*hovering, cx);
                     }))
+                    // Enter or space on the focused chip pins the panel open for
+                    // the keyboard, and closes it again.
+                    .on_activation(cx, |this, _, cx| {
+                        let pinned = !this.annotation_panel_pinned.get();
+                        this.annotation_panel_pinned.set(pinned);
+                        if pinned {
+                            this.annotation_preview_visible.set(true);
+                        } else if this.annotation_preview_hover.get() == 0 {
+                            this.annotation_preview_visible.set(false);
+                            this.annotation_preview_close_generation.set(
+                                this.annotation_preview_close_generation
+                                    .get()
+                                    .wrapping_add(1),
+                            );
+                        }
+                        cx.notify();
+                    })
                     .child(annotation_label_bounds_probe(
                         self.annotation_label_bounds.clone(),
                     ))
@@ -2482,6 +2506,9 @@ impl Waku {
                                 .justify_end()
                                 .pr(px(5.0))
                                 .cursor_default()
+                                .track_focus(&self.annotation_clear_focus)
+                                .tab_index(0)
+                                .focus_visible(|style| style.border_color(theme.accent))
                                 .child(div().absolute().left_0().top_0().bottom_0().w(px(22.0)).bg(
                                     linear_gradient(
                                         90.0,
@@ -2510,13 +2537,12 @@ impl Waku {
                                         .hover(|style| style.bg(theme.overlay_strong))
                                         .child(icon("icons/x.svg", 12.0, theme.text_secondary)),
                                 )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
+                                .on_activation(cx, |this, _, cx| {
                                     this.composer_annotations.clear();
                                     this.reset_annotation_preview_hover();
                                     this.capture_and_save_current_composer_draft(cx);
                                     cx.notify();
-                                })),
+                                }),
                         )
                     }),
             );
@@ -2557,6 +2583,7 @@ impl Waku {
     pub(super) fn reset_annotation_preview_hover(&self) {
         self.annotation_preview_hover.set(0);
         self.annotation_preview_visible.set(false);
+        self.annotation_panel_pinned.set(false);
         self.annotation_preview_close_generation.set(
             self.annotation_preview_close_generation
                 .get()
@@ -2598,6 +2625,7 @@ impl Waku {
             let _ = this.update(cx, |this, cx| {
                 if this.annotation_preview_close_generation.get() == generation
                     && this.annotation_preview_hover.get() == 0
+                    && !this.annotation_panel_pinned.get()
                     && this.annotation_preview_visible.get()
                 {
                     this.annotation_preview_visible.set(false);
@@ -2612,6 +2640,8 @@ impl Waku {
     /// number, quote and comment, plus pencil and trash. It reads the staged
     /// records already in memory, so hovering never parses or does IO, and it
     /// stays open while the pointer is inside it.
+    /// The panel's controls are keyboard reachable too: tab into the card to
+    /// jump, or onto its pencil and trash; escape closes the panel.
     fn render_annotation_preview(
         &self,
         theme: &Theme,
@@ -2625,6 +2655,7 @@ impl Waku {
         } else {
             tr!("annotation.count_other", count = count)
         };
+        let clear_focus = self.annotation_control_focus("panel-clear", cx);
         let panel = div()
             .id("composer-annotation-preview")
             .w(px(340.0))
@@ -2639,17 +2670,52 @@ impl Waku {
             .bg(theme.raised)
             .shadow_lg()
             .occlude()
+            .key_context("AnnotationEditor")
+            .on_action(cx.listener(|this, _: &DismissAnnotationEditor, _, cx| {
+                this.dismiss_annotation_overlays(cx);
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.dismiss_annotation_overlays(cx);
+            }))
             .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
                 this.set_annotation_preview_hover(*hovering, cx);
             }))
             .child(
                 div()
-                    .px(px(4.0))
-                    .text_size(sp(11.0))
-                    .line_height(sp(14.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.text_tertiary)
-                    .child(header),
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .px(px(4.0))
+                            .text_size(sp(11.0))
+                            .line_height(sp(14.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text_tertiary)
+                            .child(header),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("annotation-panel-clear")
+                            .size(px(20.0))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .track_focus(&clear_focus)
+                            .tab_index(0)
+                            .focus_visible(|style| style.bg(theme.overlay_strong))
+                            .cursor_default()
+                            .hover(|style| style.bg(theme.overlay_strong))
+                            .child(icon("icons/x.svg", 11.0, theme.text_secondary))
+                            .on_activation(cx, |this, _, cx| {
+                                this.composer_annotations.clear();
+                                this.reset_annotation_preview_hover();
+                                this.capture_and_save_current_composer_draft(cx);
+                                cx.notify();
+                            }),
+                    ),
             );
         // A long list caps here and scrolls instead of growing past the window.
         let mut list = div()
@@ -2664,6 +2730,9 @@ impl Waku {
             let id = annotation.id;
             let quote = annotation.target.quote().to_owned();
             let comment = annotation.comment.clone();
+            let card_focus = self.annotation_control_focus(format!("panel-card-{id}"), cx);
+            let edit_focus = self.annotation_control_focus(format!("panel-edit-{id}"), cx);
+            let remove_focus = self.annotation_control_focus(format!("panel-remove-{id}"), cx);
             let mut body = div()
                 .flex_1()
                 .min_w_0()
@@ -2705,13 +2774,16 @@ impl Waku {
                     .py(px(4.0))
                     .rounded(px(7.0))
                     .cursor_default()
+                    .track_focus(&card_focus)
+                    .tab_index(0)
+                    .focus_visible(|style| style.bg(theme.overlay))
                     .hover(|style| style.bg(theme.overlay))
-                    // Clicking a card jumps to its span and flashes it, fading
-                    // out; the icons stop propagation so tooltipping or editing
+                    // Activating a card jumps to its span and flashes it, fading
+                    // out; the icons stop propagation so editing or deleting
                     // never doubles as a jump.
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_activation(cx, move |this, _, cx| {
                         this.reveal_annotation_from_card(id, cx);
-                    }))
+                    })
                     .child(
                         div()
                             .flex_none()
@@ -2742,13 +2814,16 @@ impl Waku {
                                     "icons/pencil.svg",
                                     theme.clone(),
                                 )
+                                .track_focus(&edit_focus)
+                                .tab_index(0)
+                                .focus_visible(|style| style.bg(theme.overlay_strong))
                                 .tooltip(Tooltip::text(tr!("annotation.edit")))
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        cx.stop_propagation();
+                                .on_activation(
+                                    cx,
+                                    move |this, window, cx| {
                                         this.open_annotation_editor(id, editor_anchor, window, cx);
                                     },
-                                )),
+                                ),
                             )
                             .child(
                                 icon_button(
@@ -2756,18 +2831,35 @@ impl Waku {
                                     "icons/trash.svg",
                                     theme.clone(),
                                 )
+                                .track_focus(&remove_focus)
+                                .tab_index(0)
+                                .focus_visible(|style| style.bg(theme.overlay_strong))
                                 .tooltip(Tooltip::text(tr!("annotation.remove")))
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        cx.stop_propagation();
+                                .on_activation(
+                                    cx,
+                                    move |this, _, cx| {
                                         this.delete_annotation(id, cx);
                                     },
-                                )),
+                                ),
                             ),
                     ),
             );
         }
         panel.child(list)
+    }
+
+    /// One focus handle per annotation control, keyed by role and id, created
+    /// on demand because the panel renders from `&self`.
+    pub(super) fn annotation_control_focus(
+        &self,
+        key: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> FocusHandle {
+        self.annotation_card_focus
+            .borrow_mut()
+            .entry(key.into())
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
     }
 
     fn render_composer_attachments(&self, cx: &mut Context<Self>) -> Div {

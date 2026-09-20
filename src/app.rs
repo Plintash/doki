@@ -1364,6 +1364,16 @@ pub struct Waku {
     annotation_preview_close_generation: Cell<u64>,
     /// Scroll position of the annotation hover panel's card list.
     annotation_preview_scroll: ScrollHandle,
+    /// Focus for the composer annotation chip.
+    annotations_focus: FocusHandle,
+    /// Focus for the chip's clear button.
+    annotation_clear_focus: FocusHandle,
+    /// Focus for the panel's per-annotation controls, keyed by a stable role +
+    /// annotation id.
+    annotation_card_focus: RefCell<HashMap<String, FocusHandle>>,
+    /// True while the panel is held open from the keyboard, so the hover
+    /// grace period cannot close it out from under a tabbing user.
+    annotation_panel_pinned: Cell<bool>,
     /// Screen bounds of the annotation label, recorded by a paint-time probe so
     /// the hover preview can anchor above it. Read on the hovered frame only.
     annotation_label_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -2942,6 +2952,10 @@ impl Waku {
                 annotation_preview_visible: Cell::new(false),
                 annotation_preview_close_generation: Cell::new(0),
                 annotation_preview_scroll: ScrollHandle::new(),
+                annotations_focus: cx.focus_handle(),
+                annotation_clear_focus: cx.focus_handle(),
+                annotation_card_focus: RefCell::new(HashMap::new()),
+                annotation_panel_pinned: Cell::new(false),
                 annotation_label_bounds: Rc::new(Cell::new(None)),
                 image_preview: None,
                 image_preview_generation: 0,

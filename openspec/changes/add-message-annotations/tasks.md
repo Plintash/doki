@@ -47,7 +47,7 @@ rebuild or replace the installed `Doki.app` while the user is working in it.
 
 - [x] 7.1 Jump from a card by reusing the transcript search reveal path; verify an off-screen source and one taller than the viewport
 - [x] 7.2 Flash the span through a pulse-clock lease at the decorative-motion cadence and skip it under reduce-motion; verify with the system setting toggled
-- [ ] 7.3 Make the label, cards, delete, and the sent-message indicator fully keyboard operable; verify the whole review flow with the keyboard only
+- [x] 7.3 Make the label, cards, delete, and the sent-message indicator fully keyboard operable; verify the whole review flow with the keyboard only
 
 ## 8. Validation
 
