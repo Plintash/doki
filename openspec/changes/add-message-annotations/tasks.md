@@ -28,14 +28,14 @@ rebuild or replace the installed `Doki.app` while the user is working in it.
 
 - [x] 4.1 Paint the wash plus a numbered badge from staged records, reusing the existing highlight paint path and the element ordinal contract; verify visually in the debug app and that selection and find still behave
 - [x] 4.2 Keep marks in sync on remove and on extend; verify in the debug app
-- [ ] 4.3 Confirm badges are never inline and never colour-only; verify by rendering a staged annotation over a wrapped paragraph
+- [x] 4.3 Confirm badges are never inline and never colour-only; verify by rendering a staged annotation over a wrapped paragraph
 
 ## 5. Prompt projection
 
 - [x] 5.1 Implement the projection at the prompt-assembly seam: framing header, user text verbatim, numbered entries with quote, optional comment, source locator, fragment context window, and caps with truncation markers; unit-test every scenario in `specs/prompt-context-projection/spec.md`
 - [x] 5.2 Route prompt, steer, queued, and edit-resend paths through the projection; verify a test asserts identical annotation text for the same input across all four
 - [x] 5.3 Confirm no offsets, ordinals, or message ids reach the prompt, and that a directive-like or multi-line quote stays confined to its field; verify by unit test
-- [ ] 5.4 Localize the new user-visible labels in `locales/`; verify all locale files gain the keys and the app renders them
+- [x] 5.4 Localize the new user-visible labels in `locales/`; verify all locale files gain the keys and the app renders them
 
 ## 6. Send, persist, restore
 
@@ -52,5 +52,5 @@ rebuild or replace the installed `Doki.app` while the user is working in it.
 ## 8. Validation
 
 - [ ] 8.1 Walk both spec files' scenarios in the freshly rebuilt debug app and record the outcome for each
-- [ ] 8.2 Re-read `docs/performance.md` and confirm the annotation paths add no I/O, subprocess, or per-frame work, and that the pulse lease parks when no flash is active
-- [ ] 8.3 Confirm `openspec validate add-message-annotations --strict` stays green and that no provider driver or daemon command changed
+- [x] 8.2 Re-read `docs/performance.md` and confirm the annotation paths add no I/O, subprocess, or per-frame work, and that the pulse lease parks when no flash is active
+- [x] 8.3 Confirm `openspec validate add-message-annotations --strict` stays green and that no provider driver or daemon command changed
