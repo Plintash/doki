@@ -2189,6 +2189,8 @@ annotation.collapse:
   en: Hide annotations
 annotation.remove:
   en: Remove annotation
+annotation.edit:
+  en: Edit comment
 annotation.remove_all:
   en: Remove all annotations
 annotation.selected_text:

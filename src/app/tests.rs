@@ -47,32 +47,36 @@ fn a_blank_comment_field_stores_no_comment() {
     );
 }
 
-/// The hover preview is read-only by contract: it describes the staged
-/// annotations, so a control inside it would fight the pointer's next move.
+/// The hover panel is the Codex-style detail: each card jumps to its span and
+/// offers edit and delete. Comment text is edited in the floating editor rather
+/// than an inline field, so the panel stays compact and pointer-first.
 #[test]
-fn the_annotation_hover_preview_has_no_controls() {
+fn the_annotation_hover_panel_offers_edit_delete_and_jump() {
     let source = include_str!("composer.rs");
     let start = source
         .find("fn render_annotation_preview(")
-        .expect("the hover preview renderer must exist");
+        .expect("the hover panel renderer must exist");
     let body = &source[start..];
     let end = body
         .find("\n    /// One annotation card")
-        .expect("the preview must stay ahead of the card renderer");
+        .expect("the panel must stay ahead of the card renderer");
     let body = &body[..end];
-    for forbidden in [
-        "on_click(",
-        "on_activation(",
-        "on_action(",
-        "track_focus(",
-        "tab_index(",
-        "TextField::new(",
+    for required in [
+        "reveal_annotation_from_card(",
+        "open_annotation_editor(",
+        "delete_annotation(",
+        "icons/pencil.svg",
+        "icons/trash.svg",
     ] {
         assert!(
-            !body.contains(forbidden),
-            "the annotation hover preview must stay read-only; found `{forbidden}`"
+            body.contains(required),
+            "the annotation hover panel must offer `{required}`"
         );
     }
+    assert!(
+        !body.contains("TextField::new("),
+        "comment text belongs in the floating editor, not inside the hover panel"
+    );
 }
 
 #[test]

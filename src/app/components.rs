@@ -617,7 +617,7 @@ fn render_sent_annotations_indicator(
         } else {
             tr!("annotation.expand")
         }))
-        .child(icon("icons/compose.svg", 12.0, theme.text_tertiary))
+        .child(icon("icons/annotation.svg", 12.0, theme.text_tertiary))
         .child(
             div()
                 .text_size(sp(12.0))

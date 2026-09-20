@@ -1060,6 +1060,7 @@ annotation.count_other: "%{count} 条标注"
 annotation.expand: 展开标注
 annotation.collapse: 收起标注
 annotation.remove: 删除标注
+annotation.edit: 编辑评论
 annotation.remove_all: 删除全部标注
 annotation.selected_text: "引用文字："
 annotation.add_to_chat: 添加到对话

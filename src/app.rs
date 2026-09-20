@@ -1376,6 +1376,12 @@ pub struct Waku {
     /// inside. A count rather than a flag, so a pointer moving from the label
     /// into the preview cannot land the leave after the enter and blink it shut.
     annotation_preview_hover: Cell<u32>,
+    /// Whether the hover panel is showing. It survives the pointer leaving the
+    /// label and panel for a short grace period, so a fast move across the seam
+    /// does not dismiss it.
+    annotation_preview_visible: Cell<bool>,
+    /// Guards the grace timer: a later enter cancels an earlier pending close.
+    annotation_preview_close_generation: Cell<u64>,
     /// Screen bounds of the annotation label, recorded by a paint-time probe so
     /// the hover preview can anchor above it. Read on the hovered frame only.
     annotation_label_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -2957,6 +2963,8 @@ impl Waku {
                 annotation_editor: RefCell::new(None),
                 annotation_editor_input: RefCell::new(None),
                 annotation_preview_hover: Cell::new(0),
+                annotation_preview_visible: Cell::new(false),
+                annotation_preview_close_generation: Cell::new(0),
                 annotation_label_bounds: Rc::new(Cell::new(None)),
                 image_preview: None,
                 image_preview_generation: 0,
