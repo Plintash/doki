@@ -613,7 +613,6 @@ impl Waku {
             return Vec::new();
         }
         let theme = Theme::current(cx);
-        let right = self.active_transcript_rows().viewport_bounds().right();
         let registry = self.transcript_selection.registry.borrow();
         let mut pushed: Vec<f32> = Vec::new();
         let mut chips = Vec::new();
@@ -637,8 +636,11 @@ impl Waku {
             pushed.push(top);
             let id = *id;
             let number = *number;
-            let badge = point(right - px(24.0), px(top));
-            let editor = point(right + px(2.0), px(top));
+            // Anchor to the text column's own right edge, not the pane's, so
+            // the badge sits beside the text and the pane margin stays free.
+            let element_right = entry.geometry.bounds().right();
+            let badge = point(element_right + px(6.0), px(top));
+            let editor = point(element_right + px(30.0), px(top));
             chips.push(
                 gpui::deferred(
                     gpui::anchored()

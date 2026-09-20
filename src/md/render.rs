@@ -55,7 +55,9 @@ pub enum TextGeometry {
 }
 
 impl TextGeometry {
-    fn bounds(&self) -> Bounds<Pixels> {
+    /// The element's painted bounds, used to place annotation badges against
+    /// the text column's own right edge.
+    pub fn bounds(&self) -> Bounds<Pixels> {
         match self {
             Self::Text(layout) => layout.bounds(),
             Self::Math(layout) => layout.bounds(),
