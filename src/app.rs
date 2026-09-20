@@ -851,6 +851,29 @@ struct MessageEdit {
     annotations: Vec<MessageAnnotation>,
 }
 
+/// A pending request to scroll the transcript to one annotation's span.
+///
+/// Activating a composer card reveals a range inside a reply that may be off
+/// screen or taller than the viewport, so the request is applied on the frame
+/// after the row is mounted, exactly like a find-bar reveal.
+struct AnnotationReveal {
+    message_id: Uuid,
+    ordinal: usize,
+    range: Range<usize>,
+}
+
+/// The transient highlight a card activation leaves on its span. The paint
+/// fades it from `started`; a lease on the pulse clock keeps redrawing until it
+/// lapses. Never created under reduce motion.
+#[derive(Clone, Copy)]
+struct AnnotationFlashState {
+    message_id: Uuid,
+    ordinal: usize,
+    start: usize,
+    end: usize,
+    started: Instant,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TranscriptAnchor {
     session_id: Uuid,
@@ -1300,6 +1323,10 @@ pub struct Waku {
     /// Focus for a sent message's annotation indicator, one per message,
     /// created on demand because the row renders from `&self`.
     sent_annotation_focus: RefCell<HashMap<Uuid, FocusHandle>>,
+    /// A jump from a composer card waiting for its row to be revealed.
+    pending_annotation_reveal: Option<AnnotationReveal>,
+    /// The span a recent jump is briefly highlighting, if any.
+    annotation_flash: Cell<Option<AnnotationFlashState>>,
     /// How many of the annotation label and its hover preview the pointer is
     /// inside. A count rather than a flag, so a pointer moving from the label
     /// into the preview cannot land the leave after the enter and blink it shut.
@@ -2876,6 +2903,8 @@ impl Waku {
                 ),
                 expanded_sent_annotations: HashSet::new(),
                 sent_annotation_focus: RefCell::new(HashMap::new()),
+                pending_annotation_reveal: None,
+                annotation_flash: Cell::new(None),
                 annotation_preview_hover: Cell::new(0),
                 annotation_label_bounds: Rc::new(Cell::new(None)),
                 image_preview: None,

@@ -14,15 +14,15 @@ rebuild or replace the installed `Doki.app` while the user is working in it.
 
 - [x] 2.1 Add a pure resolution module: verify the range when it still matches the quote, otherwise search the message, and prefer the hit nearest the previous offset; unit-test duplicates, ambiguous quotes, multi-byte boundaries, and a quote that is gone entirely
 - [x] 2.2 Implement overlap extension and exact re-selection reveal; unit-test union of overlapping spans and the no-op duplicate case
-- [ ] 2.3 Keep resolution off the frame path: resolve once per message content version in a background pass with a generation guard; verify no resolution work runs per frame while typing and streaming
+- [x] 2.3 Keep resolution off the frame path: resolve once per message content version in a background pass with a generation guard; verify no resolution work runs per frame while typing and streaming
 
 ## 3. Creation and composer staging
 
 - [x] 3.1 Add the create action on a non-empty assistant-message selection, reachable from the message context menu and a keyboard shortcut, and refused while the reply streams; verify the refusal predicate in a test and the happy path in the debug app
 - [x] 3.2 Add the composer label row above the attachment tiles with expand, collapse, and remove; verify visually in the debug app with both annotations and an image attachment staged
 - [x] 3.3 Add the stacked card list with `Selected text:` and an optional `User comment:` field, editing the record on change; verify in the debug app and by asserting the stored record
-- [ ] 3.4 Add the read-only hover preview with no interactive controls inside it; verify by hover in the debug app
-- [ ] 3.5 Persist staged annotations with the draft; verify by switching sessions and by restarting the debug app
+- [x] 3.4 Add the read-only hover preview with no interactive controls inside it; verify by hover in the debug app
+- [x] 3.5 Persist staged annotations with the draft; verify by switching sessions and by restarting the debug app
 
 ## 4. Transcript marks
 
@@ -39,9 +39,9 @@ rebuild or replace the installed `Doki.app` while the user is working in it.
 
 ## 6. Send, persist, restore
 
-- [ ] 6.1 Write annotations onto the sent user message, show the compact indicator with on-demand expansion, and drop the draft numbering from transcript badges; verify in the debug app
+- [x] 6.1 Write annotations onto the sent user message, show the compact indicator with on-demand expansion, and drop the draft numbering from transcript badges; verify in the debug app
 - [ ] 6.2 Restore annotations into the composer on edit-resend, degrading to quote-only when the source message no longer exists; verify both cases in the debug app
-- [ ] 6.3 Reload the session after a restart and confirm sent annotations and marks are still there; verify in the debug app
+- [x] 6.3 Reload the session after a restart and confirm sent annotations and marks are still there; verify in the debug app
 
 ## 7. Reveal, flash, accessibility
 

@@ -2685,6 +2685,13 @@ impl Waku {
             .track_focus(&focus)
             .tab_index(0)
             .focus_visible(|style| style.border_color(theme.accent))
+            // The card is a jump target: click anywhere on it, or press enter or
+            // space while it holds focus, to reveal the quoted span. The comment
+            // field and the remove button stop propagation so editing and
+            // deleting never double as a jump.
+            .on_activation(cx, move |this, _, cx| {
+                this.reveal_annotation_from_card(id, cx);
+            })
             .child(
                 div()
                     .flex()
@@ -2724,6 +2731,7 @@ impl Waku {
                         )
                         .tooltip(Tooltip::text(tr!("annotation.remove")))
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
                             if index < this.composer_annotations.len() {
                                 this.composer_annotations.remove(index);
                             }
@@ -2760,10 +2768,17 @@ impl Waku {
                             .text_color(theme.text_secondary)
                             .child(tr!("annotation.user_comment")),
                     )
-                    .child(TextField::new(
-                        SharedString::from(format!("annotation-comment-{index}")),
-                        comment_input,
-                    )),
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "annotation-comment-guard-{index}"
+                            )))
+                            .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                            .child(TextField::new(
+                                SharedString::from(format!("annotation-comment-{index}")),
+                                comment_input,
+                            )),
+                    ),
             )
             .into_any_element()
     }

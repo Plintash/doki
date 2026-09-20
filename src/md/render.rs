@@ -333,6 +333,19 @@ pub struct AnnotationMark {
 pub struct AnnotationMarks {
     pub marks: Rc<Vec<AnnotationMark>>,
     pub style: AnnotationStyle,
+    /// A span a card activation is briefly flashing. Painted over its mark, on
+    /// the same underlay, so the flash needs no element of its own.
+    pub flash: Option<AnnotationFlash>,
+}
+
+/// The transient highlight a card activation leaves on its span. The wash is
+/// resolved by the caller from the shared pulse clock, so it fades without the
+/// paint path knowing anything about motion.
+#[derive(Clone)]
+pub struct AnnotationFlash {
+    pub ordinal: usize,
+    pub range: Range<usize>,
+    pub wash: Hsla,
 }
 
 /// Colors for annotation marks. The badge digit paints in the page color over
@@ -882,6 +895,26 @@ fn text_element_with_selection(
                     {
                         paint_annotation_badge(window, cx, first_line, number, annotations.style);
                     }
+                }
+            }
+            if let Some(marks) = &annotations
+                && let Some(flash) = &marks.flash
+                && flash.ordinal == key.index
+            {
+                for rect in range_rects(
+                    &layout,
+                    &flash.range,
+                    ANNOTATION_WASH_PAD_X,
+                    ANNOTATION_WASH_INSET_Y,
+                ) {
+                    window.paint_quad(quad(
+                        rect,
+                        px(ANNOTATION_WASH_RADIUS),
+                        flash.wash,
+                        px(0.0),
+                        gpui::transparent_black(),
+                        BorderStyle::default(),
+                    ));
                 }
             }
             if let Some(range) = selection.selection.borrow().wash_range(&key) {

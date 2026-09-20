@@ -14,6 +14,12 @@ const ACTIVITY_DIFF_MAX_HEIGHT: f32 = 400.0;
 /// `DiffRowStyle::ACTIVITY`.
 const ACTIVITY_DIFF_GUTTER_WIDTH: f32 = 52.0;
 
+/// How long a jump from a composer card highlights its span before settling to
+/// the resting annotation wash.
+const ANNOTATION_FLASH_DURATION: Duration = Duration::from_millis(650);
+/// Peak opacity of that highlight; it fades to zero over the duration.
+const ANNOTATION_FLASH_ALPHA: f32 = 0.42;
+
 #[derive(Clone, Debug)]
 struct ConversationNavigationRailSnapshot {
     visible: bool,
@@ -176,6 +182,7 @@ impl Waku {
         self.sync_transcript_rows();
         self.sync_transcript_layout_width(window);
         self.apply_pending_transcript_search_reveal(window, cx);
+        self.apply_pending_annotation_reveal(window, cx);
         let search_bar = self.render_transcript_search_bar(chat_viewport_width, cx);
         let transcript_rows = self.active_transcript_rows().clone();
         // A scrollbar drag owns the position for as long as it lasts, and the
@@ -596,6 +603,141 @@ impl Waku {
         self.composer_annotations_expanded = true;
         self.focused_annotation = Some(annotation);
         cx.notify();
+    }
+
+    /// Jump from a composer card to the span it quotes.
+    ///
+    /// The scroll is the signal, so it happens even under reduce motion; only
+    /// the decorative flash is suppressed there. The request is applied through
+    /// the same mount-then-reveal path the find bar uses, because the reply may
+    /// be off screen or taller than the viewport.
+    pub(super) fn reveal_annotation_from_card(&mut self, annotation: Uuid, cx: &mut Context<Self>) {
+        let Some((message_id, ordinal, range)) = self
+            .composer_annotations
+            .iter()
+            .find(|annotation_record| annotation_record.id == annotation)
+            .and_then(|annotation| match &annotation.target {
+                AnnotationTarget::MessageSpan {
+                    message_id,
+                    ordinal,
+                    span,
+                    ..
+                } => Some((*message_id, *ordinal, span.start..span.end)),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        if !cx.reduce_motion() {
+            self.annotation_flash.set(Some(AnnotationFlashState {
+                message_id,
+                ordinal,
+                start: range.start,
+                end: range.end,
+                started: Instant::now(),
+            }));
+        }
+        self.pending_annotation_reveal = Some(AnnotationReveal {
+            message_id,
+            ordinal,
+            range,
+        });
+        cx.notify();
+    }
+
+    /// Apply a pending card jump once its row exists, then retry on the next
+    /// frame for a row that had to be mounted first. Mirrors the find-bar
+    /// reveal so a reply taller than the viewport lands on the span, not the
+    /// top of the message.
+    pub(super) fn apply_pending_annotation_reveal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(reveal) = self.pending_annotation_reveal.take() else {
+            return;
+        };
+        let Some(message_index) = self.selected_session().and_then(|session| {
+            session
+                .messages
+                .iter()
+                .position(|message| message.id == reveal.message_id)
+        }) else {
+            return;
+        };
+        let Some(row_index) = self.transcript_row_kinds.borrow().iter().position(
+            |kind| matches!(kind, TranscriptRowKind::Message(index) if *index == message_index),
+        ) else {
+            return;
+        };
+        let key =
+            md::selection::TextKey::new(format!("message-{}", reveal.message_id), reveal.ordinal);
+        if self.annotation_match_bounds(&key, &reveal.range).is_some() {
+            self.reveal_annotation_geometry(&key, &reveal.range, 1, window, cx);
+            return;
+        }
+        self.detach_transcript_search_from_tail();
+        self.active_transcript_rows()
+            .scroll_to_reveal_item(row_index);
+        cx.on_next_frame(window, move |this, window, cx| {
+            this.reveal_annotation_geometry(&key, &reveal.range, 0, window, cx)
+        });
+    }
+
+    fn annotation_match_bounds(
+        &self,
+        key: &md::selection::TextKey,
+        range: &Range<usize>,
+    ) -> Option<Bounds<Pixels>> {
+        let registry = self.transcript_selection.registry.borrow();
+        registry
+            .entries()
+            .iter()
+            .find(|entry| entry.key == *key)
+            .and_then(|entry| {
+                md::render::text_range_bounds(&entry.geometry, range)
+                    .into_iter()
+                    .next()
+            })
+    }
+
+    fn reveal_annotation_geometry(
+        &mut self,
+        key: &md::selection::TextKey,
+        range: &Range<usize>,
+        attempt: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.annotation_match_bounds(key, range) else {
+            if attempt < 1 {
+                let key = key.clone();
+                let range = range.clone();
+                cx.on_next_frame(window, move |this, window, cx| {
+                    this.reveal_annotation_geometry(&key, &range, attempt + 1, window, cx)
+                });
+            }
+            return;
+        };
+        let rows = self.active_transcript_rows();
+        let viewport = rows.viewport_bounds();
+        if viewport.size.height <= Pixels::ZERO {
+            return;
+        }
+        let margin = px(24.0);
+        if bounds.top() >= viewport.top() + margin && bounds.bottom() <= viewport.bottom() - margin
+        {
+            return;
+        }
+        let target_y = viewport.top() + viewport.size.height * 0.35;
+        let current = rows.scroll_px_offset_for_scrollbar().y;
+        let max_offset = rows.max_offset_for_scrollbar().y;
+        let next = (current + (target_y - bounds.top())).clamp(-max_offset, Pixels::ZERO);
+        if next != current {
+            self.detach_transcript_search_from_tail();
+            rows.set_offset_from_scrollbar(point(Pixels::ZERO, next));
+            cx.notify();
+        }
     }
 
     /// A zero-size canvas that installs the frame's selection mouse listeners.
@@ -1555,7 +1697,9 @@ impl Waku {
                             animate_streaming,
                         )
                         .with_context_menu(menu.clone());
-                    if let Some(marks) = self.annotation_marks(message.id, &theme, metrics) {
+                    if let Some(marks) =
+                        self.annotation_marks(message.id, &theme, metrics, window, cx)
+                    {
                         ctx = ctx.with_annotations(marks);
                     }
                     if let Some(highlights) = self.transcript_search_highlights(message_index) {
@@ -1682,7 +1826,10 @@ impl Waku {
         message_id: Uuid,
         theme: &Theme,
         metrics: MarkdownMetrics,
+        window: &Window,
+        cx: &mut Context<Self>,
     ) -> Option<md::render::AnnotationMarks> {
+        let palette = MarkdownPalette::from_theme(theme);
         let mut marks = self
             .composer_annotations
             .iter()
@@ -1704,12 +1851,31 @@ impl Waku {
         if let Some(sent) = self.sent_annotation_resolution.borrow().marks(message_id) {
             marks.extend(sent.iter().cloned());
         }
+        // A jump flashes through the shared pulse clock, not a per-element
+        // animation: one lease keeps the pane redrawing while the wash fades.
+        // Reduce motion never reaches here — the jump does not set a flash.
+        let flash = self.annotation_flash.get().and_then(|flash| {
+            if flash.message_id != message_id {
+                return None;
+            }
+            let elapsed = flash.started.elapsed();
+            if elapsed >= ANNOTATION_FLASH_DURATION {
+                return None;
+            }
+            let progress = elapsed.as_secs_f32() / ANNOTATION_FLASH_DURATION.as_secs_f32();
+            motion::pulse_lease(window.current_view(), cx);
+            Some(md::render::AnnotationFlash {
+                ordinal: flash.ordinal,
+                range: flash.start..flash.end,
+                wash: palette
+                    .accent
+                    .opacity(ANNOTATION_FLASH_ALPHA * (1.0 - progress)),
+            })
+        });
         (!marks.is_empty()).then(|| md::render::AnnotationMarks {
             marks: Rc::new(marks),
-            style: md::render::AnnotationStyle::from_palette(
-                &MarkdownPalette::from_theme(theme),
-                metrics.text_size,
-            ),
+            style: md::render::AnnotationStyle::from_palette(&palette, metrics.text_size),
+            flash,
         })
     }
 
