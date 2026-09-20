@@ -2630,7 +2630,7 @@ impl Waku {
                                 div()
                                     .text_size(sp(9.0))
                                     .line_height(sp(11.0))
-                                    .text_color(theme.inset)
+                                    .text_color(theme.on_inverse)
                                     .child((index + 1).to_string()),
                             ),
                     )
@@ -2715,7 +2715,7 @@ impl Waku {
                                 div()
                                     .text_size(sp(9.5))
                                     .line_height(sp(11.0))
-                                    .text_color(theme.inset)
+                                    .text_color(theme.on_inverse)
                                     .child((index + 1).to_string()),
                             ),
                     )

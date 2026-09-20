@@ -662,7 +662,7 @@ impl Waku {
                                         .text_size(sp(10.5))
                                         .line_height(sp(12.0))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme.inset)
+                                        .text_color(theme.on_inverse)
                                         .child(number.to_string()),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -907,8 +907,14 @@ impl Waku {
                             .flex()
                             .items_center()
                             .rounded(px(7.0))
-                            .bg(theme.inverse)
+                            // The annotation feature's own accent, matching the
+                            // badges, rather than the black inverse surface the
+                            // send button uses: a text pill reads heavier than a
+                            // small icon there. `on_inverse` is the readable
+                            // ink on the accent in both themes.
+                            .bg(theme.accent)
                             .text_size(sp(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme.on_inverse)
                             .cursor_default()
                             .hover(|style| style.opacity(0.9))
