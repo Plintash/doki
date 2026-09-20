@@ -1,11 +1,11 @@
 //! Re-anchoring the annotations a sent message carried.
 //!
-//! A sent annotation is a stored record: its element ordinal and byte range
+//! A sent annotation is a stored record: its element ordinals and byte ranges
 //! were taken from the reply as it rendered when the annotation was created,
 //! and that reply is rendered again after a reload, after an app update that
 //! changes how text is normalized, or after any other reparse. Verifying or
-//! re-finding the quote is real work — a full markdown parse of the reply — so
-//! it never runs on a frame. The app resolves a session's sent anchors in one
+//! re-finding a quote is real work — a full markdown parse of the reply — so it
+//! never runs on a frame. The app resolves a session's sent anchors in one
 //! background pass per signature (see `sync_sent_annotation_resolution`),
 //! caches the ranges per target message, and a render only reads that cache. A
 //! miss draws no mark; the quote and comment still live on the message and
@@ -23,13 +23,19 @@ use uuid::Uuid;
 
 use super::transcript::{EMPTY_TRANSCRIPT_FINGERPRINT, mix, mix_uuid};
 use crate::md;
-use crate::model::{AgentSession, AnnotationTarget, MessageAnnotation};
+use crate::model::{AgentSession, MessageAnnotation};
 
-/// One stored anchor, as the pass needs it: where it was, and what it quoted.
-pub(super) struct StoredAnchor {
+/// One element's share of a stored annotation, as the pass needs it: where it
+/// was, and which text of that element it quoted.
+pub(super) struct StoredPart {
     pub ordinal: usize,
     pub range: Range<usize>,
     pub quote: String,
+}
+
+/// A stored annotation's full anchor — one part per painted element.
+pub(super) struct StoredAnnotation {
+    pub parts: Vec<StoredPart>,
 }
 
 /// A session's resolved sent annotations plus the signature they were resolved
@@ -74,54 +80,47 @@ impl SentAnnotationResolution {
     }
 }
 
-/// The message id a sent annotation points at, when it is a message-span
-/// annotation (the only kind today).
-pub(super) fn annotated_message_id(annotation: &MessageAnnotation) -> Option<Uuid> {
-    match &annotation.target {
-        AnnotationTarget::MessageSpan { message_id, .. } => Some(*message_id),
+/// The stored anchor for one sent annotation.
+pub(super) fn stored_annotation(annotation: &MessageAnnotation) -> StoredAnnotation {
+    StoredAnnotation {
+        parts: annotation
+            .target
+            .spans()
+            .iter()
+            .map(|part| StoredPart {
+                ordinal: part.ordinal,
+                range: part.span.start..part.span.end,
+                quote: part.quote.clone(),
+            })
+            .collect(),
     }
 }
 
-/// The anchor a sent annotation stores, for the reply it targets.
-pub(super) fn stored_anchor(annotation: &MessageAnnotation) -> StoredAnchor {
-    match &annotation.target {
-        AnnotationTarget::MessageSpan {
-            ordinal,
-            span,
-            quote,
-            ..
-        } => StoredAnchor {
-            ordinal: *ordinal,
-            range: span.start..span.end,
-            quote: quote.clone(),
-        },
-    }
-}
-
-/// Every sent anchor that targets `message_id`, in session order.
-pub(super) fn anchors_targeting(session: &AgentSession, message_id: Uuid) -> Vec<StoredAnchor> {
+/// Every sent annotation that targets `message_id`, in session order.
+pub(super) fn annotations_targeting(
+    session: &AgentSession,
+    message_id: Uuid,
+) -> Vec<StoredAnnotation> {
     session
         .messages
         .iter()
         .flat_map(|message| message.annotations.iter())
-        .filter(|annotation| annotated_message_id(annotation) == Some(message_id))
-        .map(stored_anchor)
+        .filter(|annotation| annotation.target.message_id() == message_id)
+        .map(stored_annotation)
         .collect()
 }
 
 /// The replies in this session that some sent annotation targets, and the
 /// content the pass must reparse for each. Recomputed only when the signature
 /// moves, never on a frame.
-pub(super) fn resolution_jobs(session: &AgentSession) -> Vec<(Uuid, String, Vec<StoredAnchor>)> {
-    let mut jobs: Vec<(Uuid, String, Vec<StoredAnchor>)> = Vec::new();
+pub(super) fn resolution_jobs(session: &AgentSession) -> Vec<(Uuid, String, Vec<StoredAnnotation>)> {
+    let mut jobs: Vec<(Uuid, String, Vec<StoredAnnotation>)> = Vec::new();
     for annotation in session
         .messages
         .iter()
         .flat_map(|message| message.annotations.iter())
     {
-        let Some(message_id) = annotated_message_id(annotation) else {
-            continue;
-        };
+        let message_id = annotation.target.message_id();
         if jobs.iter().any(|(existing, _, _)| *existing == message_id) {
             continue;
         }
@@ -135,7 +134,7 @@ pub(super) fn resolution_jobs(session: &AgentSession) -> Vec<(Uuid, String, Vec<
         jobs.push((
             message_id,
             target.visible_content().to_owned(),
-            anchors_targeting(session, message_id),
+            annotations_targeting(session, message_id),
         ));
     }
     jobs
@@ -152,44 +151,39 @@ pub(super) fn sent_annotation_signature(session: &AgentSession) -> u64 {
         for annotation in &source.annotations {
             hash = mix_uuid(hash, source.id);
             hash = mix_uuid(hash, annotation.id);
-            if let Some(target) = annotated_message_id(annotation) {
-                hash = mix_uuid(hash, target);
-                // The stored ranges are relative to the target's text, so a
-                // rewrite or an append there must re-run the pass too. A
-                // still-streaming reply is skipped: its text moves every
-                // commit and it cannot carry a sent annotation yet, so hashing
-                // its length would only schedule pointless passes.
-                if let Some(reply) = session
-                    .messages
-                    .iter()
-                    .find(|message| message.id == target && !message.streaming)
-                {
-                    hash = mix(hash, reply.visible_content().len() as u64);
-                }
+            let target = annotation.target.message_id();
+            hash = mix_uuid(hash, target);
+            // The stored ranges are relative to the target's text, so a
+            // rewrite or an append there must re-run the pass too. A
+            // still-streaming reply is skipped: its text moves every commit
+            // and it cannot carry a sent annotation yet, so hashing its length
+            // would only schedule pointless passes.
+            if let Some(reply) = session
+                .messages
+                .iter()
+                .find(|message| message.id == target && !message.streaming)
+            {
+                hash = mix(hash, reply.visible_content().len() as u64);
             }
-            let AnnotationTarget::MessageSpan {
-                ordinal,
-                span,
-                quote,
-                ..
-            } = &annotation.target;
-            hash = mix(hash, *ordinal as u64);
-            hash = mix(hash, span.start as u64);
-            hash = mix(hash, span.end as u64);
-            hash = mix(hash, quote.len() as u64);
+            for part in annotation.target.spans() {
+                hash = mix(hash, part.ordinal as u64);
+                hash = mix(hash, part.span.start as u64);
+                hash = mix(hash, part.span.end as u64);
+                hash = mix(hash, part.quote.len() as u64);
+            }
         }
     }
     hash
 }
 
-/// Re-anchor one reply's stored anchors against its current content.
+/// Re-anchor one reply's stored annotations against its current content.
 ///
-/// Returns the marks in input order, dropping any anchor whose quote can no
+/// Returns the marks in input order, dropping any part whose quote can no
 /// longer be located. Unnumbered by construction: a sent annotation has left
 /// the composer, so it carries no draft number to paint.
 pub(super) fn resolve_sent_annotations(
     content: &str,
-    anchors: &[StoredAnchor],
+    anchors: &[StoredAnnotation],
 ) -> Vec<md::render::AnnotationMark> {
     if anchors.is_empty() {
         return Vec::new();
@@ -202,34 +196,41 @@ pub(super) fn resolve_sent_annotations(
             text: text.as_str(),
         })
         .collect::<Vec<_>>();
-    anchors
-        .iter()
-        .filter_map(|anchor| {
+    let mut marks = Vec::new();
+    for anchor in anchors {
+        for part in &anchor.parts {
             let stored = md::annotation::Anchor {
-                ordinal: anchor.ordinal,
-                range: anchor.range.clone(),
+                ordinal: part.ordinal,
+                range: part.range.clone(),
             };
-            md::annotation::resolve(&stored, &anchor.quote, &elements).map(|resolved| {
-                md::render::AnnotationMark {
+            if let Some(resolved) = md::annotation::resolve(&stored, &part.quote, &elements) {
+                marks.push(md::render::AnnotationMark {
                     ordinal: resolved.ordinal,
                     range: resolved.range,
                     number: None,
-                }
-            })
-        })
-        .collect()
+                });
+            }
+        }
+    }
+    marks
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Message, MessageRole, ProviderKind, TextSpan};
+    use crate::model::{AnnotationSpan, Message, MessageRole, ProviderKind, TextSpan};
 
-    fn anchor(ordinal: usize, range: Range<usize>, quote: &str) -> StoredAnchor {
-        StoredAnchor {
+    fn part(ordinal: usize, range: Range<usize>, quote: &str) -> StoredPart {
+        StoredPart {
             ordinal,
             range,
             quote: quote.to_owned(),
+        }
+    }
+
+    fn annotation(ordinal: usize, range: Range<usize>, quote: &str) -> StoredAnnotation {
+        StoredAnnotation {
+            parts: vec![part(ordinal, range, quote)],
         }
     }
 
@@ -243,10 +244,13 @@ mod tests {
         let mut carrier = Message::new(MessageRole::User, "fix 1");
         carrier.annotations.push(MessageAnnotation {
             id: Uuid::new_v4(),
-            target: AnnotationTarget::MessageSpan {
+            target: crate::model::AnnotationTarget::MessageSpan {
                 message_id: reply_id,
-                ordinal: 0,
-                span: TextSpan { start: 0, end: 3 },
+                spans: vec![AnnotationSpan {
+                    ordinal: 0,
+                    span: TextSpan { start: 0, end: 3 },
+                    quote: "the".to_owned(),
+                }],
                 quote: "the".to_owned(),
                 block: reply.to_owned(),
             },
@@ -261,7 +265,7 @@ mod tests {
 
     #[test]
     fn a_span_that_still_matches_resolves_to_itself() {
-        let marks = resolve_sent_annotations(SOURCE, &[anchor(0, 4..9, "retry")]);
+        let marks = resolve_sent_annotations(SOURCE, &[annotation(0, 4..9, "retry")]);
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].ordinal, 0);
         assert_eq!(marks[0].range, 4..9);
@@ -272,7 +276,7 @@ mod tests {
     #[test]
     fn a_quote_that_shifted_is_found_by_search() {
         // The stored offsets are wrong, but the quote is still in element 0.
-        let marks = resolve_sent_annotations(SOURCE, &[anchor(0, 0..5, "retry")]);
+        let marks = resolve_sent_annotations(SOURCE, &[annotation(0, 0..5, "retry")]);
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].ordinal, 0);
         assert_eq!(marks[0].range, 4..9);
@@ -280,7 +284,7 @@ mod tests {
 
     #[test]
     fn a_fragment_in_the_second_block_resolves_to_its_ordinal() {
-        let marks = resolve_sent_annotations(SOURCE, &[anchor(0, 0..7, "timeout")]);
+        let marks = resolve_sent_annotations(SOURCE, &[annotation(0, 0..7, "timeout")]);
         assert_eq!(marks.len(), 1);
         // Second top-level block: ordinal stride 1 << 16.
         assert_eq!(marks[0].ordinal, 1 << 16);
@@ -288,7 +292,7 @@ mod tests {
 
     #[test]
     fn a_quote_that_is_gone_draws_no_mark() {
-        let marks = resolve_sent_annotations(SOURCE, &[anchor(0, 0..4, "nomatch")]);
+        let marks = resolve_sent_annotations(SOURCE, &[annotation(0, 0..4, "nomatch")]);
         assert!(marks.is_empty());
     }
 
@@ -296,14 +300,28 @@ mod tests {
     fn a_repeated_quote_stays_near_its_stored_offset() {
         let source = "alpha beta alpha beta\n";
         // Stored in the middle, nearer the first occurrence.
-        let marks = resolve_sent_annotations(source, &[anchor(0, 3..8, "alpha")]);
+        let marks = resolve_sent_annotations(source, &[annotation(0, 3..8, "alpha")]);
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].range, 0..5);
 
         // And nearer the second one.
-        let marks = resolve_sent_annotations(source, &[anchor(0, 14..19, "alpha")]);
+        let marks = resolve_sent_annotations(source, &[annotation(0, 14..19, "alpha")]);
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].range, 11..16);
+    }
+
+    #[test]
+    fn a_multi_element_annotation_resolves_each_part() {
+        let source = "first paragraph\n\nsecond paragraph\n";
+        let marks = resolve_sent_annotations(
+            source,
+            &[StoredAnnotation {
+                parts: vec![part(0, 0..5, "first"), part(1 << 16, 0..6, "second")],
+            }],
+        );
+        assert_eq!(marks.len(), 2);
+        assert_eq!(marks[0].range, 0..5);
+        assert_eq!(marks[1].ordinal, 1 << 16);
     }
 
     #[test]
@@ -311,9 +329,9 @@ mod tests {
         let marks = resolve_sent_annotations(
             SOURCE,
             &[
-                anchor(0, 0..5, "retry"),
-                anchor(0, 0..4, "nomatch"),
-                anchor(1 << 16, 0..7, "timeout"),
+                annotation(0, 0..5, "retry"),
+                annotation(0, 0..4, "nomatch"),
+                annotation(1 << 16, 0..7, "timeout"),
             ],
         );
         assert_eq!(marks.len(), 2);

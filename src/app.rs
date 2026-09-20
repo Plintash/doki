@@ -12,7 +12,8 @@ use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, Context, Div,
     Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, IntoElement, KeyDownEvent,
     ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, NavigationDirection, ObjectFit, PathPromptOptions, Pixels, Render, ScrollHandle,
+    MouseUpEvent, NavigationDirection, ObjectFit, PathPromptOptions, Pixels, Point, Render,
+    ScrollHandle,
     SharedString, Stateful, StyleRefinement, TextRun, WeakEntity, Window, WindowBounds, canvas,
     div, ease_out_quint, fill, font, img, linear_color_stop, linear_gradient, list, point,
     prelude::*, pulsating_between, px, rgb,
@@ -30,7 +31,7 @@ use crate::git_branch::BranchSnapshot;
 use crate::input::{ComposerAttachmentPaste, ComposerEvent, ComposerInput, InputEvent, TextInput};
 use crate::md;
 use crate::model::{
-    ActivityItem, ActivityKind, AgentSession, AnnotationTarget, BackgroundWorkEvent,
+    ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget, BackgroundWorkEvent,
     BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind, BackgroundWorkStatus, Checkpoint,
     CheckpointStatus, ContextUsage, DriverEvent, FavoriteModel, Message, MessageAnnotation,
     MessageAttachment, MessageRole, PendingPermission, Project, ProviderKind, ProviderModel,
@@ -846,9 +847,6 @@ struct MessageEdit {
     turn_count: usize,
     input: Entity<ComposerInput>,
     attachments: Vec<MessageAttachment>,
-    /// The annotations the message carried, restored so resubmitting it sends
-    /// the same context and keeps its marks.
-    annotations: Vec<MessageAnnotation>,
     /// The composer's staged annotations before this edit opened, put back on
     /// cancel so opening a past message never discards an unsent review.
     previous_annotations: Vec<MessageAnnotation>,
@@ -864,6 +862,29 @@ struct AnnotationReveal {
     message_id: Uuid,
     ordinal: usize,
     range: Range<usize>,
+}
+
+/// One validated annotation candidate captured from the transcript selection:
+/// a single assistant reply's selected element ranges, in document order, with
+/// the whole selected text and the block it starts in.
+#[derive(Clone)]
+pub(super) struct SelectionAnnotation {
+    pub(super) message_id: Uuid,
+    pub(super) parts: Vec<AnnotationSpan>,
+    pub(super) quote: String,
+    pub(super) block: String,
+}
+
+/// The floating action the transcript selection shows.
+///
+/// The selection is captured while it is live: a click on the toolbar itself
+/// lands outside every painted text element, and the transcript's global
+/// mouse-down handler clears the selection before the click handler runs.
+struct SelectionToolbar {
+    anchor: Point<Pixels>,
+    annotation: SelectionAnnotation,
+    /// Whether "Add to chat" has opened the comment field.
+    comment_open: bool,
 }
 
 /// The transient highlight a card activation leaves on its span. The paint
@@ -1331,9 +1352,12 @@ pub struct Waku {
     /// created on demand because the row renders from `&self`.
     sent_annotation_focus: RefCell<HashMap<Uuid, FocusHandle>>,
     /// A jump from a composer card waiting for its row to be revealed.
-    pending_annotation_reveal: Option<AnnotationReveal>,
-    /// The span a recent jump is briefly highlighting, if any.
+    pending_annotation_reveal: Option<AnnotationReveal>,    /// The span a recent jump is briefly highlighting, if any.
     annotation_flash: Cell<Option<AnnotationFlashState>>,
+    /// The floating selection action, and its comment field once opened.
+    selection_toolbar: RefCell<Option<SelectionToolbar>>,
+    /// The one comment field the selection toolbar's "Add to chat" opens.
+    annotation_prompt_input: RefCell<Option<Entity<TextInput>>>,
     /// How many of the annotation label and its hover preview the pointer is
     /// inside. A count rather than a flag, so a pointer moving from the label
     /// into the preview cannot land the leave after the enter and blink it shut.
@@ -2913,6 +2937,8 @@ impl Waku {
                 sent_annotation_focus: RefCell::new(HashMap::new()),
                 pending_annotation_reveal: None,
                 annotation_flash: Cell::new(None),
+                selection_toolbar: RefCell::new(None),
+                annotation_prompt_input: RefCell::new(None),
                 annotation_preview_hover: Cell::new(0),
                 annotation_label_bounds: Rc::new(Cell::new(None)),
                 image_preview: None,

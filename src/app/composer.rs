@@ -2238,12 +2238,12 @@ impl Waku {
         annotations
             .iter()
             .map(|annotation| {
-                let AnnotationTarget::MessageSpan { message_id, .. } = &annotation.target;
+                let message_id = annotation.target.message_id();
                 let source = messages
                     .and_then(|messages| {
                         messages
                             .iter()
-                            .position(|message| message.id == *message_id)
+                            .position(|message| message.id == message_id)
                             .map(|index| {
                                 let sent_from = sender.unwrap_or(messages.len());
                                 annotation_projection::source_locator(
@@ -2390,6 +2390,13 @@ impl Waku {
             .into_iter()
             .map(ComposerAttachment::from)
             .collect();
+        // A restored submission takes its annotations back too: editing a
+        // queued message or retrying a failed send must replay the same
+        // projection, not silently drop the block.
+        self.composer_annotations = submission.annotations;
+        self.composer_annotations_expanded = !self.composer_annotations.is_empty();
+        self.annotation_comment_inputs.borrow_mut().clear();
+        self.reset_annotation_preview_hover();
         let content = submission.display_content.unwrap_or(submission.prompt);
         self.composer
             .update(cx, |input, cx| input.set_content(content, cx));
@@ -2580,9 +2587,7 @@ impl Waku {
                     .child(header),
             );
         for (index, annotation) in self.composer_annotations.iter().enumerate() {
-            let quote = match &annotation.target {
-                AnnotationTarget::MessageSpan { quote, .. } => quote.as_str(),
-            };
+            let quote = annotation.target.quote();
             let mut body = div()
                 .flex_1()
                 .min_w_0()

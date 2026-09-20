@@ -623,15 +623,18 @@ mod tests {
 
     #[test]
     fn staged_annotations_round_trip_through_the_draft_payload() {
-        use crate::model::{AnnotationTarget, MessageAnnotation, TextSpan};
+        use crate::model::{AnnotationSpan, AnnotationTarget, MessageAnnotation, TextSpan};
 
         let message_id = Uuid::from_u128(11);
         let annotation = MessageAnnotation {
             id: Uuid::from_u128(12),
             target: AnnotationTarget::MessageSpan {
                 message_id,
-                ordinal: 2,
-                span: TextSpan { start: 7, end: 19 },
+                spans: vec![AnnotationSpan {
+                    ordinal: 2,
+                    span: TextSpan { start: 7, end: 19 },
+                    quote: "still fine".to_owned(),
+                }],
                 quote: "still fine".to_owned(),
                 block: "the body is still fine here".to_owned(),
             },
@@ -657,7 +660,7 @@ mod tests {
             staged["target"]["message_id"],
             serde_json::json!(message_id)
         );
-        assert_eq!(staged["target"]["span"]["start"], 7);
+        assert_eq!(staged["target"]["spans"][0]["span"]["start"], 7);
         assert_eq!(staged["target"]["quote"], "still fine");
         assert!(staged.get("comment").is_none());
 

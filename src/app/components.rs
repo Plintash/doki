@@ -1075,22 +1075,6 @@ fn message_menu_items(
         }));
     }
 
-    // Annotating is a selection action, so it only appears when a selection
-    // exists and that selection is inside an assistant reply. The action
-    // itself re-checks the role, the streaming state and the single-reply rule
-    // and refuses with a toast; here it is only an entry point.
-    if role == MessageRole::Assistant && selection.selection.borrow().selected_text().is_some() {
-        let annotate_waku = waku.clone();
-        items.push(MenuItem::new(
-            tr!("annotation.create"),
-            move |window, cx| {
-                let _ = annotate_waku.update(cx, |this, cx| {
-                    this.annotate_selection_action(&AnnotateSelection, window, cx);
-                });
-            },
-        ));
-    }
-
     let copy_content = content.to_owned();
     items.push(MenuItem::new(
         tr!("common.copy_message_title"),

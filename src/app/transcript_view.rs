@@ -179,6 +179,7 @@ impl Waku {
     ) -> AnyElement {
         self.prefetch_checkpoint_refs(cx);
         self.sync_sent_annotation_resolution(cx);
+        self.sync_selection_toolbar();
         self.sync_transcript_rows();
         self.sync_transcript_layout_width(window);
         self.apply_pending_transcript_search_reveal(window, cx);
@@ -377,6 +378,7 @@ impl Waku {
             ))
             .child(self.transcript_selection_input())
             .children(search_bar)
+            .children(self.render_selection_toolbar(cx))
             .into_any_element()
     }
 
@@ -439,160 +441,441 @@ impl Waku {
         }
     }
 
-    /// Stage an annotation for the transcript selection.
+    /// Keep the selection toolbar in step with the live transcript selection.
     ///
-    /// The selection registry already resolved the drag into per-element spans,
-    /// so an anchor is the span itself: the element ordinal plus the byte range
-    /// inside that element's rendered text, with the quote and its enclosing
-    /// block snapshotted beside it. Nothing is resolved here — the anchor is
-    /// born exact and only needs re-resolution after a reload.
-    pub(super) fn annotate_selection_action(
-        &mut self,
-        _: &AnnotateSelection,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// The toolbar follows the selection while no comment field is open; once
+    /// one is, the captured selection stays put and the pointer can move into
+    /// the field without dismissing it. A cleared selection removes a toolbar
+    /// that has captured nothing.
+    fn sync_selection_toolbar(&self) {
+        let mut toolbar = self.selection_toolbar.borrow_mut();
+        if toolbar
+            .as_ref()
+            .is_some_and(|toolbar| toolbar.comment_open)
+        {
+            return;
+        }
+        // Capture while the selection is still live. Clicking the toolbar
+        // itself lands outside every painted element, so the transcript's
+        // global mouse-down handler clears the selection before the click
+        // handler runs; the stored copy is what gets staged.
+        let Ok(annotation) = self.capture_selection_annotation() else {
+            *toolbar = None;
+            return;
+        };
         let spans = self
             .transcript_selection
             .selection
             .borrow()
             .spans()
             .to_vec();
-        if spans.is_empty() {
-            return;
-        }
-        // Every span has to belong to one assistant reply: an annotation is
-        // anchored to one message, and a reply that is still streaming is still
-        // moving under the anchor.
-        let mut source = None;
-        for span in &spans {
-            let Some(message_id) = message_id_from_row(&span.key.row) else {
-                self.show_annotation_refusal(tr!("annotation.select_reply"));
-                return;
-            };
-            match source {
-                Some(source) if source != message_id => {
-                    self.show_annotation_refusal(tr!("annotation.select_one_reply"));
-                    return;
-                }
-                None => source = Some(message_id),
-                _ => {}
-            }
-        }
-        let Some(message_id) = source else {
+        *toolbar = self
+            .selection_first_line_bounds(&spans)
+            .map(|bounds| SelectionToolbar {
+                anchor: point(bounds.left(), bounds.top()),
+                annotation,
+                comment_open: false,
+            });
+    }
+
+    /// The top-left of the selection's first line, in window coordinates.
+    fn selection_first_line_bounds(
+        &self,
+        spans: &[md::selection::Span],
+    ) -> Option<Bounds<Pixels>> {
+        let first = spans.first()?;
+        let registry = self.transcript_selection.registry.borrow();
+        let entry = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.key == first.key)?;
+        md::render::text_range_bounds(&entry.geometry, &first.range)
+            .into_iter()
+            .next()
+    }
+
+    /// The floating action beside the selection, and its comment field once
+    /// "Add to chat" opened one. Both stop the mouse-down from reaching the
+    /// transcript so the selection highlight survives the click.
+    fn render_selection_toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let toolbar = self.selection_toolbar.borrow();
+        let toolbar = toolbar.as_ref()?;
+        let theme = Theme::current(cx);
+        let position = point(toolbar.anchor.x, toolbar.anchor.y - px(46.0));
+        let card: AnyElement = if toolbar.comment_open {
+            let input = self.annotation_prompt_input.borrow().clone()?;
+            div()
+                .w(px(360.0))
+                .h(px(36.0))
+                .px(px(14.0))
+                .flex()
+                .items_center()
+                .rounded(px(18.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .bg(theme.raised)
+                .shadow_md()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        *this.selection_toolbar.borrow_mut() = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(div().flex_1().min_w_0().child(input))
+                .into_any_element()
+        } else {
+            div()
+                .p(px(4.0))
+                .flex()
+                .items_center()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .bg(theme.raised)
+                .shadow_md()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                .child(
+                    div()
+                        .id("selection-add-to-chat")
+                        .h(px(28.0))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .rounded(px(7.0))
+                        .cursor_default()
+                        .hover(|style| style.bg(theme.overlay))
+                        .child(icon("icons/compose.svg", 12.0, theme.text_secondary))
+                        .child(
+                            div()
+                                .text_size(sp(12.5))
+                                .line_height(sp(16.0))
+                                .text_color(theme.text)
+                                .child(tr!("annotation.add_to_chat")),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.begin_annotation_comment(window, cx);
+                        })),
+                )
+                .into_any_element()
+        };
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(position)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(card),
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// Open the comment field over the selection the toolbar captured.
+    pub(super) fn begin_annotation_comment(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.annotation_prompt_input(window, cx);
+        input.update(cx, |input, cx| input.set_content("", cx));
+        let mut toolbar = self.selection_toolbar.borrow_mut();
+        let Some(toolbar) = toolbar.as_mut() else {
             return;
         };
+        toolbar.comment_open = true;
+        drop(toolbar);
+        let focus = input.read(cx).focus();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// The one comment field the toolbar opens, created on first use.
+    fn annotation_prompt_input(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextInput> {
+        if let Some(input) = self.annotation_prompt_input.borrow().clone() {
+            return input;
+        }
+        let input = cx.new(|cx| {
+            TextInput::new(window, cx).placeholder(tr!("annotation.comment_placeholder"))
+        });
+        self.annotation_prompt_input
+            .borrow_mut()
+            .replace(input.clone());
+        cx.subscribe(&input, |this, input, event, cx| {
+            if !matches!(event, InputEvent::Submit(_)) {
+                return;
+            }
+            let comment = input.read(cx).content().to_owned();
+            let selection = this
+                .selection_toolbar
+                .borrow()
+                .as_ref()
+                .map(|toolbar| toolbar.annotation.clone());
+            let Some(selection) = selection else {
+                return;
+            };
+            let comment = super::composer::annotation_comment_value(&comment);
+            let changed = this.stage_selection_annotation(selection, comment, cx);
+            *this.selection_toolbar.borrow_mut() = None;
+            if changed {
+                this.transcript_selection.selection.borrow_mut().clear();
+                this.composer_annotations_expanded = true;
+                this.capture_and_save_current_composer_draft(cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        input
+    }
+
+    /// Stage an annotation for the transcript selection.
+    ///
+    /// The keyboard shortcut creates one immediately, with no comment; the
+    /// selection toolbar opens a comment field and stages on submit. Both go
+    /// through the same capture, so a drag across several elements becomes one
+    /// annotation either way.
+    pub(super) fn annotate_selection_action(
+        &mut self,
+        _: &AnnotateSelection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selection = match self.capture_selection_annotation() {
+            Ok(selection) => selection,
+            Err(refusal) => {
+                self.show_annotation_refusal(refusal);
+                return;
+            }
+        };
+        if self.stage_selection_annotation(selection, None, cx) {
+            self.transcript_selection.selection.borrow_mut().clear();
+            self.composer_annotations_expanded = true;
+            self.capture_and_save_current_composer_draft(cx);
+            cx.notify();
+        }
+    }
+
+    /// Validate the current transcript selection as one annotatable candidate.
+    ///
+    /// Every span has to belong to one assistant reply: an annotation is
+    /// anchored to one message, and a reply that is still streaming is still
+    /// moving under the anchor. The parts share the selection's document order,
+    /// so a drag across paragraphs stays one annotation.
+    pub(super) fn capture_selection_annotation(
+        &self,
+    ) -> Result<SelectionAnnotation, String> {
+        let spans = self
+            .transcript_selection
+            .selection
+            .borrow()
+            .spans()
+            .to_vec();
+        let mut message_id = None;
+        let mut parts = Vec::new();
+        let mut quote = String::new();
+        let mut block = String::new();
+        for span in spans {
+            let Some(id) = message_id_from_row(&span.key.row) else {
+                return Err(tr!("annotation.select_reply"));
+            };
+            match message_id {
+                Some(existing) if existing != id => {
+                    return Err(tr!("annotation.select_one_reply"));
+                }
+                None => message_id = Some(id),
+                _ => {}
+            }
+            let text = span.text[span.range.clone()].to_string();
+            if text.trim().is_empty() {
+                continue;
+            }
+            if block.is_empty() {
+                block = span.text.to_string();
+            } else if span.block_break {
+                quote.push('\n');
+            }
+            quote.push_str(&text);
+            parts.push(AnnotationSpan {
+                ordinal: span.key.index,
+                span: TextSpan {
+                    start: span.range.start,
+                    end: span.range.end,
+                },
+                quote: text,
+            });
+        }
+        let Some(message_id) = message_id else {
+            return Err(tr!("annotation.select_reply"));
+        };
+        if parts.is_empty() {
+            return Err(tr!("annotation.select_reply"));
+        }
         let Some(message) = self.selected_session().and_then(|session| {
             session
                 .messages
                 .iter()
                 .find(|message| message.id == message_id)
         }) else {
-            return;
+            return Err(tr!("annotation.select_reply"));
         };
         if message.role != MessageRole::Assistant {
-            self.show_annotation_refusal(tr!("annotation.reply_only"));
-            return;
+            return Err(tr!("annotation.reply_only"));
         }
         if message.streaming {
-            self.show_annotation_refusal(tr!("annotation.wait_for_reply"));
-            return;
+            return Err(tr!("annotation.wait_for_reply"));
         }
+        Ok(SelectionAnnotation {
+            message_id,
+            parts,
+            quote,
+            block,
+        })
+    }
 
-        let mut staged = false;
-        for span in spans {
-            let quote = span.text[span.range.clone()].to_string();
-            if quote.trim().is_empty() {
-                continue;
+    /// Stage `selection` as one annotation, merging it into an overlapping
+    /// staged annotation or revealing one the selection matches exactly.
+    /// Returns whether the staged set changed.
+    pub(super) fn stage_selection_annotation(
+        &mut self,
+        selection: SelectionAnnotation,
+        comment: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let SelectionAnnotation {
+            message_id,
+            parts,
+            quote,
+            block,
+        } = selection;
+        let anchors = parts
+            .iter()
+            .map(|part| md::annotation::Anchor {
+                ordinal: part.ordinal,
+                range: part.span.start..part.span.end,
+            })
+            .collect::<Vec<_>>();
+        // The merge decision indexes the staged slice, so keep the ids in the
+        // same order and translate back through it.
+        let staged_here = self
+            .composer_annotations
+            .iter()
+            .filter_map(|annotation| {
+                annotation_anchor(annotation, message_id).map(|anchors| (annotation.id, anchors))
+            })
+            .collect::<Vec<_>>();
+        let staged_sets = staged_here
+            .iter()
+            .map(|(_, anchors)| anchors.clone())
+            .collect::<Vec<_>>();
+        match md::annotation::merge(&anchors, &staged_sets) {
+            md::annotation::MergeDecision::Duplicate { index } => {
+                if let Some((id, _)) = staged_here.get(index) {
+                    self.reveal_annotation_card(*id, cx);
+                }
+                false
             }
-            let anchor = md::annotation::Anchor {
-                ordinal: span.key.index,
-                range: span.range.clone(),
-            };
-            // The merge decision indexes the staged slice, so keep the ids in
-            // the same order and translate back through it.
-            let staged_here = self
-                .composer_annotations
-                .iter()
-                .filter_map(|annotation| {
-                    annotation_anchor(annotation, message_id).map(|anchor| (annotation.id, anchor))
-                })
-                .collect::<Vec<_>>();
-            let anchors = staged_here
-                .iter()
-                .map(|(_, anchor)| anchor.clone())
-                .collect::<Vec<_>>();
-            match md::annotation::merge(&anchor, &anchors) {
-                md::annotation::MergeDecision::Duplicate { index } => {
-                    if let Some((id, _)) = staged_here.get(index) {
-                        self.reveal_annotation_card(*id, cx);
+            md::annotation::MergeDecision::Extend {
+                index,
+                absorbed,
+                parts: union,
+            } => {
+                let Some((id, _)) = staged_here.get(index) else {
+                    return false;
+                };
+                let id = *id;
+                let absorbed = absorbed
+                    .iter()
+                    .filter_map(|absorbed| staged_here.get(*absorbed))
+                    .map(|(id, _)| *id)
+                    .filter(|absorbed| *absorbed != id)
+                    .collect::<Vec<_>>();
+                let union_parts = self.annotation_parts_for(message_id, &union, &parts);
+                let union_quote = union_parts
+                    .iter()
+                    .map(|part| part.quote.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.composer_annotations
+                    .retain(|annotation| !absorbed.contains(&annotation.id));
+                if let Some(annotation) = self
+                    .composer_annotations
+                    .iter_mut()
+                    .find(|annotation| annotation.id == id)
+                    && let AnnotationTarget::MessageSpan {
+                        spans, quote, block, ..
+                    } = &mut annotation.target
+                {
+                    *spans = union_parts;
+                    *quote = union_quote;
+                    if !block.is_empty() {
+                        *block = block.clone();
                     }
-                    continue;
                 }
-                md::annotation::MergeDecision::Extend {
-                    index,
-                    absorbed,
-                    range,
-                } => {
-                    let Some((id, _)) = staged_here.get(index) else {
-                        continue;
-                    };
-                    let id = *id;
-                    let absorbed = absorbed
-                        .iter()
-                        .filter_map(|absorbed| staged_here.get(*absorbed))
-                        .map(|(id, _)| *id)
-                        .filter(|absorbed| *absorbed != id)
-                        .collect::<Vec<_>>();
-                    let union_quote = span.text[range.clone()].to_string();
-                    self.composer_annotations
-                        .retain(|annotation| !absorbed.contains(&annotation.id));
-                    if let Some(annotation) = self
-                        .composer_annotations
-                        .iter_mut()
-                        .find(|annotation| annotation.id == id)
-                        && let AnnotationTarget::MessageSpan {
-                            span: anchor,
-                            quote,
-                            block,
-                            ..
-                        } = &mut annotation.target
-                    {
-                        *anchor = TextSpan {
-                            start: range.start,
-                            end: range.end,
-                        };
-                        *quote = union_quote;
-                        *block = span.text.to_string();
-                    }
-                    staged = true;
-                }
-                md::annotation::MergeDecision::New => {
-                    self.composer_annotations.push(MessageAnnotation {
-                        id: Uuid::new_v4(),
-                        target: AnnotationTarget::MessageSpan {
-                            message_id,
-                            ordinal: span.key.index,
-                            span: TextSpan {
-                                start: span.range.start,
-                                end: span.range.end,
-                            },
-                            quote,
-                            block: span.text.to_string(),
-                        },
-                        comment: None,
-                    });
-                    staged = true;
-                }
+                true
+            }
+            md::annotation::MergeDecision::New => {
+                self.composer_annotations.push(MessageAnnotation {
+                    id: Uuid::new_v4(),
+                    target: AnnotationTarget::MessageSpan {
+                        message_id,
+                        spans: parts,
+                        quote,
+                        block,
+                    },
+                    comment,
+                });
+                true
             }
         }
-        if !staged {
-            return;
-        }
-        self.composer_annotations_expanded = true;
-        self.transcript_selection.selection.borrow_mut().clear();
-        self.capture_and_save_current_composer_draft(cx);
-        cx.notify();
+    }
+
+    /// Rebuild the union ranges as annotation parts, slicing each element's
+    /// current text so an extended part carries the right quote. Falls back to
+    /// a part's own stored quote when the element is no longer in the registry.
+    fn annotation_parts_for(
+        &self,
+        message_id: Uuid,
+        anchors: &[md::annotation::Anchor],
+        known: &[AnnotationSpan],
+    ) -> Vec<AnnotationSpan> {
+        let row = format!("message-{message_id}");
+        let registry = self.transcript_selection.registry.borrow();
+        anchors
+            .iter()
+            .map(|anchor| {
+                let element = registry
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.key.index == anchor.ordinal && entry.key.row.as_ref() == row)
+                    .map(|entry| entry.text.clone());
+                let quote = element
+                    .as_deref()
+                    .and_then(|text| text.get(anchor.range.clone()))
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        known
+                            .iter()
+                            .find(|part| part.ordinal == anchor.ordinal)
+                            .map(|part| part.quote.clone())
+                    })
+                    .unwrap_or_default();
+                AnnotationSpan {
+                    ordinal: anchor.ordinal,
+                    span: TextSpan {
+                        start: anchor.range.start,
+                        end: anchor.range.end,
+                    },
+                    quote,
+                }
+            })
+            .collect()
     }
 
     fn show_annotation_refusal(&mut self, message: impl Into<String>) {
@@ -616,14 +899,13 @@ impl Waku {
             .composer_annotations
             .iter()
             .find(|annotation_record| annotation_record.id == annotation)
-            .and_then(|annotation| match &annotation.target {
-                AnnotationTarget::MessageSpan {
-                    message_id,
-                    ordinal,
-                    span,
-                    ..
-                } => Some((*message_id, *ordinal, span.start..span.end)),
-                _ => None,
+            .and_then(|annotation| {
+                let message_id = annotation.target.message_id();
+                annotation
+                    .target
+                    .spans()
+                    .first()
+                    .map(|part| (message_id, part.ordinal, part.span.start..part.span.end))
             })
         else {
             return;
@@ -780,19 +1062,21 @@ fn message_id_from_row(row: &str) -> Option<Uuid> {
 fn annotation_anchor(
     annotation: &MessageAnnotation,
     message_id: Uuid,
-) -> Option<md::annotation::Anchor> {
-    match &annotation.target {
-        AnnotationTarget::MessageSpan {
-            message_id: source,
-            ordinal,
-            span,
-            ..
-        } if *source == message_id => Some(md::annotation::Anchor {
-            ordinal: *ordinal,
-            range: span.start..span.end,
-        }),
-        _ => None,
+) -> Option<Vec<md::annotation::Anchor>> {
+    if annotation.target.message_id() != message_id {
+        return None;
     }
+    Some(
+        annotation
+            .target
+            .spans()
+            .iter()
+            .map(|part| md::annotation::Anchor {
+                ordinal: part.ordinal,
+                range: part.span.start..part.span.end,
+            })
+            .collect(),
+    )
 }
 
 impl Render for ConversationNavigationRail {
@@ -1837,15 +2121,21 @@ impl Waku {
             .filter_map(|(index, annotation)| match &annotation.target {
                 AnnotationTarget::MessageSpan {
                     message_id: source,
-                    ordinal,
-                    span,
+                    spans,
                     ..
-                } if *source == message_id => Some(md::render::AnnotationMark {
-                    ordinal: *ordinal,
-                    range: span.start..span.end,
-                    number: Some(index + 1),
-                }),
+                } if *source == message_id => Some((index, spans)),
                 _ => None,
+            })
+            .flat_map(|(index, spans)| {
+                spans.iter().enumerate().map(move |(part_ix, part)| {
+                    md::render::AnnotationMark {
+                        ordinal: part.ordinal,
+                        range: part.span.start..part.span.end,
+                        // The number marks the annotation, once: only its
+                        // first element carries the badge, the rest the wash.
+                        number: (part_ix == 0).then_some(index + 1),
+                    }
+                })
             })
             .collect::<Vec<_>>();
         if let Some(sent) = self.sent_annotation_resolution.borrow().marks(message_id) {
@@ -1866,6 +2156,9 @@ impl Waku {
                     .cloned(),
             );
         }
+        // The painter scans ascending ordinals, and creation order need not be
+        // document order.
+        marks.sort_by_key(|mark| (mark.ordinal, mark.range.start));
         // A jump flashes through the shared pulse clock, not a per-element
         // animation: one lease keeps the pane redrawing while the wash fades.
         // Reduce motion never reaches here — the jump does not set a flash.
@@ -1926,11 +2219,9 @@ impl Waku {
             message
                 .annotations
                 .iter()
-                .filter_map(|annotation| match &annotation.target {
-                    AnnotationTarget::MessageSpan { quote, .. } => Some(SentAnnotationEntry {
-                        quote: quote.clone(),
-                        comment: annotation.comment.clone(),
-                    }),
+                .map(|annotation| SentAnnotationEntry {
+                    quote: annotation.target.quote().to_owned(),
+                    comment: annotation.comment.clone(),
                 })
                 .collect()
         } else {

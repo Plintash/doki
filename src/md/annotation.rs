@@ -94,7 +94,7 @@ pub enum MergeDecision {
     Extend {
         index: usize,
         absorbed: Vec<usize>,
-        range: Range<usize>,
+        parts: Vec<Anchor>,
     },
     /// The selection is exactly a staged annotation: reveal that card instead of
     /// staging a second one.
@@ -104,18 +104,22 @@ pub enum MergeDecision {
 }
 
 /// Decide how a new selection joins the annotations already staged for one
-/// message. `staged` is in creation order, and the returned indices address it.
+/// message. `staged` is in creation order, each entry the full set of element
+/// ranges that annotation covers, and the returned indices address it.
 ///
-/// Only spans in the same element can merge: one anchor cannot describe a union
-/// that spans two ordinals, so a selection overlapping only across elements is a
-/// new annotation.
-pub fn merge(selection: &Anchor, staged: &[Anchor]) -> MergeDecision {
+/// A selection and a staged annotation overlap when any part of one shares an
+/// element ordinal with and overlaps a part of the other; the union keeps one
+/// range per element.
+pub fn merge(selection: &[Anchor], staged: &[Vec<Anchor>]) -> MergeDecision {
+    if selection.is_empty() {
+        return MergeDecision::New;
+    }
     // An exact match wins over widening: re-selecting the same span asks to look
     // at that annotation, not to grow it.
-    let duplicate = staged
+    if let Some(index) = staged
         .iter()
-        .position(|staged| staged.ordinal == selection.ordinal && staged.range == selection.range);
-    if let Some(index) = duplicate {
+        .position(|staged| same_parts(staged, selection))
+    {
         return MergeDecision::Duplicate { index };
     }
 
@@ -124,14 +128,13 @@ pub fn merge(selection: &Anchor, staged: &[Anchor]) -> MergeDecision {
     // set overlapping itself.
     let mut index = None;
     let mut absorbed = Vec::new();
-    let mut range = selection.range.clone();
+    let mut parts = selection.to_vec();
     loop {
         let mut grew = false;
         for (position, candidate) in staged.iter().enumerate() {
-            if candidate.ordinal != selection.ordinal
-                || index == Some(position)
+            if index == Some(position)
                 || absorbed.contains(&position)
-                || !overlaps(&range, &candidate.range)
+                || !overlaps_any(&parts, candidate)
             {
                 continue;
             }
@@ -140,8 +143,7 @@ pub fn merge(selection: &Anchor, staged: &[Anchor]) -> MergeDecision {
             } else {
                 absorbed.push(position);
             }
-            range.start = range.start.min(candidate.range.start);
-            range.end = range.end.max(candidate.range.end);
+            parts = union_parts(&parts, candidate);
             grew = true;
         }
         if !grew {
@@ -153,10 +155,66 @@ pub fn merge(selection: &Anchor, staged: &[Anchor]) -> MergeDecision {
         Some(index) => MergeDecision::Extend {
             index,
             absorbed,
-            range,
+            parts,
         },
         None => MergeDecision::New,
     }
+}
+
+/// Whether two part sets address exactly the same ranges.
+fn same_parts(a: &[Anchor], b: &[Anchor]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a = a.to_vec();
+    let mut b = b.to_vec();
+    let key = |anchor: &Anchor| (anchor.ordinal, anchor.range.start, anchor.range.end);
+    a.sort_by_key(key);
+    b.sort_by_key(key);
+    a.iter().zip(b.iter()).all(|(a, b)| {
+        a.ordinal == b.ordinal && a.range.start == b.range.start && a.range.end == b.range.end
+    })
+}
+
+/// Whether any part of one set overlaps a part of the other in the same element.
+fn overlaps_any(a: &[Anchor], b: &[Anchor]) -> bool {
+    a.iter().any(|a| {
+        b.iter().any(|b| {
+            a.ordinal == b.ordinal && overlaps(&a.range, &b.range)
+        })
+    })
+}
+
+/// The union of two part sets: one range per element, overlapping and touching
+/// ranges within an element merged, sorted by ordinal then start.
+fn union_parts(a: &[Anchor], b: &[Anchor]) -> Vec<Anchor> {
+    let mut parts = a.to_vec();
+    parts.extend(b.iter().cloned());
+    // Merge within each element until stable: unioning two ranges can bridge a
+    // third that neither touched before.
+    loop {
+        let mut merged = Vec::with_capacity(parts.len());
+        let mut changed = false;
+        for part in parts.drain(..) {
+            if let Some(existing) = merged.iter_mut().find(|existing: &&mut Anchor| {
+                existing.ordinal == part.ordinal
+                    && existing.range.start <= part.range.end
+                    && part.range.start <= existing.range.end
+            }) {
+                existing.range.start = existing.range.start.min(part.range.start);
+                existing.range.end = existing.range.end.max(part.range.end);
+                changed = true;
+            } else {
+                merged.push(part);
+            }
+        }
+        parts = merged;
+        if !changed {
+            break;
+        }
+    }
+    parts.sort_by_key(|part| (part.ordinal, part.range.start));
+    parts
 }
 
 fn element_text<'a>(elements: &[ElementText<'a>], ordinal: usize) -> Option<&'a str> {
@@ -332,61 +390,76 @@ mod tests {
 
     #[test]
     fn merges_an_overlapping_selection_into_the_staged_annotation() {
-        let staged = [anchor(0, 10..20)];
+        let staged = [vec![anchor(0, 10..20)]];
         assert_eq!(
-            merge(&anchor(0, 15..25), &staged),
+            merge(&[anchor(0, 15..25)], &staged),
             MergeDecision::Extend {
                 index: 0,
                 absorbed: Vec::new(),
-                range: 10..25,
+                parts: vec![anchor(0, 10..25)],
             }
         );
     }
 
     #[test]
     fn an_exact_reselection_reveals_instead_of_widening() {
-        let staged = [anchor(0, 10..20), anchor(0, 10..20)];
+        let staged = [vec![anchor(0, 10..20)], vec![anchor(0, 10..20)]];
         assert_eq!(
-            merge(&anchor(0, 10..20), &staged),
+            merge(&[anchor(0, 10..20)], &staged),
             MergeDecision::Duplicate { index: 0 }
         );
     }
 
     #[test]
     fn touching_spans_and_other_elements_stay_separate() {
-        let staged = [anchor(0, 10..20)];
+        let staged = [vec![anchor(0, 10..20)]];
         // Adjacent, not overlapping: two passages, two annotations.
-        assert_eq!(merge(&anchor(0, 20..30), &staged), MergeDecision::New);
+        assert_eq!(merge(&[anchor(0, 20..30)], &staged), MergeDecision::New);
         // Same range, different element: one anchor cannot cover both.
         assert_eq!(
-            merge(&anchor(SECOND_BLOCK, 10..20), &staged),
+            merge(&[anchor(SECOND_BLOCK, 10..20)], &staged),
             MergeDecision::New
         );
-        assert_eq!(merge(&anchor(0, 0..5), &[]), MergeDecision::New);
+        assert_eq!(merge(&[anchor(0, 0..5)], &[]), MergeDecision::New);
     }
 
     #[test]
     fn absorbs_every_staged_span_the_union_reaches() {
-        let staged = [anchor(0, 10..20), anchor(0, 30..40)];
+        let staged = [vec![anchor(0, 10..20)], vec![anchor(0, 30..40)]];
         assert_eq!(
-            merge(&anchor(0, 15..35), &staged),
+            merge(&[anchor(0, 15..35)], &staged),
             MergeDecision::Extend {
                 index: 0,
                 absorbed: vec![1],
-                range: 10..40,
+                parts: vec![anchor(0, 10..40)],
             }
         );
     }
 
     #[test]
     fn the_first_overlapping_span_in_creation_order_is_kept() {
-        let staged = [anchor(0, 10..20), anchor(0, 25..30)];
+        let staged = [vec![anchor(0, 10..20)], vec![anchor(0, 25..30)]];
         assert_eq!(
-            merge(&anchor(0, 28..35), &staged),
+            merge(&[anchor(0, 28..35)], &staged),
             MergeDecision::Extend {
                 index: 1,
                 absorbed: Vec::new(),
-                range: 25..35,
+                parts: vec![anchor(0, 25..35)],
+            }
+        );
+    }
+
+    #[test]
+    fn a_multi_element_selection_is_one_annotation() {
+        // A drag across two elements is one selection; a staged annotation
+        // starting in the first element absorbs the second part.
+        let staged = [vec![anchor(0, 10..20)]];
+        assert_eq!(
+            merge(&[anchor(0, 10..20), anchor(SECOND_BLOCK, 0..5)], &staged),
+            MergeDecision::Extend {
+                index: 0,
+                absorbed: Vec::new(),
+                parts: vec![anchor(0, 10..20), anchor(SECOND_BLOCK, 0..5)],
             }
         );
     }

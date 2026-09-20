@@ -7,6 +7,7 @@ export type { ActivityKind } from "./ActivityKind";
 export type { AgentInvocation } from "./AgentInvocation";
 export type { AgentSession } from "./AgentSession";
 export type { AgentTurn } from "./AgentTurn";
+export type { AnnotationSpan } from "./AnnotationSpan";
 export type { AnnotationTarget } from "./AnnotationTarget";
 export type { AttachmentUpload } from "./AttachmentUpload";
 export type { AttachmentUploadEntry } from "./AttachmentUploadEntry";

@@ -25,10 +25,10 @@ use super::{
 };
 use crate::git_branch::BranchEntry;
 use crate::model::{
-    ActivityItem, ActivityKind, AgentSession, AnnotationTarget, Checkpoint, CheckpointFile,
-    CheckpointStatus, DriverEvent, Message, MessageAnnotation, MessageRole, ProviderKind,
-    ReasoningBlock, RuntimeEventCursor, SessionStatus, TextSpan, TranscriptBlock, TurnStatus,
-    UserInputOption, UserInputQuestion,
+    ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget, Checkpoint,
+    CheckpointFile, CheckpointStatus, DriverEvent, Message, MessageAnnotation, MessageRole,
+    ProviderKind, ReasoningBlock, RuntimeEventCursor, SessionStatus, TextSpan, TranscriptBlock,
+    TurnStatus, UserInputOption, UserInputQuestion,
 };
 
 #[test]
@@ -346,8 +346,11 @@ fn a_queued_submission_replays_its_projected_prompt_unchanged() {
         id: Uuid::new_v4(),
         target: AnnotationTarget::MessageSpan {
             message_id: Uuid::new_v4(),
-            ordinal: 1 << 16,
-            span: TextSpan { start: 0, end: 5 },
+            spans: vec![AnnotationSpan {
+                ordinal: 1 << 16,
+                span: TextSpan { start: 0, end: 5 },
+                quote: "wrong".to_owned(),
+            }],
             quote: "wrong".to_owned(),
             block: "wrong".to_owned(),
         },

@@ -30,8 +30,8 @@ use crate::computer_use::ComputerAppGrant;
 use crate::i18n::AppLanguage;
 use crate::identity::DATA_DIRECTORY_NAME;
 use crate::model::{
-    AgentSession, AnnotationTarget, FavoriteModel, Message, MessageAnnotation, MessageAttachment,
-    MessageRole, Project, ProviderKind, RuntimeMode, SessionWorkspace,
+    AgentSession, AnnotationSpan, AnnotationTarget, FavoriteModel, Message, MessageAnnotation,
+    MessageAttachment, MessageRole, Project, ProviderKind, RuntimeMode, SessionWorkspace,
 };
 use crate::theme::ThemePreference;
 pub use waku_protocol::persistence::{
@@ -1759,8 +1759,7 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
         match &annotation.target {
             AnnotationTarget::MessageSpan {
                 message_id,
-                ordinal,
-                span,
+                spans,
                 quote,
                 block,
             } => {
@@ -1769,9 +1768,13 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
                 let (high, low) = message_id.as_u64_pair();
                 fold(high);
                 fold(low);
-                fold(*ordinal as u64);
-                fold(span.start as u64);
-                fold(span.end as u64);
+                fold(spans.len() as u64);
+                for part in spans {
+                    fold(part.ordinal as u64);
+                    fold(part.span.start as u64);
+                    fold(part.span.end as u64);
+                    fold(fingerprint(&part.quote));
+                }
                 fold(fingerprint(quote));
                 fold(fingerprint(block));
             }
@@ -2181,9 +2184,9 @@ mod tests {
             Some("this drops the error")
         );
         assert_eq!(restored.annotations[1].comment, None);
-        let AnnotationTarget::MessageSpan { quote, span, .. } = &restored.annotations[0].target;
+        let AnnotationTarget::MessageSpan { quote, spans, .. } = &restored.annotations[0].target;
         assert_eq!(quote, "retry helper");
-        assert_eq!((span.start, span.end), (4, 16));
+        assert_eq!((spans[0].span.start, spans[0].span.end), (4, 16));
     }
 
     #[test]
@@ -3302,8 +3305,11 @@ mod tests {
             id: Uuid::new_v4(),
             target: AnnotationTarget::MessageSpan {
                 message_id,
-                ordinal: 1 << 16,
-                span: crate::model::TextSpan { start: 4, end: 16 },
+                spans: vec![AnnotationSpan {
+                    ordinal: 1 << 16,
+                    span: crate::model::TextSpan { start: 4, end: 16 },
+                    quote: "retry helper".to_owned(),
+                }],
                 quote: "retry helper".to_owned(),
                 block: "the retry helper returns Ok(())".to_owned(),
             },

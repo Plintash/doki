@@ -13,7 +13,7 @@
 //! indentation, so a multi-line note cannot start a line that looks like a new
 //! entry either.
 
-use crate::model::{AnnotationTarget, MessageAnnotation};
+use crate::model::MessageAnnotation;
 
 /// Longest quote sent, and longest excerpt sent as its context. Both exist so a
 /// selection spanning a whole answer cannot turn one annotation into the bulk
@@ -62,9 +62,8 @@ pub(super) struct ProjectedAnnotation {
 
 impl ProjectedAnnotation {
     pub(super) fn new(annotation: &MessageAnnotation, source: impl Into<String>) -> Self {
-        let (quote, block) = match &annotation.target {
-            AnnotationTarget::MessageSpan { quote, block, .. } => (quote.trim(), block.trim()),
-        };
+        let quote = annotation.target.quote().trim();
+        let block = annotation.target.block().trim();
         Self {
             source: source.into().trim().to_owned(),
             quote: quote_value(&cap_quote(quote)),
@@ -238,7 +237,7 @@ mod tests {
 
     use uuid::Uuid;
 
-    use crate::model::TextSpan;
+    use crate::model::{AnnotationSpan, AnnotationTarget, TextSpan};
 
     use super::super::composer::merged_submission;
 
@@ -252,11 +251,14 @@ mod tests {
             id: Uuid::new_v4(),
             target: AnnotationTarget::MessageSpan {
                 message_id: Uuid::new_v4(),
-                ordinal,
-                span: TextSpan {
-                    start: span.0,
-                    end: span.1,
-                },
+                spans: vec![AnnotationSpan {
+                    ordinal,
+                    span: TextSpan {
+                        start: span.0,
+                        end: span.1,
+                    },
+                    quote: quote.to_owned(),
+                }],
                 quote: quote.to_owned(),
                 block: block.to_owned(),
             },
@@ -370,8 +372,8 @@ mod tests {
     fn internal_coordinates_never_reach_the_prompt() {
         let message_id = Uuid::new_v4();
         let mut record = annotation(424_242, (17, 42), "the retry loop", "the retry loop");
-        if let AnnotationTarget::MessageSpan { message_id: id, .. } = &mut record.target {
-            *id = message_id;
+        match &mut record.target {
+            AnnotationTarget::MessageSpan { message_id: id, .. } => *id = message_id,
         }
         let project = ProjectedAnnotation::new(&record, REPLY);
 

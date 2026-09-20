@@ -2191,6 +2191,10 @@ annotation.remove_all:
   en: Remove all annotations
 annotation.selected_text:
   en: "Selected text:"
+annotation.add_to_chat:
+  en: Add to chat
+annotation.comment_placeholder:
+  en: Add an optional comment…
 annotation.create:
   en: Annotate selection
 annotation.user_comment:

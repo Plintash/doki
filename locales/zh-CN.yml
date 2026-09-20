@@ -1061,6 +1061,8 @@ annotation.collapse: 收起标注
 annotation.remove: 删除标注
 annotation.remove_all: 删除全部标注
 annotation.selected_text: "引用文字："
+annotation.add_to_chat: 添加到对话
+annotation.comment_placeholder: 添加可选评论…
 annotation.create: 标注所选文字
 annotation.user_comment: "用户评论："
 annotation.reply_only: 标注只能指向助手的回复

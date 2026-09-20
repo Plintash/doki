@@ -2119,7 +2119,6 @@ impl Waku {
             turn_count,
             input: input.clone(),
             attachments,
-            annotations: annotations.clone(),
             previous_annotations,
             previous_annotations_expanded,
         });

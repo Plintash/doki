@@ -1705,6 +1705,21 @@ pub struct TextSpan {
     pub end: usize,
 }
 
+/// One painted element's share of an annotation's selection.
+///
+/// A selection is a list of these because the renderer's coordinate system is
+/// per element: a drag can cross a bold run, a link, or a paragraph boundary,
+/// and each element keeps its own byte range. Order is document order.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct AnnotationSpan {
+    /// Element ordinal inside the message, in the renderer's own order.
+    pub ordinal: usize,
+    pub span: TextSpan,
+    /// The selected text of this element, snapshotted so this range alone can
+    /// be re-anchored when the message is rendered again.
+    pub quote: String,
+}
+
 /// What a [`MessageAnnotation`] points at.
 ///
 /// One arm today. The tag exists so a later target kind — a file span, a diff
@@ -1716,17 +1731,46 @@ pub enum AnnotationTarget {
     MessageSpan {
         /// The assistant message the span belongs to.
         message_id: Uuid,
-        /// Element ordinal inside that message, in the renderer's own order.
-        ordinal: usize,
-        span: TextSpan,
-        /// Snapshot of the annotated text. Kept so the annotation survives a
-        /// re-render that moves the span, and so a prompt still carries the
+        /// The selected ranges, one per painted element, in document order.
+        spans: Vec<AnnotationSpan>,
+        /// Snapshot of the whole selected text. Kept so the annotation survives
+        /// a re-render that moves its ranges, and so a prompt still carries the
         /// quote when the anchor can no longer be resolved.
         quote: String,
-        /// Snapshot of the block containing the quote, used to give a fragment
-        /// selection some context in the prompt.
+        /// Snapshot of the block containing the start of the quote, used to
+        /// give a fragment selection some context in the prompt.
         block: String,
     },
+}
+
+impl AnnotationTarget {
+    /// The message the annotation points at.
+    pub fn message_id(&self) -> Uuid {
+        match self {
+            Self::MessageSpan { message_id, .. } => *message_id,
+        }
+    }
+
+    /// The selected element ranges, in document order.
+    pub fn spans(&self) -> &[AnnotationSpan] {
+        match self {
+            Self::MessageSpan { spans, .. } => spans,
+        }
+    }
+
+    /// The whole selected text.
+    pub fn quote(&self) -> &str {
+        match self {
+            Self::MessageSpan { quote, .. } => quote,
+        }
+    }
+
+    /// The block the selection started in.
+    pub fn block(&self) -> &str {
+        match self {
+            Self::MessageSpan { block, .. } => block,
+        }
+    }
 }
 
 /// One span of an assistant reply the user pointed at, with an optional
@@ -3667,8 +3711,11 @@ mod tests {
                 id: Uuid::from_u128(9),
                 target: AnnotationTarget::MessageSpan {
                     message_id,
-                    ordinal: 1 << 16,
-                    span: TextSpan { start: 4, end: 11 },
+                    spans: vec![AnnotationSpan {
+                        ordinal: 1 << 16,
+                        span: TextSpan { start: 4, end: 11 },
+                        quote: "retry helper".to_owned(),
+                    }],
                     quote: "retry helper".to_owned(),
                     block: "the retry helper returns Ok(())".to_owned(),
                 },
@@ -3678,8 +3725,11 @@ mod tests {
                 id: Uuid::from_u128(10),
                 target: AnnotationTarget::MessageSpan {
                     message_id,
-                    ordinal: 0,
-                    span: TextSpan { start: 0, end: 3 },
+                    spans: vec![AnnotationSpan {
+                        ordinal: 0,
+                        span: TextSpan { start: 0, end: 3 },
+                        quote: "the".to_owned(),
+                    }],
                     quote: "the".to_owned(),
                     block: "the retry helper returns Ok(())".to_owned(),
                 },
@@ -3693,9 +3743,15 @@ mod tests {
             json["annotations"][0]["target"]["message_id"],
             serde_json::json!(message_id)
         );
-        assert_eq!(json["annotations"][0]["target"]["ordinal"], 1 << 16);
-        assert_eq!(json["annotations"][0]["target"]["span"]["start"], 4);
-        assert_eq!(json["annotations"][0]["target"]["span"]["end"], 11);
+        assert_eq!(json["annotations"][0]["target"]["spans"][0]["ordinal"], 1 << 16);
+        assert_eq!(
+            json["annotations"][0]["target"]["spans"][0]["span"]["start"],
+            4
+        );
+        assert_eq!(
+            json["annotations"][0]["target"]["spans"][0]["span"]["end"],
+            11
+        );
         assert_eq!(json["annotations"][0]["comment"], "this drops the error");
         // A bare annotation is a pointer, so the field is absent rather than
         // an empty string the projection would have to filter out.
