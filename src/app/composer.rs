@@ -2464,8 +2464,9 @@ impl Waku {
                             .child(label),
                     )
                     // No reserved slot: on hover the clear button lands at the
-                    // far right over the count. A horizontal band fades the
-                    // count out into the button, so the × never hard-cuts it.
+                    // far right over the count. A soft band fades the count
+                    // into the button, and a solid strip under the button keeps
+                    // the text from showing through it.
                     .when(chip_hovered, |chip| {
                         let band = theme.composer.blend(theme.overlay);
                         chip.child(
@@ -2475,19 +2476,40 @@ impl Waku {
                                 .right(px(0.0))
                                 .top_0()
                                 .bottom_0()
-                                .w(px(42.0))
-                                .pr(px(5.0))
-                                .rounded(px(9.0))
+                                .w(px(44.0))
                                 .flex()
                                 .items_center()
                                 .justify_end()
+                                .pr(px(5.0))
                                 .cursor_default()
-                                .bg(linear_gradient(
-                                    90.0,
-                                    linear_color_stop(band.opacity(0.0), 0.0),
-                                    linear_color_stop(band, 1.0),
+                                .child(div().absolute().left_0().top_0().bottom_0().w(px(22.0)).bg(
+                                    linear_gradient(
+                                        90.0,
+                                        linear_color_stop(band.opacity(0.0), 0.0),
+                                        linear_color_stop(band, 1.0),
+                                    ),
                                 ))
-                                .child(icon("icons/x.svg", 12.0, theme.text_secondary))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .right_0()
+                                        .top_0()
+                                        .bottom_0()
+                                        .w(px(22.0))
+                                        .rounded_tr(px(9.0))
+                                        .rounded_br(px(9.0))
+                                        .bg(band),
+                                )
+                                .child(
+                                    div()
+                                        .size(px(20.0))
+                                        .rounded_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .hover(|style| style.bg(theme.overlay_strong))
+                                        .child(icon("icons/x.svg", 12.0, theme.text_secondary)),
+                                )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.composer_annotations.clear();
