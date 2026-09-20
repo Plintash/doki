@@ -172,6 +172,9 @@ impl Waku {
             .map(ComposerAttachment::from)
             .collect();
         self.composer_annotations = draft.annotations;
+        // Restored annotations may reuse ids, so editors created for the
+        // previous draft must not carry their old comments into this one.
+        self.annotation_comment_inputs.borrow_mut().clear();
         self.composer
             .update(cx, |input, cx| input.set_content(draft.text, cx));
         cx.notify();

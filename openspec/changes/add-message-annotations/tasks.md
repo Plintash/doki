@@ -20,7 +20,7 @@ rebuild or replace the installed `Doki.app` while the user is working in it.
 
 - [x] 3.1 Add the create action on a non-empty assistant-message selection, reachable from the message context menu and a keyboard shortcut, and refused while the reply streams; verify the refusal predicate in a test and the happy path in the debug app
 - [x] 3.2 Add the composer label row above the attachment tiles with expand, collapse, and remove; verify visually in the debug app with both annotations and an image attachment staged
-- [ ] 3.3 Add the stacked card list with `Selected text:` and an optional `User comment:` field, editing the record on change; verify in the debug app and by asserting the stored record
+- [x] 3.3 Add the stacked card list with `Selected text:` and an optional `User comment:` field, editing the record on change; verify in the debug app and by asserting the stored record
 - [ ] 3.4 Add the read-only hover preview with no interactive controls inside it; verify by hover in the debug app
 - [ ] 3.5 Persist staged annotations with the draft; verify by switching sessions and by restarting the debug app
 

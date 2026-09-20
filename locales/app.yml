@@ -2191,6 +2191,8 @@ annotation.remove_all:
   en: Remove all annotations
 annotation.selected_text:
   en: "Selected text:"
+annotation.user_comment:
+  en: "User comment:"
 annotation.reply_only:
   en: Annotations point at the assistant's replies
 annotation.select_reply:

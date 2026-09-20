@@ -1285,6 +1285,11 @@ pub struct Waku {
     /// map below, created on demand because the composer renders from `&self`.
     annotations_focus: FocusHandle,
     annotation_card_focus: RefCell<HashMap<Uuid, FocusHandle>>,
+    /// One comment editor per staged annotation, created on first render and
+    /// keyed by annotation id. A comment is edited in place, so its record has
+    /// to be written back as the field changes; the map is pruned whenever the
+    /// staged set changes.
+    annotation_comment_inputs: RefCell<HashMap<Uuid, Entity<TextInput>>>,
     /// Window-modal expansion of an image attachment. The path is already
     /// cached attachment metadata; render never probes the filesystem.
     image_preview: Option<image_preview::ImagePreviewState>,
@@ -2847,6 +2852,7 @@ impl Waku {
                 focused_annotation: None,
                 annotations_focus: cx.focus_handle(),
                 annotation_card_focus: RefCell::new(HashMap::new()),
+                annotation_comment_inputs: RefCell::new(HashMap::new()),
                 image_preview: None,
                 image_preview_generation: 0,
                 remote_images: RefCell::new(HashMap::new()),

@@ -1302,7 +1302,9 @@ impl Waku {
         session_id: Uuid,
         status: TurnStatus,
     ) -> Option<(Uuid, usize)> {
-        self.state.session_mut(session_id)?.finish_active_turn(status)
+        self.state
+            .session_mut(session_id)?
+            .finish_active_turn(status)
     }
 
     /// The directory every filesystem and provider operation for `session`
@@ -2183,25 +2185,23 @@ impl Waku {
         let entries = if edit.annotations.is_empty() {
             Vec::new()
         } else {
-            let sender = self
-                .selected_session()
-                .and_then(|session| {
-                    session
-                        .messages
-                        .iter()
-                        .position(|message| message.id == edit.message_id)
-                });
+            let sender = self.selected_session().and_then(|session| {
+                session
+                    .messages
+                    .iter()
+                    .position(|message| message.id == edit.message_id)
+            });
             self.projected_annotations(&edit.annotations, sender)
         };
-        let provider_prompt = match (composer::merged_submission(&prompt, &mentions), entries.is_empty())
-        {
+        let provider_prompt = match (
+            composer::merged_submission(&prompt, &mentions),
+            entries.is_empty(),
+        ) {
             (Some(merged), true) => merged,
             (Some(merged), false) => {
                 super::annotation_projection::project_annotations(&merged, &entries)
             }
-            (None, false) => {
-                super::annotation_projection::project_annotations("", &entries)
-            }
+            (None, false) => super::annotation_projection::project_annotations("", &entries),
             (None, true) => {
                 self.show_toast(tr!("session.edited_message_empty"));
                 cx.notify();

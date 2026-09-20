@@ -1,8 +1,8 @@
-use super::composer::{
-    ComposerSubmitAction, composer_submit_action, dropped_file_mention, merged_submission,
-    next_picker_highlight, visible_branch_entries,
-};
 use super::ComposerSubmission;
+use super::composer::{
+    ComposerSubmitAction, annotation_comment_value, composer_submit_action, dropped_file_mention,
+    merged_submission, next_picker_highlight, visible_branch_entries,
+};
 use super::runtime::{merge_remote_session_catalog, session_has_active_provider_turn};
 use super::settings::visible_settings_pages;
 use super::{
@@ -30,6 +30,22 @@ use crate::model::{
     ReasoningBlock, RuntimeEventCursor, SessionStatus, TextSpan, TranscriptBlock, TurnStatus,
     UserInputOption, UserInputQuestion,
 };
+
+#[test]
+fn a_blank_comment_field_stores_no_comment() {
+    assert_eq!(annotation_comment_value("   "), None);
+    assert_eq!(annotation_comment_value(""), None);
+    assert_eq!(
+        annotation_comment_value("keep the error, drop the retry"),
+        Some("keep the error, drop the retry".to_owned())
+    );
+    // Surrounding whitespace survives in the record; the projection trims it
+    // when it writes the comment line.
+    assert_eq!(
+        annotation_comment_value("  fix 2  "),
+        Some("  fix 2  ".to_owned())
+    );
+}
 
 #[test]
 fn structured_user_input_preserves_question_order_and_custom_answer_precedence() {

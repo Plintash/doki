@@ -49,6 +49,13 @@ pub(super) fn composer_submit_action(
     }
 }
 
+/// The stored form of a comment field's text. A blank field is the absence of a
+/// comment, not an empty string: the projection omits the field entirely and
+/// the card stops showing an empty note.
+pub(super) fn annotation_comment_value(text: &str) -> Option<String> {
+    (!text.trim().is_empty()).then(|| text.to_owned())
+}
+
 impl Waku {
     // ── Permission ─────────────────────────────────────────────────────────
 
@@ -2171,6 +2178,7 @@ impl Waku {
             .map(MessageAttachment::from)
             .collect::<Vec<_>>();
         let annotations = std::mem::take(&mut self.composer_annotations);
+        self.annotation_comment_inputs.borrow_mut().clear();
         let mentions = attachments
             .iter()
             .map(|attachment| attachment.mention.clone())
@@ -2182,9 +2190,7 @@ impl Waku {
         let entries = self.projected_annotations(&annotations, None);
         let submission = match (merged_submission(prompt, &mentions), entries.is_empty()) {
             (Some(merged), true) => merged,
-            (Some(merged), false) => {
-                annotation_projection::project_annotations(&merged, &entries)
-            }
+            (Some(merged), false) => annotation_projection::project_annotations(&merged, &entries),
             // Annotations with nothing typed still carry a message: the quotes
             // are the user's whole ask, and inventing an instruction for them
             // would be putting words in their mouth.
@@ -2387,8 +2393,19 @@ impl Waku {
     /// marks use, so a mark and its card can be matched by eye. The list starts
     /// collapsed and expands the moment an annotation is created, because that
     /// is where its comment is written.
-    fn render_composer_annotations(&self, cx: &mut Context<Self>) -> Div {
+    fn render_composer_annotations(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
+        // Drop editors whose annotation is gone. Removal and send both leave the
+        // map behind, and an editor keyed to a dropped id would otherwise be
+        // recreated empty if that id ever came back.
+        let live = self
+            .composer_annotations
+            .iter()
+            .map(|annotation| annotation.id)
+            .collect::<HashSet<_>>();
+        self.annotation_comment_inputs
+            .borrow_mut()
+            .retain(|id, _| live.contains(id));
         let count = self.composer_annotations.len();
         let label = if count == 1 {
             tr!("annotation.count_one", count = count)
@@ -2466,7 +2483,7 @@ impl Waku {
             );
         if expanded {
             for index in 0..self.composer_annotations.len() {
-                list = list.child(self.render_annotation_card(index, cx));
+                list = list.child(self.render_annotation_card(index, window, cx));
             }
         }
         list
@@ -2474,17 +2491,21 @@ impl Waku {
 
     /// One annotation card: what it quotes, which number it carries, and the
     /// controls that remove it.
-    fn render_annotation_card(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_annotation_card(
+        &self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::current(cx);
         let Some(annotation) = self.composer_annotations.get(index) else {
             return div().into_any_element();
         };
         let id = annotation.id;
-        let (quote, comment) = match &annotation.target {
-            AnnotationTarget::MessageSpan { quote, .. } => {
-                (quote.as_str(), annotation.comment.as_deref())
-            }
+        let quote = match &annotation.target {
+            AnnotationTarget::MessageSpan { quote, .. } => quote.as_str(),
         };
+        let comment_input = self.annotation_comment_input(annotation, window, cx);
         let focused = self.focused_annotation == Some(id);
         let focus = self
             .annotation_card_focus
@@ -2566,17 +2587,70 @@ impl Waku {
                     .line_clamp(2)
                     .child(SharedString::from(quote.to_owned())),
             )
-            .when_some(comment, |card, comment| {
-                card.child(
-                    div()
-                        .pl(px(21.0))
-                        .text_size(sp(12.0))
-                        .line_height(sp(16.0))
-                        .text_color(theme.text_tertiary)
-                        .child(SharedString::from(comment.to_owned())),
-                )
-            })
+            .child(
+                div()
+                    .pl(px(21.0))
+                    .pt(px(4.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .text_size(sp(12.0))
+                            .line_height(sp(16.0))
+                            .text_color(theme.text_secondary)
+                            .child(tr!("annotation.user_comment")),
+                    )
+                    .child(TextField::new(
+                        SharedString::from(format!("annotation-comment-{index}")),
+                        comment_input,
+                    )),
+            )
             .into_any_element()
+    }
+
+    /// The comment editor for one staged annotation.
+    ///
+    /// Created on first render and kept for the annotation's lifetime, so the
+    /// field's own caret and selection survive re-renders. Edits are written
+    /// straight back onto the record and saved with the draft; the field owns
+    /// its repaint, so typing never notifies the whole app.
+    fn annotation_comment_input(
+        &self,
+        annotation: &MessageAnnotation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextInput> {
+        let id = annotation.id;
+        if let Some(input) = self.annotation_comment_inputs.borrow().get(&id) {
+            return input.clone();
+        }
+        let initial = annotation.comment.clone().unwrap_or_default();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(window, cx).placeholder(tr!("annotation.user_comment"));
+            input.set_content(initial, cx);
+            input
+        });
+        self.annotation_comment_inputs
+            .borrow_mut()
+            .insert(id, input.clone());
+        cx.subscribe(&input, move |this, input, event, cx| {
+            if !matches!(event, InputEvent::Edited) {
+                return;
+            }
+            let comment = input.read(cx).content().to_owned();
+            let Some(annotation) = this
+                .composer_annotations
+                .iter_mut()
+                .find(|annotation| annotation.id == id)
+            else {
+                return;
+            };
+            annotation.comment = annotation_comment_value(&comment);
+            this.capture_and_save_current_composer_draft(cx);
+        })
+        .detach();
+        input
     }
 
     fn render_composer_attachments(&self, cx: &mut Context<Self>) -> Div {
@@ -2961,7 +3035,7 @@ impl Waku {
         )
     }
 
-    pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+    pub(super) fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
         let session = self.selected_session();
         let preparing = session.is_some_and(|session| {
@@ -3044,7 +3118,7 @@ impl Waku {
                 })
                 .children(autocomplete)
                 .when(!self.composer_annotations.is_empty(), |card| {
-                    card.child(self.render_composer_annotations(cx))
+                    card.child(self.render_composer_annotations(window, cx))
                 })
                 .when(!self.composer_attachments.is_empty(), |card| {
                     card.child(self.render_composer_attachments(cx))
