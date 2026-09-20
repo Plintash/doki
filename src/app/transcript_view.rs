@@ -660,6 +660,10 @@ impl Waku {
             return Vec::new();
         }
         let theme = Theme::current(cx);
+        // Keep badges inside the transcript viewport: a line scrolled past the
+        // top or under the composer must not float a badge over the header or
+        // the composer card.
+        let safe = self.annotation_safe_bounds();
         let registry = self.transcript_selection.registry.borrow();
         let mut pushed: Vec<f32> = Vec::new();
         let mut chips = Vec::new();
@@ -676,6 +680,11 @@ impl Waku {
             else {
                 continue;
             };
+            if let Some(safe) = safe
+                && (bounds.top() < safe.top() || bounds.bottom() > safe.bottom())
+            {
+                continue;
+            }
             let mut top = bounds.top().as_f32();
             while pushed.iter().any(|pushed| (pushed - top).abs() < 20.0) {
                 top += 20.0;
@@ -686,8 +695,12 @@ impl Waku {
             // Anchor to the text column's own right edge, not the pane's, so
             // the badge sits beside the text and the pane margin stays free.
             let element_right = entry.geometry.bounds().right();
-            let badge = point(element_right + px(6.0), px(top));
-            let editor = point(element_right + px(30.0), px(top));
+            let mut badge_x = element_right + px(6.0);
+            if let Some(safe) = safe {
+                badge_x = badge_x.min(safe.right() - px(18.0)).max(safe.left());
+            }
+            let badge = point(badge_x, px(top));
+            let editor = point(badge_x + px(24.0), px(top));
             chips.push(
                 gpui::deferred(
                     gpui::anchored()

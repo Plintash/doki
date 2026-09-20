@@ -2428,43 +2428,42 @@ impl Waku {
             .flex_col()
             .gap(px(6.0))
             .child(
+                // One bordered pill holds the icon, the count and the clear
+                // button; hovering anywhere in it lays a soft scrim under all
+                // three, the way the transcript fades soften their edges.
                 div()
+                    .id("composer-annotations-label")
+                    .relative()
                     .flex()
                     .items_center()
                     .gap(px(6.0))
+                    .pl(px(8.0))
+                    .pr(px(2.0))
+                    .py(px(2.0))
+                    .rounded(px(9.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .cursor_default()
+                    .hover(|style| style.bg(theme.overlay))
+                    .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
+                        this.set_annotation_preview_hover(*hovering, cx);
+                    }))
+                    .child(annotation_label_bounds_probe(
+                        self.annotation_label_bounds.clone(),
+                    ))
+                    .child(icon("icons/annotation.svg", 12.5, theme.text_secondary))
                     .child(
                         div()
-                            .id("composer-annotations-label")
-                            .relative()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .px(px(6.0))
-                            .py(px(3.0))
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .cursor_default()
-                            .hover(|style| style.bg(theme.overlay))
-                            .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
-                                this.set_annotation_preview_hover(*hovering, cx);
-                            }))
-                            .child(annotation_label_bounds_probe(
-                                self.annotation_label_bounds.clone(),
-                            ))
-                            .child(icon("icons/annotation.svg", 12.5, theme.text_secondary))
-                            .child(
-                                div()
-                                    .text_size(sp(12.0))
-                                    .line_height(sp(15.0))
-                                    .text_color(theme.text)
-                                    .child(label),
-                            ),
+                            .text_size(sp(12.0))
+                            .line_height(sp(15.0))
+                            .text_color(theme.text)
+                            .child(label),
                     )
                     .child(
                         icon_button("composer-annotations-clear", "icons/x.svg", theme.clone())
                             .tooltip(Tooltip::text(tr!("annotation.remove_all")))
                             .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
                                 this.composer_annotations.clear();
                                 this.reset_annotation_preview_hover();
                                 this.capture_and_save_current_composer_draft(cx);
