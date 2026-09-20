@@ -2560,7 +2560,9 @@ impl Waku {
             list = list.child(
                 gpui::deferred(
                     gpui::anchored()
-                        .position(point(bounds.origin.x, bounds.origin.y + px(1.0)))
+                        // A small gap above the chip; the hover grace period keeps
+                        // the panel open while the pointer crosses it.
+                        .position(point(bounds.origin.x, bounds.origin.y - px(6.0)))
                         .anchor(gpui::Anchor::BottomLeft)
                         .snap_to_window_with_margin(px(8.0))
                         .child(self.render_annotation_preview(
