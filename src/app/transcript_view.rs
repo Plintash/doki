@@ -1849,7 +1849,22 @@ impl Waku {
             })
             .collect::<Vec<_>>();
         if let Some(sent) = self.sent_annotation_resolution.borrow().marks(message_id) {
-            marks.extend(sent.iter().cloned());
+            // An annotation is staged *and* still recorded on the message while
+            // that message is being edited. Its staged copy already paints the
+            // span; drop the sent duplicate so the wash is not drawn twice.
+            let staged = marks
+                .iter()
+                .map(|mark| (mark.ordinal, mark.range.clone()))
+                .collect::<Vec<_>>();
+            marks.extend(
+                sent.iter()
+                    .filter(|sent_mark| {
+                        !staged.iter().any(|(ordinal, range)| {
+                            *ordinal == sent_mark.ordinal && *range == sent_mark.range
+                        })
+                    })
+                    .cloned(),
+            );
         }
         // A jump flashes through the shared pulse clock, not a per-element
         // animation: one lease keeps the pane redrawing while the wash fades.
@@ -1888,6 +1903,16 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> Option<SentAnnotationIndicator> {
         if message.annotations.is_empty() {
+            return None;
+        }
+        // While this message is open for editing its records are staged as
+        // composer cards, which are the thing to read and change; the sent
+        // indicator would be a second, frozen copy of the same list.
+        if self
+            .message_edit
+            .as_ref()
+            .is_some_and(|edit| edit.message_id == message.id)
+        {
             return None;
         }
         let focus = self

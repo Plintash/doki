@@ -849,6 +849,10 @@ struct MessageEdit {
     /// The annotations the message carried, restored so resubmitting it sends
     /// the same context and keeps its marks.
     annotations: Vec<MessageAnnotation>,
+    /// The composer's staged annotations before this edit opened, put back on
+    /// cancel so opening a past message never discards an unsent review.
+    previous_annotations: Vec<MessageAnnotation>,
+    previous_annotations_expanded: bool,
 }
 
 /// A pending request to scroll the transcript to one annotation's span.
@@ -1308,6 +1312,9 @@ pub struct Waku {
     /// map below, created on demand because the composer renders from `&self`.
     annotations_focus: FocusHandle,
     annotation_card_focus: RefCell<HashMap<Uuid, FocusHandle>>,
+    /// Focus for each card's remove button, so deleting is a tab stop of its
+    /// own rather than something the card's activation swallows.
+    annotation_remove_focus: RefCell<HashMap<Uuid, FocusHandle>>,
     /// One comment editor per staged annotation, created on first render and
     /// keyed by annotation id. A comment is edited in place, so its record has
     /// to be written back as the field changes; the map is pruned whenever the
@@ -2897,6 +2904,7 @@ impl Waku {
                 focused_annotation: None,
                 annotations_focus: cx.focus_handle(),
                 annotation_card_focus: RefCell::new(HashMap::new()),
+                annotation_remove_focus: RefCell::new(HashMap::new()),
                 annotation_comment_inputs: RefCell::new(HashMap::new()),
                 sent_annotation_resolution: RefCell::new(
                     annotation_resolution::SentAnnotationResolution::default(),

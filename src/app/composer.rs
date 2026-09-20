@@ -2723,14 +2723,23 @@ impl Waku {
                             .text_color(theme.text_secondary)
                             .child(tr!("annotation.selected_text")),
                     )
-                    .child(
+                    .child({
+                        let remove_focus = self
+                            .annotation_remove_focus
+                            .borrow_mut()
+                            .entry(id)
+                            .or_insert_with(|| cx.focus_handle())
+                            .clone();
                         icon_button(
                             SharedString::from(format!("annotation-remove-{index}")),
                             "icons/trash.svg",
                             theme.clone(),
                         )
+                        .track_focus(&remove_focus)
+                        .tab_index(0)
+                        .focus_visible(|style| style.bg(theme.overlay))
                         .tooltip(Tooltip::text(tr!("annotation.remove")))
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_activation(cx, move |this, _, cx| {
                             cx.stop_propagation();
                             if index < this.composer_annotations.len() {
                                 this.composer_annotations.remove(index);
@@ -2742,8 +2751,8 @@ impl Waku {
                             this.focused_annotation = None;
                             this.capture_and_save_current_composer_draft(cx);
                             cx.notify();
-                        })),
-                    ),
+                        })
+                    }),
             )
             .child(
                 div()
