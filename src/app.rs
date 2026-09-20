@@ -13,10 +13,9 @@ use gpui::{
     Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, IntoElement, KeyDownEvent,
     ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, ObjectFit, PathPromptOptions, Pixels, Point, Render,
-    ScrollHandle,
-    SharedString, Stateful, StyleRefinement, TextRun, WeakEntity, Window, WindowBounds, canvas,
-    div, ease_out_quint, fill, font, img, linear_color_stop, linear_gradient, list, point,
-    prelude::*, pulsating_between, px, rgb,
+    ScrollHandle, SharedString, Stateful, StyleRefinement, TextRun, WeakEntity, Window,
+    WindowBounds, canvas, div, ease_out_quint, fill, font, img, linear_color_stop, linear_gradient,
+    list, point, prelude::*, pulsating_between, px, rgb,
 };
 use uuid::Uuid;
 
@@ -31,14 +30,14 @@ use crate::git_branch::BranchSnapshot;
 use crate::input::{ComposerAttachmentPaste, ComposerEvent, ComposerInput, InputEvent, TextInput};
 use crate::md;
 use crate::model::{
-    ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget, BackgroundWorkEvent,
-    BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind, BackgroundWorkStatus, Checkpoint,
-    CheckpointStatus, ContextUsage, DriverEvent, FavoriteModel, Message, MessageAnnotation,
-    MessageAttachment, MessageRole, PendingPermission, Project, ProviderKind, ProviderModel,
-    ProviderProbe, ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary,
-    QueuedMessage, ReasoningBlock, RuntimeMode, SessionStatus, SessionWorkspace, TextSpan,
-    TranscriptBlock, TurnStatus, UserInputAnswer, UserInputQuestion, compact_path, unix_time,
-    unix_time_millis,
+    ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget,
+    BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind,
+    BackgroundWorkStatus, Checkpoint, CheckpointStatus, ContextUsage, DriverEvent, FavoriteModel,
+    Message, MessageAnnotation, MessageAttachment, MessageRole, PendingPermission, Project,
+    ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor, ProviderSessionHistory,
+    ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode, SessionStatus,
+    SessionWorkspace, TextSpan, TranscriptBlock, TurnStatus, UserInputAnswer, UserInputQuestion,
+    compact_path, unix_time, unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -1352,7 +1351,8 @@ pub struct Waku {
     /// created on demand because the row renders from `&self`.
     sent_annotation_focus: RefCell<HashMap<Uuid, FocusHandle>>,
     /// A jump from a composer card waiting for its row to be revealed.
-    pending_annotation_reveal: Option<AnnotationReveal>,    /// The span a recent jump is briefly highlighting, if any.
+    pending_annotation_reveal: Option<AnnotationReveal>,
+    /// The span a recent jump is briefly highlighting, if any.
     annotation_flash: Cell<Option<AnnotationFlashState>>,
     /// The floating selection action, and its comment field once opened.
     selection_toolbar: RefCell<Option<SelectionToolbar>>,

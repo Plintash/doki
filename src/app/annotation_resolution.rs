@@ -33,8 +33,10 @@ pub(super) struct StoredPart {
     pub quote: String,
 }
 
-/// A stored annotation's full anchor — one part per painted element.
+/// A stored annotation's full anchor — one part per painted element — plus the
+/// id a badge jumps back to.
 pub(super) struct StoredAnnotation {
+    pub id: Uuid,
     pub parts: Vec<StoredPart>,
 }
 
@@ -83,6 +85,7 @@ impl SentAnnotationResolution {
 /// The stored anchor for one sent annotation.
 pub(super) fn stored_annotation(annotation: &MessageAnnotation) -> StoredAnnotation {
     StoredAnnotation {
+        id: annotation.id,
         parts: annotation
             .target
             .spans()
@@ -113,7 +116,9 @@ pub(super) fn annotations_targeting(
 /// The replies in this session that some sent annotation targets, and the
 /// content the pass must reparse for each. Recomputed only when the signature
 /// moves, never on a frame.
-pub(super) fn resolution_jobs(session: &AgentSession) -> Vec<(Uuid, String, Vec<StoredAnnotation>)> {
+pub(super) fn resolution_jobs(
+    session: &AgentSession,
+) -> Vec<(Uuid, String, Vec<StoredAnnotation>)> {
     let mut jobs: Vec<(Uuid, String, Vec<StoredAnnotation>)> = Vec::new();
     for annotation in session
         .messages
@@ -197,17 +202,20 @@ pub(super) fn resolve_sent_annotations(
         })
         .collect::<Vec<_>>();
     let mut marks = Vec::new();
-    for anchor in anchors {
-        for part in &anchor.parts {
+    for (index, anchor) in anchors.iter().enumerate() {
+        for (part_ix, part) in anchor.parts.iter().enumerate() {
             let stored = md::annotation::Anchor {
                 ordinal: part.ordinal,
                 range: part.range.clone(),
             };
             if let Some(resolved) = md::annotation::resolve(&stored, &part.quote, &elements) {
                 marks.push(md::render::AnnotationMark {
+                    id: anchor.id,
                     ordinal: resolved.ordinal,
                     range: resolved.range,
-                    number: None,
+                    // Sent annotations keep their number: the badge is how the
+                    // user finds the comment again after the draft is gone.
+                    number: (part_ix == 0).then_some(index + 1),
                 });
             }
         }
@@ -230,6 +238,7 @@ mod tests {
 
     fn annotation(ordinal: usize, range: Range<usize>, quote: &str) -> StoredAnnotation {
         StoredAnnotation {
+            id: Uuid::new_v4(),
             parts: vec![part(ordinal, range, quote)],
         }
     }
@@ -269,8 +278,9 @@ mod tests {
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].ordinal, 0);
         assert_eq!(marks[0].range, 4..9);
-        // Sent marks are never numbered.
-        assert_eq!(marks[0].number, None);
+        // Sent annotations keep a badge number, so the comment can be found
+        // again after the draft is gone; only the first part carries it.
+        assert_eq!(marks[0].number, Some(1));
     }
 
     #[test]
@@ -316,6 +326,7 @@ mod tests {
         let marks = resolve_sent_annotations(
             source,
             &[StoredAnnotation {
+                id: Uuid::new_v4(),
                 parts: vec![part(0, 0..5, "first"), part(1 << 16, 0..6, "second")],
             }],
         );

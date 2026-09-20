@@ -379,6 +379,7 @@ impl Waku {
             .child(self.transcript_selection_input())
             .children(search_bar)
             .children(self.render_selection_toolbar(cx))
+            .children(self.render_annotation_badges(cx))
             .into_any_element()
     }
 
@@ -449,10 +450,7 @@ impl Waku {
     /// that has captured nothing.
     fn sync_selection_toolbar(&self) {
         let mut toolbar = self.selection_toolbar.borrow_mut();
-        if toolbar
-            .as_ref()
-            .is_some_and(|toolbar| toolbar.comment_open)
-        {
+        if toolbar.as_ref().is_some_and(|toolbar| toolbar.comment_open) {
             return;
         }
         // Capture while the selection is still live. Clicking the toolbar
@@ -479,10 +477,7 @@ impl Waku {
     }
 
     /// The top-left of the selection's first line, in window coordinates.
-    fn selection_first_line_bounds(
-        &self,
-        spans: &[md::selection::Span],
-    ) -> Option<Bounds<Pixels>> {
+    fn selection_first_line_bounds(&self, spans: &[md::selection::Span]) -> Option<Bounds<Pixels>> {
         let first = spans.first()?;
         let registry = self.transcript_selection.registry.borrow();
         let entry = registry
@@ -516,7 +511,10 @@ impl Waku {
                 .bg(theme.raised)
                 .shadow_md()
                 .occlude()
-                .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                )
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                     if event.keystroke.key == "escape" {
                         *this.selection_toolbar.borrow_mut() = None;
@@ -537,7 +535,10 @@ impl Waku {
                 .bg(theme.raised)
                 .shadow_md()
                 .occlude()
-                .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                )
                 .child(
                     div()
                         .id("selection-add-to-chat")
@@ -574,20 +575,115 @@ impl Waku {
         )
     }
 
+    /// The numbered badges in the transcript's right gutter, Codex-style.
+    ///
+    /// One per annotation whose first span is painted this frame — staged and
+    /// sent alike — and each is a jump target. Positions come from the selection
+    /// registry, which only holds what was painted, so off-screen replies cost
+    /// nothing, and a badge that would land on the previous one is nudged down.
+    fn render_annotation_badges(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut badges: HashMap<(Uuid, usize), (Uuid, usize, Range<usize>)> = HashMap::new();
+        for (index, annotation) in self.composer_annotations.iter().enumerate() {
+            if let Some(part) = annotation.target.spans().first() {
+                badges.insert(
+                    (annotation.target.message_id(), part.ordinal),
+                    (annotation.id, index + 1, part.span.start..part.span.end),
+                );
+            }
+        }
+        if let Some(session) = self.selected_session() {
+            for message in &session.messages {
+                let Some(marks) = self.sent_annotation_resolution.borrow().marks(message.id) else {
+                    continue;
+                };
+                for mark in marks.iter() {
+                    if let Some(number) = mark.number {
+                        badges.entry((message.id, mark.ordinal)).or_insert((
+                            mark.id,
+                            number,
+                            mark.range.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        if badges.is_empty() {
+            return Vec::new();
+        }
+        let theme = Theme::current(cx);
+        let right = self.active_transcript_rows().viewport_bounds().right();
+        let registry = self.transcript_selection.registry.borrow();
+        let mut pushed: Vec<f32> = Vec::new();
+        let mut chips = Vec::new();
+        for entry in registry.entries() {
+            let Some(message_id) = message_id_from_row(&entry.key.row) else {
+                continue;
+            };
+            let Some((id, number, range)) = badges.get(&(message_id, entry.key.index)) else {
+                continue;
+            };
+            let Some(bounds) = md::render::text_range_bounds(&entry.geometry, range)
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            let mut top = bounds.top().as_f32();
+            while pushed.iter().any(|pushed| (pushed - top).abs() < 20.0) {
+                top += 20.0;
+            }
+            pushed.push(top);
+            let id = *id;
+            let number = *number;
+            let waku = cx.entity().downgrade();
+            chips.push(
+                gpui::deferred(
+                    gpui::anchored()
+                        .position(point(right - px(24.0), px(top)))
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("annotation-badge-{id}")))
+                                .size(px(18.0))
+                                .rounded_full()
+                                .bg(theme.accent)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_default()
+                                .occlude()
+                                .child(
+                                    div()
+                                        .text_size(sp(10.5))
+                                        .line_height(sp(12.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.inset)
+                                        .child(number.to_string()),
+                                )
+                                .on_click(move |_, _, cx| {
+                                    let _ = waku.update(cx, |this, cx| {
+                                        this.reveal_annotation_from_card(id, cx);
+                                    });
+                                }),
+                        ),
+                )
+                .into_any_element(),
+            );
+        }
+        chips
+    }
+
     /// Open the comment field over the selection the toolbar captured.
-    pub(super) fn begin_annotation_comment(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn begin_annotation_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input = self.annotation_prompt_input(window, cx);
         input.update(cx, |input, cx| input.set_content("", cx));
-        let mut toolbar = self.selection_toolbar.borrow_mut();
-        let Some(toolbar) = toolbar.as_mut() else {
-            return;
-        };
-        toolbar.comment_open = true;
-        drop(toolbar);
+        {
+            let mut guard = self.selection_toolbar.borrow_mut();
+            let Some(toolbar) = guard.as_mut() else {
+                return;
+            };
+            toolbar.comment_open = true;
+        }
         let focus = input.read(cx).focus();
         window.focus(&focus, cx);
         cx.notify();
@@ -626,7 +722,6 @@ impl Waku {
             *this.selection_toolbar.borrow_mut() = None;
             if changed {
                 this.transcript_selection.selection.borrow_mut().clear();
-                this.composer_annotations_expanded = true;
                 this.capture_and_save_current_composer_draft(cx);
             }
             cx.notify();
@@ -656,7 +751,6 @@ impl Waku {
         };
         if self.stage_selection_annotation(selection, None, cx) {
             self.transcript_selection.selection.borrow_mut().clear();
-            self.composer_annotations_expanded = true;
             self.capture_and_save_current_composer_draft(cx);
             cx.notify();
         }
@@ -668,9 +762,7 @@ impl Waku {
     /// anchored to one message, and a reply that is still streaming is still
     /// moving under the anchor. The parts share the selection's document order,
     /// so a drag across paragraphs stays one annotation.
-    pub(super) fn capture_selection_annotation(
-        &self,
-    ) -> Result<SelectionAnnotation, String> {
+    pub(super) fn capture_selection_annotation(&self) -> Result<SelectionAnnotation, String> {
         let spans = self
             .transcript_selection
             .selection
@@ -809,7 +901,10 @@ impl Waku {
                     .iter_mut()
                     .find(|annotation| annotation.id == id)
                     && let AnnotationTarget::MessageSpan {
-                        spans, quote, block, ..
+                        spans,
+                        quote,
+                        block,
+                        ..
                     } = &mut annotation.target
                 {
                     *spans = union_parts;
@@ -853,7 +948,9 @@ impl Waku {
                 let element = registry
                     .entries()
                     .iter()
-                    .find(|entry| entry.key.index == anchor.ordinal && entry.key.row.as_ref() == row)
+                    .find(|entry| {
+                        entry.key.index == anchor.ordinal && entry.key.row.as_ref() == row
+                    })
                     .map(|entry| entry.text.clone());
                 let quote = element
                     .as_deref()
@@ -888,26 +985,15 @@ impl Waku {
         cx.notify();
     }
 
-    /// Jump from a composer card to the span it quotes.
+    /// Jump to the span an annotation quotes.
     ///
-    /// The scroll is the signal, so it happens even under reduce motion; only
-    /// the decorative flash is suppressed there. The request is applied through
-    /// the same mount-then-reveal path the find bar uses, because the reply may
-    /// be off screen or taller than the viewport.
+    /// Works for a staged card and for a sent annotation's badge. The scroll is
+    /// the signal, so it happens even under reduce motion; only the decorative
+    /// flash is suppressed there. The request is applied through the same
+    /// mount-then-reveal path the find bar uses, because the reply may be off
+    /// screen or taller than the viewport.
     pub(super) fn reveal_annotation_from_card(&mut self, annotation: Uuid, cx: &mut Context<Self>) {
-        let Some((message_id, ordinal, range)) = self
-            .composer_annotations
-            .iter()
-            .find(|annotation_record| annotation_record.id == annotation)
-            .and_then(|annotation| {
-                let message_id = annotation.target.message_id();
-                annotation
-                    .target
-                    .spans()
-                    .first()
-                    .map(|part| (message_id, part.ordinal, part.span.start..part.span.end))
-            })
-        else {
+        let Some((message_id, ordinal, range)) = self.annotation_span(annotation) else {
             return;
         };
         if !cx.reduce_motion() {
@@ -925,6 +1011,39 @@ impl Waku {
             range,
         });
         cx.notify();
+    }
+
+    /// The message, element ordinal and current range an annotation points at.
+    ///
+    /// A staged record is exact. A sent one uses its resolved range once the
+    /// background pass has landed, so the jump lands where the mark is drawn,
+    /// and falls back to the stored anchor otherwise.
+    fn annotation_span(&self, annotation: Uuid) -> Option<(Uuid, usize, Range<usize>)> {
+        if let Some(staged) = self
+            .composer_annotations
+            .iter()
+            .find(|record| record.id == annotation)
+        {
+            return first_annotation_part(staged);
+        }
+        let session = self.selected_session()?;
+        for message in &session.messages {
+            let Some(record) = message
+                .annotations
+                .iter()
+                .find(|record| record.id == annotation)
+            else {
+                continue;
+            };
+            let message_id = record.target.message_id();
+            if let Some(marks) = self.sent_annotation_resolution.borrow().marks(message_id)
+                && let Some(mark) = marks.iter().find(|mark| mark.id == annotation)
+            {
+                return Some((message_id, mark.ordinal, mark.range.clone()));
+            }
+            return first_annotation_part(record);
+        }
+        None
     }
 
     /// Apply a pending card jump once its row exists, then retry on the next
@@ -1077,6 +1196,17 @@ fn annotation_anchor(
             })
             .collect(),
     )
+}
+
+/// The first element range of an annotation, used to place and jump to its
+/// badge.
+fn first_annotation_part(annotation: &MessageAnnotation) -> Option<(Uuid, usize, Range<usize>)> {
+    let message_id = annotation.target.message_id();
+    annotation
+        .target
+        .spans()
+        .first()
+        .map(|part| (message_id, part.ordinal, part.span.start..part.span.end))
 }
 
 impl Render for ConversationNavigationRail {
@@ -1981,9 +2111,7 @@ impl Waku {
                             animate_streaming,
                         )
                         .with_context_menu(menu.clone());
-                    if let Some(marks) =
-                        self.annotation_marks(message.id, &theme, metrics, window, cx)
-                    {
+                    if let Some(marks) = self.annotation_marks(message.id, &theme, window, cx) {
                         ctx = ctx.with_annotations(marks);
                     }
                     if let Some(highlights) = self.transcript_search_highlights(message_index) {
@@ -2109,7 +2237,6 @@ impl Waku {
         &self,
         message_id: Uuid,
         theme: &Theme,
-        metrics: MarkdownMetrics,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<md::render::AnnotationMarks> {
@@ -2123,12 +2250,13 @@ impl Waku {
                     message_id: source,
                     spans,
                     ..
-                } if *source == message_id => Some((index, spans)),
+                } if *source == message_id => Some((index, annotation.id, spans)),
                 _ => None,
             })
-            .flat_map(|(index, spans)| {
+            .flat_map(|(index, id, spans)| {
                 spans.iter().enumerate().map(move |(part_ix, part)| {
                     md::render::AnnotationMark {
+                        id,
                         ordinal: part.ordinal,
                         range: part.span.start..part.span.end,
                         // The number marks the annotation, once: only its
@@ -2182,7 +2310,7 @@ impl Waku {
         });
         (!marks.is_empty()).then(|| md::render::AnnotationMarks {
             marks: Rc::new(marks),
-            style: md::render::AnnotationStyle::from_palette(&palette, metrics.text_size),
+            style: md::render::AnnotationStyle::from_palette(&palette),
             flash,
         })
     }

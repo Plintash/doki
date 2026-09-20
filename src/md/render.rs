@@ -26,11 +26,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Font,
-    FontStyle, FontWeight, Hsla, InteractiveText, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, SharedString,
-    StrikethroughStyle, StyledText, TextAlign, TextLayout, TextRun, UnderlineStyle, Window, canvas,
-    div, font, img, point, prelude::*, px, quad, relative, size,
+    AnyElement, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Font, FontStyle,
+    FontWeight, Hsla, InteractiveText, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, SharedString, StrikethroughStyle,
+    StyledText, TextLayout, TextRun, UnderlineStyle, Window, canvas, div, font, img, point,
+    prelude::*, px, quad, relative, size,
 };
 use regex::Regex;
 
@@ -323,6 +323,8 @@ pub struct SearchHighlights {
 /// the wash remains, because the number was draft vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnnotationMark {
+    /// The annotation the mark belongs to, so a badge can jump back to it.
+    pub id: uuid::Uuid,
     pub ordinal: usize,
     pub range: Range<usize>,
     pub number: Option<usize>,
@@ -348,24 +350,17 @@ pub struct AnnotationFlash {
     pub wash: Hsla,
 }
 
-/// Colors for annotation marks. The badge digit paints in the page color over
-/// the accent fill, so one pair of colors reads on both themes.
+/// Colors for annotation marks. The numbered badge is an element in the
+/// transcript's right gutter now, so only the wash is painted here.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnnotationStyle {
     pub wash: Hsla,
-    pub fill: Hsla,
-    pub digit: Hsla,
-    /// Side of the numbered badge, sized off the body text at render time.
-    pub badge: Pixels,
 }
 
 impl AnnotationStyle {
-    pub fn from_palette(palette: &Palette, text_size: f32) -> Self {
+    pub fn from_palette(palette: &Palette) -> Self {
         Self {
-            wash: palette.accent.opacity(0.16),
-            fill: palette.accent,
-            digit: palette.inset,
-            badge: px((text_size * 0.7).clamp(9.0, 13.0)),
+            wash: palette.accent.opacity(0.20),
         }
     }
 }
@@ -828,7 +823,7 @@ fn text_element_with_selection(
         let code_ranges = flat.code_ranges.clone();
         let layout = layout.clone();
         let key = key.clone();
-        move |_, _, window, cx| {
+        move |_, _, window, _| {
             for range in &code_ranges {
                 for rect in range_rects(&layout, range, CODE_WASH_PAD_X, CODE_WASH_INSET_Y) {
                     window.paint_quad(quad(
@@ -889,11 +884,6 @@ fn text_element_with_selection(
                             gpui::transparent_black(),
                             BorderStyle::default(),
                         ));
-                    }
-                    if let Some(number) = mark.number
-                        && let Some(first_line) = rects.first()
-                    {
-                        paint_annotation_badge(window, cx, first_line, number, annotations.style);
                     }
                 }
             }
@@ -956,50 +946,6 @@ fn text_element_with_selection(
 const ANNOTATION_WASH_PAD_X: f32 = 1.0;
 const ANNOTATION_WASH_INSET_Y: f32 = 1.0;
 const ANNOTATION_WASH_RADIUS: f32 = 2.0;
-
-/// Paint one numbered badge in the leading above a mark's first line.
-///
-/// The badge is painted rather than rendered as an element on purpose:
-/// inserting a glyph into the text would reflow the paragraph and move the very
-/// byte range the mark addresses. A line box is taller than the glyphs inside
-/// it, so the leading above the first line holds the number without covering
-/// any text.
-fn paint_annotation_badge(
-    window: &mut Window,
-    cx: &mut App,
-    first_line: &Bounds<Pixels>,
-    number: usize,
-    style: AnnotationStyle,
-) {
-    let side = style.badge;
-    let origin = point(first_line.left(), first_line.top() + px(1.0));
-    window.paint_quad(quad(
-        Bounds::new(origin, size(side, side)),
-        side / 2.0,
-        style.fill,
-        px(0.0),
-        gpui::transparent_black(),
-        BorderStyle::default(),
-    ));
-    let text = SharedString::from(number.to_string());
-    let run = TextRun {
-        len: text.len(),
-        font: Font {
-            weight: FontWeight::SEMIBOLD,
-            ..font(MONO_FAMILY)
-        },
-        color: style.digit,
-        ..Default::default()
-    };
-    let line = window
-        .text_system()
-        .shape_line(text, side * 0.78, &[run], None);
-    let text_origin = point(
-        origin.x + (side - line.width) / 2.0,
-        origin.y + (side - px(f32::from(line.ascent + line.descent))) / 2.0,
-    );
-    let _ = line.paint(text_origin, side, TextAlign::Left, None, window, cx);
-}
 
 fn text_element(flat: &Rc<FlatText>, key: TextKey, ctx: &Ctx) -> AnyElement {
     if ctx.math_enabled && flat.math.is_some() {
