@@ -314,19 +314,21 @@ pub struct SearchHighlights {
     pub active: Option<TextSearchMatch>,
 }
 
-/// One staged annotation's mark inside a message.
+/// One annotation's mark inside a message.
 ///
 /// `range` addresses the same flattened rendered text a search hit does, and
 /// `number` is the annotation's position in the composer list — the number the
-/// user reads on the card, so a mark and a card can be matched by eye.
+/// user reads on the card, so a mark and a card can be matched by eye. A mark
+/// for a *sent* annotation has no draft number: the badge is dropped and only
+/// the wash remains, because the number was draft vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnnotationMark {
     pub ordinal: usize,
     pub range: Range<usize>,
-    pub number: usize,
+    pub number: Option<usize>,
 }
 
-/// This message's staged marks and the treatment they paint with.
+/// This message's marks and the treatment they paint with.
 #[derive(Clone)]
 pub struct AnnotationMarks {
     pub marks: Rc<Vec<AnnotationMark>>,
@@ -875,14 +877,10 @@ fn text_element_with_selection(
                             BorderStyle::default(),
                         ));
                     }
-                    if let Some(first_line) = rects.first() {
-                        paint_annotation_badge(
-                            window,
-                            cx,
-                            first_line,
-                            mark.number,
-                            annotations.style,
-                        );
+                    if let Some(number) = mark.number
+                        && let Some(first_line) = rects.first()
+                    {
+                        paint_annotation_badge(window, cx, first_line, number, annotations.style);
                     }
                 }
             }
@@ -1330,6 +1328,66 @@ pub fn plain_search_matches(
     let mut matches = Vec::new();
     let limited = search_text(text, ordinal, regex, cap, &mut matches);
     (matches, limited)
+}
+
+/// Flatten every shaped text element of a markdown source into the ordinal the
+/// renderer assigns it, in paint order.
+///
+/// Deliberately the same block shapes and ordinal advance as
+/// [`markdown_search_matches`] — the find bar's canonical walk — so an anchor
+/// re-resolved here points at the exact glyph range the renderer will paint.
+/// Pure and gpui-free, so the annotation re-anchor pass can run it on the
+/// background executor instead of against a live [`MarkdownView`].
+pub fn markdown_element_texts(source: &str) -> Vec<(usize, String)> {
+    let tree = super::parser::parse(source);
+    let mut texts = Vec::new();
+    for (block_ix, top) in tree.blocks.iter().enumerate() {
+        let mut ordinal = block_ordinal_base(block_ix);
+        collect_block_texts(&top.block, &mut ordinal, &mut texts);
+    }
+    texts
+}
+
+fn collect_block_texts(block: &Block, ordinal: &mut usize, texts: &mut Vec<(usize, String)>) {
+    match block {
+        Block::Paragraph { runs } | Block::Heading { runs, .. } => {
+            let text = runs.iter().map(|run| run.text.as_str()).collect::<String>();
+            let current = *ordinal;
+            *ordinal += 1;
+            texts.push((current, text));
+        }
+        Block::CodeBlock { code, .. } | Block::DisplayMath { latex: code } => {
+            let current = *ordinal;
+            *ordinal += 1;
+            texts.push((current, code.clone()));
+        }
+        Block::Image { .. } => {
+            // The renderer consumes an ordinal for the image id, but the alt
+            // caption is not a shaped text element.
+            *ordinal += 1;
+        }
+        Block::BlockQuote { children } => {
+            for child in children {
+                collect_block_texts(child, ordinal, texts);
+            }
+        }
+        Block::List { items, .. } => {
+            for item in items {
+                for child in &item.blocks {
+                    collect_block_texts(child, ordinal, texts);
+                }
+            }
+        }
+        Block::Table { header, rows, .. } => {
+            for cell in header.iter().chain(rows.iter().flat_map(|row| row.iter())) {
+                let text = cell.iter().map(|run| run.text.as_str()).collect::<String>();
+                let current = *ordinal;
+                *ordinal += 1;
+                texts.push((current, text));
+            }
+        }
+        Block::Rule => {}
+    }
 }
 
 fn search_block(
@@ -2137,6 +2195,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 7..10), (1 << 16, 0..3), ((2 << 16) + 1, 0..3)]
         );
+    }
+
+    /// The re-anchor pass flattens a reply's text elements itself, on the
+    /// background executor, so it must land on exactly the ordinals the
+    /// renderer and the find bar use. Checked against the search walk's hits,
+    /// which are the same address space a mark paints in.
+    #[test]
+    fn markdown_element_texts_agrees_with_the_search_walk() {
+        let source = "first\n\n> quoted *needle*\n\n```txt\nneedle\n```";
+        let (matches, limited) =
+            markdown_search_matches(source, &Regex::new("needle").unwrap(), 20);
+        assert!(!limited);
+        assert_eq!(matches.len(), 2);
+        let texts = markdown_element_texts(source);
+        for found in &matches {
+            let (_, text) = texts
+                .iter()
+                .find(|(ordinal, _)| *ordinal == found.ordinal)
+                .expect("every search ordinal has an element");
+            assert_eq!(&text[found.range.clone()], "needle");
+        }
+        // Card markers, images and rules consume ordinals without a shaped
+        // element; the walk still has to leave the gap so later blocks agree.
+        assert!(texts.iter().any(|(ordinal, _)| *ordinal == 2 << 16));
     }
 
     fn runs_of(source: &str) -> Vec<InlineRun> {

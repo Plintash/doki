@@ -1112,6 +1112,7 @@ annotation.collapse: 注釈を隠す
 annotation.remove: 注釈を削除
 annotation.remove_all: 注釈をすべて削除
 annotation.selected_text: "引用したテキスト："
+annotation.create: 選択範囲を注釈
 annotation.user_comment: "ユーザーのコメント："
 annotation.reply_only: 注釈はアシスタントの返信にのみ付けられます
 annotation.select_reply: 返信の中のテキストを選択してください
