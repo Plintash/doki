@@ -51,6 +51,6 @@ rebuild or replace the installed `Doki.app` while the user is working in it.
 
 ## 8. Validation
 
-- [ ] 8.1 Walk both spec files' scenarios in the freshly rebuilt debug app and record the outcome for each
+- [x] 8.1 Walk both spec files' scenarios in the freshly rebuilt debug app and record the outcome for each (validated over several live passes across selection, staging, hover review, send, edit-resend, jumping and the keyboard flow; no defects found)
 - [x] 8.2 Re-read `docs/performance.md` and confirm the annotation paths add no I/O, subprocess, or per-frame work, and that the pulse lease parks when no flash is active
 - [x] 8.3 Confirm `openspec validate add-message-annotations --strict` stays green and that no provider driver or daemon command changed
