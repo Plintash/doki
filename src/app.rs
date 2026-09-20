@@ -1290,6 +1290,16 @@ pub struct Waku {
     /// to be written back as the field changes; the map is pruned whenever the
     /// staged set changes.
     annotation_comment_inputs: RefCell<HashMap<Uuid, Entity<TextInput>>>,
+    /// Sent annotations re-anchored against the reply each points at. Filled by
+    /// one background pass per session signature, never resolved on a frame;
+    /// a render reads only these ranges.
+    sent_annotation_resolution: RefCell<annotation_resolution::SentAnnotationResolution>,
+    /// Sent user messages whose annotation indicator is expanded. Keyed by
+    /// message id; collapsed is the default so the transcript stays quiet.
+    expanded_sent_annotations: HashSet<Uuid>,
+    /// Focus for a sent message's annotation indicator, one per message,
+    /// created on demand because the row renders from `&self`.
+    sent_annotation_focus: RefCell<HashMap<Uuid, FocusHandle>>,
     /// Window-modal expansion of an image attachment. The path is already
     /// cached attachment metadata; render never probes the filesystem.
     image_preview: Option<image_preview::ImagePreviewState>,
@@ -1641,6 +1651,7 @@ pub struct Waku {
 
 mod activity_diff;
 mod annotation_projection;
+mod annotation_resolution;
 mod autocomplete;
 mod background_work;
 mod branches;
@@ -2853,6 +2864,11 @@ impl Waku {
                 annotations_focus: cx.focus_handle(),
                 annotation_card_focus: RefCell::new(HashMap::new()),
                 annotation_comment_inputs: RefCell::new(HashMap::new()),
+                sent_annotation_resolution: RefCell::new(
+                    annotation_resolution::SentAnnotationResolution::default(),
+                ),
+                expanded_sent_annotations: HashSet::new(),
+                sent_annotation_focus: RefCell::new(HashMap::new()),
                 image_preview: None,
                 image_preview_generation: 0,
                 remote_images: RefCell::new(HashMap::new()),

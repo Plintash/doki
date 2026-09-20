@@ -172,6 +172,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.prefetch_checkpoint_refs(cx);
+        self.sync_sent_annotation_resolution(cx);
         self.sync_transcript_rows();
         self.sync_transcript_layout_width(window);
         self.apply_pending_transcript_search_reveal(window, cx);
@@ -1236,6 +1237,59 @@ impl Waku {
             .set(self.checkpoint_ref_generation.get().wrapping_add(1));
     }
 
+    /// Re-anchor the annotations sent messages carry, once per session
+    /// signature.
+    ///
+    /// A sent annotation stores the element ordinal and byte range it was
+    /// taken from, and its reply is reparsed on every load, so those ranges
+    /// must be verified against the current rendering. That verification is a
+    /// markdown parse per reply and must never run on a frame: this compares a
+    /// cheap signature once per frame, hands the parses to the background
+    /// executor, and a render reads only the cache the pass fills in. A
+    /// superseded pass cannot overwrite newer state, because a result is only
+    /// stored while the signature that produced it still holds.
+    fn sync_sent_annotation_resolution(&self, cx: &mut Context<Self>) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        let signature = annotation_resolution::sent_annotation_signature(session);
+        if self.sent_annotation_resolution.borrow().signature() == Some(signature) {
+            return;
+        }
+        let jobs = annotation_resolution::resolution_jobs(session);
+        self.sent_annotation_resolution
+            .borrow_mut()
+            .reset(signature);
+        if jobs.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let resolved = cx
+                .background_executor()
+                .spawn(async move {
+                    jobs.into_iter()
+                        .map(|(message_id, content, anchors)| {
+                            (
+                                message_id,
+                                annotation_resolution::resolve_sent_annotations(&content, &anchors),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                {
+                    let mut cache = this.sent_annotation_resolution.borrow_mut();
+                    for (message_id, marks) in resolved {
+                        cache.insert(signature, message_id, marks);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Resolve the selected session's checkpoint refs on the background
     /// executor — one `git for-each-ref` per session per invalidation — and
     /// cache which retained turn counts have one. The rewind affordance
@@ -1501,7 +1555,7 @@ impl Waku {
                             animate_streaming,
                         )
                         .with_context_menu(menu.clone());
-                    if let Some(marks) = self.staged_annotation_marks(message.id, &theme, metrics) {
+                    if let Some(marks) = self.annotation_marks(message.id, &theme, metrics) {
                         ctx = ctx.with_annotations(marks);
                     }
                     if let Some(highlights) = self.transcript_search_highlights(message_index) {
@@ -1517,10 +1571,12 @@ impl Waku {
                             view.set_text(message.visible_content(), message.streaming);
                             &*view
                         });
+                    let sent_annotations = self.sent_annotation_indicator(&message, cx);
                     let rendered = render_message(
                         MessageRender {
                             theme: &theme,
                             message: &message,
+                            sent_annotations,
                             assistant_footer_copy_content,
                             assistant_footer_time,
                             copied,
@@ -1612,20 +1668,22 @@ impl Waku {
         row.into_any_element()
     }
 
-    /// The marks this reply's staged annotations paint.
+    /// The marks this reply's annotations paint.
     ///
-    /// Staged anchors were created against this frame's own render, so no
-    /// re-resolution happens here: the stored ordinal and range are exact, and
-    /// the number is the annotation's position in the composer list — the one
-    /// the card shows. `None` when this reply has none, which is the common
-    /// case and costs nothing.
-    fn staged_annotation_marks(
+    /// Staged anchors were created against this frame's own render, so their
+    /// ordinal and range are exact and their number is the composer card's;
+    /// no re-resolution happens here. Sent anchors come from the background
+    /// resolution cache, never from a parse on this path, and are unnumbered —
+    /// the draft's vocabulary is released once the message is sent. `None`
+    /// when this reply has neither, which is the common case and costs
+    /// nothing.
+    fn annotation_marks(
         &self,
         message_id: Uuid,
         theme: &Theme,
         metrics: MarkdownMetrics,
     ) -> Option<md::render::AnnotationMarks> {
-        let marks = self
+        let mut marks = self
             .composer_annotations
             .iter()
             .enumerate()
@@ -1638,11 +1696,14 @@ impl Waku {
                 } if *source == message_id => Some(md::render::AnnotationMark {
                     ordinal: *ordinal,
                     range: span.start..span.end,
-                    number: index + 1,
+                    number: Some(index + 1),
                 }),
                 _ => None,
             })
             .collect::<Vec<_>>();
+        if let Some(sent) = self.sent_annotation_resolution.borrow().marks(message_id) {
+            marks.extend(sent.iter().cloned());
+        }
         (!marks.is_empty()).then(|| md::render::AnnotationMarks {
             marks: Rc::new(marks),
             style: md::render::AnnotationStyle::from_palette(
@@ -1650,6 +1711,64 @@ impl Waku {
                 metrics.text_size,
             ),
         })
+    }
+
+    /// What a sent message's annotation indicator needs, or `None` when it
+    /// carries none. Entries are cloned only while the detail is showing, so a
+    /// collapsed indicator costs a count and a focus handle.
+    fn sent_annotation_indicator(
+        &self,
+        message: &Message,
+        cx: &mut Context<Self>,
+    ) -> Option<SentAnnotationIndicator> {
+        if message.annotations.is_empty() {
+            return None;
+        }
+        let focus = self
+            .sent_annotation_focus
+            .borrow_mut()
+            .entry(message.id)
+            .or_insert_with(|| cx.focus_handle())
+            .clone();
+        let expanded = self.expanded_sent_annotations.contains(&message.id);
+        let entries = if expanded {
+            message
+                .annotations
+                .iter()
+                .filter_map(|annotation| match &annotation.target {
+                    AnnotationTarget::MessageSpan { quote, .. } => Some(SentAnnotationEntry {
+                        quote: quote.clone(),
+                        comment: annotation.comment.clone(),
+                    }),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(SentAnnotationIndicator {
+            count: message.annotations.len(),
+            expanded,
+            focus,
+            entries,
+        })
+    }
+
+    /// Open or close one sent message's annotation detail. The row's height
+    /// changes, so it is remeasured in the same frame the virtualized list
+    /// would otherwise keep the old size.
+    pub(super) fn toggle_sent_annotations(&mut self, message_id: Uuid, cx: &mut Context<Self>) {
+        if !self.expanded_sent_annotations.insert(message_id) {
+            self.expanded_sent_annotations.remove(&message_id);
+        }
+        if let Some(index) = self.selected_session().and_then(|session| {
+            session
+                .messages
+                .iter()
+                .position(|message| message.id == message_id)
+        }) {
+            self.remeasure_transcript_message(index);
+        }
+        cx.notify();
     }
 
     fn render_response_footer_row(
@@ -3317,5 +3436,36 @@ mod live_reasoning_window_tests {
     fn window_below_the_threshold_keeps_the_cached_start() {
         let content = "a".repeat(LIVE_REASONING_WINDOW_MAX);
         assert_eq!(live_reasoning_window_anchor(7, &content), 7);
+    }
+}
+
+#[cfg(test)]
+mod annotation_frame_path_tests {
+    /// A render must never re-anchor anything: it reads the cache the
+    /// background pass filled. Encoding that as a source guard keeps a later
+    /// edit from quietly moving the parse back onto the frame, where it would
+    /// run for every visible annotated reply on every frame — including every
+    /// stream commit while a reply is still typing.
+    #[test]
+    fn the_render_path_reads_the_cache_and_never_resolves() {
+        let source = include_str!("transcript_view.rs");
+        let start = source
+            .find("\n    fn annotation_marks(")
+            .expect("annotation_marks");
+        let body = &source[start + 1..];
+        let end = body
+            .find("\n    /// What a sent message's annotation indicator needs")
+            .expect("sent_annotation_indicator");
+        let body = &body[..end];
+        for forbidden in [
+            "resolve_sent_annotations",
+            "markdown_element_texts",
+            "parser::parse",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "annotation_marks must read only the resolution cache; found `{forbidden}`",
+            );
+        }
     }
 }
