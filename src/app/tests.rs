@@ -47,6 +47,34 @@ fn a_blank_comment_field_stores_no_comment() {
     );
 }
 
+/// The hover preview is read-only by contract: it describes the staged
+/// annotations, so a control inside it would fight the pointer's next move.
+#[test]
+fn the_annotation_hover_preview_has_no_controls() {
+    let source = include_str!("composer.rs");
+    let start = source
+        .find("fn render_annotation_preview(")
+        .expect("the hover preview renderer must exist");
+    let body = &source[start..];
+    let end = body
+        .find("\n    /// One annotation card")
+        .expect("the preview must stay ahead of the card renderer");
+    let body = &body[..end];
+    for forbidden in [
+        "on_click(",
+        "on_activation(",
+        "on_action(",
+        "track_focus(",
+        "tab_index(",
+        "TextField::new(",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "the annotation hover preview must stay read-only; found `{forbidden}`"
+        );
+    }
+}
+
 #[test]
 fn structured_user_input_preserves_question_order_and_custom_answer_precedence() {
     let questions = vec![

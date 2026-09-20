@@ -1300,6 +1300,13 @@ pub struct Waku {
     /// Focus for a sent message's annotation indicator, one per message,
     /// created on demand because the row renders from `&self`.
     sent_annotation_focus: RefCell<HashMap<Uuid, FocusHandle>>,
+    /// How many of the annotation label and its hover preview the pointer is
+    /// inside. A count rather than a flag, so a pointer moving from the label
+    /// into the preview cannot land the leave after the enter and blink it shut.
+    annotation_preview_hover: Cell<u32>,
+    /// Screen bounds of the annotation label, recorded by a paint-time probe so
+    /// the hover preview can anchor above it. Read on the hovered frame only.
+    annotation_label_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Window-modal expansion of an image attachment. The path is already
     /// cached attachment metadata; render never probes the filesystem.
     image_preview: Option<image_preview::ImagePreviewState>,
@@ -2869,6 +2876,8 @@ impl Waku {
                 ),
                 expanded_sent_annotations: HashSet::new(),
                 sent_annotation_focus: RefCell::new(HashMap::new()),
+                annotation_preview_hover: Cell::new(0),
+                annotation_label_bounds: Rc::new(Cell::new(None)),
                 image_preview: None,
                 image_preview_generation: 0,
                 remote_images: RefCell::new(HashMap::new()),

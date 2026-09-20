@@ -2143,6 +2143,50 @@ mod tests {
     }
 
     #[test]
+    fn switching_sessions_keeps_each_sessions_staged_annotations() {
+        // Switching sessions is capture(current) -> restore(next) against this
+        // store, so the behaviour to pin is two sessions holding different
+        // staged sets at once, with the first one coming back intact.
+        let first_session = Uuid::new_v4();
+        let second_session = Uuid::new_v4();
+        let staged = vec![
+            sample_annotation(Uuid::new_v4(), Some("this drops the error")),
+            sample_annotation(Uuid::new_v4(), None),
+        ];
+        let mut drafts = ComposerDrafts::default();
+        drafts.set(
+            ComposerDraftKey::Session(first_session),
+            ComposerDraft {
+                text: String::new(),
+                attachments: Vec::new(),
+                annotations: staged.clone(),
+            },
+        );
+        // A draft staged on the other session must not merge into the first.
+        drafts.set(
+            ComposerDraftKey::Session(second_session),
+            ComposerDraft {
+                text: "a note on the other task".to_owned(),
+                attachments: Vec::new(),
+                annotations: Vec::new(),
+            },
+        );
+
+        let restored = drafts
+            .get(ComposerDraftKey::Session(first_session))
+            .expect("the first session's draft is still stored");
+        assert_eq!(restored.annotations, staged);
+        assert_eq!(
+            restored.annotations[0].comment.as_deref(),
+            Some("this drops the error")
+        );
+        assert_eq!(restored.annotations[1].comment, None);
+        let AnnotationTarget::MessageSpan { quote, span, .. } = &restored.annotations[0].target;
+        assert_eq!(quote, "retry helper");
+        assert_eq!((span.start, span.end), (4, 16));
+    }
+
+    #[test]
     fn composer_draft_changes_preserve_unrelated_client_keys() {
         let directory = temporary_directory();
         let store = ComposerDraftStore::for_state_path(&directory.join("app.db"));

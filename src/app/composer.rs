@@ -56,6 +56,18 @@ pub(super) fn annotation_comment_value(text: &str) -> Option<String> {
     (!text.trim().is_empty()).then(|| text.to_owned())
 }
 
+/// Records the annotation label's screen bounds for the hover preview's anchor.
+/// `inset_0` inside the label's own relative box reports the label rather than
+/// the composer card, so the preview sits above the chip the pointer is on.
+fn annotation_label_bounds_probe(bounds: Rc<Cell<Option<Bounds<Pixels>>>>) -> impl IntoElement {
+    canvas(
+        move |recorded: Bounds<Pixels>, _, _| bounds.set(Some(recorded)),
+        |_, _, _, _| (),
+    )
+    .absolute()
+    .inset_0()
+}
+
 impl Waku {
     // ── Permission ─────────────────────────────────────────────────────────
 
@@ -2179,6 +2191,7 @@ impl Waku {
             .collect::<Vec<_>>();
         let annotations = std::mem::take(&mut self.composer_annotations);
         self.annotation_comment_inputs.borrow_mut().clear();
+        self.reset_annotation_preview_hover();
         let mentions = attachments
             .iter()
             .map(|attachment| attachment.mention.clone())
@@ -2413,6 +2426,7 @@ impl Waku {
             tr!("annotation.count_other", count = count)
         };
         let expanded = self.composer_annotations_expanded;
+        let preview_open = self.annotation_preview_hover.get() > 0;
         let mut list = div()
             .px(px(14.0))
             .pt(px(2.0))
@@ -2428,6 +2442,7 @@ impl Waku {
                     .child(
                         div()
                             .id("composer-annotations-label")
+                            .relative()
                             .flex()
                             .items_center()
                             .gap(px(6.0))
@@ -2441,11 +2456,12 @@ impl Waku {
                             .track_focus(&self.annotations_focus)
                             .tab_index(0)
                             .focus_visible(|style| style.border_color(theme.accent))
-                            .tooltip(Tooltip::text(if expanded {
-                                tr!("annotation.collapse")
-                            } else {
-                                tr!("annotation.expand")
+                            .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
+                                this.set_annotation_preview_hover(*hovering, cx);
                             }))
+                            .child(annotation_label_bounds_probe(
+                                self.annotation_label_bounds.clone(),
+                            ))
                             .child(icon("icons/compose.svg", 12.5, theme.text_secondary))
                             .child(
                                 div()
@@ -2475,6 +2491,7 @@ impl Waku {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.composer_annotations.clear();
                                 this.composer_annotations_expanded = false;
+                                this.reset_annotation_preview_hover();
                                 this.focused_annotation = None;
                                 this.capture_and_save_current_composer_draft(cx);
                                 cx.notify();
@@ -2486,7 +2503,148 @@ impl Waku {
                 list = list.child(self.render_annotation_card(index, window, cx));
             }
         }
+        // The preview lives in the deferred layer, so the composer card cannot
+        // clip it and it never shares layout with the cards it describes.
+        if preview_open && let Some(bounds) = self.annotation_label_bounds.get() {
+            list = list.child(
+                gpui::deferred(
+                    gpui::anchored()
+                        .position(point(bounds.origin.x, bounds.origin.y - px(6.0)))
+                        .anchor(gpui::Anchor::BottomLeft)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(self.render_annotation_preview(&theme, cx)),
+                )
+                .with_priority(1),
+            );
+        }
         list
+    }
+
+    /// Forget the label's hover tracking. The counters only ever step down on a
+    /// leave event, and a label that disappears under the pointer never sends
+    /// one, so whatever drops the staged set has to clear them or a later
+    /// staging would show the preview with no pointer on the label.
+    pub(super) fn reset_annotation_preview_hover(&self) {
+        self.annotation_preview_hover.set(0);
+    }
+
+    /// Track the annotation label and its preview as one hover region. Leaving
+    /// one and entering the other lands both events in the same frame's
+    /// dispatch, and a count keeps the order from mattering.
+    fn set_annotation_preview_hover(&mut self, hovering: bool, cx: &mut Context<Self>) {
+        let count = self.annotation_preview_hover.get();
+        let next = if hovering {
+            count.saturating_add(1)
+        } else {
+            count.saturating_sub(1)
+        };
+        if next != count {
+            self.annotation_preview_hover.set(next);
+            cx.notify();
+        }
+    }
+
+    /// The read-only hover preview: the same quotes, comments and numbers the
+    /// cards carry, with nothing focusable or clickable inside it. It reads the
+    /// staged records already in memory, so hovering never parses or does IO.
+    fn render_annotation_preview(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.composer_annotations.len();
+        let header = if count == 1 {
+            tr!("annotation.count_one", count = count)
+        } else {
+            tr!("annotation.count_other", count = count)
+        };
+        let mut card = div()
+            .id("composer-annotation-preview")
+            .w(px(320.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .px(px(10.0))
+            .py(px(9.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.raised)
+            .shadow_lg()
+            .occlude()
+            .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
+                this.set_annotation_preview_hover(*hovering, cx);
+            }))
+            .child(
+                div()
+                    .text_size(sp(11.0))
+                    .line_height(sp(14.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_tertiary)
+                    .child(header),
+            );
+        for (index, annotation) in self.composer_annotations.iter().enumerate() {
+            let quote = match &annotation.target {
+                AnnotationTarget::MessageSpan { quote, .. } => quote.as_str(),
+            };
+            let mut body = div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(sp(12.0))
+                        .line_height(sp(16.0))
+                        .text_color(theme.text)
+                        .line_clamp(3)
+                        .child(SharedString::from(quote.to_owned())),
+                );
+            if let Some(comment) = annotation.comment.as_deref() {
+                body = body.child(
+                    div()
+                        .text_size(sp(12.0))
+                        .line_height(sp(16.0))
+                        .text_color(theme.text_tertiary)
+                        .line_clamp(2)
+                        .child(SharedString::from(comment.to_owned())),
+                );
+            }
+            card = card.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(14.0))
+                            .rounded_full()
+                            .bg(theme.accent)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(sp(9.0))
+                                    .line_height(sp(11.0))
+                                    .text_color(theme.inset)
+                                    .child((index + 1).to_string()),
+                            ),
+                    )
+                    .child(body),
+            );
+        }
+        // The expand/collapse hint that used to live in the label's tooltip;
+        // the preview supersedes that tooltip, so the hint moves here as text.
+        card.child(
+            div()
+                .text_size(sp(11.0))
+                .line_height(sp(14.0))
+                .text_color(theme.text_tertiary)
+                .child(if self.composer_annotations_expanded {
+                    tr!("annotation.collapse")
+                } else {
+                    tr!("annotation.expand")
+                }),
+        )
     }
 
     /// One annotation card: what it quotes, which number it carries, and the
@@ -2571,6 +2729,7 @@ impl Waku {
                             }
                             if this.composer_annotations.is_empty() {
                                 this.composer_annotations_expanded = false;
+                                this.reset_annotation_preview_hover();
                             }
                             this.focused_annotation = None;
                             this.capture_and_save_current_composer_draft(cx);
