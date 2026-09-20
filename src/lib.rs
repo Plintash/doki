@@ -107,7 +107,9 @@ actions!(
         WebviewCopy,
         WebviewCut,
         WebviewPaste,
-        WebviewSelectAll
+        WebviewSelectAll,
+        FocusNext,
+        FocusPrev
     ]
 );
 
@@ -260,6 +262,10 @@ pub fn run() {
                 KeyBinding::new("secondary-u", ToggleUsagePanel, None),
                 KeyBinding::new("secondary-s", SaveFile, None),
                 KeyBinding::new("escape", CancelTurn, Some("Waku")),
+                // GPUI's focus_next/focus_prev are not bound by default, so Tab
+                // does nothing without this. Zed binds the same pair.
+                KeyBinding::new("tab", FocusNext, Some("Waku")),
+                KeyBinding::new("shift-tab", FocusPrev, Some("Waku")),
                 // Escape inside the annotation comment field or editor closes
                 // the overlay before it can cancel the turn.
                 KeyBinding::new("escape", DismissAnnotationEditor, Some("AnnotationEditor")),

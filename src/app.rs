@@ -68,12 +68,12 @@ use crate::ui::{
 };
 use crate::{
     AnnotateSelection, CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch,
-    CopySelection, DismissAnnotationEditor, FindNext, FindPrevious, FocusComposer, NavigateBack,
-    NavigateForward, NewProject, NewSession, OpenFind, OpenFindReplace, OpenResumePicker,
-    OpenSettings, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask, SwitchTaskBackward,
-    SwitchTaskForward, ToggleCommandPalette, ToggleFindCaseSensitive, ToggleFindRegex,
-    ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
-    ToggleUsagePanel,
+    CopySelection, DismissAnnotationEditor, FindNext, FindPrevious, FocusComposer, FocusNext,
+    FocusPrev, NavigateBack, NavigateForward, NewProject, NewSession, OpenFind, OpenFindReplace,
+    OpenResumePicker, OpenSettings, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask,
+    SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette, ToggleFindCaseSensitive,
+    ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel,
+    ToggleSidebar, ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]

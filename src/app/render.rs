@@ -306,6 +306,8 @@ impl Render for Waku {
             .on_action(cx.listener(Self::toggle_usage_panel_action))
             .on_action(cx.listener(Self::save_right_panel_file_action))
             .on_action(cx.listener(Self::cancel_turn_action))
+            .on_action(cx.listener(|_, _: &FocusNext, window, cx| window.focus_next(cx)))
+            .on_action(cx.listener(|_, _: &FocusPrev, window, cx| window.focus_prev(cx)))
             .on_action(cx.listener(Self::copy_selection_action))
             .on_action(cx.listener(Self::annotate_selection_action))
             .on_action(cx.listener(Self::open_find_action))
