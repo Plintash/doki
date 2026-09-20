@@ -807,7 +807,8 @@ impl Waku {
         (viewport.size.height > px(0.0) && viewport.size.width > px(0.0)).then_some(viewport)
     }
 
-    /// Keep the annotation editor fully inside the safe region.
+    /// Keep the annotation editor fully inside the safe region, clearing the
+    /// scroll-to-bottom button that sits at the bottom centre of the list.
     pub(super) fn clamp_annotation_editor(&self, anchor: Point<Pixels>) -> Point<Pixels> {
         let Some(safe) = self.annotation_safe_bounds() else {
             return anchor;
@@ -817,10 +818,11 @@ impl Waku {
             .x
             .min(safe.right() - px(EDITOR_WIDTH) - margin)
             .max(safe.left() + margin);
-        // The editor is about this tall; keep its bottom above the composer.
+        // The editor is about this tall, and the bottom lip keeps it above the
+        // 32px scroll-to-bottom button and its 8px inset.
         let y = anchor
             .y
-            .min(safe.bottom() - px(EDITOR_HEIGHT) - margin)
+            .min(safe.bottom() - px(EDITOR_HEIGHT) - px(48.0))
             .max(safe.top() + margin);
         point(x, y)
     }

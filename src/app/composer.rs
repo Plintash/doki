@@ -2435,6 +2435,7 @@ impl Waku {
                     .id("composer-annotations-label")
                     .relative()
                     .flex()
+                    .self_start()
                     .items_center()
                     .gap(px(6.0))
                     .pl(px(8.0))
