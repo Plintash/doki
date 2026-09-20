@@ -69,9 +69,9 @@ use crate::ui::{
 };
 use crate::{
     AnnotateSelection, CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch,
-    CopySelection, FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward,
-    NewProject, NewSession, OpenFind, OpenFindReplace, OpenResumePicker, OpenSettings,
-    ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask, SwitchTaskBackward,
+    CopySelection, DismissAnnotationEditor, FindNext, FindPrevious, FocusComposer, NavigateBack,
+    NavigateForward, NewProject, NewSession, OpenFind, OpenFindReplace, OpenResumePicker,
+    OpenSettings, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask, SwitchTaskBackward,
     SwitchTaskForward, ToggleCommandPalette, ToggleFindCaseSensitive, ToggleFindRegex,
     ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
     ToggleUsagePanel,
@@ -886,6 +886,13 @@ struct SelectionToolbar {
     comment_open: bool,
 }
 
+/// The floating editor a clicked annotation badge opens: the annotation's
+/// comment, with delete, cancel and save. `anchor` is just right of the badge.
+struct AnnotationEditor {
+    id: Uuid,
+    anchor: Point<Pixels>,
+}
+
 /// The transient highlight a card activation leaves on its span. The paint
 /// fades it from `started`; a lease on the pulse clock keeps redrawing until it
 /// lapses. Never created under reduce motion.
@@ -1358,6 +1365,13 @@ pub struct Waku {
     selection_toolbar: RefCell<Option<SelectionToolbar>>,
     /// The one comment field the selection toolbar's "Add to chat" opens.
     annotation_prompt_input: RefCell<Option<Entity<TextInput>>>,
+    /// The annotation whose spans are highlighted and whose editor is open.
+    /// Nothing is highlighted while this is `None`.
+    active_annotation: Cell<Option<Uuid>>,
+    /// The floating comment editor a badge click opened.
+    annotation_editor: RefCell<Option<AnnotationEditor>>,
+    /// The comment field the badge editor edits.
+    annotation_editor_input: RefCell<Option<Entity<TextInput>>>,
     /// How many of the annotation label and its hover preview the pointer is
     /// inside. A count rather than a flag, so a pointer moving from the label
     /// into the preview cannot land the leave after the enter and blink it shut.
@@ -2939,6 +2953,9 @@ impl Waku {
                 annotation_flash: Cell::new(None),
                 selection_toolbar: RefCell::new(None),
                 annotation_prompt_input: RefCell::new(None),
+                active_annotation: Cell::new(None),
+                annotation_editor: RefCell::new(None),
+                annotation_editor_input: RefCell::new(None),
                 annotation_preview_hover: Cell::new(0),
                 annotation_label_bounds: Rc::new(Cell::new(None)),
                 image_preview: None,

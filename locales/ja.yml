@@ -292,6 +292,7 @@ common.copy_to_composer: 入力欄にコピー
 common.copy_code: コードをコピー
 common.copy_expression: 数式をコピー
 common.cancel: キャンセル
+common.save: 保存
 common.send: 送信
 
 session.fork_task: タスクをフォーク

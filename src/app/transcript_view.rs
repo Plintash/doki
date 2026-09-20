@@ -380,6 +380,7 @@ impl Waku {
             .children(search_bar)
             .children(self.render_selection_toolbar(cx))
             .children(self.render_annotation_badges(cx))
+            .children(self.render_annotation_editor(cx))
             .into_any_element()
     }
 
@@ -500,6 +501,7 @@ impl Waku {
         let card: AnyElement = if toolbar.comment_open {
             let input = self.annotation_prompt_input.borrow().clone()?;
             div()
+                .id("annotation-comment-field")
                 .w(px(360.0))
                 .h(px(36.0))
                 .px(px(14.0))
@@ -511,17 +513,17 @@ impl Waku {
                 .bg(theme.raised)
                 .shadow_md()
                 .occlude()
+                .key_context("AnnotationEditor")
+                .on_action(cx.listener(|this, _: &DismissAnnotationEditor, _, cx| {
+                    this.dismiss_annotation_overlays(cx);
+                }))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.dismiss_annotation_overlays(cx);
+                }))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_, _, _, cx| cx.stop_propagation()),
                 )
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if event.keystroke.key == "escape" {
-                        *this.selection_toolbar.borrow_mut() = None;
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                }))
                 .child(div().flex_1().min_w_0().child(input))
                 .into_any_element()
         } else {
@@ -635,11 +637,12 @@ impl Waku {
             pushed.push(top);
             let id = *id;
             let number = *number;
-            let waku = cx.entity().downgrade();
+            let badge = point(right - px(24.0), px(top));
+            let editor = point(right + px(2.0), px(top));
             chips.push(
                 gpui::deferred(
                     gpui::anchored()
-                        .position(point(right - px(24.0), px(top)))
+                        .position(badge)
                         .snap_to_window_with_margin(px(8.0))
                         .child(
                             div()
@@ -660,17 +663,269 @@ impl Waku {
                                         .text_color(theme.inset)
                                         .child(number.to_string()),
                                 )
-                                .on_click(move |_, _, cx| {
-                                    let _ = waku.update(cx, |this, cx| {
-                                        this.reveal_annotation_from_card(id, cx);
-                                    });
-                                }),
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_annotation_editor(id, editor, window, cx);
+                                })),
                         ),
                 )
                 .into_any_element(),
             );
         }
         chips
+    }
+
+    /// The comment on an annotation, staged or sent.
+    fn annotation_comment(&self, id: Uuid) -> Option<String> {
+        self.find_annotation(id)
+            .and_then(|annotation| annotation.comment.clone())
+    }
+
+    /// Find an annotation by id: staged first, then among the session's sent
+    /// records.
+    fn find_annotation(&self, id: Uuid) -> Option<&MessageAnnotation> {
+        if let Some(staged) = self
+            .composer_annotations
+            .iter()
+            .find(|record| record.id == id)
+        {
+            return Some(staged);
+        }
+        self.selected_session()?
+            .messages
+            .iter()
+            .flat_map(|message| message.annotations.iter())
+            .find(|record| record.id == id)
+    }
+
+    /// Open the floating editor for an annotation badge, highlight its spans,
+    /// and jump to them. The editor opens just right of the badge.
+    pub(super) fn open_annotation_editor(
+        &mut self,
+        id: Uuid,
+        anchor: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let comment = self.annotation_comment(id).unwrap_or_default();
+        let input = self.annotation_editor_input(window, cx);
+        input.update(cx, |input, cx| input.set_content(comment, cx));
+        self.active_annotation.set(Some(id));
+        *self.annotation_editor.borrow_mut() = Some(AnnotationEditor { id, anchor });
+        self.reveal_annotation_from_card(id, cx);
+        let focus = input.read(cx).focus();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Close the editor and drop the highlight.
+    pub(super) fn close_annotation_editor(&mut self, cx: &mut Context<Self>) {
+        if self.annotation_editor.borrow().is_none() && self.active_annotation.get().is_none() {
+            return;
+        }
+        *self.annotation_editor.borrow_mut() = None;
+        self.active_annotation.set(None);
+        cx.notify();
+    }
+
+    /// Close whichever floating annotation surface is open.
+    pub(super) fn dismiss_annotation_overlays(&mut self, cx: &mut Context<Self>) {
+        *self.selection_toolbar.borrow_mut() = None;
+        self.close_annotation_editor(cx);
+    }
+
+    /// Write the editor's comment onto its annotation and persist.
+    pub(super) fn save_annotation_comment(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .annotation_editor
+            .borrow()
+            .as_ref()
+            .map(|editor| editor.id)
+        else {
+            return;
+        };
+        let comment = self
+            .annotation_editor_input
+            .borrow()
+            .as_ref()
+            .map(|input| input.read(cx).content().to_owned())
+            .unwrap_or_default();
+        let comment = super::composer::annotation_comment_value(&comment);
+        self.set_annotation_comment(id, comment, cx);
+        self.close_annotation_editor(cx);
+    }
+
+    /// Remove an annotation, staged or sent, and persist.
+    pub(super) fn delete_annotation(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let staged = self
+            .composer_annotations
+            .iter()
+            .any(|record| record.id == id);
+        if staged {
+            let before = self.composer_annotations.len();
+            self.composer_annotations.retain(|record| record.id != id);
+            if self.composer_annotations.len() != before {
+                self.annotation_comment_inputs.borrow_mut().clear();
+                self.reset_annotation_preview_hover();
+                self.capture_and_save_current_composer_draft(cx);
+            }
+        } else {
+            let mut changed = false;
+            for session in &mut self.state.sessions {
+                for message in &mut session.messages {
+                    let before = message.annotations.len();
+                    message.annotations.retain(|record| record.id != id);
+                    changed |= message.annotations.len() != before;
+                }
+            }
+            if changed {
+                self.save();
+            }
+        }
+        self.close_annotation_editor(cx);
+    }
+
+    /// Store a comment on a staged or sent annotation.
+    fn set_annotation_comment(
+        &mut self,
+        id: Uuid,
+        comment: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(staged) = self
+            .composer_annotations
+            .iter_mut()
+            .find(|record| record.id == id)
+        {
+            staged.comment = comment;
+            self.capture_and_save_current_composer_draft(cx);
+            return;
+        }
+        let mut changed = false;
+        for session in &mut self.state.sessions {
+            for message in &mut session.messages {
+                if let Some(record) = message
+                    .annotations
+                    .iter_mut()
+                    .find(|record| record.id == id)
+                {
+                    record.comment = comment.clone();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.save();
+        }
+    }
+
+    /// The comment field the badge editor edits, created on first use.
+    fn annotation_editor_input(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextInput> {
+        if let Some(input) = self.annotation_editor_input.borrow().clone() {
+            return input;
+        }
+        let input = cx.new(|cx| {
+            TextInput::new(window, cx).placeholder(tr!("annotation.comment_placeholder"))
+        });
+        self.annotation_editor_input
+            .borrow_mut()
+            .replace(input.clone());
+        input
+    }
+
+    /// The floating editor a badge click opens: the comment, delete, cancel,
+    /// save. Escape or a click outside dismisses it without saving.
+    fn render_annotation_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let editor = self.annotation_editor.borrow();
+        let editor = editor.as_ref()?;
+        let theme = Theme::current(cx);
+        let input = self.annotation_editor_input.borrow().clone()?;
+        let id = editor.id;
+        let body = div()
+            .id("annotation-editor")
+            .w(px(340.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .p(px(10.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.raised)
+            .shadow_md()
+            .occlude()
+            .key_context("AnnotationEditor")
+            .on_action(cx.listener(|this, _: &DismissAnnotationEditor, _, cx| {
+                this.dismiss_annotation_overlays(cx);
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.dismiss_annotation_overlays(cx);
+            }))
+            .child(div().min_h(px(26.0)).child(input))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        icon_button("annotation-editor-delete", "icons/trash.svg", theme.clone())
+                            .tooltip(Tooltip::text(tr!("annotation.remove")))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.delete_annotation(id, cx);
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("annotation-editor-cancel")
+                            .h(px(26.0))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(theme.border_strong)
+                            .text_size(sp(12.0))
+                            .text_color(theme.text)
+                            .cursor_default()
+                            .hover(|style| style.bg(theme.overlay))
+                            .child(tr!("common.cancel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_annotation_editor(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("annotation-editor-save")
+                            .h(px(26.0))
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(7.0))
+                            .bg(theme.inverse)
+                            .text_size(sp(12.0))
+                            .text_color(theme.on_inverse)
+                            .cursor_default()
+                            .hover(|style| style.opacity(0.9))
+                            .child(tr!("common.save"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save_annotation_comment(cx);
+                            })),
+                    ),
+            )
+            .into_any_element();
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(editor.anchor)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(body),
+            )
+            .into_any_element(),
+        )
     }
 
     /// Open the comment field over the selection the toolbar captured.
@@ -2287,6 +2542,12 @@ impl Waku {
         // The painter scans ascending ordinals, and creation order need not be
         // document order.
         marks.sort_by_key(|mark| (mark.ordinal, mark.range.start));
+        // Only the annotation the user opened stays washed; the badges carry
+        // the rest, and an ordinary frame paints no annotation at all.
+        match self.active_annotation.get() {
+            Some(active) => marks.retain(|mark| mark.id == active),
+            None => marks.clear(),
+        }
         // A jump flashes through the shared pulse clock, not a per-element
         // animation: one lease keeps the pane redrawing while the wash fades.
         // Reduce motion never reaches here — the jump does not set a flash.
@@ -2308,7 +2569,10 @@ impl Waku {
                     .opacity(ANNOTATION_FLASH_ALPHA * (1.0 - progress)),
             })
         });
-        (!marks.is_empty()).then(|| md::render::AnnotationMarks {
+        if marks.is_empty() && flash.is_none() {
+            return None;
+        }
+        Some(md::render::AnnotationMarks {
             marks: Rc::new(marks),
             style: md::render::AnnotationStyle::from_palette(&palette),
             flash,

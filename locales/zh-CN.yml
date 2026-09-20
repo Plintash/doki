@@ -278,6 +278,7 @@ common.copy_to_composer: 复制到输入框
 common.copy_code: 复制代码
 common.copy_expression: 复制表达式
 common.cancel: 取消
+common.save: 保存
 common.send: 发送
 session.fork_task: 从此处派生任务
 session.fork_task_title: 从此处派生任务

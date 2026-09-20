@@ -576,6 +576,8 @@ common.copy_expression:
   en: Copy Expression
 common.cancel:
   en: Cancel
+common.save:
+  en: Save
 common.send:
   en: Send
 

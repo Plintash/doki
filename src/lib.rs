@@ -86,6 +86,7 @@ actions!(
         CancelTurn,
         CopySelection,
         AnnotateSelection,
+        DismissAnnotationEditor,
         OpenFind,
         OpenFindReplace,
         CloseFind,
@@ -259,6 +260,9 @@ pub fn run() {
                 KeyBinding::new("secondary-u", ToggleUsagePanel, None),
                 KeyBinding::new("secondary-s", SaveFile, None),
                 KeyBinding::new("escape", CancelTurn, Some("Waku")),
+                // Escape inside the annotation comment field or editor closes
+                // the overlay before it can cancel the turn.
+                KeyBinding::new("escape", DismissAnnotationEditor, Some("AnnotationEditor")),
                 KeyBinding::new("secondary-c", CopySelection, Some("Waku")),
                 // The transcript note action. It shares the composer's focus
                 // fallback with copy, so an active selection anywhere in the
