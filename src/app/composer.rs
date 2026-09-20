@@ -2442,8 +2442,8 @@ impl Waku {
                     .items_center()
                     .gap(px(6.0))
                     .pl(px(8.0))
-                    .pr(px(2.0))
-                    .py(px(2.0))
+                    .pr(px(4.0))
+                    .py(px(5.0))
                     .rounded(px(9.0))
                     .border_1()
                     .border_color(theme.border)
@@ -2464,31 +2464,30 @@ impl Waku {
                             .child(label),
                     )
                     // No reserved slot: on hover the clear button lands at the
-                    // far right over the count, on its own soft disc, the way
-                    // Codex's chip reveals it.
+                    // far right over the count. A horizontal band fades the
+                    // count out into the button, so the × never hard-cuts it.
                     .when(chip_hovered, |chip| {
+                        let band = theme.composer.blend(theme.overlay);
                         chip.child(
                             div()
                                 .id("composer-annotations-clear")
                                 .absolute()
-                                .right(px(1.0))
+                                .right(px(0.0))
                                 .top_0()
                                 .bottom_0()
-                                .w(px(22.0))
+                                .w(px(42.0))
+                                .pr(px(5.0))
+                                .rounded(px(9.0))
                                 .flex()
                                 .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .size(px(20.0))
-                                        .rounded_full()
-                                        .bg(theme.overlay_strong)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_default()
-                                        .child(icon("icons/x.svg", 11.0, theme.text_secondary)),
-                                )
+                                .justify_end()
+                                .cursor_default()
+                                .bg(linear_gradient(
+                                    90.0,
+                                    linear_color_stop(band.opacity(0.0), 0.0),
+                                    linear_color_stop(band, 1.0),
+                                ))
+                                .child(icon("icons/x.svg", 12.0, theme.text_secondary))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.composer_annotations.clear();
