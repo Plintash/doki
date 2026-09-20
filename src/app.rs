@@ -1366,9 +1366,6 @@ pub struct Waku {
     annotation_preview_scroll: ScrollHandle,
     /// Focus for the composer annotation chip.
     annotations_focus: FocusHandle,
-    /// Whether the chip currently holds focus, so it can paint the accent
-    /// treatment its children need to read on.
-    annotation_chip_focused: Cell<bool>,
     /// Focus for the chip's clear button.
     annotation_clear_focus: FocusHandle,
     /// Focus for the panel's per-annotation controls, keyed by a stable role +
@@ -2401,7 +2398,6 @@ impl Waku {
             let onboarding_add_project_focus = cx.focus_handle();
             let onboarding_projectless_focus = cx.focus_handle();
             let updater_button_focus = cx.focus_handle();
-            let annotation_chip_focus = cx.focus_handle();
             let model_picker_empty_focus = cx.focus_handle();
             let task_switcher_focus = cx.focus_handle();
             cx.on_focus_out(
@@ -2423,19 +2419,6 @@ impl Waku {
             .detach();
             cx.on_blur(&updater_button_focus, window, |this: &mut Self, _, cx| {
                 this.set_updater_button_focused(false, cx);
-            })
-            .detach();
-
-            // The annotation chip paints an accent treatment while focused, so
-            // the keyboard path is visible rather than a hairline border.
-            cx.on_focus(&annotation_chip_focus, window, |this: &mut Self, _, cx| {
-                this.annotation_chip_focused.set(true);
-                cx.notify();
-            })
-            .detach();
-            cx.on_blur(&annotation_chip_focus, window, |this: &mut Self, _, cx| {
-                this.annotation_chip_focused.set(false);
-                cx.notify();
             })
             .detach();
 
@@ -2969,8 +2952,7 @@ impl Waku {
                 annotation_preview_visible: Cell::new(false),
                 annotation_preview_close_generation: Cell::new(0),
                 annotation_preview_scroll: ScrollHandle::new(),
-                annotations_focus: annotation_chip_focus,
-                annotation_chip_focused: Cell::new(false),
+                annotations_focus: cx.focus_handle(),
                 annotation_clear_focus: cx.focus_handle(),
                 annotation_card_focus: RefCell::new(HashMap::new()),
                 annotation_panel_pinned: Cell::new(false),
