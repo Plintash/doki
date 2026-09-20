@@ -173,8 +173,10 @@ impl Waku {
             .collect();
         self.composer_annotations = draft.annotations;
         // Restored annotations may reuse ids, so editors created for the
-        // previous draft must not carry their old comments into this one.
+        // previous draft must not carry their old comments into this one, and
+        // the label in the outgoing draft never sent a leave event.
         self.annotation_comment_inputs.borrow_mut().clear();
+        self.reset_annotation_preview_hover();
         self.composer
             .update(cx, |input, cx| input.set_content(draft.text, cx));
         cx.notify();
