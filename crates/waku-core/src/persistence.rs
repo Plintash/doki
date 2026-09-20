@@ -30,8 +30,8 @@ use crate::computer_use::ComputerAppGrant;
 use crate::i18n::AppLanguage;
 use crate::identity::DATA_DIRECTORY_NAME;
 use crate::model::{
-    AgentSession, AnnotationSpan, AnnotationTarget, FavoriteModel, Message, MessageAnnotation,
-    MessageAttachment, MessageRole, Project, ProviderKind, RuntimeMode, SessionWorkspace,
+    AgentSession, AnnotationTarget, FavoriteModel, Message, MessageAnnotation, MessageAttachment,
+    MessageRole, Project, ProviderKind, RuntimeMode, SessionWorkspace,
 };
 use crate::theme::ThemePreference;
 pub use waku_protocol::persistence::{
