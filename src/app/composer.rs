@@ -2427,6 +2427,7 @@ impl Waku {
         // in reach too.
         let chip_hovered =
             self.annotation_preview_hover.get() > 0 || self.annotation_panel_pinned.get();
+        let chip_focused = self.annotation_chip_focused.get();
         let mut list = div()
             .px(px(14.0))
             .pt(px(2.0))
@@ -2450,12 +2451,18 @@ impl Waku {
                     .py(px(5.0))
                     .rounded(px(9.0))
                     .border_1()
-                    .border_color(theme.border)
+                    .border_color(if chip_focused {
+                        theme.accent
+                    } else {
+                        theme.border
+                    })
+                    .when(chip_focused, |chip| chip.bg(theme.accent))
+                    .when(!chip_focused, |chip| {
+                        chip.hover(|style| style.bg(theme.overlay))
+                    })
                     .cursor_default()
                     .track_focus(&self.annotations_focus)
                     .tab_index(0)
-                    .focus_visible(|style| style.border_color(theme.accent))
-                    .hover(|style| style.bg(theme.overlay))
                     .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
                         this.set_annotation_preview_hover(*hovering, cx);
                     }))
@@ -2479,12 +2486,24 @@ impl Waku {
                     .child(annotation_label_bounds_probe(
                         self.annotation_label_bounds.clone(),
                     ))
-                    .child(icon("icons/annotation.svg", 12.5, theme.text_secondary))
+                    .child(icon(
+                        "icons/annotation.svg",
+                        12.5,
+                        if chip_focused {
+                            theme.on_inverse
+                        } else {
+                            theme.text_secondary
+                        },
+                    ))
                     .child(
                         div()
                             .text_size(sp(12.0))
                             .line_height(sp(15.0))
-                            .text_color(theme.text)
+                            .text_color(if chip_focused {
+                                theme.on_inverse
+                            } else {
+                                theme.text
+                            })
                             .child(label),
                     )
                     // No reserved slot: on hover the clear button lands at the
@@ -2535,7 +2554,15 @@ impl Waku {
                                         .items_center()
                                         .justify_center()
                                         .hover(|style| style.bg(theme.overlay_strong))
-                                        .child(icon("icons/x.svg", 12.0, theme.text_secondary)),
+                                        .child(icon(
+                                            "icons/x.svg",
+                                            12.0,
+                                            if chip_focused {
+                                                theme.on_inverse
+                                            } else {
+                                                theme.text_secondary
+                                            },
+                                        )),
                                 )
                                 .on_activation(cx, |this, _, cx| {
                                     this.composer_annotations.clear();
