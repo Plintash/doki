@@ -3252,6 +3252,8 @@ impl Waku {
                 .w_full()
                 .max_w(px(CONTENT_MAX_WIDTH))
                 .mx_auto()
+                .tab_group()
+                .tab_index(1)
                 .rounded(px(13.0))
                 .border_1()
                 .border_color(theme.border)
