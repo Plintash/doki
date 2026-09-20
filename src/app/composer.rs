@@ -2420,6 +2420,9 @@ impl Waku {
             tr!("annotation.count_other", count = count)
         };
         let preview_open = self.annotation_preview_visible.get();
+        // The clear button is a hover reveal, so it stays out of the way while
+        // the count is just being read.
+        let chip_hovered = self.annotation_preview_hover.get() > 0;
         let mut list = div()
             .px(px(14.0))
             .pt(px(2.0))
@@ -2461,15 +2464,37 @@ impl Waku {
                             .child(label),
                     )
                     .child(
-                        icon_button("composer-annotations-clear", "icons/x.svg", theme.clone())
-                            .tooltip(Tooltip::text(tr!("annotation.remove_all")))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.composer_annotations.clear();
-                                this.reset_annotation_preview_hover();
-                                this.capture_and_save_current_composer_draft(cx);
-                                cx.notify();
-                            })),
+                        // A fixed slot keeps the chip's width steady; the clear
+                        // button fades in on hover over its own soft disc.
+                        div()
+                            .w(px(22.0))
+                            .h(px(22.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(chip_hovered, |slot| {
+                                slot.child(
+                                    div()
+                                        .id("composer-annotations-clear")
+                                        .size(px(20.0))
+                                        .rounded_full()
+                                        .bg(theme.overlay_strong)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_default()
+                                        .hover(|style| style.bg(theme.overlay))
+                                        .child(icon("icons/x.svg", 11.0, theme.text_secondary))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.composer_annotations.clear();
+                                            this.reset_annotation_preview_hover();
+                                            this.capture_and_save_current_composer_draft(cx);
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
                     ),
             );
         // The panel lives in the deferred layer, so the composer card cannot
