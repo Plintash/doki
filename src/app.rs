@@ -63,9 +63,8 @@ use crate::terminal::TerminalView;
 use crate::theme::{Theme, ThemePreference, sp};
 use crate::ui::text_field::TextField;
 use crate::ui::{
-    ActivationExt, MenuChip, ProjectNameSelector, activity_icon, activity_noun, contain_scroll,
-    file_icon, icon, icon_button, motion, provider_color, provider_mark, status_color,
-    toggle_switch,
+    MenuChip, ProjectNameSelector, activity_icon, activity_noun, contain_scroll, file_icon, icon,
+    icon_button, motion, provider_color, provider_mark, status_color, toggle_switch,
 };
 use crate::{
     AnnotateSelection, CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch,
@@ -849,7 +848,6 @@ struct MessageEdit {
     /// The composer's staged annotations before this edit opened, put back on
     /// cancel so opening a past message never discards an unsent review.
     previous_annotations: Vec<MessageAnnotation>,
-    previous_annotations_expanded: bool,
 }
 
 /// A pending request to scroll the transcript to one annotation's span.
@@ -1329,24 +1327,6 @@ pub struct Waku {
     /// label above the attachment chips, drained into the next submission, and
     /// saved with the draft so a session switch does not lose them.
     composer_annotations: Vec<MessageAnnotation>,
-    /// Whether the annotation list is showing its cards. Creating one expands
-    /// it, because that is where its comment gets written.
-    composer_annotations_expanded: bool,
-    /// The card the composer should draw attention to, set when a duplicate
-    /// selection reveals an annotation that is already staged.
-    focused_annotation: Option<Uuid>,
-    /// Focus for the annotation label. Each card gets its own handle from the
-    /// map below, created on demand because the composer renders from `&self`.
-    annotations_focus: FocusHandle,
-    annotation_card_focus: RefCell<HashMap<Uuid, FocusHandle>>,
-    /// Focus for each card's remove button, so deleting is a tab stop of its
-    /// own rather than something the card's activation swallows.
-    annotation_remove_focus: RefCell<HashMap<Uuid, FocusHandle>>,
-    /// One comment editor per staged annotation, created on first render and
-    /// keyed by annotation id. A comment is edited in place, so its record has
-    /// to be written back as the field changes; the map is pruned whenever the
-    /// staged set changes.
-    annotation_comment_inputs: RefCell<HashMap<Uuid, Entity<TextInput>>>,
     /// Sent annotations re-anchored against the reply each points at. Filled by
     /// one background pass per session signature, never resolved on a frame;
     /// a render reads only these ranges.
@@ -1382,6 +1362,8 @@ pub struct Waku {
     annotation_preview_visible: Cell<bool>,
     /// Guards the grace timer: a later enter cancels an earlier pending close.
     annotation_preview_close_generation: Cell<u64>,
+    /// Scroll position of the annotation hover panel's card list.
+    annotation_preview_scroll: ScrollHandle,
     /// Screen bounds of the annotation label, recorded by a paint-time probe so
     /// the hover preview can anchor above it. Read on the hovered frame only.
     annotation_label_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -2944,12 +2926,6 @@ impl Waku {
                 composer_autocomplete: autocomplete::AutocompleteUi::new(),
                 composer_attachments,
                 composer_annotations,
-                composer_annotations_expanded: false,
-                focused_annotation: None,
-                annotations_focus: cx.focus_handle(),
-                annotation_card_focus: RefCell::new(HashMap::new()),
-                annotation_remove_focus: RefCell::new(HashMap::new()),
-                annotation_comment_inputs: RefCell::new(HashMap::new()),
                 sent_annotation_resolution: RefCell::new(
                     annotation_resolution::SentAnnotationResolution::default(),
                 ),
@@ -2965,6 +2941,7 @@ impl Waku {
                 annotation_preview_hover: Cell::new(0),
                 annotation_preview_visible: Cell::new(false),
                 annotation_preview_close_generation: Cell::new(0),
+                annotation_preview_scroll: ScrollHandle::new(),
                 annotation_label_bounds: Rc::new(Cell::new(None)),
                 image_preview: None,
                 image_preview_generation: 0,

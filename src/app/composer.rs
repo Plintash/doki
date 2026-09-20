@@ -2195,7 +2195,6 @@ impl Waku {
             .map(MessageAttachment::from)
             .collect::<Vec<_>>();
         let annotations = std::mem::take(&mut self.composer_annotations);
-        self.annotation_comment_inputs.borrow_mut().clear();
         self.reset_annotation_preview_hover();
         let mentions = attachments
             .iter()
@@ -2399,8 +2398,6 @@ impl Waku {
         // queued message or retrying a failed send must replay the same
         // projection, not silently drop the block.
         self.composer_annotations = submission.annotations;
-        self.composer_annotations_expanded = !self.composer_annotations.is_empty();
-        self.annotation_comment_inputs.borrow_mut().clear();
         self.reset_annotation_preview_hover();
         let content = submission.display_content.unwrap_or(submission.prompt);
         self.composer
@@ -2409,35 +2406,19 @@ impl Waku {
         cx.notify();
     }
 
-    /// The staged-attachment chips above the input: a thumbnail tile per
-    /// image, a file-type icon and basename for everything else, each with a
-    /// floating remove button — T3 Code's attachment row in graphite.
     /// The staged annotations, drawn above the attachment chips.
     ///
-    /// The label names the count; the cards carry the numbers the transcript
-    /// marks use, so a mark and its card can be matched by eye. The list starts
-    /// collapsed and expands the moment an annotation is created, because that
-    /// is where its comment is written.
-    fn render_composer_annotations(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+    /// The chip names the count and opens the hover panel with the annotations
+    /// themselves; there is no inline list any more, so the composer stays
+    /// short. The clear button empties the staged set.
+    fn render_composer_annotations(&self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
-        // Drop editors whose annotation is gone. Removal and send both leave the
-        // map behind, and an editor keyed to a dropped id would otherwise be
-        // recreated empty if that id ever came back.
-        let live = self
-            .composer_annotations
-            .iter()
-            .map(|annotation| annotation.id)
-            .collect::<HashSet<_>>();
-        self.annotation_comment_inputs
-            .borrow_mut()
-            .retain(|id, _| live.contains(id));
         let count = self.composer_annotations.len();
         let label = if count == 1 {
             tr!("annotation.count_one", count = count)
         } else {
             tr!("annotation.count_other", count = count)
         };
-        let expanded = self.composer_annotations_expanded;
         let preview_open = self.annotation_preview_visible.get();
         let mut list = div()
             .px(px(14.0))
@@ -2458,16 +2439,13 @@ impl Waku {
                             .flex()
                             .items_center()
                             .gap(px(6.0))
-                            .px(px(8.0))
-                            .py(px(3.0))
-                            .rounded(px(6.0))
+                            .px(px(9.0))
+                            .py(px(4.0))
+                            .rounded(px(8.0))
                             .border_1()
-                            .border_color(if expanded { theme.accent } else { theme.border })
-                            .bg(theme.inset)
+                            .border_color(theme.border)
+                            .bg(theme.raised)
                             .cursor_default()
-                            .track_focus(&self.annotations_focus)
-                            .tab_index(0)
-                            .focus_visible(|style| style.border_color(theme.accent))
                             .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
                                 this.set_annotation_preview_hover(*hovering, cx);
                             }))
@@ -2479,51 +2457,25 @@ impl Waku {
                                 div()
                                     .text_size(sp(12.0))
                                     .line_height(sp(15.0))
-                                    .text_color(theme.text_secondary)
+                                    .text_color(theme.text)
                                     .child(label),
-                            )
-                            .child(icon(
-                                if expanded {
-                                    "icons/chevron-up.svg"
-                                } else {
-                                    "icons/chevron-down.svg"
-                                },
-                                12.0,
-                                theme.text_tertiary,
-                            ))
-                            .on_activation(cx, |this, _, cx| {
-                                this.composer_annotations_expanded =
-                                    !this.composer_annotations_expanded;
-                                cx.notify();
-                            }),
+                            ),
                     )
                     .child(
                         icon_button("composer-annotations-clear", "icons/x.svg", theme.clone())
                             .tooltip(Tooltip::text(tr!("annotation.remove_all")))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.composer_annotations.clear();
-                                this.composer_annotations_expanded = false;
                                 this.reset_annotation_preview_hover();
-                                this.focused_annotation = None;
                                 this.capture_and_save_current_composer_draft(cx);
                                 cx.notify();
                             })),
                     ),
             );
-        if expanded {
-            for index in 0..self.composer_annotations.len() {
-                list = list.child(self.render_annotation_card(index, window, cx));
-            }
-        }
         // The panel lives in the deferred layer, so the composer card cannot
-        // clip it and it never shares layout with the cards it describes. It is
-        // suppressed while the inline list is open, so the two never show the
-        // same annotations at once, and it abuts the label so the pointer never
-        // crosses a dead gap on its way up.
-        if preview_open
-            && !expanded
-            && let Some(bounds) = self.annotation_label_bounds.get()
-        {
+        // clip it, and it abuts the label so the pointer never crosses a dead
+        // gap on its way up.
+        if preview_open && let Some(bounds) = self.annotation_label_bounds.get() {
             list = list.child(
                 gpui::deferred(
                     gpui::anchored()
@@ -2533,7 +2485,6 @@ impl Waku {
                         .child(self.render_annotation_preview(
                             &theme,
                             point(bounds.right() + px(8.0), bounds.top()),
-                            window,
                             cx,
                         )),
                 )
@@ -2609,7 +2560,6 @@ impl Waku {
         &self,
         theme: &Theme,
         editor_anchor: Point<Pixels>,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let count = self.composer_annotations.len();
@@ -2618,7 +2568,7 @@ impl Waku {
         } else {
             tr!("annotation.count_other", count = count)
         };
-        let mut card = div()
+        let panel = div()
             .id("composer-annotation-preview")
             .w(px(340.0))
             .flex()
@@ -2644,6 +2594,15 @@ impl Waku {
                     .text_color(theme.text_tertiary)
                     .child(header),
             );
+        // A long list caps here and scrolls instead of growing past the window.
+        let mut list = div()
+            .id("composer-annotation-preview-list")
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .max_h(px(360.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.annotation_preview_scroll);
         for (index, annotation) in self.composer_annotations.iter().enumerate() {
             let id = annotation.id;
             let quote = annotation.target.quote().to_owned();
@@ -2679,7 +2638,7 @@ impl Waku {
                         .child(SharedString::from(comment)),
                 );
             }
-            card = card.child(
+            list = list.child(
                 div()
                     .id(SharedString::from(format!("annotation-preview-card-{id}")))
                     .flex()
@@ -2751,196 +2710,7 @@ impl Waku {
                     ),
             );
         }
-        card
-    }
-
-    /// One annotation card: what it quotes, which number it carries, and the
-    /// controls that remove it.
-    fn render_annotation_card(
-        &self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = Theme::current(cx);
-        let Some(annotation) = self.composer_annotations.get(index) else {
-            return div().into_any_element();
-        };
-        let id = annotation.id;
-        let quote = match &annotation.target {
-            AnnotationTarget::MessageSpan { quote, .. } => quote.as_str(),
-        };
-        let comment_input = self.annotation_comment_input(annotation, window, cx);
-        let focused = self.focused_annotation == Some(id);
-        let focus = self
-            .annotation_card_focus
-            .borrow_mut()
-            .entry(id)
-            .or_insert_with(|| cx.focus_handle())
-            .clone();
-        div()
-            .id(SharedString::from(format!("annotation-card-{index}")))
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(if focused { theme.accent } else { theme.border })
-            .bg(theme.inset)
-            .track_focus(&focus)
-            .tab_index(0)
-            .focus_visible(|style| style.border_color(theme.accent))
-            // The card is a jump target: click anywhere on it, or press enter or
-            // space while it holds focus, to reveal the quoted span. The comment
-            // field and the remove button stop propagation so editing and
-            // deleting never double as a jump.
-            .on_activation(cx, move |this, _, cx| {
-                this.reveal_annotation_from_card(id, cx);
-            })
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .flex_none()
-                            .size(px(15.0))
-                            .rounded_full()
-                            .bg(theme.accent)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .text_size(sp(9.5))
-                                    .line_height(sp(11.0))
-                                    .text_color(theme.on_inverse)
-                                    .child((index + 1).to_string()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(sp(12.0))
-                            .line_height(sp(16.0))
-                            .text_color(theme.text_secondary)
-                            .child(tr!("annotation.selected_text")),
-                    )
-                    .child({
-                        let remove_focus = self
-                            .annotation_remove_focus
-                            .borrow_mut()
-                            .entry(id)
-                            .or_insert_with(|| cx.focus_handle())
-                            .clone();
-                        icon_button(
-                            SharedString::from(format!("annotation-remove-{index}")),
-                            "icons/trash.svg",
-                            theme.clone(),
-                        )
-                        .track_focus(&remove_focus)
-                        .tab_index(0)
-                        .focus_visible(|style| style.bg(theme.overlay))
-                        .tooltip(Tooltip::text(tr!("annotation.remove")))
-                        .on_activation(cx, move |this, _, cx| {
-                            cx.stop_propagation();
-                            if index < this.composer_annotations.len() {
-                                this.composer_annotations.remove(index);
-                            }
-                            if this.composer_annotations.is_empty() {
-                                this.composer_annotations_expanded = false;
-                                this.reset_annotation_preview_hover();
-                            }
-                            this.focused_annotation = None;
-                            this.capture_and_save_current_composer_draft(cx);
-                            cx.notify();
-                        })
-                    }),
-            )
-            .child(
-                div()
-                    .pl(px(21.0))
-                    .text_size(sp(12.0))
-                    .line_height(sp(16.0))
-                    .text_color(theme.text)
-                    .line_clamp(2)
-                    .child(SharedString::from(quote.to_owned())),
-            )
-            .child(
-                div()
-                    .pl(px(21.0))
-                    .pt(px(4.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
-                    .child(
-                        div()
-                            .text_size(sp(12.0))
-                            .line_height(sp(16.0))
-                            .text_color(theme.text_secondary)
-                            .child(tr!("annotation.user_comment")),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "annotation-comment-guard-{index}"
-                            )))
-                            .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
-                            .child(TextField::new(
-                                SharedString::from(format!("annotation-comment-{index}")),
-                                comment_input,
-                            )),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// The comment editor for one staged annotation.
-    ///
-    /// Created on first render and kept for the annotation's lifetime, so the
-    /// field's own caret and selection survive re-renders. Edits are written
-    /// straight back onto the record and saved with the draft; the field owns
-    /// its repaint, so typing never notifies the whole app.
-    fn annotation_comment_input(
-        &self,
-        annotation: &MessageAnnotation,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<TextInput> {
-        let id = annotation.id;
-        if let Some(input) = self.annotation_comment_inputs.borrow().get(&id) {
-            return input.clone();
-        }
-        let initial = annotation.comment.clone().unwrap_or_default();
-        let input = cx.new(|cx| {
-            let mut input = TextInput::new(window, cx).placeholder(tr!("annotation.user_comment"));
-            input.set_content(initial, cx);
-            input
-        });
-        self.annotation_comment_inputs
-            .borrow_mut()
-            .insert(id, input.clone());
-        cx.subscribe(&input, move |this, input, event, cx| {
-            if !matches!(event, InputEvent::Edited) {
-                return;
-            }
-            let comment = input.read(cx).content().to_owned();
-            let Some(annotation) = this
-                .composer_annotations
-                .iter_mut()
-                .find(|annotation| annotation.id == id)
-            else {
-                return;
-            };
-            annotation.comment = annotation_comment_value(&comment);
-            this.capture_and_save_current_composer_draft(cx);
-        })
-        .detach();
-        input
+        panel.child(list)
     }
 
     fn render_composer_attachments(&self, cx: &mut Context<Self>) -> Div {
@@ -3408,7 +3178,7 @@ impl Waku {
                 })
                 .children(autocomplete)
                 .when(!self.composer_annotations.is_empty(), |card| {
-                    card.child(self.render_composer_annotations(window, cx))
+                    card.child(self.render_composer_annotations(cx))
                 })
                 .when(!self.composer_attachments.is_empty(), |card| {
                     card.child(self.render_composer_attachments(cx))

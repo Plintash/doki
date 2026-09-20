@@ -2093,8 +2093,6 @@ impl Waku {
         let input = cx.new(|cx| ComposerInput::new(window, cx).padding_x(px(12.0), cx));
         input.update(cx, |input, cx| input.set_content(initial_message, cx));
         let previous_annotations = std::mem::take(&mut self.composer_annotations);
-        let previous_annotations_expanded =
-            std::mem::replace(&mut self.composer_annotations_expanded, false);
         cx.subscribe(
             &input,
             |this: &mut Self, _, event: &ComposerEvent, cx| match event {
@@ -2120,15 +2118,10 @@ impl Waku {
             input: input.clone(),
             attachments,
             previous_annotations,
-            previous_annotations_expanded,
         });
-        // Reopening a sent message restores its annotations as staged cards:
-        // the same records, now editable and numbered, with the transcript
-        // marks following the composer's numbering again.
+        // Reopening a sent message restores its annotations as staged records:
+        // the same quotes and comments, shown in the hover panel.
         self.composer_annotations = annotations;
-        self.composer_annotations_expanded = !self.composer_annotations.is_empty();
-        self.focused_annotation = None;
-        self.annotation_comment_inputs.borrow_mut().clear();
         self.reset_annotation_preview_hover();
         self.hide_toast();
         self.remeasure_transcript_message(message_index);
@@ -2151,8 +2144,6 @@ impl Waku {
         // Put the draft's own staged review back exactly as it was before this
         // message was opened.
         self.composer_annotations = edit.previous_annotations;
-        self.composer_annotations_expanded = edit.previous_annotations_expanded;
-        self.annotation_comment_inputs.borrow_mut().clear();
         self.reset_annotation_preview_hover();
         let message_index = self.selected_session().and_then(|session| {
             session
@@ -2423,7 +2414,6 @@ impl Waku {
         // The recorded records now live on the message; the staged copies have
         // done their job and must not linger as a second set of marks.
         self.composer_annotations.clear();
-        self.annotation_comment_inputs.borrow_mut().clear();
         self.reset_annotation_preview_hover();
         self.submission_preparations.insert(session_id);
         self.hide_toast();
@@ -2486,8 +2476,6 @@ impl Waku {
                     // The rewind failed, so the message still carries its old
                     // records: put the staged set back for another attempt.
                     self.composer_annotations = submission.annotations.clone();
-                    self.composer_annotations_expanded = !self.composer_annotations.is_empty();
-                    self.annotation_comment_inputs.borrow_mut().clear();
                     self.reset_annotation_preview_hover();
                 }
                 if selected

@@ -58,8 +58,8 @@ fn the_annotation_hover_panel_offers_edit_delete_and_jump() {
         .expect("the hover panel renderer must exist");
     let body = &source[start..];
     let end = body
-        .find("\n    /// One annotation card")
-        .expect("the panel must stay ahead of the card renderer");
+        .find("\n    fn render_composer_attachments(")
+        .expect("the panel must stay ahead of the attachment row");
     let body = &body[..end];
     for required in [
         "reveal_annotation_from_card(",

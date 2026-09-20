@@ -711,10 +711,13 @@ impl Waku {
     pub(super) fn open_annotation_editor(
         &mut self,
         id: Uuid,
-        anchor: Point<Pixels>,
+        fallback: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Anchor the editor to the mark itself when it is painted; the caller's
+        // point is only the fallback for a mark that is off screen.
+        let anchor = self.annotation_mark_anchor(id).unwrap_or(fallback);
         let comment = self.annotation_comment(id).unwrap_or_default();
         let input = self.annotation_editor_input(window, cx);
         input.update(cx, |input, cx| input.set_content(comment, cx));
@@ -724,6 +727,22 @@ impl Waku {
         let focus = input.read(cx).focus();
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    /// Just past the annotated span's first line, in window coordinates, when
+    /// that span is painted this frame.
+    fn annotation_mark_anchor(&self, id: Uuid) -> Option<Point<Pixels>> {
+        let (message_id, ordinal, range) = self.annotation_span(id)?;
+        let row = format!("message-{message_id}");
+        let registry = self.transcript_selection.registry.borrow();
+        let entry = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.key.index == ordinal && entry.key.row.as_ref() == row)?;
+        let bounds = md::render::text_range_bounds(&entry.geometry, &range)
+            .into_iter()
+            .next()?;
+        Some(point(bounds.right() + px(10.0), bounds.top()))
     }
 
     /// Close the editor and drop the highlight.
@@ -773,7 +792,6 @@ impl Waku {
             let before = self.composer_annotations.len();
             self.composer_annotations.retain(|record| record.id != id);
             if self.composer_annotations.len() != before {
-                self.annotation_comment_inputs.borrow_mut().clear();
                 self.reset_annotation_preview_hover();
                 self.capture_and_save_current_composer_draft(cx);
             }
@@ -1139,7 +1157,9 @@ impl Waku {
         match md::annotation::merge(&anchors, &staged_sets) {
             md::annotation::MergeDecision::Duplicate { index } => {
                 if let Some((id, _)) = staged_here.get(index) {
-                    self.reveal_annotation_card(*id, cx);
+                    // Re-selecting an annotated span reveals it instead of
+                    // stacking a second annotation on the same passage.
+                    self.reveal_annotation_from_card(*id, cx);
                 }
                 false
             }
@@ -1247,12 +1267,6 @@ impl Waku {
 
     fn show_annotation_refusal(&mut self, message: impl Into<String>) {
         self.show_toast(message);
-    }
-
-    fn reveal_annotation_card(&mut self, annotation: Uuid, cx: &mut Context<Self>) {
-        self.composer_annotations_expanded = true;
-        self.focused_annotation = Some(annotation);
-        cx.notify();
     }
 
     /// Jump to the span an annotation quotes.
