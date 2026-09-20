@@ -3743,7 +3743,10 @@ mod tests {
             json["annotations"][0]["target"]["message_id"],
             serde_json::json!(message_id)
         );
-        assert_eq!(json["annotations"][0]["target"]["spans"][0]["ordinal"], 1 << 16);
+        assert_eq!(
+            json["annotations"][0]["target"]["spans"][0]["ordinal"],
+            1 << 16
+        );
         assert_eq!(
             json["annotations"][0]["target"]["spans"][0]["span"]["start"],
             4

@@ -40,13 +40,13 @@ rebuild or replace the installed `Doki.app` while the user is working in it.
 ## 6. Send, persist, restore
 
 - [x] 6.1 Write annotations onto the sent user message, show the compact indicator with on-demand expansion, and drop the draft numbering from transcript badges; verify in the debug app
-- [ ] 6.2 Restore annotations into the composer on edit-resend, degrading to quote-only when the source message no longer exists; verify both cases in the debug app
+- [x] 6.2 Restore annotations into the composer on edit-resend, degrading to quote-only when the source message no longer exists; verify both cases in the debug app
 - [x] 6.3 Reload the session after a restart and confirm sent annotations and marks are still there; verify in the debug app
 
 ## 7. Reveal, flash, accessibility
 
-- [ ] 7.1 Jump from a card by reusing the transcript search reveal path; verify an off-screen source and one taller than the viewport
-- [ ] 7.2 Flash the span through a pulse-clock lease at the decorative-motion cadence and skip it under reduce-motion; verify with the system setting toggled
+- [x] 7.1 Jump from a card by reusing the transcript search reveal path; verify an off-screen source and one taller than the viewport
+- [x] 7.2 Flash the span through a pulse-clock lease at the decorative-motion cadence and skip it under reduce-motion; verify with the system setting toggled
 - [ ] 7.3 Make the label, cards, delete, and the sent-message indicator fully keyboard operable; verify the whole review flow with the keyboard only
 
 ## 8. Validation

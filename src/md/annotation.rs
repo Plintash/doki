@@ -179,9 +179,8 @@ fn same_parts(a: &[Anchor], b: &[Anchor]) -> bool {
 /// Whether any part of one set overlaps a part of the other in the same element.
 fn overlaps_any(a: &[Anchor], b: &[Anchor]) -> bool {
     a.iter().any(|a| {
-        b.iter().any(|b| {
-            a.ordinal == b.ordinal && overlaps(&a.range, &b.range)
-        })
+        b.iter()
+            .any(|b| a.ordinal == b.ordinal && overlaps(&a.range, &b.range))
     })
 }
 
