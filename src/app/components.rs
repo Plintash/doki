@@ -746,6 +746,13 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                 .items_end()
                 .gap(px(3.0))
                 .group(group_name.clone());
+            // Annotations first, then attachments, then the message itself — the
+            // same order the composer stages them in.
+            if let Some(indicator) = sent_annotations {
+                column = column.child(render_sent_annotations_indicator(
+                    message_id, indicator, theme, &waku,
+                ));
+            }
             if let Some(attachments) = render_sent_message_attachments(
                 message_id,
                 &message.attachments,
@@ -960,11 +967,6 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                                     )
                             }),
                     );
-                }
-                if let Some(indicator) = sent_annotations {
-                    column = column.child(render_sent_annotations_indicator(
-                        message_id, indicator, theme, &waku,
-                    ));
                 }
                 column = column.child(render_message_footer(
                     theme,
