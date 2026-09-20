@@ -2655,7 +2655,6 @@ impl Waku {
         } else {
             tr!("annotation.count_other", count = count)
         };
-        let clear_focus = self.annotation_control_focus("panel-clear", cx);
         let panel = div()
             .id("composer-annotation-preview")
             .w(px(340.0))
@@ -2682,40 +2681,12 @@ impl Waku {
             }))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .px(px(4.0))
-                            .text_size(sp(11.0))
-                            .line_height(sp(14.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text_tertiary)
-                            .child(header),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .id("annotation-panel-clear")
-                            .size(px(20.0))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .track_focus(&clear_focus)
-                            .tab_index(0)
-                            .focus_visible(|style| style.bg(theme.overlay_strong))
-                            .cursor_default()
-                            .hover(|style| style.bg(theme.overlay_strong))
-                            .child(icon("icons/x.svg", 11.0, theme.text_secondary))
-                            .on_activation(cx, |this, _, cx| {
-                                this.composer_annotations.clear();
-                                this.reset_annotation_preview_hover();
-                                this.capture_and_save_current_composer_draft(cx);
-                                cx.notify();
-                            }),
-                    ),
+                    .px(px(4.0))
+                    .text_size(sp(11.0))
+                    .line_height(sp(14.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_tertiary)
+                    .child(header),
             );
         // A long list caps here and scrolls instead of growing past the window.
         let mut list = div()
