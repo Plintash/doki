@@ -871,6 +871,10 @@ impl Waku {
         let theme = Theme::current(cx);
         let input = self.annotation_editor_input.borrow().clone()?;
         let id = editor.id;
+        // Follow the mark each frame, so an off-screen editor lands on its span
+        // once the reveal scroll has mounted it; the stored point is only the
+        // fallback until then.
+        let anchor = self.annotation_mark_anchor(id).unwrap_or(editor.anchor);
         let body = div()
             .id("annotation-editor")
             .w(px(340.0))
@@ -953,7 +957,7 @@ impl Waku {
         Some(
             gpui::deferred(
                 gpui::anchored()
-                    .position(editor.anchor)
+                    .position(anchor)
                     .snap_to_window_with_margin(px(8.0))
                     .child(body),
             )
