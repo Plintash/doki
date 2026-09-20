@@ -1252,13 +1252,19 @@ pub fn install_selection_input(window: &mut Window, state: &TranscriptSelection)
 
     window.on_mouse_event({
         let state = state.clone();
-        move |_: &MouseUpEvent, phase, _, _| {
+        move |_: &MouseUpEvent, phase, window, _| {
             if phase != DispatchPhase::Bubble {
                 return;
             }
+            let was_dragging = state.selection.borrow().is_dragging();
             let key = state.selection.borrow().anchor().cloned();
             if let Some(key) = key {
                 state.selection.borrow_mut().end_drag(&key);
+            }
+            // The selection toolbar appears on release, so this frame has to
+            // happen even though the pointer stopped moving.
+            if was_dragging {
+                window.refresh();
             }
         }
     });

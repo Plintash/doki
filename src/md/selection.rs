@@ -67,6 +67,12 @@ impl Selection {
         self.spans.iter().all(|span| span.range.is_empty())
     }
 
+    /// Whether a drag is still in flight. The selection toolbar waits for the
+    /// pointer to be released before it appears.
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
     /// Begin a drag anchored at `offset` in `key`.
     pub fn begin(&mut self, key: TextKey, offset: usize) {
         self.anchor = Some(key);

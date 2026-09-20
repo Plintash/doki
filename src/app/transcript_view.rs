@@ -454,6 +454,12 @@ impl Waku {
         if toolbar.as_ref().is_some_and(|toolbar| toolbar.comment_open) {
             return;
         }
+        // Wait for the pointer to be released: the toolbar belongs at the end
+        // of the selection, not trailing it through the drag.
+        if self.transcript_selection.selection.borrow().is_dragging() {
+            *toolbar = None;
+            return;
+        }
         // Capture while the selection is still live. Clicking the toolbar
         // itself lands outside every painted element, so the transcript's
         // global mouse-down handler clears the selection before the click
@@ -469,7 +475,7 @@ impl Waku {
             .spans()
             .to_vec();
         *toolbar = self
-            .selection_first_line_bounds(&spans)
+            .selection_end_bounds(&spans)
             .map(|bounds| SelectionToolbar {
                 anchor: point(bounds.left(), bounds.top()),
                 annotation,
@@ -477,17 +483,18 @@ impl Waku {
             });
     }
 
-    /// The top-left of the selection's first line, in window coordinates.
-    fn selection_first_line_bounds(&self, spans: &[md::selection::Span]) -> Option<Bounds<Pixels>> {
-        let first = spans.first()?;
+    /// The top-left of the selection's last line, in window coordinates, so the
+    /// toolbar appears where the drag ended.
+    fn selection_end_bounds(&self, spans: &[md::selection::Span]) -> Option<Bounds<Pixels>> {
+        let last = spans.last()?;
         let registry = self.transcript_selection.registry.borrow();
         let entry = registry
             .entries()
             .iter()
-            .find(|entry| entry.key == first.key)?;
-        md::render::text_range_bounds(&entry.geometry, &first.range)
+            .find(|entry| entry.key == last.key)?;
+        md::render::text_range_bounds(&entry.geometry, &last.range)
             .into_iter()
-            .next()
+            .last()
     }
 
     /// The floating action beside the selection, and its comment field once
