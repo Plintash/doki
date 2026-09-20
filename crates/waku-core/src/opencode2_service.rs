@@ -58,13 +58,8 @@ use crate::http_wire::{
 /// The Basic username the service demands. Any other username answers 401.
 const SERVICE_USER: &str = "opencode";
 const REGISTRATION_FILE: &str = "service.json";
-const HEALTH_ROUTE: &str = "/api/health";
 const EVENT_ROUTE: &str = "/api/event";
 const MODEL_ROUTE: &str = "/api/model";
-
-/// Health is a liveness question, not a work request: a probe that hangs must
-/// not eat the start budget it is being polled inside.
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MODEL_TIMEOUT: Duration = Duration::from_secs(10);
 /// The service heartbeats `: heartbeat` exactly 15.000s apart (measured over a
 /// live idle stream), so 20s would tear down a healthy connection that merely
@@ -115,7 +110,31 @@ pub(crate) fn registration_path() -> PathBuf {
     state_directory().join(REGISTRATION_FILE)
 }
 
-fn state_directory() -> PathBuf {
+/// The state root the live tests own, when they have claimed one.
+///
+/// Production always resolves the descriptor from the environment. The tests
+/// point it at a directory they own instead, because the alternative — mutating
+/// `XDG_STATE_HOME` from a test — is both unsafe in edition 2024 and a race
+/// against every process this crate spawns.
+#[cfg(test)]
+static TEST_STATE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn use_test_state_root(root: PathBuf) {
+    let _ = TEST_STATE_ROOT.set(root);
+}
+
+#[cfg(test)]
+fn test_state_root() -> Option<&'static PathBuf> {
+    TEST_STATE_ROOT.get()
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn state_directory() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TEST_STATE_ROOT.get() {
+        return root.join("opencode");
+    }
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
@@ -160,25 +179,35 @@ fn read_registration_file(path: &Path) -> Option<ServiceRegistration> {
 
 /// Confirms a descriptor still names a live service, and returns the endpoint
 /// to talk to it with.
+///
+/// Identification is `/api/info` — the route the current API answers — and the
+/// pid it reports is compared against the descriptor's. That comparison is the
+/// whole point of the probe: a descriptor left behind by a service that died
+/// still parses, and its port can already have been reused by an unrelated
+/// listener that answers 200.
 pub(crate) fn probe(registration: &ServiceRegistration) -> anyhow::Result<Endpoint> {
     let endpoint = Endpoint::basic(&registration.url, SERVICE_USER, &registration.password)?;
-    let health = request_json(&endpoint, "GET", HEALTH_ROUTE, None, HEALTH_TIMEOUT)
-        .context("the OpenCode 2 service did not answer its health route")?;
-    accept_health(registration, &health)?;
+    let identity = crate::opencode2_api::identify(&endpoint).with_context(|| {
+        format!(
+            "the OpenCode 2 service on {} did not identify itself",
+            registration.url
+        )
+    })?;
+    accept_identity(registration, &identity)?;
     Ok(endpoint)
 }
 
-fn accept_health(registration: &ServiceRegistration, health: &Value) -> anyhow::Result<()> {
-    if health.get("healthy").and_then(Value::as_bool) != Some(true) {
-        bail!("the OpenCode 2 service reported itself unhealthy");
-    }
-    // The pid comparison is the whole point of the probe: a descriptor left
-    // behind by a service that died still parses, and its port can already
-    // have been reused by an unrelated listener that answers 200.
-    if health.get("pid").and_then(Value::as_u64) != Some(u64::from(registration.pid)) {
+fn accept_identity(
+    registration: &ServiceRegistration,
+    identity: &crate::opencode2_api::ServiceIdentity,
+) -> anyhow::Result<()> {
+    if identity.pid != registration.pid {
         bail!(
-            "the OpenCode 2 service on {} is not the process its registration names",
-            registration.url
+            "the OpenCode 2 service {} on {} is not the process its registration names (pid {}, registered {})",
+            identity.version,
+            registration.url,
+            identity.pid,
+            registration.pid
         );
     }
     Ok(())
@@ -643,6 +672,17 @@ fn revalidate(service: &Arc<Opencode2Service>, may_spawn: bool) -> anyhow::Resul
 /// pid-checked rediscovery below is the only thing that converges both
 /// processes on one service.
 fn spawn_service(binary: &Path) -> anyhow::Result<(ServiceRegistration, Endpoint)> {
+    // A test must never start a service against the real state directory: it
+    // registers a daemon in the user's own tree and leaves it running, which is
+    // exactly what happened when the live tests were run with `--ignored`
+    // before the harness existed. The harness claims a test state root before
+    // anything can reach here, so reaching this without one means a test
+    // bypassed it.
+    #[cfg(test)]
+    assert!(
+        test_state_root().is_some(),
+        "a test reached the real service spawn; use live_service::service()"
+    );
     let mut command = crate::command_env::command(binary);
     command
         .args(["serve", "--service"])
@@ -890,13 +930,14 @@ fn context_windows(response: &Value) -> HashMap<String, u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opencode2_api::ServiceIdentity;
     use serde_json::json;
     use std::io::Write as _;
 
     fn registration(pid: u32) -> ServiceRegistration {
         ServiceRegistration {
             id: "796c624d-c94e-4086-b245-0a9560a14019".to_owned(),
-            version: Some("0.0.0-beta-19192".to_owned()),
+            version: Some("2.0.10".to_owned()),
             url: "http://127.0.0.1:49374".to_owned(),
             pid,
             password: "secret".to_owned(),
@@ -1012,31 +1053,44 @@ mod tests {
         assert!(matches!(frames[3], SseFrame::Named { .. }));
     }
 
+    /// Drives the production discovery path against a service this test owns.
+    ///
+    /// It is the regression test for the identity route, which moved four times
+    /// in a fortnight and which a hard-coded spelling silently stops being able
+    /// to answer: probing is on the path that turns a registration into a
+    /// session, so a wrong route fails every task rather than one feature.
     #[test]
-    fn health_is_rejected_when_it_names_a_different_process() {
+    fn live_service_identifies_itself_through_the_production_probe() {
+        let live = crate::live_service::service();
+        let registration = read_registration().expect("the harness must publish a descriptor");
+        assert_eq!(registration.pid, live.registration.pid);
+        let endpoint = probe(&registration).expect("the service must identify itself");
+        let identity =
+            crate::opencode2_api::identify(&endpoint).expect("the identity route must answer");
+        assert_eq!(identity.pid, registration.pid);
+        assert_eq!(Some(identity.version), live.registration.version.clone());
+
+        // The same descriptor naming a different process must not be adopted:
+        // a stale one still parses, and its port can already belong to a
+        // listener that is not this service.
+        let stale = ServiceRegistration {
+            pid: registration.pid.wrapping_add(1),
+            ..registration
+        };
+        let error = probe(&stale).expect_err("a foreign pid must not be adopted");
+        assert!(error.to_string().contains("not the process"), "{error}");
+    }
+
+    #[test]
+    fn a_stale_descriptor_cannot_adopt_a_different_process() {
         // A stale descriptor still parses, and its port can already have been
         // reused by a healthy listener that is not this service.
-        assert!(
-            accept_health(
-                &registration(58286),
-                &json!({"healthy": true, "version": "0.0.0-beta-19192", "pid": 99999})
-            )
-            .is_err()
-        );
-        assert!(
-            accept_health(
-                &registration(58286),
-                &json!({"healthy": false, "pid": 58286})
-            )
-            .is_err()
-        );
-        assert!(
-            accept_health(
-                &registration(58286),
-                &json!({"healthy": true, "version": "0.0.0-beta-19192", "pid": 58286})
-            )
-            .is_ok()
-        );
+        let identity = |pid| ServiceIdentity {
+            version: "2.0.10".to_owned(),
+            pid,
+        };
+        assert!(accept_identity(&registration(58286), &identity(99999)).is_err());
+        assert!(accept_identity(&registration(58286), &identity(58286)).is_ok());
     }
 
     #[test]
@@ -1092,18 +1146,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the user's running OpenCode 2 service"]
     fn adopts_the_registered_service() {
+        crate::live_service::service();
         let registration = read_registration().expect("no OpenCode 2 service is registered");
         let endpoint = probe(&registration).expect("the registered service is not healthy");
         assert_eq!(endpoint.host, "127.0.0.1");
         assert!(endpoint.auth.is_some());
         assert!(registration.version.is_some());
 
+        // The catalogue is fetched from models.dev at startup, so this asserts
+        // the route answers and parses; the api-level live test asserts its
+        // contents once they have arrived.
         let response = request_json(&endpoint, "GET", MODEL_ROUTE, None, MODEL_TIMEOUT).unwrap();
-        assert!(
-            !context_windows(&response).is_empty(),
-            "the live catalog should report at least one context window"
-        );
+        assert!(response.get("data").is_some(), "{response}");
     }
 }

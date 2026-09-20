@@ -1388,6 +1388,8 @@ errors.provider_no_session_id:
   en: "%{provider} did not report a session ID"
 errors.provider_rejected_prompt_detail:
   en: "%{provider} rejected the prompt: %{error}"
+errors.provider_catalogue_unavailable:
+  en: "%{provider} could not read its %{catalogue} catalogue: %{error}"
 errors.stop_provider:
   en: "Could not stop %{provider}: %{error}"
 errors.switch_provider_model:

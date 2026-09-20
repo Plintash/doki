@@ -161,7 +161,13 @@ fn discover_opencode2(binary: &Path, project_root: &Path) -> Option<Vec<SlashCom
     let service = crate::opencode2_service::shared(binary).ok()?;
     let endpoint = service.endpoint();
     let commands = crate::opencode2_api::list_commands(&endpoint, Some(&directory)).ok()?;
-    let skills = crate::opencode2_api::list_skills(&endpoint, Some(&directory)).unwrap_or_default();
+    // Skills are listed beside commands, the same way the Pi integration lists
+    // them: the current API carries no member that marks one user-invocable,
+    // so hiding the catalogue behind a guess would drop the user's own skills.
+    // A decode failure takes the whole catalogue with it rather than half of
+    // it, so a route that moved is visible instead of silently narrowing the
+    // palette to commands.
+    let skills = crate::opencode2_api::list_skills(&endpoint, Some(&directory)).ok()?;
     Some(opencode2_commands(commands, skills))
 }
 
@@ -379,20 +385,18 @@ fn opencode2_commands(
                 None,
             )
         })
-        .chain(
-            skills
-                .into_iter()
-                .filter(|skill| skill.slash == Some(true))
-                .filter_map(|entry| {
-                    command(
-                        &entry.name,
-                        entry.description.as_deref(),
-                        CommandScope::Skill,
-                        None,
-                        None,
-                    )
-                }),
-        )
+        // A skill is typed by its id; its name is a display label that can
+        // carry capitals and spaces (`report` / `Report`).
+        .chain(skills.into_iter().filter_map(|entry| {
+            let description = entry.description.unwrap_or(entry.name);
+            command(
+                &entry.id,
+                Some(description.as_str()),
+                CommandScope::Skill,
+                None,
+                None,
+            )
+        }))
         .take(COMMAND_CATALOG_CAP)
         .collect()
 }
@@ -757,27 +761,40 @@ mod tests {
     }
 
     #[test]
-    fn opencode2_catalog_keeps_only_user_invocable_skills() {
+    fn opencode2_catalog_lists_commands_and_skills_together() {
+        // The current API has no member that marks a skill user-invocable, so
+        // the whole catalogue is listed — the same thing the Pi integration
+        // does. The id is the typed token; the name is only a label.
         let commands = opencode2_commands(
             vec![crate::opencode2_api::CommandInfo {
                 name: "review".into(),
                 description: Some("Review changes".into()),
             }],
-            serde_json::from_value(json!([
-                {"id": "hidden", "name": "hidden", "slash": false, "location": "builtin"},
-                {"id": "deploy", "name": "deploy", "slash": true, "location": "skills/deploy.md"}
-            ]))
-            .unwrap(),
+            vec![
+                crate::opencode2_api::SkillInfo {
+                    id: "report".into(),
+                    name: "Report".into(),
+                    description: Some("File an issue".into()),
+                },
+                crate::opencode2_api::SkillInfo {
+                    id: "opencode".into(),
+                    name: "OpenCode".into(),
+                    description: None,
+                },
+            ],
         );
         assert_eq!(
             commands
                 .iter()
                 .map(|command| command.name.as_str())
                 .collect::<Vec<_>>(),
-            ["review", "deploy"]
+            ["review", "report", "opencode"]
         );
         assert_eq!(commands[0].scope, CommandScope::Builtin);
         assert_eq!(commands[1].scope, CommandScope::Skill);
+        assert_eq!(commands[1].description, "File an issue");
+        // A skill with no description still gets a readable row.
+        assert_eq!(commands[2].description, "OpenCode");
         assert!(commands.iter().all(|command| command.template.is_none()));
     }
 
@@ -821,10 +838,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an installed opencode2; reads a cold workspace catalogue without creating sessions"]
     fn opencode2_builtin_catalog_against_a_real_service() {
-        let binary =
-            crate::command_env::find_executable("opencode2").expect("opencode2 is not installed");
+        let binary = crate::live_service::binary();
+        crate::live_service::service();
         let root =
             std::env::temp_dir().join(format!("waku-command-catalog-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".opencode/commands")).unwrap();

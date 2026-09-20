@@ -41,6 +41,8 @@ mod http_wire;
 pub mod i18n;
 pub mod identity;
 pub mod kimi_session;
+#[cfg(test)]
+mod live_service;
 pub mod model;
 pub mod model_catalog;
 pub mod opencode2_api;

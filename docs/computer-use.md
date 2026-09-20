@@ -49,8 +49,10 @@ Cua Driver. Headless hosts still report unavailable graphics facilities.
 ## OpenCode 2
 
 OpenCode 2 uses the existing shared service. Waku registers one temporary MCP
-connection per workspace through `/api/mcp` and attaches a session instruction
-pointing to the bundled skill (OpenCode limits each entry to 8 KB). `js` and `js_reset` remain direct tools, with
+connection per workspace through `/api/experimental/mcp` and attaches a session
+instruction entry through
+`/api/experimental/session/{id}/instructions/entries/{key}` (OpenCode limits
+each entry to 8 KB). `js` and `js_reset` remain direct tools, with
 OpenCode's additional codemode wrapper disabled for this server.
 
 OpenCode's `_meta.sessionID` selects a Waku-owned registration, so each task

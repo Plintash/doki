@@ -9,8 +9,8 @@ polled off disk, and the one Waku generates itself — is in
 [titles.md](titles.md).
 
 Every provider is reached through the same driver abstraction in
-[driver/mod.rs](../crates/waku-core/src/driver/mod.rs). There are seven
-transport implementations behind eleven providers, and **every one of them holds a
+[driver/mod.rs](../crates/waku-core/src/driver/mod.rs). There are eight
+transport implementations behind twelve providers, and **every one of them holds a
 session that spans the whole conversation**:
 
 | Transport | File | Providers |
@@ -18,6 +18,7 @@ session that spans the whole conversation**:
 | Codex app-server (JSON-RPC over stdio) | [driver/codex.rs](../crates/waku-core/src/driver/codex.rs) | Codex CLI |
 | Agent Client Protocol (JSON-RPC over stdio) | [driver/acp.rs](../crates/waku-core/src/driver/acp.rs) | Cursor CLI, Fx, Grok Build, Kimi Code |
 | OpenCode server (HTTP + server-sent events) | [driver/opencode.rs](../crates/waku-core/src/driver/opencode.rs) | OpenCode |
+| OpenCode 2 shared service (HTTP + one server-sent event stream) | [driver/opencode2.rs](../crates/waku-core/src/driver/opencode2.rs) | OpenCode 2 |
 | Pi RPC mode (NDJSON request/response over stdio) | [driver/pi.rs](../crates/waku-core/src/driver/pi.rs) | Pi, Oh My Pi |
 | Claude streaming-input session (NDJSON over stdio) | [driver/claude.rs](../crates/waku-core/src/driver/claude.rs) | Claude Code |
 | Amp streaming-JSON session (NDJSON over stdio) | [driver/amp.rs](../crates/waku-core/src/driver/amp.rs) | Amp |
@@ -168,6 +169,14 @@ Kimi Code's steering is the transport's, not a probed policy: the ACP driver
 sends the second `session/prompt` for every agent it drives, but Kimi's
 superseded-prompt behaviour has not been observed against a live turn the way
 Cursor's and Grok's were.
+
+OpenCode 2 is absent from this table because it is the one provider Waku does
+not launch: it adopts a background service the user's own terminal may already
+be driving, and it answers to `opencode2` or `opencode` depending on how it was
+installed. Its row would read the same as OpenCode's — SSE, in-session model
+changes, steering, rewind and branch, Computer Use — except that it is the only
+transport whose every route and event had to be re-read after the provider
+reshaped its API mid-release; see [OpenCode 2](#opencode-2).
 
 Every provider now holds a session across turns. That was not true when this
 document was first written: five of the seven spawned a process per prompt, and
@@ -574,6 +583,84 @@ the same local resources; a cold task may use a short-lived server
 **Computer Use** — `OPENCODE_CONFIG_CONTENT` and the helper paths are handed to
 the resident server through its environment, exactly as the one-shot invocation
 received them.
+
+---
+
+### OpenCode 2
+
+**Launch** — nothing is launched. OpenCode 2 is one background service started
+by whoever needed it first (usually the user's own TUI), and it serves every
+workspace because a v2 session carries its own `location.directory`. Waku
+*finds* it through `${XDG_STATE_HOME:-~/.local/state}/opencode/service.json`,
+opening that descriptor read-only: the service polls its own file and
+self-terminates when the contents change, so a "repair" would kill the user's
+daemon. Teardown cancels the SSE socket and returns — the pid is never
+signalled, and `opencode2 serve --service` is idempotent against a healthy
+incumbent, so a second Waku daemon converges on the same process.
+
+The CLI is named `opencode2` or `opencode` depending on how it was installed
+(the preview shipped only the first; the npm/bun package declares both, while
+the standalone zip and the Homebrew formula install only `opencode`, which is
+also OpenCode 1's name). Waku tries `opencode2` first and accepts `opencode`
+only when it reports a 2.x version.
+
+**Protocol** — OpenCode's own HTTP API plus the one server-wide
+`GET /api/event` stream. Everything believed about that API here was read off
+a running build rather than guessed, because it moves fast: the identity route
+alone went `/api/health` → `/api/server` → `/api/status` → `/api/info` inside a
+fortnight, and the session routes that Waku calls were reshaped at 2.0.4.
+**Waku drives the current API and refuses older builds by name** — see
+[opencode2_api.rs](../crates/waku-core/src/opencode2_api.rs).
+
+**Handshake** — `GET /api/info` identifies the service and reports the pid the
+descriptor is checked against, then `POST /api/session` creates a session with a
+client-minted id. The id is minted by Waku because the subscription is opened
+*before* the create, which is what makes the create-vs-first-event race
+impossible.
+
+**Per turn** — the execution outcome IS the terminal event:
+`session.execution.{succeeded,failed,interrupted}` settles the turn, and
+settling is idempotent so a steered second message still settles once. Nothing
+waits for `session.idle`; the service does not emit it, and waiting for one
+pins every finished turn to Working forever.
+
+**Steer** — `POST /api/session/{id}/prompt` with `delivery: "steer"`, or
+`PATCH /api/session/{id}/inbox/{inboxID}` with a new delivery for a message that
+is already pending. Delivery modes are fields of a pending item, not verbs of
+their own, and the service promotes them at a step boundary — which is also why
+a message can never be spliced between an assistant's tool calls and their
+results.
+
+**Inbound stream** — `GET /api/event`, server-wide, demultiplexed by session
+id: the frame reaches exactly the subscriber that owns the session, the whole
+`tui.*` remote-control family is dropped, and anything Waku does not own is
+dropped too.
+
+**Approvals** — `POST /api/session/{id}/permission/{requestID}/reply` with
+`once` or `reject`. `always` never goes on the wire: it writes into
+`/api/permission/saved`, a global store shared with the user's own terminal, so
+durable choices stay in the driver's own state and every provider reply is
+one-shot.
+
+**Rewind and branch** — `POST /api/session/{id}/fork` with a boundary, sent
+through the resident service so a second OpenCode process never contends for the
+same local resources.
+
+**Computer Use** — the runtime MCP routes under `/api/experimental/mcp` plus a
+session instruction entry; see [computer-use.md](computer-use.md).
+
+**Skills** — listed beside commands, because the current API dropped the member
+that marked a skill user-invocable and hiding half the catalogue behind a guess
+would drop the user's own skills. A typed `/skill-id` is not a command: it is a
+prompt carrying a skill attachment (`{id, name}`), which the service expands
+into the message it records — an id it does not know is refused outright, so the
+palette cannot offer a dead entry. Words typed after the name ride along as the
+prompt's text.
+
+**Not supported** — a subagent's own transcript. A subagent runs as a child
+session, so its events are routed to a subscriber Waku never opens; what reaches
+the transcript is the parent's task tool row and, when the child finishes, the
+parent's `session.synthetic` note (`<subagent …>`) rendered as an activity.
 
 ---
 

@@ -20,8 +20,8 @@
 //!   `{succeeded,failed,interrupted}` ends the turn and emits exactly one
 //!   `TurnFinished`; settling is idempotent, so a steered second message —
 //!   which joins the running execution rather than starting its own — still
-//!   settles once. Do NOT wait for `session.idle`: 0.0.0-beta-19192 does not
-//!   emit it (verified against a live turn; the stream ends at
+//!   settles once. Do NOT wait for `session.idle`: the service does not emit
+//!   it (verified against a live turn; the stream ends at
 //!   `session.execution.*` and nothing follows), and waiting for it pins every
 //!   finished turn to Working forever. A prompt whose HTTP call fails settles
 //!   the turn itself, because no execution ever starts.
@@ -73,30 +73,6 @@ const ACTION_TIMEOUT: Duration = Duration::from_secs(150);
 /// An option change is a live UI interaction: a `false` answer restarts the
 /// driver, which is always correct, so waiting long for a `true` is pointless.
 const OPTIONS_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Event names the pre-beta `next` channel used for payloads the beta still
-/// sends under a new name.
-///
-/// Between `next-17028` and `beta-19192` — three weeks apart — `session.input.*`
-/// became `session.inbox.*`, and the beta OpenAPI hides the whole event union
-/// behind `V2EventEncoded: {"type": "string"}`. A generated exhaustive
-/// `#[serde(tag = "type")]` enum would therefore have failed to deserialize on
-/// upgrade day; a string match plus this table drives both channels from one
-/// binary.
-///
-/// `question.*` is deliberately NOT aliased onto `form.*`. The beta deleted
-/// every question route in favour of forms and the payloads are not the same
-/// shape — a form field carries a `key` that an answer round-trips, a question
-/// never had one — so a next-era build gets no forms rather than mangled ones.
-const ALIASES: &[(&str, &str)] = &[
-    ("session.input.enqueued", "session.inbox.enqueued"),
-    ("session.input.delivered", "session.inbox.delivered"),
-    ("session.input.cancelled", "session.inbox.cancelled"),
-    (
-        "session.input.delivery.changed",
-        "session.inbox.delivery.changed",
-    ),
-];
 
 /// Provider control markers, which must never reach a transcript.
 ///
@@ -354,6 +330,10 @@ struct Worker {
     /// the server compares those by exact string equality.
     directory: String,
     command_names: HashSet<String>,
+    /// Typed token -> display name, for the skills the palette offers. A skill
+    /// travels as a prompt attachment rather than through the command route,
+    /// so it needs its own dispatch.
+    skills: HashMap<String, String>,
     events: DriverEventSender,
     commands: Sender<DriverCommand>,
     computer_use: Option<Arc<OpenCode2ComputerUse>>,
@@ -439,7 +419,11 @@ impl OpenCode2Driver {
         let subscription = service.subscribe(&session_id);
         let frames = subscription.rx.clone();
 
-        let agents = opencode2_api::list_agents(&endpoint, Some(&directory)).unwrap_or_default();
+        let agents = catalogue_or_report(
+            opencode2_api::list_agents(&endpoint, Some(&directory)),
+            "agent",
+            &events,
+        );
         let requested_agent = agent_preset.filter(|preset| !preset.is_empty());
         let agent = resolve_agent(requested_agent.as_deref(), &agents);
         let model = model_ref(model.as_deref(), reasoning_effort.as_deref());
@@ -535,16 +519,29 @@ impl OpenCode2Driver {
         if let Some(title) = generated_title(session.title.as_deref()) {
             let _ = events.send(DriverEvent::AutoTitleUpdated(Some(title)));
         }
-        let native_commands =
-            opencode2_api::list_commands(&endpoint, Some(&directory)).unwrap_or_default();
+        // The composer's slash entries come from these two catalogues, so a
+        // failure is reported rather than swallowed: an empty palette is
+        // indistinguishable from a route that no longer exists, and that is
+        // exactly how the last round of API drift went unnoticed.
+        let native_commands = catalogue_or_report(
+            opencode2_api::list_commands(&endpoint, Some(&directory)),
+            "command",
+            &events,
+        );
+        let skills = catalogue_or_report(
+            opencode2_api::list_skills(&endpoint, Some(&directory)),
+            "skill",
+            &events,
+        );
         let command_names = native_commands
             .iter()
             .map(|command| command.name.clone())
             .collect();
-        let reported = reported_commands(
-            native_commands,
-            opencode2_api::list_skills(&endpoint, Some(&directory)).unwrap_or_default(),
-        );
+        let skill_names: HashMap<String, String> = skills
+            .iter()
+            .map(|skill| (skill.id.clone(), skill.name.clone()))
+            .collect();
+        let reported = reported_commands(native_commands, skills);
         if !reported.is_empty() {
             let _ = events.send(DriverEvent::AvailableCommands(reported));
         }
@@ -555,6 +552,7 @@ impl OpenCode2Driver {
             session_id: session_id.clone(),
             directory,
             command_names,
+            skills: skill_names,
             events,
             commands: commands.clone(),
             computer_use: computer_use.clone(),
@@ -800,6 +798,32 @@ fn generated_title(title: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Reads one catalogue, reporting a failure instead of swallowing it.
+///
+/// Every catalogue route moved with the API it belongs to, and an empty list is
+/// indistinguishable from a route that no longer answers — so a decode or route
+/// failure is surfaced as an error rather than degrading into a blank picker.
+/// The session still starts: a missing catalogue costs one feature, while
+/// refusing to start would cost the task.
+fn catalogue_or_report<T>(
+    result: opencode2_api::Result<Vec<T>>,
+    catalogue: &str,
+    events: &impl DriverEventSink,
+) -> Vec<T> {
+    match result {
+        Ok(items) => items,
+        Err(error) => {
+            let _ = events.send(DriverEvent::Error(tr!(
+                "errors.provider_catalogue_unavailable",
+                provider = "OpenCode 2",
+                catalogue = catalogue,
+                error = error
+            )));
+            Vec::new()
+        }
+    }
+}
+
 fn reported_commands(
     commands: Vec<opencode2_api::CommandInfo>,
     skills: Vec<opencode2_api::SkillInfo>,
@@ -811,26 +835,16 @@ fn reported_commands(
             name: command.name,
             description: command.description.unwrap_or_default(),
         })
-        // Only skills the user can actually type reach the composer; the rest
-        // are model-invoked and would be noise in a command palette.
-        .chain(
-            skills
-                .into_iter()
-                .filter(|skill| skill.slash.unwrap_or(false))
-                .map(|skill| ReportedCommand {
-                    name: skill.name,
-                    description: skill.description.unwrap_or_default(),
-                }),
-        )
+        // Skills are listed beside commands, which is what the Pi integration
+        // does and what the user can actually type: the id is the token, since
+        // the display name can carry capitals and spaces. They are NOT routed
+        // like commands — see `skill_invocation`.
+        .chain(skills.into_iter().map(|skill| ReportedCommand {
+            name: skill.id,
+            description: skill.description.unwrap_or(skill.name),
+        }))
         .filter(|command| !command.name.is_empty() && seen.insert(command.name.clone()))
         .collect()
-}
-
-fn canonical_event(kind: &str) -> &str {
-    ALIASES
-        .iter()
-        .find_map(|(from, to)| (*from == kind).then_some(*to))
-        .unwrap_or(kind)
 }
 
 fn strip_provider_state(value: &mut Value) {
@@ -881,6 +895,28 @@ fn native_command_invocation<'a>(
     commands.contains(name).then(|| (name, arguments.trim()))
 }
 
+/// A typed `/skill-id`, with whatever the user wrote after it.
+///
+/// Skills are matched by their catalogue id, which is also the token the
+/// palette inserts — `name` is a display label and can carry capitals and
+/// spaces (`report` / `Report`), so it is not what anyone types.
+///
+/// Commands win a collision: both are matched on the first token, and a
+/// provider that registers a command and a skill under one id means the
+/// command, which is the one the service expands server-side.
+fn skill_invocation<'a>(
+    text: &'a str,
+    skills: &'a HashMap<String, String>,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    let invocation = text.strip_prefix('/')?;
+    let (id, arguments) = invocation
+        .split_once(char::is_whitespace)
+        .unwrap_or((invocation, ""));
+    skills
+        .get_key_value(id)
+        .map(|(id, name)| (id.as_str(), name.as_str(), arguments.trim()))
+}
+
 fn submit_prompt(
     worker: &Worker,
     endpoint: &Endpoint,
@@ -893,6 +929,16 @@ fn submit_prompt(
     if let Some((name, arguments)) = native_command_invocation(text, &worker.command_names) {
         opencode2_api::command(endpoint, &worker.session_id, name, arguments, delivery)
             .map(|_| None)
+    } else if let Some((id, name, arguments)) = skill_invocation(text, &worker.skills) {
+        opencode2_api::prompt_with_skill(
+            endpoint,
+            &worker.session_id,
+            arguments,
+            id,
+            name,
+            delivery,
+        )
+        .map(Some)
     } else {
         opencode2_api::prompt(endpoint, &worker.session_id, text, delivery).map(Some)
     }
@@ -1344,6 +1390,14 @@ fn tool_content(content: &[ToolContent]) -> Value {
     )
 }
 
+/// Dispatches one frame from the shared stream.
+///
+/// Events are matched by their `type` string rather than through a generated
+/// `#[serde(tag)]` enum: the union is large and still moving, and an exhaustive
+/// enum would turn every server-side addition into a decode failure for the
+/// whole stream. An unrecognized name falls through and is ignored, which is
+/// what lets an event Waku has no use for (`model.updated`, `tui.*`) pass a
+/// live turn without disturbing it.
 fn handle_event(
     envelope: &Value,
     state: &mut StreamState,
@@ -1351,21 +1405,19 @@ fn handle_event(
     commands: &Sender<DriverCommand>,
     service: &impl ContextWindows,
 ) {
-    let kind = canonical_event(
-        envelope
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-    );
+    let kind = envelope
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let data = envelope.get("data").unwrap_or(&Value::Null);
 
     match kind {
-        // Turn lifecycle. The execution outcome IS the terminal event:
-        // beta-19192 does not emit `session.idle` at all (verified against a
-        // live turn on 0.0.0-beta-19192 — the stream ends at
-        // `session.execution.*` and nothing follows), so waiting for one left
-        // every turn pinned to Working forever. `session.idle` is still
-        // handled below in case a build sends it; settling is idempotent.
+        // Turn lifecycle. The execution outcome IS the terminal event: the
+        // service does not emit `session.idle` (verified against a live turn —
+        // the stream ends at `session.execution.*` and nothing follows), so
+        // waiting for one left every turn pinned to Working forever.
+        // `session.idle` is still handled below in case a build sends it;
+        // settling is idempotent.
         "session.execution.started" => state.begin_turn(events),
         "session.step.started" => {
             let Some(message_id) = data.get("assistantMessageID").and_then(Value::as_str) else {
@@ -1409,8 +1461,9 @@ fn handle_event(
             state.arm(success, Some(reason));
             state.finish_turn(events);
         }
-        // Retained for forward/backward compatibility only; beta-19192 never
-        // sends this. Harmless after the outcome already settled the turn.
+        // The service does not emit `session.idle`, so this is only a belt for
+        // a build that starts to. Harmless after the outcome already settled
+        // the turn, since settling is idempotent.
         "session.idle" => state.finish_turn(events),
 
         // Streaming. Text and reasoning share one ordinal namespace.
@@ -1511,7 +1564,7 @@ fn handle_event(
 
         // Inbox and steering.
         "session.inbox.enqueued" => {
-            let Some(id) = data.get("id").and_then(Value::as_str) else {
+            let Some(id) = inbox_event_id(data) else {
                 return;
             };
             let Some(pending) = state.pending_input.as_mut() else {
@@ -1522,9 +1575,11 @@ fn handle_event(
             }
         }
         "session.inbox.delivered" => {
-            if state.pending_input.as_ref().is_some_and(|pending| {
-                Some(pending.inbox_id.as_str()) == data.get("id").and_then(Value::as_str)
-            }) {
+            if state
+                .pending_input
+                .as_ref()
+                .is_some_and(|pending| Some(pending.inbox_id.as_str()) == inbox_event_id(data))
+            {
                 state.pending_input = None;
             }
         }
@@ -1532,7 +1587,7 @@ fn handle_event(
             let Some(pending) = state.pending_input.as_ref() else {
                 return;
             };
-            if Some(pending.inbox_id.as_str()) != data.get("id").and_then(Value::as_str) {
+            if Some(pending.inbox_id.as_str()) != inbox_event_id(data) {
                 return;
             }
             // The app falls back to its own follow-up queue.
@@ -1725,6 +1780,15 @@ fn is_ignored(kind: &str) -> bool {
     PREFIXES.iter().any(|prefix| kind.starts_with(prefix))
         || EXACT.contains(&kind)
         || UNINTERESTING.contains(&kind)
+}
+
+/// The inbox id an inbox event names.
+///
+/// The event and the route that admitted the same item disagree on the field
+/// name — `session.inbox.*` carries `inboxID`, while `POST .../prompt` answers
+/// with the item's `id` — so the events are read here and only here.
+fn inbox_event_id(data: &Value) -> Option<&str> {
+    data.get("inboxID").and_then(Value::as_str)
 }
 
 fn error_message(error: Option<&Value>) -> String {
@@ -2284,10 +2348,10 @@ mod tests {
         })
     }
 
-    /// The regression that shipped: beta-19192 emits NO `session.idle`, so a
+    /// The regression that shipped: the service emits NO `session.idle`, so a
     /// driver that settles only there leaves every finished turn stuck on
-    /// "Working" forever. Captured live on 0.0.0-beta-19192, the terminal
-    /// frame is `session.execution.*` and nothing follows it.
+    /// "Working" forever. Captured live, the terminal frame is
+    /// `session.execution.*` and nothing follows it.
     #[test]
     fn turn_settles_without_any_session_idle() {
         let mut harness = Harness::new(RuntimeMode::FullAccess);
@@ -2831,29 +2895,46 @@ mod tests {
         );
     }
 
-    /// One binary drives both upstream channels: the beta renamed
-    /// `session.input.*` to `session.inbox.*` three weeks after the `next`
-    /// dump this integration was designed against.
+    /// The event names the driver matches are the ones the service actually
+    /// emits, and the inbox family names its item `inboxID` — captured from a
+    /// live 2.0.10 stream, where the payload is `{inboxID, sessionID, item}`.
+    /// The route that admitted the same item answers with `id` instead, so the
+    /// two spellings must not be conflated.
     #[test]
-    fn next_era_event_names_reach_the_beta_handlers() {
-        assert_eq!(
-            canonical_event("session.input.cancelled"),
-            "session.inbox.cancelled"
-        );
-        assert_eq!(canonical_event("session.idle"), "session.idle");
-
+    fn an_inbox_event_names_its_item_by_inbox_id() {
         let mut harness = Harness::new(RuntimeMode::FullAccess);
         harness.state.pending_input = Some(PendingInput {
             inbox_id: "msg_1".into(),
             message: "keep going".into(),
             steer: true,
         });
-        harness.feed(json!({"type": "session.input.cancelled", "data": {"sessionID": "ses_1", "id": "msg_1"}}));
+        harness.feed(json!({
+            "type": "session.inbox.cancelled",
+            "data": {"sessionID": "ses_1", "inboxID": "msg_1", "item": {"type": "user"}}
+        }));
         assert!(matches!(
             harness.drain().as_slice(),
             [DriverEvent::SteerRejected { message, .. }] if message == "keep going"
         ));
         assert!(harness.state.pending_input.is_none());
+    }
+
+    /// The route's own shape: an entry that names the item `id` is NOT the
+    /// event, and matching it would mean the two agree when they do not.
+    #[test]
+    fn an_inbox_event_without_an_inbox_id_is_ignored() {
+        let mut harness = Harness::new(RuntimeMode::FullAccess);
+        harness.state.pending_input = Some(PendingInput {
+            inbox_id: "msg_1".into(),
+            message: "keep going".into(),
+            steer: true,
+        });
+        harness.feed(json!({
+            "type": "session.inbox.cancelled",
+            "data": {"sessionID": "ses_1", "id": "msg_1"}
+        }));
+        assert!(harness.drain().is_empty());
+        assert!(harness.state.pending_input.is_some());
     }
 
     #[test]
@@ -2908,7 +2989,7 @@ mod tests {
     }
 
     #[test]
-    fn only_slash_skills_join_the_command_palette() {
+    fn reported_commands_are_the_registered_names_and_skills() {
         let reported = reported_commands(
             vec![opencode2_api::CommandInfo {
                 name: "review".into(),
@@ -2916,20 +2997,15 @@ mod tests {
             }],
             vec![
                 opencode2_api::SkillInfo {
-                    id: "opencode".into(),
-                    name: "opencode".into(),
-                    description: None,
-                    slash: Some(false),
-                    autoinvoke: None,
-                    location: "/builtin/opencode.md".into(),
+                    id: "report".into(),
+                    name: "Report".into(),
+                    description: Some("File an issue".into()),
                 },
+                // A skill with no description still needs a readable row.
                 opencode2_api::SkillInfo {
-                    id: "deploy".into(),
-                    name: "deploy".into(),
-                    description: Some("Ship it".into()),
-                    slash: Some(true),
-                    autoinvoke: None,
-                    location: "/skills/deploy.md".into(),
+                    id: "opencode".into(),
+                    name: "OpenCode".into(),
+                    description: None,
                 },
             ],
         );
@@ -2938,8 +3014,31 @@ mod tests {
                 .iter()
                 .map(|command| command.name.as_str())
                 .collect::<Vec<_>>(),
-            ["review", "deploy"]
+            ["review", "report", "opencode"]
         );
+        assert_eq!(reported[2].description, "OpenCode");
+    }
+
+    /// A typed skill is an attachment on a prompt, not a command: the command
+    /// route only knows registered commands and would answer 404 for a skill.
+    #[test]
+    fn a_typed_skill_resolves_to_its_id_with_the_rest_as_arguments() {
+        let skills = HashMap::from([
+            ("report".to_owned(), "Report".to_owned()),
+            ("opencode".to_owned(), "OpenCode".to_owned()),
+        ]);
+        assert_eq!(
+            skill_invocation("/report", &skills),
+            Some(("report", "Report", ""))
+        );
+        assert_eq!(
+            skill_invocation("/report   the login page", &skills),
+            Some(("report", "Report", "the login page"))
+        );
+        // The display name is not a token: `Report` is not what anyone types.
+        assert_eq!(skill_invocation("/Report", &skills), None);
+        assert_eq!(skill_invocation("report", &skills), None);
+        assert_eq!(skill_invocation("/missing", &skills), None);
     }
 
     #[test]
@@ -2976,20 +3075,16 @@ mod tests {
         );
     }
 
-    /// Drives the user's own adopted service through the real driver. Ignored
-    /// by default: it needs the OpenCode 2 CLI installed and its background
-    /// service healthy. Run with
-    /// `cargo test -p waku-core opencode2_session_against_the_adopted_service -- --ignored`.
+    /// Drives a real service through the real driver.
     #[test]
-    #[ignore = "requires a healthy opencode2 background service"]
     fn opencode2_session_against_the_adopted_service() {
-        let binary =
-            crate::command_env::find_executable("opencode2").expect("opencode2 is not installed");
+        let binary = crate::live_service::binary();
+        let live = crate::live_service::service();
         let (events, event_rx) = crate::driver::test_event_channel();
         let driver = OpenCode2Driver::start(
             DriverStartOptions {
                 binary,
-                cwd: std::env::temp_dir(),
+                cwd: live.workspace.clone(),
                 mode: RuntimeMode::FullAccess,
                 model: None,
                 reasoning_effort: None,

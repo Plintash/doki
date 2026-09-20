@@ -813,10 +813,9 @@ mod tests {
     /// Exercises the real catalog against the user's own service. Read-only:
     /// it lists sessions and never creates, prompts or deletes.
     #[test]
-    #[ignore = "requires a running opencode2 background service"]
     fn lists_real_root_sessions_across_workspaces() {
-        let binary =
-            crate::command_env::find_executable("opencode2").expect("opencode2 is not installed");
+        let binary = crate::live_service::binary();
+        crate::live_service::service();
         let sessions = list_provider_sessions(&binary, 50).expect("the catalog should load");
         assert!(sessions.iter().all(|session| session.cwd.is_absolute()));
         assert!(
@@ -830,10 +829,9 @@ mod tests {
     /// The service is the only source of the v2 catalog, and both halves have
     /// to arrive together or the picker degrades to the disk cache.
     #[test]
-    #[ignore = "requires a running opencode2 background service"]
     fn discovers_the_real_model_and_agent_catalog() {
-        let binary =
-            crate::command_env::find_executable("opencode2").expect("opencode2 is not installed");
+        let binary = crate::live_service::binary();
+        crate::live_service::service().wait_for_models();
         let (models, presets) = discover_catalog(&binary);
         assert!(!models.is_empty(), "the service should expose models");
         assert!(models.iter().all(|model| model.id.contains('/')));
@@ -869,9 +867,9 @@ mod discovery_smoke {
     /// Proves the picker is actually populated against a live service, which a
     /// unit test over canned JSON cannot.
     #[test]
-    #[ignore = "requires a running opencode2 background service"]
     fn discovers_models_from_the_adopted_service() {
-        let (models, presets) = super::discover_catalog(std::path::Path::new("opencode2"));
+        crate::live_service::service().wait_for_models();
+        let (models, presets) = super::discover_catalog(&crate::live_service::binary());
         println!(
             "models={} presets={:?}",
             models.len(),
