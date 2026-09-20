@@ -2439,13 +2439,13 @@ impl Waku {
                             .flex()
                             .items_center()
                             .gap(px(6.0))
-                            .px(px(9.0))
-                            .py(px(4.0))
+                            .px(px(6.0))
+                            .py(px(3.0))
                             .rounded(px(8.0))
                             .border_1()
                             .border_color(theme.border)
-                            .bg(theme.raised)
                             .cursor_default()
+                            .hover(|style| style.bg(theme.overlay))
                             .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
                                 this.set_annotation_preview_hover(*hovering, cx);
                             }))
@@ -2476,6 +2476,13 @@ impl Waku {
         // clip it, and it abuts the label so the pointer never crosses a dead
         // gap on its way up.
         if preview_open && let Some(bounds) = self.annotation_label_bounds.get() {
+            // Cap the panel to the space between the label and the transcript
+            // viewport's top, so a long list scrolls instead of climbing over
+            // the header.
+            let max_height = self
+                .annotation_safe_bounds()
+                .map(|safe| (bounds.top() - safe.top() - px(16.0)).max(px(140.0)))
+                .unwrap_or(px(360.0));
             list = list.child(
                 gpui::deferred(
                     gpui::anchored()
@@ -2485,6 +2492,7 @@ impl Waku {
                         .child(self.render_annotation_preview(
                             &theme,
                             point(bounds.right() + px(8.0), bounds.top()),
+                            max_height,
                             cx,
                         )),
                 )
@@ -2560,6 +2568,7 @@ impl Waku {
         &self,
         theme: &Theme,
         editor_anchor: Point<Pixels>,
+        max_height: Pixels,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let count = self.composer_annotations.len();
@@ -2600,7 +2609,7 @@ impl Waku {
             .flex()
             .flex_col()
             .gap(px(4.0))
-            .max_h(px(360.0))
+            .max_h(max_height)
             .overflow_y_scroll()
             .track_scroll(&self.annotation_preview_scroll);
         for (index, annotation) in self.composer_annotations.iter().enumerate() {

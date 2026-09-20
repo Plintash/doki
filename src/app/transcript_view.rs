@@ -14,11 +14,21 @@ const ACTIVITY_DIFF_MAX_HEIGHT: f32 = 400.0;
 /// `DiffRowStyle::ACTIVITY`.
 const ACTIVITY_DIFF_GUTTER_WIDTH: f32 = 52.0;
 
+/// Height of the soft fade at the top and bottom of the transcript, so content
+/// dissolves into the header and the composer instead of stopping at a hard
+/// edge.
+const TRANSCRIPT_FADE_HEIGHT: f32 = 26.0;
+
 /// How long a jump from a composer card highlights its span before settling to
 /// the resting annotation wash.
 const ANNOTATION_FLASH_DURATION: Duration = Duration::from_millis(650);
 /// Peak opacity of that highlight; it fades to zero over the duration.
 const ANNOTATION_FLASH_ALPHA: f32 = 0.42;
+
+/// Sizes of the floating annotation editor, used to keep it inside the safe
+/// region before it has been measured.
+const EDITOR_WIDTH: f32 = 340.0;
+const EDITOR_HEIGHT: f32 = 96.0;
 
 #[derive(Clone, Debug)]
 struct ConversationNavigationRailSnapshot {
@@ -178,6 +188,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.prefetch_checkpoint_refs(cx);
+        let theme = Theme::current(cx);
         self.sync_sent_annotation_resolution(cx);
         self.sync_selection_toolbar();
         self.sync_transcript_rows();
@@ -377,6 +388,35 @@ impl Waku {
                 &self.transcript_scrollbar,
             ))
             .child(self.transcript_selection_input())
+            // Soft fades so rows dissolve into the header above and the composer
+            // below rather than ending at a hard edge. Plain divs: no hitbox, so
+            // selection and scrolling pass straight through.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w_full()
+                    .h(px(TRANSCRIPT_FADE_HEIGHT))
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(theme.surface, 0.0),
+                        linear_color_stop(theme.surface.opacity(0.0), 1.0),
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .w_full()
+                    .h(px(TRANSCRIPT_FADE_HEIGHT))
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(theme.surface.opacity(0.0), 0.0),
+                        linear_color_stop(theme.surface, 1.0),
+                    )),
+            )
             .children(search_bar)
             .children(self.render_selection_toolbar(cx))
             .children(self.render_annotation_badges(cx))
@@ -745,6 +785,33 @@ impl Waku {
         Some(point(bounds.right() + px(10.0), bounds.top()))
     }
 
+    /// The comfortable region for floating annotation surfaces: the transcript
+    /// list's viewport, which already sits below the header and above the
+    /// composer. Keeping overlays inside it stops them covering the chrome or
+    /// landing inside the composer.
+    pub(super) fn annotation_safe_bounds(&self) -> Option<Bounds<Pixels>> {
+        let viewport = self.active_transcript_rows().viewport_bounds();
+        (viewport.size.height > px(0.0) && viewport.size.width > px(0.0)).then_some(viewport)
+    }
+
+    /// Keep the annotation editor fully inside the safe region.
+    pub(super) fn clamp_annotation_editor(&self, anchor: Point<Pixels>) -> Point<Pixels> {
+        let Some(safe) = self.annotation_safe_bounds() else {
+            return anchor;
+        };
+        let margin = px(8.0);
+        let x = anchor
+            .x
+            .min(safe.right() - px(EDITOR_WIDTH) - margin)
+            .max(safe.left() + margin);
+        // The editor is about this tall; keep its bottom above the composer.
+        let y = anchor
+            .y
+            .min(safe.bottom() - px(EDITOR_HEIGHT) - margin)
+            .max(safe.top() + margin);
+        point(x, y)
+    }
+
     /// Close the editor and drop the highlight.
     pub(super) fn close_annotation_editor(&mut self, cx: &mut Context<Self>) {
         if self.annotation_editor.borrow().is_none() && self.active_annotation.get().is_none() {
@@ -874,7 +941,8 @@ impl Waku {
         // Follow the mark each frame, so an off-screen editor lands on its span
         // once the reveal scroll has mounted it; the stored point is only the
         // fallback until then.
-        let anchor = self.annotation_mark_anchor(id).unwrap_or(editor.anchor);
+        let anchor =
+            self.clamp_annotation_editor(self.annotation_mark_anchor(id).unwrap_or(editor.anchor));
         let body = div()
             .id("annotation-editor")
             .w(px(340.0))
