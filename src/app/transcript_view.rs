@@ -381,16 +381,10 @@ impl Waku {
                 .size_full()
                 .pb(anchor_end_space),
             )
-            .children(navigation_rail)
-            .children(scroll_to_bottom)
-            .child(scrollbar::vertical(
-                &scrollbar_handle,
-                &self.transcript_scrollbar,
-            ))
-            .child(self.transcript_selection_input())
             // Soft fades so rows dissolve into the header above and the composer
-            // below rather than ending at a hard edge. Plain divs: no hitbox, so
-            // selection and scrolling pass straight through.
+            // below rather than ending at a hard edge. Painted before the
+            // scrollbar and the other overlays so those stay crisp on top of
+            // the mask. Plain divs: no hitbox, so selection passes through.
             .child(
                 div()
                     .absolute()
@@ -417,6 +411,13 @@ impl Waku {
                         linear_color_stop(theme.surface, 1.0),
                     )),
             )
+            .children(navigation_rail)
+            .children(scroll_to_bottom)
+            .child(scrollbar::vertical(
+                &scrollbar_handle,
+                &self.transcript_scrollbar,
+            ))
+            .child(self.transcript_selection_input())
             .children(search_bar)
             .children(self.render_selection_toolbar(cx))
             .children(self.render_annotation_badges(cx))
@@ -599,7 +600,7 @@ impl Waku {
                         .rounded(px(7.0))
                         .cursor_default()
                         .hover(|style| style.bg(theme.overlay))
-                        .child(icon("icons/compose.svg", 12.0, theme.text_secondary))
+                        .child(icon("icons/annotation.svg", 12.0, theme.text_secondary))
                         .child(
                             div()
                                 .text_size(sp(12.5))

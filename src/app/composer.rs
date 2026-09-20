@@ -2463,20 +2463,23 @@ impl Waku {
                             .text_color(theme.text)
                             .child(label),
                     )
-                    .child(
-                        // A fixed slot keeps the chip's width steady; the clear
-                        // button fades in on hover over its own soft disc.
-                        div()
-                            .w(px(22.0))
-                            .h(px(22.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(chip_hovered, |slot| {
-                                slot.child(
+                    // No reserved slot: on hover the clear button lands at the
+                    // far right over the count, on its own soft disc, the way
+                    // Codex's chip reveals it.
+                    .when(chip_hovered, |chip| {
+                        chip.child(
+                            div()
+                                .id("composer-annotations-clear")
+                                .absolute()
+                                .right(px(1.0))
+                                .top_0()
+                                .bottom_0()
+                                .w(px(22.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
                                     div()
-                                        .id("composer-annotations-clear")
                                         .size(px(20.0))
                                         .rounded_full()
                                         .bg(theme.overlay_strong)
@@ -2484,18 +2487,17 @@ impl Waku {
                                         .items_center()
                                         .justify_center()
                                         .cursor_default()
-                                        .hover(|style| style.bg(theme.overlay))
-                                        .child(icon("icons/x.svg", 11.0, theme.text_secondary))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.composer_annotations.clear();
-                                            this.reset_annotation_preview_hover();
-                                            this.capture_and_save_current_composer_draft(cx);
-                                            cx.notify();
-                                        })),
+                                        .child(icon("icons/x.svg", 11.0, theme.text_secondary)),
                                 )
-                            }),
-                    ),
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.composer_annotations.clear();
+                                    this.reset_annotation_preview_hover();
+                                    this.capture_and_save_current_composer_draft(cx);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             );
         // The panel lives in the deferred layer, so the composer card cannot
         // clip it, and it abuts the label so the pointer never crosses a dead
