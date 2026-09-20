@@ -1184,6 +1184,23 @@ pub fn install_selection_input(window: &mut Window, state: &TranscriptSelection)
                 !entry.geometry.is_missing() && entry.geometry.bounds().contains(&event.position)
             });
             let mut selection = state.selection.borrow_mut();
+            // Shift-click extends the selection from its existing anchor
+            // instead of starting a new one, the way a text editor does.
+            if event.modifiers.shift
+                && let Some((anchor_key, anchor_offset)) = selection.anchor_with_offset()
+                && let Some(anchor_index) = registry.position(&anchor_key)
+                && let Some(head) = registry_point(&registry, event.position)
+            {
+                selection.resume_drag();
+                let spans = registry.resolve((anchor_index, anchor_offset), head);
+                let changed = selection.set_spans(spans);
+                drop(selection);
+                drop(registry);
+                if changed {
+                    window.refresh();
+                }
+                return;
+            }
             match hit {
                 Some((_, entry)) => {
                     let offset = match entry.geometry.index_for_position(event.position) {

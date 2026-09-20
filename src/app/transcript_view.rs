@@ -475,7 +475,7 @@ impl Waku {
             .spans()
             .to_vec();
         *toolbar = self
-            .selection_end_bounds(&spans)
+            .selection_toolbar_bounds(&spans)
             .map(|bounds| SelectionToolbar {
                 anchor: point(bounds.left(), bounds.top()),
                 annotation,
@@ -483,18 +483,18 @@ impl Waku {
             });
     }
 
-    /// The top-left of the selection's last line, in window coordinates, so the
-    /// toolbar appears where the drag ended.
-    fn selection_end_bounds(&self, spans: &[md::selection::Span]) -> Option<Bounds<Pixels>> {
-        let last = spans.last()?;
+    /// The top-left of the selection's first line, in window coordinates, so
+    /// the toolbar sits above the selection rather than over it.
+    fn selection_toolbar_bounds(&self, spans: &[md::selection::Span]) -> Option<Bounds<Pixels>> {
+        let first = spans.first()?;
         let registry = self.transcript_selection.registry.borrow();
         let entry = registry
             .entries()
             .iter()
-            .find(|entry| entry.key == last.key)?;
-        md::render::text_range_bounds(&entry.geometry, &last.range)
+            .find(|entry| entry.key == first.key)?;
+        md::render::text_range_bounds(&entry.geometry, &first.range)
             .into_iter()
-            .last()
+            .next()
     }
 
     /// The floating action beside the selection, and its comment field once
