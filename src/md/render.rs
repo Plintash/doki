@@ -38,7 +38,7 @@ use super::highlight::{self, Lang, TokenClass};
 use super::mend::PENDING_LINK_URL;
 use super::parser::{Block, IncrementalParser, InlineRun, ListItem, TableAlign, TopBlock};
 use super::selection::{
-    RegisteredText, SelectionRegistry, SelectionState, TextKey, line_range, word_range,
+    RegisteredText, Selection, SelectionRegistry, SelectionState, TextKey, line_range, word_range,
 };
 use super::veil::{RowVeil, apply_veil};
 use crate::theme::Theme;
@@ -1166,6 +1166,37 @@ fn registry_point(
     Some((index, offset))
 }
 
+/// One end of the current selection: where it sits in document order (registry
+/// index, byte offset), and the key/offset needed to re-anchor a drag there.
+struct SelectionEnd {
+    position: (usize, usize),
+    key: TextKey,
+    offset: usize,
+}
+
+/// The document extent of the current selection, from its first span to its
+/// last, used to decide which end a shift-click grows.
+fn selection_extent(
+    selection: &Selection,
+    registry: &SelectionRegistry<TextGeometry>,
+) -> Option<(SelectionEnd, SelectionEnd)> {
+    let spans = selection.spans();
+    let first = spans.first()?;
+    let last = spans.last()?;
+    Some((
+        SelectionEnd {
+            position: (registry.position(&first.key)?, first.range.start),
+            key: first.key.clone(),
+            offset: first.range.start,
+        },
+        SelectionEnd {
+            position: (registry.position(&last.key)?, last.range.end),
+            key: last.key.clone(),
+            offset: last.range.end,
+        },
+    ))
+}
+
 /// Install the frame's selection mouse listeners.
 ///
 /// These live once per frame at the transcript root rather than once per
@@ -1184,15 +1215,26 @@ pub fn install_selection_input(window: &mut Window, state: &TranscriptSelection)
                 !entry.geometry.is_missing() && entry.geometry.bounds().contains(&event.position)
             });
             let mut selection = state.selection.borrow_mut();
-            // Shift-click extends the selection from its existing anchor
-            // instead of starting a new one, the way a text editor does.
+            // Shift-click grows the selection from the end the click is beyond:
+            // a click past the current end keeps the start and moves the end, a
+            // click before the start keeps the end and moves the start. The
+            // click never shrinks it, the way Codex behaves.
             if event.modifiers.shift
-                && let Some((anchor_key, anchor_offset)) = selection.anchor_with_offset()
-                && let Some(anchor_index) = registry.position(&anchor_key)
                 && let Some(head) = registry_point(&registry, event.position)
+                && let Some((start, end)) = selection_extent(&selection, &registry)
             {
-                selection.resume_drag();
-                let spans = registry.resolve((anchor_index, anchor_offset), head);
+                let spans = if head >= end.position {
+                    registry.resolve(start.position, head)
+                } else if head <= start.position {
+                    registry.resolve(end.position, head)
+                } else {
+                    // Inside the selection: leave it alone.
+                    drop(selection);
+                    drop(registry);
+                    return;
+                };
+                let pivot = if head >= end.position { start } else { end };
+                selection.extend_from(pivot.key, pivot.offset);
                 let changed = selection.set_spans(spans);
                 drop(selection);
                 drop(registry);

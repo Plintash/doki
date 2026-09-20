@@ -99,21 +99,14 @@ impl Selection {
         (self.dragging && self.anchor.as_ref() == Some(key)).then_some(self.anchor_offset)
     }
 
-    /// The anchor and its offset, whether or not a drag is live. A shift-click
-    /// extends from here.
-    pub fn anchor_with_offset(&self) -> Option<(TextKey, usize)> {
-        self.anchor.clone().map(|key| (key, self.anchor_offset))
-    }
-
-    /// Resume extending an existing selection from its stored anchor instead of
-    /// starting a new one. False when there is nothing to extend.
-    pub fn resume_drag(&mut self) -> bool {
-        if self.anchor.is_some() {
-            self.dragging = true;
-            true
-        } else {
-            false
-        }
+    /// Continue the selection from `key`/`offset` instead of from the original
+    /// drag anchor. A shift-click replays the drag from the far end of the
+    /// current selection, so the click always grows it rather than shrinking
+    /// the side it moved past.
+    pub fn extend_from(&mut self, key: TextKey, offset: usize) {
+        self.anchor = Some(key);
+        self.anchor_offset = offset;
+        self.dragging = true;
     }
 
     pub fn anchor(&self) -> Option<&TextKey> {
