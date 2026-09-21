@@ -14,7 +14,7 @@ import { parseArgs } from "node:util";
 import { defaultDownloadUrlPrefix, generateAppcast } from "./appcast";
 import { extractReleaseNotes } from "./changelog";
 
-const appName = "Waku";
+const appName = "Doki";
 const executableName = "Waku";
 const jsReplExecutableName = "waku_js_repl";
 const daemonExecutableName = "waku-daemon";
