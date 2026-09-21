@@ -1332,11 +1332,37 @@ pub(crate) fn list_commands(
     endpoint: &Endpoint,
     directory: Option<&str>,
 ) -> Result<Vec<CommandInfo>> {
-    // A cold location publishes its registry in stages: first empty, then
-    // built-ins, then configured commands and skills. Wait for those plugins
-    // to finish before caching the list. The budget also bounds older builds
-    // whose plugin identifiers or readiness surface differ.
-    let path = format!("/api/command{}", location_query(directory));
+    catalogue(endpoint, "/api/command", directory, "command catalogue")
+}
+
+/// Reads one of the location-scoped catalogues.
+///
+/// Every catalogue is published by a plugin (`opencode.models.dev`,
+/// `opencode.command`, `opencode.config.skill`, …), so a location the service
+/// has not opened yet answers empty and answers its real contents a moment
+/// later. A single read taken inside that window looks like "this location has
+/// nothing": the model picker fell back to its disk cache, and the first
+/// session in a fresh workspace resolved no agent, from a location that had
+/// both.
+///
+/// `/api/plugin` is the readiness surface the service publishes for exactly
+/// this, so wait for the location's registries and read again. The wait is
+/// bounded by [`REQUEST_TIMEOUT`] and the newest catalogue wins if the budget
+/// runs out; a location whose registries are up returns on its first read even
+/// when its catalogue is legitimately empty, so an empty answer costs nothing
+/// once the location is warm. A build that answers without a plugin surface at
+/// all reports `None` from the readiness check, and then a non-empty catalogue
+/// is the only evidence the location is up.
+///
+/// The catalogue routes differ only in their element type: each answers
+/// `{ location, data }` and each scopes by deepObject `location[directory]`.
+fn catalogue<T: DeserializeOwned>(
+    endpoint: &Endpoint,
+    route: &str,
+    directory: Option<&str>,
+    what: &str,
+) -> Result<Vec<T>> {
+    let path = format!("{route}{}", location_query(directory));
     let plugins_path = format!("/api/plugin{}", location_query(directory));
     let deadline = Instant::now() + REQUEST_TIMEOUT;
     let mut latest = Vec::new();
@@ -1347,12 +1373,12 @@ pub(crate) fn list_commands(
         let ready = request(endpoint, "GET", &plugins_path, None, remaining)
             .ok()
             .as_ref()
-            .and_then(command_plugins_ready);
+            .and_then(location_registries_ready);
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return Ok(latest);
         };
         let response = request(endpoint, "GET", &path, None, remaining)?;
-        latest = decode(data(response, "command catalogue")?, "command catalogue")?;
+        latest = decode(data(response, what)?, what)?;
         if ready == Some(true) || (ready.is_none() && !latest.is_empty()) {
             return Ok(latest);
         }
@@ -1362,7 +1388,13 @@ pub(crate) fn list_commands(
     }
 }
 
-fn command_plugins_ready(response: &Value) -> Option<bool> {
+/// Whether a location's registries have finished their staged publication.
+///
+/// The members are the three the command catalogue converges from; they load
+/// in one pass with every other registry, so they also answer for the model,
+/// agent and skill catalogues. A build that never reports them keeps the
+/// non-empty fallback rather than failing.
+fn location_registries_ready(response: &Value) -> Option<bool> {
     let plugins = response.get("data")?.as_array()?;
     Some(
         [
@@ -1384,19 +1416,6 @@ fn command_plugins_ready(response: &Value) -> Option<bool> {
             })
         }),
     )
-}
-
-/// The catalogue routes differ only in their element type: each answers
-/// `{ location, data }` and each scopes by deepObject `location[directory]`.
-fn catalogue<T: DeserializeOwned>(
-    endpoint: &Endpoint,
-    route: &str,
-    directory: Option<&str>,
-    what: &str,
-) -> Result<Vec<T>> {
-    let path = format!("{route}{}", location_query(directory));
-    let response = request(endpoint, "GET", &path, None, REQUEST_TIMEOUT)?;
-    decode(data(response, what)?, what)
 }
 
 fn request(
@@ -1618,6 +1637,21 @@ mod tests {
         Endpoint::local(port)
     }
 
+    /// Wraps canned JSON bodies as the HTTP responses the catalogue reader
+    /// consumes in request order.
+    fn canned(values: Vec<serde_json::Value>) -> Vec<String> {
+        values
+            .into_iter()
+            .map(|value| {
+                let body = value.to_string();
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn command_catalog_waits_for_cold_location_builtins() {
         let responses = [
@@ -1649,6 +1683,65 @@ mod tests {
                 .map(|command| command.name.as_str())
                 .collect::<Vec<_>>(),
             ["init", "review", "custom"]
+        );
+    }
+
+    /// The same staged publication for a catalogue the command plugins do not
+    /// own: a cold location answers no models until its registries are up, and
+    /// a reader that takes that first answer reports "no models" for a
+    /// location that has them.
+    #[test]
+    fn model_catalog_waits_for_cold_location_registries() {
+        let responses = canned(vec![
+            json!({"data": []}),
+            json!({"data": []}),
+            json!({"data": [{"id": "opencode.models.dev", "state": {"status": "active"}}]}),
+            json!({"data": []}),
+            json!({"data": [
+                {"id": "opencode.command", "state": {"status": "active"}},
+                {"id": "opencode.config.command", "state": {"status": "active"}},
+                {"id": "opencode.config.skill", "state": {"status": "active"}}
+            ]}),
+            json!({"data": [{
+                "id": "gpt-5", "modelID": "gpt-5", "providerID": "openai",
+                "name": "GPT-5", "status": "active", "enabled": true,
+                "limit": {"context": 400000, "output": 128000}
+            }]}),
+        ]);
+        let endpoint = serve_responses(responses);
+        let models = list_models(&endpoint, Some("/cold-workspace")).unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-5"]
+        );
+    }
+
+    /// A warm location answers the truth when that truth is "nothing here":
+    /// the wait must not make a location that genuinely has no models pay the
+    /// whole budget on every read.
+    #[test]
+    fn a_warm_location_with_no_catalogue_answers_at_once() {
+        let responses = canned(vec![
+            json!({"data": [
+                {"id": "opencode.command", "state": {"status": "active"}},
+                {"id": "opencode.config.command", "state": {"status": "active"}},
+                {"id": "opencode.config.skill", "state": {"status": "active"}}
+            ]}),
+            json!({"data": []}),
+        ]);
+        let endpoint = serve_responses(responses);
+        let started = Instant::now();
+        assert!(
+            list_models(&endpoint, Some("/empty-workspace"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            started.elapsed() < REQUEST_TIMEOUT / 2,
+            "an empty catalogue from a warm location must not wait for a second answer"
         );
     }
 
@@ -2059,8 +2152,12 @@ mod tests {
     /// bodyless 500, which is a bad workspace rather than a server fault.
     #[test]
     fn a_bodyless_500_reads_as_an_unresolvable_workspace() {
-        let endpoint =
-            serve_once("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        // The readiness probe answers first: a catalogue read settles its
+        // location before it asks for the catalogue itself.
+        let mut responses = canned(vec![json!({"data": []})]);
+        responses
+            .push("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_owned());
+        let endpoint = serve_responses(responses);
         let error = list_models(&endpoint, Some("/nope/nope")).unwrap_err();
         assert!(error.is_unresolvable_location(), "{error:?}");
         assert_eq!(error.status(), Some(500));
@@ -2250,5 +2347,24 @@ mod tests {
         }
 
         delete_session(&endpoint, &id).unwrap();
+    }
+
+    /// A location the service has never opened, read the way the picker reads
+    /// it: one call, no harness warm-up.
+    ///
+    /// Every other live catalogue test reads a location the harness has
+    /// already polled, so none of them can see the window this guards — a cold
+    /// location answers empty first and its real contents a moment later.
+    #[test]
+    fn live_catalogues_settle_a_cold_location() {
+        let live = crate::live_service::service();
+        let endpoint = live.endpoint.clone();
+        let directory = live.cold_workspace();
+        let directory = directory.to_string_lossy().into_owned();
+        assert!(
+            !list_models(&endpoint, Some(&directory)).unwrap().is_empty(),
+            "a cold location has models, so the first empty answer is not the truth"
+        );
+        assert!(!list_agents(&endpoint, Some(&directory)).unwrap().is_empty());
     }
 }

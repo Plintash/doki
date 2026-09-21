@@ -649,6 +649,15 @@ same local resources.
 **Computer Use** — the runtime MCP routes under `/api/experimental/mcp` plus a
 session instruction entry; see [computer-use.md](computer-use.md).
 
+**Catalogues** — every location-scoped catalogue is published by a plugin, so a
+location the service has not opened yet answers empty and answers its contents
+a moment later. A read waits for `/api/plugin` to report that location's
+registries up instead of taking the first empty answer as the truth, which is
+what left the first session in a fresh workspace with the disk-cached model
+list and no resolved agent. A location whose registries are already up answers
+on its first read even when its catalogue is legitimately empty, and the wait
+is bounded so a build without that surface still gets an answer.
+
 **Skills** — listed beside commands, because the current API dropped the member
 that marked a skill user-invocable and hiding half the catalogue behind a guess
 would drop the user's own skills. A typed `/skill-id` is not a command: it is a

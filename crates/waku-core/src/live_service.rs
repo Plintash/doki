@@ -107,6 +107,23 @@ impl LiveService {
             thread::sleep(POLL);
         }
     }
+
+    /// A location the service has never opened.
+    ///
+    /// Nothing is planted in it and nothing has polled it, so its registries
+    /// are published on the first read — the window a catalogue reader has to
+    /// wait out. Canonicalized for the same reason [`Self::workspace`] is: the
+    /// service compares locations by exact string equality.
+    pub(crate) fn cold_workspace(&self) -> PathBuf {
+        let cold = self
+            .workspace
+            .parent()
+            .expect("the live workspace lives under the harness root")
+            .join("cold");
+        std::fs::create_dir_all(&cold).expect("a cold location needs a directory");
+        cold.canonicalize()
+            .expect("the cold workspace must resolve")
+    }
 }
 
 /// The CLI these tests drive, or a failure that says what to install.
