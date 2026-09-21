@@ -394,6 +394,7 @@ fn handle_command(
                         });
                         state.turn_active = false;
                         let _ = events.send(DriverEvent::TurnFinished {
+                            interrupted: false,
                             success: execution.success,
                             summary,
                         });
@@ -401,6 +402,7 @@ fn handle_command(
                     Err(error) => {
                         state.turn_active = false;
                         let _ = events.send(DriverEvent::TurnFinished {
+                            interrupted: false,
                             success: false,
                             summary: Some(format!(
                                 "DeepSeek Harness rejected the command: {error}"
@@ -418,6 +420,7 @@ fn handle_command(
                         "DeepSeek Harness rejected the prompt: {error}"
                     )));
                     let _ = events.send(DriverEvent::TurnFinished {
+                        interrupted: false,
                         success: false,
                         summary: Some("DeepSeek Harness could not start the turn".into()),
                     });
@@ -689,7 +692,11 @@ fn handle_session_event(
             }
             if state.turn_active {
                 state.turn_active = false;
-                let _ = events.send(DriverEvent::TurnFinished { success, summary });
+                let _ = events.send(DriverEvent::TurnFinished {
+                    success,
+                    summary,
+                    interrupted: false,
+                });
             }
         }
         Some("assistant/chunk") => {

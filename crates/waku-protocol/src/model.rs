@@ -2052,6 +2052,12 @@ pub enum DriverEvent {
     TurnFinished {
         success: bool,
         summary: Option<String>,
+        /// True when the turn ended because the user stopped it: the app's own
+        /// Stop button, or a provider-side stop such as a denied OpenCode
+        /// permission. Clients present it as an interruption rather than a
+        /// failure; it defaults to false on the wire so an older payload or
+        /// client keeps its existing behaviour.
+        interrupted: bool,
     },
     Error(String),
     ProcessExited,

@@ -1238,6 +1238,15 @@ pub(crate) fn list_permissions(
 
 /// Answers one permission request.
 ///
+/// The route's payload is `{decision, message?}`. The field is `decision`,
+/// NOT the `reply` the matching `permission.replied` event carries: the
+/// event names the answer, the request names the choice, and sending the
+/// event's spelling back is a schema 400 (`Missing key at ["decision"]`).
+///
+/// A `message` rides along only when the caller has one: OpenCode turns a
+/// rejection's message into feedback the agent reads and continues from,
+/// while a rejection without one aborts the turn.
+///
 /// `always` is rejected here, not upstream: it writes a persistent allow rule
 /// into the user's own OpenCode permission config, which is a decision Waku
 /// has no mandate to make on the user's behalf from a transcript button.
@@ -1246,6 +1255,7 @@ pub(crate) fn reply_permission(
     session: &str,
     request_id: &str,
     reply: PermissionReply,
+    message: Option<&str>,
 ) -> Result<()> {
     if matches!(reply, PermissionReply::Always) {
         return Err(ApiError::Transport(anyhow!(
@@ -1257,7 +1267,10 @@ pub(crate) fn reply_permission(
         encode_path_segment(session),
         encode_path_segment(request_id)
     );
-    let body = json!({ "reply": reply });
+    let mut body = json!({ "decision": reply });
+    if let Some(message) = message.filter(|message| !message.is_empty()) {
+        body["message"] = Value::String(message.to_owned());
+    }
     request(endpoint, "POST", &path, Some(&body), REQUEST_TIMEOUT)?;
     Ok(())
 }
@@ -1652,6 +1665,49 @@ mod tests {
             .collect()
     }
 
+    /// Answers `count` requests with 204 and hands back each request line and
+    /// body, so a route's exact payload can be asserted.
+    fn capture_requests(count: usize) -> (Endpoint, std::sync::mpsc::Receiver<(String, Value)>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = Endpoint::local(listener.local_addr().unwrap().port());
+        let (sent, received) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..count {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut input = std::io::BufReader::new(&mut socket);
+                let mut request = String::new();
+                input.read_line(&mut request).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    input.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = header.split_once(':')
+                        && key.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                input.read_exact(&mut body).unwrap();
+                sent.send((
+                    request,
+                    serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+                ))
+                .unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+            }
+        });
+        (endpoint, received)
+    }
+
     #[test]
     fn command_catalog_waits_for_cold_location_builtins() {
         let responses = [
@@ -1760,43 +1816,7 @@ mod tests {
 
     #[test]
     fn computer_use_runtime_configuration_is_location_and_session_scoped() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let endpoint = Endpoint::local(listener.local_addr().unwrap().port());
-        let (sent, received) = std::sync::mpsc::channel();
-        let server = thread::spawn(move || {
-            for _ in 0..4 {
-                let (mut socket, _) = listener.accept().unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut input = std::io::BufReader::new(&mut socket);
-                let mut request = String::new();
-                input.read_line(&mut request).unwrap();
-                let mut length = 0;
-                loop {
-                    let mut header = String::new();
-                    input.read_line(&mut header).unwrap();
-                    if header == "\r\n" {
-                        break;
-                    }
-                    if let Some((key, value)) = header.split_once(':')
-                        && key.eq_ignore_ascii_case("content-length")
-                    {
-                        length = value.trim().parse().unwrap();
-                    }
-                }
-                let mut body = vec![0; length];
-                input.read_exact(&mut body).unwrap();
-                sent.send((
-                    request,
-                    serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
-                ))
-                .unwrap();
-                socket
-                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                    .unwrap();
-            }
-        });
+        let (endpoint, received) = capture_requests(4);
         let config = json!({"type":"local","command":["/app/waku_js_repl"],"codemode":false});
         add_mcp(
             &endpoint,
@@ -1814,7 +1834,6 @@ mod tests {
         .unwrap();
         remove_instruction_entry(&endpoint, "ses_test", "waku-computer-use").unwrap();
         remove_mcp(&endpoint, "/work/project with space", "waku_js_repl_test").unwrap();
-        server.join().unwrap();
         let requests: Vec<_> = received.try_iter().collect();
         assert_eq!(
             requests[0].0,
@@ -2122,12 +2141,45 @@ mod tests {
             "ses_1",
             "per_1",
             PermissionReply::Always,
+            None,
         )
         .unwrap_err();
         assert!(matches!(error, ApiError::Transport(_)));
         assert_eq!(
             serde_json::to_value(PermissionReply::Once).unwrap(),
             json!("once")
+        );
+    }
+
+    /// The route's payload schema names `decision`. The matching
+    /// `permission.replied` event names its field `reply`, so sending that
+    /// spelling back is a schema 400 (`Missing key at ["decision"]`) — the
+    /// regression this pins, without needing a live service.
+    #[test]
+    fn permission_replies_use_the_decision_envelope() {
+        let (endpoint, received) = capture_requests(3);
+        reply_permission(&endpoint, "ses_1", "per_1", PermissionReply::Once, None).unwrap();
+        reply_permission(&endpoint, "ses_1", "per_1", PermissionReply::Reject, None).unwrap();
+        reply_permission(
+            &endpoint,
+            "ses_1",
+            "per_1",
+            PermissionReply::Reject,
+            Some("use the cached copy instead"),
+        )
+        .unwrap();
+        let requests: Vec<_> = received.try_iter().collect();
+        assert_eq!(
+            requests[0].0,
+            "POST /api/session/ses_1/permission/per_1/reply HTTP/1.1\r\n"
+        );
+        assert_eq!(requests[0].1, json!({"decision":"once"}));
+        assert_eq!(requests[1].1, json!({"decision":"reject"}));
+        // The explanation is the only optional field; an empty one is absent
+        // rather than an empty string the service would hand the agent.
+        assert_eq!(
+            requests[2].1,
+            json!({"decision":"reject", "message":"use the cached copy instead"})
         );
     }
 
@@ -2248,6 +2300,20 @@ mod tests {
                 .is_empty()
         );
         assert!(list_permissions(&endpoint, &id).unwrap().is_empty());
+        // The reply payload is validated before the request is looked up, so a
+        // request id that does not exist proves the envelope parses: the wrong
+        // key answers a schema 400 here, and only a parsed payload reaches the
+        // not-found arm.
+        let missing = reply_permission(
+            &endpoint,
+            &id,
+            "per_waku_route_check",
+            PermissionReply::Once,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(missing.status(), Some(404), "{missing}");
+        assert_eq!(missing.tag(), Some("PermissionNotFoundError"));
         assert!(list_forms(&endpoint, &id).unwrap().is_empty());
 
         let admitted: InboxUser = decode(

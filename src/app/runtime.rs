@@ -2508,6 +2508,7 @@ impl Waku {
             runtime.stream_remeasure_pending = false;
             runtime.stream_phase = None;
             runtime.pending_permission = None;
+            runtime.permission_note_open = false;
             runtime.pending_user_input = None;
             runtime.pending_computer_approval = None;
         }
@@ -2923,6 +2924,7 @@ impl Waku {
                 park_announced: false,
                 stream_remeasure_pending: false,
                 pending_permission: None,
+                permission_note_open: false,
                 pending_user_input: None,
                 pending_computer_approval: None,
                 computer_use_previews: Vec::new(),
@@ -3416,6 +3418,7 @@ impl Waku {
             runtime.stream_remeasure_pending = false;
             runtime.stream_phase = None;
             runtime.pending_permission = None;
+            runtime.permission_note_open = false;
             runtime.pending_user_input = None;
             runtime.pending_computer_approval = None;
             runtime.last_active_at = Instant::now();

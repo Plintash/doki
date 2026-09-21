@@ -669,6 +669,7 @@ impl Waku {
                 DriverEvent::TurnFinished {
                     success: true,
                     summary: None,
+                    interrupted: false,
                 },
                 true,
                 cx,

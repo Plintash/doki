@@ -225,6 +225,7 @@ impl AmpDriver {
                                 )));
                                 if std::mem::take(&mut *writer_turn.lock()) {
                                     let _ = writer_events.send(DriverEvent::TurnFinished {
+                                        interrupted: false,
                                         success: false,
                                         summary: Some(tr!(
                                             "errors.provider_receive_prompt",
@@ -282,6 +283,7 @@ impl AmpDriver {
                                     )));
                                     if std::mem::take(&mut *writer_turn.lock()) {
                                         let _ = writer_events.send(DriverEvent::TurnFinished {
+                                            interrupted: false,
                                             success: false,
                                             summary: Some(tr!(
                                                 "errors.provider_stopped_receiving",
@@ -496,6 +498,7 @@ fn handle_message(
                 && std::mem::take(&mut *turn_active.lock())
             {
                 let _ = events.send(DriverEvent::TurnFinished {
+                    interrupted: false,
                     success: true,
                     summary: None,
                 });

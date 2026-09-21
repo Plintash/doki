@@ -470,6 +470,9 @@ permission.allow_named_permission: "%{permission} を許可しますか？"
 permission.agent_asks_for_named_permission: エージェントが %{permission} の権限を求めています
 permission.agent_asks_for_permission: エージェントが権限を求めています
 permission.agent_wants_to: エージェントが次の操作を実行しようとしています：%{action}
+permission.declined_tool_call: このツール呼び出しを拒否しました
+permission.deny_note_placeholder: 代わりにどうするか OpenCode に伝える（任意）
+permission.deny_note_hint: 説明を書くとターンは続行します。空欄なら拒否のみ
 
 common.close: 閉じる
 common.default: デフォルト

@@ -1897,6 +1897,7 @@ fn handle_codex_message(
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             let _ = events.send(DriverEvent::TurnFinished {
+                interrupted: false,
                 success: status == "completed",
                 summary: error,
             });
@@ -2615,7 +2616,9 @@ mod tests {
                         eprintln!("live fork test cursor: {provider_cursor:?}");
                     }
                     DriverEvent::TextDelta(delta) => text.push_str(&delta),
-                    DriverEvent::TurnFinished { success, summary } => {
+                    DriverEvent::TurnFinished {
+                        success, summary, ..
+                    } => {
                         assert!(success, "Codex failed: {summary:?}");
                         return text;
                     }

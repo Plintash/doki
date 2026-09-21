@@ -273,9 +273,14 @@ impl DriverControl for RemoteDriverControl {
     }
 
     fn respond(&self, request_id: String, option_id: String) {
+        self.respond_with_message(request_id, option_id, None);
+    }
+
+    fn respond_with_message(&self, request_id: String, option_id: String, message: Option<String>) {
         self.notify(waku_client::Command::Respond {
             request_id,
             option_id,
+            message,
         });
     }
 

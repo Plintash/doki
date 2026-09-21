@@ -930,6 +930,9 @@ struct SessionRuntime {
     park_announced: bool,
     stream_remeasure_pending: bool,
     pending_permission: Option<PendingPermission>,
+    /// The approval card is showing its denial-note field, so the option
+    /// buttons are replaced by the note and its Deny/Close row.
+    permission_note_open: bool,
     pending_user_input: Option<PendingUserInput>,
     pending_computer_approval: Option<PendingComputerApproval>,
     /// Back-to-front stack of window previews captured during the active turn.
@@ -1126,6 +1129,10 @@ pub struct Waku {
     home_directory: Option<PathBuf>,
     composer: Entity<ComposerInput>,
     user_input_answer: Entity<TextInput>,
+    /// The approval card's optional denial note. Only a provider whose
+    /// rejection accepts an explanation shows the field (see the composer
+    /// card); an empty note is the plain deny.
+    permission_note: Entity<TextInput>,
     /// Drafts are independent of transcript persistence: started tasks key by
     /// session id, while blank New Task pages key by project id.
     composer_drafts: ComposerDrafts,
@@ -2081,6 +2088,9 @@ impl Waku {
         let composer = cx.new(|cx| ComposerInput::new(window, cx).padding_x(px(14.0), cx));
         let user_input_answer = cx
             .new(|cx| TextInput::new(window, cx).placeholder(tr!("user_input.other_placeholder")));
+        let permission_note = cx.new(|cx| {
+            TextInput::new(window, cx).placeholder(tr!("permission.deny_note_placeholder"))
+        });
         let command_palette_search = cx.new(|cx| {
             TextInput::new(window, cx)
                 .clear_on_escape()
@@ -2554,6 +2564,19 @@ impl Waku {
             )
             .detach();
 
+            // Enter in the denial note confirms the denied answer with the
+            // explanation; the field keeps its text until the card closes, so
+            // a refused reply can re-open the same note.
+            cx.subscribe(
+                &permission_note,
+                |this: &mut Self, _, event: &InputEvent, cx| {
+                    if let InputEvent::Submit(note) = event {
+                        this.confirm_permission_note(Some(note.clone()), cx);
+                    }
+                },
+            )
+            .detach();
+
             // Clipboard images and Finder file copies are attachment payloads,
             // not text paths. The input owns representation priority; Waku
             // owns durable staging and composer/session state.
@@ -2827,6 +2850,7 @@ impl Waku {
                 home_directory,
                 composer,
                 user_input_answer,
+                permission_note,
                 composer_drafts,
                 composer_draft_store,
                 composer_draft_save_generation: 0,
