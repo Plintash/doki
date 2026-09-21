@@ -17,7 +17,7 @@ session that spans the whole conversation**:
 | --- | --- | --- |
 | Codex app-server (JSON-RPC over stdio) | [driver/codex.rs](../crates/waku-core/src/driver/codex.rs) | Codex CLI |
 | Agent Client Protocol (JSON-RPC over stdio) | [driver/acp.rs](../crates/waku-core/src/driver/acp.rs) | Cursor CLI, Fx, Grok Build, Kimi Code |
-| OpenCode server (HTTP + server-sent events) | [driver/opencode.rs](../crates/waku-core/src/driver/opencode.rs) | OpenCode |
+| OpenCode shared service (HTTP + one server-sent event stream) | [driver/opencode.rs](../crates/waku-core/src/driver/opencode.rs) | OpenCode |
 | Pi RPC mode (NDJSON request/response over stdio) | [driver/pi.rs](../crates/waku-core/src/driver/pi.rs) | Pi, Oh My Pi |
 | Claude streaming-input session (NDJSON over stdio) | [driver/claude.rs](../crates/waku-core/src/driver/claude.rs) | Claude Code |
 | Amp streaming-JSON session (NDJSON over stdio) | [driver/amp.rs](../crates/waku-core/src/driver/amp.rs) | Amp |
@@ -137,15 +137,13 @@ when stderr has not already explained itself. Rust's `Child::drop` neither kills
 nor reaps, so a driver that skipped that thread would leave a zombie for the life
 of the app — which Pi did until it was given one.
 
-**The OpenCode server is different**: it has no stdin to close, so
-`OpenCodeServer`'s own `Drop` kills and waits on it
-([opencode_session.rs](../crates/waku-core/src/opencode_session.rs)). Waku quitting without
-running `Drop` is the one case that could orphan it, where the stdio drivers get
-cleanup from the OS for free.
+**The OpenCode service is different again**: Waku does not own it. The service
+was started by whoever needed it first — usually the user's own terminal — so
+Waku only cancels its own streaming subscription and never signals the process.
 
-The other explicit kills are narrow and deliberate: Amp's process when the user
-stops a turn, the short-lived servers that back a fork — OpenCode's and Grok's — and the
-OpenCode server itself, whose driver kills it explicitly on drop.
+Every explicit kill is narrow and deliberate: Amp's process when the user stops
+a turn, and the short-lived server Grok's fork needs. OpenCode has none at all:
+the service belongs to the user and outlives every Waku task.
 
 ## At a glance
 
@@ -168,6 +166,14 @@ Kimi Code's steering is the transport's, not a probed policy: the ACP driver
 sends the second `session/prompt` for every agent it drives, but Kimi's
 superseded-prompt behaviour has not been observed against a live turn the way
 Cursor's and Grok's were.
+
+OpenCode is the one provider Waku does not launch: it adopts a background
+service the user's own terminal may already be driving, through a descriptor in
+that user's state directory, and it never signals that process. The binary is
+`opencode`, which is also OpenCode 1's name, so the provider accepts it only
+when it reports a 2.x version. It is also the only transport whose every route
+and event had to be re-read after the provider reshaped its API mid-release; see
+[OpenCode](#opencode).
 
 Every provider now holds a session across turns. That was not true when this
 document was first written: five of the seven spawned a process per prompt, and
@@ -511,69 +517,87 @@ re-expands the nested envelope first, so branches of branches stay flat
 
 ---
 
-## OpenCode server
+## OpenCode
 
-**Launch** — `opencode serve --hostname 127.0.0.1 --port <ephemeral>`
-([driver/opencode.rs](../crates/waku-core/src/driver/opencode.rs)). Waku already started this
-server to fork a session; it now runs the conversation too.
+**Launch** — nothing is launched. OpenCode is one background service started
+by whoever needed it first (usually the user's own TUI), and it serves every
+workspace because a v2 session carries its own `location.directory`. Waku
+*finds* it through `${XDG_STATE_HOME:-~/.local/state}/opencode/service.json`,
+opening that descriptor read-only: the service polls its own file and
+self-terminates when the contents change, so a "repair" would kill the user's
+daemon. Teardown cancels the SSE socket and returns — the pid is never
+signalled, and `opencode serve --service` is idempotent against a healthy
+incumbent, so a second Waku daemon converges on the same process.
 
-**Protocol** — OpenCode's own HTTP API plus a server-sent event stream. Routes
-and payloads here were read off a live server's OpenAPI document, not guessed.
+The CLI is `opencode` on every 2.x channel, which is also OpenCode 1's name, so
+the provider accepts the binary only when it reports a 2.x version.
 
-**Lifetime** — long-lived: one server per session runtime.
+**Protocol** — OpenCode's own HTTP API plus the one server-wide
+`GET /api/event` stream. Everything believed about that API here was read off
+a running build rather than guessed, because it moves fast: the identity route
+alone went `/api/health` → `/api/server` → `/api/status` → `/api/info` inside a
+fortnight, and the session routes that Waku calls were reshaped at 2.0.4.
+**Waku drives the current API and refuses older builds by name** — see
+[opencode_api.rs](../crates/waku-core/src/opencode_api.rs).
 
-**Handshake** — `POST /session` with OpenCode's standard `build` agent for a
-fresh session, or reuse the resume cursor's id.
+**Handshake** — `GET /api/info` identifies the service and reports the pid the
+descriptor is checked against, then `POST /api/session` creates a session with a
+client-minted id. The id is minted by Waku because the subscription is opened
+*before* the create, which is what makes the create-vs-first-event race
+impossible.
 
-**Per turn** — `POST /session/{id}/prompt_async` with
-`{parts: [{type: "text", …}]}`, which acknowledges with `204 No Content` as
-soon as the prompt is accepted; the turn's completion arrives as
-`session.idle` on the event stream. The blocking `message` route holds its
-response until the turn ends — longer than any sane read timeout — so it is
-not used for prompting. T3 Code's SDK calls the same route as
-`session.promptAsync`.
+**Per turn** — the execution outcome IS the terminal event:
+`session.execution.{succeeded,failed,interrupted}` settles the turn, and
+settling is idempotent so a steered second message still settles once. Nothing
+waits for `session.idle`; the service does not emit it, and waiting for one
+pins every finished turn to Working forever.
 
-**Steer** — the same `prompt_async` post while the session is busy: the
-server folds the message into the running turn and one `session.idle` still
-settles everything. OpenCode's own UI labels this "queued", but it is the
-live turn absorbing the message, not a follow-up turn. The `204`
-acknowledgment resolves to `SteerAccepted`; a failed post resolves to
-`SteerRejected` and leaves the running turn untouched. Verified against a
-real server by injecting an instruction while a bash `sleep` ran: one idle,
-one reply, honoring both messages.
+**Steer** — `POST /api/session/{id}/prompt` with `delivery: "steer"`, or
+`PATCH /api/session/{id}/inbox/{inboxID}` with a new delivery for a message that
+is already pending. Delivery modes are fields of a pending item, not verbs of
+their own, and the service promotes them at a step boundary — which is also why
+a message can never be spliced between an assistant's tool calls and their
+results.
 
-**Inbound stream** — `GET /event`, server-wide. The per-session route exists
-only under `/api`, and since this server is Waku's alone, filtering by
-`properties.sessionID` is enough — and necessary, so one task's traffic cannot
-reach another's transcript.
+**Inbound stream** — `GET /api/event`, server-wide, demultiplexed by session
+id: the frame reaches exactly the subscriber that owns the session, the whole
+`tui.*` remote-control family is dropped, and anything Waku does not own is
+dropped too.
 
-| Event | Becomes |
-| --- | --- |
-| `message.part.delta`, `field: "text"` on a text or unknown part | `TextDelta` |
-| `message.part.delta`, `field: "reasoning"` / `field: "thinking"`, or `field: "text"` on a native reasoning part | `ReasoningDelta` |
-| `message.part.updated` with a `reasoning` / `thinking` part | records its `partID`, since OpenCode streams the part's content as the generic `text` field |
-| `message.part.updated` with a `tool` part | `RichActivity`, read off `/state/status`, `/state/input`, `/state/output` |
-| `message.updated` with assistant token counters | `UsageUpdated`, paired with `/api/model`'s context limit for the reported provider/model |
-| `session.idle` | `TurnFinished` |
-| `session.error` | `Error` |
-| `permission.*` | `Permission` |
-| `session.created`, `session.updated`, `session.diff`, plugin/catalog chatter | ignored |
+**Approvals** — `POST /api/session/{id}/permission/{requestID}/reply` with
+`once` or `reject`. `always` never goes on the wire: it writes into
+`/api/permission/saved`, a global store shared with the user's own terminal, so
+durable choices stay in the driver's own state and every provider reply is
+one-shot.
 
-**Approvals** — `POST /session/{id}/permission/{requestID}/reply` with
-`{reply: "once" | "always" | "reject"}`. Supervised surfaces the request with the
-permission's own patterns as the title; the auto modes answer `always` so the
-agent stops asking about the same permission.
+**Rewind and branch** — `POST /api/session/{id}/fork` with a boundary, sent
+through the resident service so a second OpenCode process never contends for the
+same local resources.
 
-**Cancel** — `POST /session/{id}/abort`.
+**Computer Use** — the runtime MCP routes under `/api/experimental/mcp` plus a
+session instruction entry; see [computer-use.md](computer-use.md).
 
-**Rewind and branch** — `POST /session/{id}/fork`. A live task sends the fork
-through its resident server, avoiding a second OpenCode process contending for
-the same local resources; a cold task may use a short-lived server
-([opencode_session.rs](../crates/waku-core/src/opencode_session.rs)).
+**Catalogues** — every location-scoped catalogue is published by a plugin, so a
+location the service has not opened yet answers empty and answers its contents
+a moment later. A read waits for `/api/plugin` to report that location's
+registries up instead of taking the first empty answer as the truth, which is
+what left the first session in a fresh workspace with the disk-cached model
+list and no resolved agent. A location whose registries are already up answers
+on its first read even when its catalogue is legitimately empty, and the wait
+is bounded so a build without that surface still gets an answer.
 
-**Computer Use** — `OPENCODE_CONFIG_CONTENT` and the helper paths are handed to
-the resident server through its environment, exactly as the one-shot invocation
-received them.
+**Skills** — listed beside commands, because the current API dropped the member
+that marked a skill user-invocable and hiding half the catalogue behind a guess
+would drop the user's own skills. A typed `/skill-id` is not a command: it is a
+prompt carrying a skill attachment (`{id, name}`), which the service expands
+into the message it records — an id it does not know is refused outright, so the
+palette cannot offer a dead entry. Words typed after the name ride along as the
+prompt's text.
+
+**Not supported** — a subagent's own transcript. A subagent runs as a child
+session, so its events are routed to a subscriber Waku never opens; what reaches
+the transcript is the parent's task tool row and, when the child finishes, the
+parent's `session.synthetic` note (`<subagent …>`) rendered as an activity.
 
 ---
 
@@ -829,7 +853,7 @@ persisted with the session and is what makes a Waku task outlive its process:
 | Amp | `thread_id`, `fork_context` | `fork_context` is the seeded history for a branch |
 | Cursor | `session_id`, `fork_context` | id is empty until a seeded branch streams one |
 | Fx | `session_id` | `session/resume`; no fork or rewind, see above |
-| OpenCode | `session_id` | `--session` / server fork |
+| OpenCode | `session_id`, `directory` | the adopted service names the location, so a resume needs both |
 | Grok | `session_id` | `--resume` / ACP fork |
 | Kimi Code | `session_id` | `session/resume`; no fork, see above |
 
@@ -852,7 +876,7 @@ hold a long-lived session; the transport differs, the lifetime does not.
 | Claude | `@anthropic-ai/claude-agent-sdk` `query()` with an `AsyncIterable` prompt queue | same protocol, spoken directly — the SDK is a wrapper around these flags |
 | Cursor | **`cursor-agent acp`** — ACP over stdio (`packages/effect-acp`) | same |
 | Grok | **`grok agent stdio`** — ACP over stdio | same |
-| OpenCode | long-lived `opencode serve` + HTTP SDK | same |
+| OpenCode | long-lived `opencode serve` + HTTP SDK | the user's own service, adopted rather than launched |
 
 **All five now match**, and Claude reaches the same place without the SDK: there
 is no Rust Agent SDK, but the SDK is a wrapper around the `claude` CLI's own

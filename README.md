@@ -20,23 +20,6 @@ On Linux run `./scripts/bundle-linux.sh`, and on Windows run
 all three recipes and their native build prerequisites. Run `bun install` once
 before any of them.
 
-For a ready-made build, install upstream [Waku](https://github.com/egoist/waku)
-instead: on macOS, [download the signed `.dmg`](https://waku.sh); on Linux:
-
-```sh
-curl -fsSL https://waku.sh/install.sh | sh
-```
-
-The script installs into `~/.local` without root. See
-[docs/linux.md](docs/linux.md) for requirements, manual installation, and
-uninstalling.
-
-On Windows, run `Waku-<version>-<arch>-Setup.exe` from the
-[latest upstream release](https://github.com/egoist/waku/releases/latest). It
-installs per-user and updates itself. A portable `.zip` is published alongside
-it. See [docs/windows.md](docs/windows.md) for requirements and what is not
-available there yet.
-
 ## Supported agents
 
 Doki works with:
@@ -135,6 +118,5 @@ by the upstream project.
 
 ## License
 
-Doki is licensed under the [GNU General Public License v3.0 only](LICENSE), the
-same license as the upstream [Waku](https://github.com/egoist/waku) project it
-is derived from — a fork cannot change it.
+Doki is licensed under the [GNU General Public License v3.0 only](LICENSE). As a
+fork of a GPLv3-only project, Doki cannot change that license.

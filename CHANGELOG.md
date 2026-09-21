@@ -16,6 +16,8 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+- Support the current OpenCode CLI as the one OpenCode provider: it attaches to the background service you already run, and the retired OpenCode 1 support is gone
+
 ## [0.1.19]
 
 - Render inline and block LaTeX math in Markdown, with a Copy Expression action and a setting to show the source

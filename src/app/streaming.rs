@@ -318,7 +318,7 @@ impl Waku {
                         session.status = SessionStatus::Working;
                     } else if matches!(
                         session.provider,
-                        ProviderKind::Codex | ProviderKind::Claude | ProviderKind::OpenCode2
+                        ProviderKind::Codex | ProviderKind::Claude | ProviderKind::OpenCode
                     ) {
                         // Some providers start turns on their own: Codex goal
                         // continuation pursues an active goal whenever the

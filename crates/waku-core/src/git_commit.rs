@@ -292,31 +292,23 @@ fn agent_arguments(
             push(&mut args, "--no-color");
             push(&mut args, "--");
         }
-        // `opencode2 run` takes the message positionally and has no `--pure`;
+        // `opencode run` takes the message positionally and has no `--pure`;
         // `--standalone` keeps the one-shot off the shared background service
         // so a commit-message run cannot appear in the user's session list.
-        ProviderKind::OpenCode2 => {
+        // The reasoning variant has no flag of its own on this line: it rides
+        // on the model as `provider/model#variant`.
+        ProviderKind::OpenCode => {
             push(&mut args, "run");
             push(&mut args, "--standalone");
             push(&mut args, "--agent");
             push(&mut args, "plan");
             if let Some(model) = model {
+                let carried = match reasoning_effort {
+                    Some(effort) => format!("{model}#{effort}"),
+                    None => model.to_owned(),
+                };
                 push(&mut args, "--model");
-                push(&mut args, model);
-            }
-        }
-        ProviderKind::OpenCode => {
-            push(&mut args, "run");
-            push(&mut args, "--pure");
-            push(&mut args, "--agent");
-            push(&mut args, "plan");
-            if let Some(model) = model {
-                push(&mut args, "--model");
-                push(&mut args, model);
-            }
-            if let Some(effort) = reasoning_effort {
-                push(&mut args, "--variant");
-                push(&mut args, effort);
+                push(&mut args, &carried);
             }
         }
         ProviderKind::Grok => {
@@ -766,17 +758,12 @@ mod tests {
                 }
                 ProviderKind::OpenCode => {
                     assert_eq!(args.first().and_then(|arg| arg.to_str()), Some("run"));
-                    assert!(has(&args, "--pure"));
-                    assert!(has_pair(&args, "--agent", "plan"));
-                    assert!(has_pair(&args, "--variant", "low"));
-                }
-                ProviderKind::OpenCode2 => {
-                    assert_eq!(args.first().and_then(|arg| arg.to_str()), Some("run"));
-                    // `opencode2 run` has no `--pure`; `--standalone` is what
-                    // keeps the one-shot off the shared background service.
+                    // `opencode run` has no `--pure`; `--standalone` is what
+                    // keeps the one-shot off the shared background service,
+                    // and the variant rides on the model string.
                     assert!(has(&args, "--standalone"));
                     assert!(has_pair(&args, "--agent", "plan"));
-                    assert!(has_pair(&args, "--model", "model"));
+                    assert!(has_pair(&args, "--model", "model#low"));
                 }
                 ProviderKind::Claude => {
                     assert!(has(&args, "--print"));

@@ -1,6 +1,6 @@
-//! Discovery, adoption and event fan-out for the shared OpenCode 2 service.
+//! Discovery, adoption and event fan-out for the shared OpenCode service.
 //!
-//! OpenCode 2 is not a per-workspace server. One background process, started
+//! OpenCode is not a per-workspace server. One background process, started
 //! by whoever needed it first — usually the user's own TUI — serves every
 //! workspace, because a v2 session carries its own `location.directory` and
 //! the service itself sits in `$HOME`. Waku therefore *finds* that process
@@ -11,7 +11,7 @@
 //!
 //! * **An adopted service is never killed.** Teardown cancels the SSE socket
 //!   and returns. Waku never signals the pid, never calls the service's own
-//!   stop route, and never runs `opencode2 service stop` — the process it
+//!   stop route, and never runs `opencode service stop` — the process it
 //!   found may be driving the user's terminal, and a process Waku started with
 //!   `serve --service` is indistinguishable from one it found.
 //! * **The registration file is opened read-only, always.** The service polls
@@ -19,12 +19,12 @@
 //!   so any write — including a well-meaning repair of a stale descriptor —
 //!   kills the user's daemon within 5s.
 //! * **The reader thread is leaseless.** It holds the hub, the stream control,
-//!   an [`Endpoint`] snapshot and a `Weak<Opencode2Service>` it upgrades
+//!   an [`Endpoint`] snapshot and a `Weak<OpenCodeService>` it upgrades
 //!   briefly; it must never hold a strong handle. An SSE stream only ends when
 //!   the connection dies, so a strong handle there would make the parked and
 //!   torn-down paths unreachable — the reader would keep itself alive forever.
-//!   This generalizes the rule `opencode_pool` obeys by handing its reader a
-//!   bare port.
+//!   This is the same leak-free rule the streaming, port-only readers follow:
+//!   a reader that outlives its service must never be the reason it is alive.
 //!
 //! Demultiplexing is a security boundary rather than an optimization: the one
 //! stream carries the user's own TUI sessions and every other Waku task, so a
@@ -58,13 +58,8 @@ use crate::http_wire::{
 /// The Basic username the service demands. Any other username answers 401.
 const SERVICE_USER: &str = "opencode";
 const REGISTRATION_FILE: &str = "service.json";
-const HEALTH_ROUTE: &str = "/api/health";
 const EVENT_ROUTE: &str = "/api/event";
 const MODEL_ROUTE: &str = "/api/model";
-
-/// Health is a liveness question, not a work request: a probe that hangs must
-/// not eat the start budget it is being polled inside.
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MODEL_TIMEOUT: Duration = Duration::from_secs(10);
 /// The service heartbeats `: heartbeat` exactly 15.000s apart (measured over a
 /// live idle stream), so 20s would tear down a healthy connection that merely
@@ -83,7 +78,7 @@ const MAX_REDISCOVERY_FAILURES: u32 = 3;
 ///
 /// `version` is the service's own build id. Waku surfaces it rather than
 /// comparing it: the CLI's incumbency check compares against *its* build, and
-/// Waku is not an opencode2 build, so equality there would reject every
+/// Waku is not an opencode build, so equality there would reject every
 /// perfectly healthy service.
 #[derive(Clone, Deserialize)]
 pub(crate) struct ServiceRegistration {
@@ -115,7 +110,31 @@ pub(crate) fn registration_path() -> PathBuf {
     state_directory().join(REGISTRATION_FILE)
 }
 
-fn state_directory() -> PathBuf {
+/// The state root the live tests own, when they have claimed one.
+///
+/// Production always resolves the descriptor from the environment. The tests
+/// point it at a directory they own instead, because the alternative — mutating
+/// `XDG_STATE_HOME` from a test — is both unsafe in edition 2024 and a race
+/// against every process this crate spawns.
+#[cfg(test)]
+static TEST_STATE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn use_test_state_root(root: PathBuf) {
+    let _ = TEST_STATE_ROOT.set(root);
+}
+
+#[cfg(test)]
+fn test_state_root() -> Option<&'static PathBuf> {
+    TEST_STATE_ROOT.get()
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn state_directory() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TEST_STATE_ROOT.get() {
+        return root.join("opencode");
+    }
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
@@ -160,25 +179,35 @@ fn read_registration_file(path: &Path) -> Option<ServiceRegistration> {
 
 /// Confirms a descriptor still names a live service, and returns the endpoint
 /// to talk to it with.
+///
+/// Identification is `/api/info` — the route the current API answers — and the
+/// pid it reports is compared against the descriptor's. That comparison is the
+/// whole point of the probe: a descriptor left behind by a service that died
+/// still parses, and its port can already have been reused by an unrelated
+/// listener that answers 200.
 pub(crate) fn probe(registration: &ServiceRegistration) -> anyhow::Result<Endpoint> {
     let endpoint = Endpoint::basic(&registration.url, SERVICE_USER, &registration.password)?;
-    let health = request_json(&endpoint, "GET", HEALTH_ROUTE, None, HEALTH_TIMEOUT)
-        .context("the OpenCode 2 service did not answer its health route")?;
-    accept_health(registration, &health)?;
+    let identity = crate::opencode_api::identify(&endpoint).with_context(|| {
+        format!(
+            "the OpenCode service on {} did not identify itself",
+            registration.url
+        )
+    })?;
+    accept_identity(registration, &identity)?;
     Ok(endpoint)
 }
 
-fn accept_health(registration: &ServiceRegistration, health: &Value) -> anyhow::Result<()> {
-    if health.get("healthy").and_then(Value::as_bool) != Some(true) {
-        bail!("the OpenCode 2 service reported itself unhealthy");
-    }
-    // The pid comparison is the whole point of the probe: a descriptor left
-    // behind by a service that died still parses, and its port can already
-    // have been reused by an unrelated listener that answers 200.
-    if health.get("pid").and_then(Value::as_u64) != Some(u64::from(registration.pid)) {
+fn accept_identity(
+    registration: &ServiceRegistration,
+    identity: &crate::opencode_api::ServiceIdentity,
+) -> anyhow::Result<()> {
+    if identity.pid != registration.pid {
         bail!(
-            "the OpenCode 2 service on {} is not the process its registration names",
-            registration.url
+            "the OpenCode service {} on {} is not the process its registration names (pid {}, registered {})",
+            identity.version,
+            registration.url,
+            identity.pid,
+            registration.pid
         );
     }
     Ok(())
@@ -317,7 +346,7 @@ fn route(envelope: &Value) -> Route {
         .unwrap_or_default();
     // `tui.*` are remote-control commands the service broadcasts to every
     // connected client — append to the prompt, execute a command, select a
-    // session, show a toast. Forwarding them would let a foreign opencode2
+    // session, show a toast. Forwarding them would let a foreign opencode
     // client drive Waku's composer and navigation.
     if kind.starts_with("tui.") {
         return Route::Drop;
@@ -361,7 +390,7 @@ struct V2Event {
 }
 
 /// The one adopted service, and everything hanging off its event stream.
-pub(crate) struct Opencode2Service {
+pub(crate) struct OpenCodeService {
     /// Swapped in place when a CLI upgrade replaces the service: the upgrade
     /// version-checks incumbency and takes over with a new url, pid and
     /// password, which must not look like a dead provider to live sessions.
@@ -385,7 +414,7 @@ pub(crate) struct Opencode2Service {
     binary: PathBuf,
 }
 
-impl Opencode2Service {
+impl OpenCodeService {
     fn adopt(binary: &Path, registration: ServiceRegistration, endpoint: Endpoint) -> Arc<Self> {
         Arc::new(Self {
             endpoint: RwLock::new(endpoint),
@@ -475,7 +504,7 @@ impl Opencode2Service {
         // and therefore itself — alive forever. See the module doc.
         let service = Arc::downgrade(self);
         if thread::Builder::new()
-            .name("waku-opencode2-events".into())
+            .name("waku-opencode-events".into())
             .spawn(move || run_reader(hub, stream, endpoint, service))
             .is_ok()
         {
@@ -490,7 +519,7 @@ impl Opencode2Service {
 /// parks the reader. The service object itself is permanent either way — it is
 /// never a lease over the user's process.
 pub(crate) struct Subscription {
-    service: Arc<Opencode2Service>,
+    service: Arc<OpenCodeService>,
     session_id: String,
     rx_id: usize,
     pub rx: Receiver<HubFrame>,
@@ -511,7 +540,7 @@ impl Drop for Subscription {
 enum SlotState {
     Vacant,
     Starting,
-    Running(Arc<Opencode2Service>),
+    Running(Arc<OpenCodeService>),
 }
 
 /// There is exactly one service, so the slot is keyed on nothing. `Running`
@@ -529,19 +558,18 @@ fn slot() -> &'static (StdMutex<SlotState>, Condvar) {
 ///
 /// The only entry point allowed to spawn, and reached only from driver start.
 /// Blocking: discovery, an HTTP probe, and up to a 20s start poll.
-pub(crate) fn shared(binary: &Path) -> anyhow::Result<Arc<Opencode2Service>> {
-    acquire(binary, true)?
-        .ok_or_else(|| anyhow!("the OpenCode 2 background service is not running"))
+pub(crate) fn shared(binary: &Path) -> anyhow::Result<Arc<OpenCodeService>> {
+    acquire(binary, true)?.ok_or_else(|| anyhow!("the OpenCode background service is not running"))
 }
 
 /// Returns the shared service only if one is already healthy, NEVER starting
 /// it. Opening the Resume picker or refreshing the model catalog must not
 /// start the user's background daemon.
-pub(crate) fn attached(binary: &Path) -> anyhow::Result<Option<Arc<Opencode2Service>>> {
+pub(crate) fn attached(binary: &Path) -> anyhow::Result<Option<Arc<OpenCodeService>>> {
     acquire(binary, false)
 }
 
-fn acquire(binary: &Path, may_spawn: bool) -> anyhow::Result<Option<Arc<Opencode2Service>>> {
+fn acquire(binary: &Path, may_spawn: bool) -> anyhow::Result<Option<Arc<OpenCodeService>>> {
     let (state, changed) = slot();
     loop {
         let mut slot = state.lock().unwrap();
@@ -591,25 +619,17 @@ fn acquire(binary: &Path, may_spawn: bool) -> anyhow::Result<Option<Arc<Opencode
     }
 }
 
-fn connect(binary: &Path, may_spawn: bool) -> anyhow::Result<Option<Arc<Opencode2Service>>> {
+fn connect(binary: &Path, may_spawn: bool) -> anyhow::Result<Option<Arc<OpenCodeService>>> {
     if let Some(registration) = read_registration() {
         if let Ok(endpoint) = probe(&registration) {
-            return Ok(Some(Opencode2Service::adopt(
-                binary,
-                registration,
-                endpoint,
-            )));
+            return Ok(Some(OpenCodeService::adopt(binary, registration, endpoint)));
         }
     }
     if !may_spawn {
         return Ok(None);
     }
     let (registration, endpoint) = spawn_service(binary)?;
-    Ok(Some(Opencode2Service::adopt(
-        binary,
-        registration,
-        endpoint,
-    )))
+    Ok(Some(OpenCodeService::adopt(binary, registration, endpoint)))
 }
 
 /// Re-checks the service the slot has been holding.
@@ -619,7 +639,7 @@ fn connect(binary: &Path, may_spawn: bool) -> anyhow::Result<Option<Arc<Opencode
 /// are absorbed by refreshing the endpoint IN PLACE — minting a second service
 /// object would put a second reader on the same process and orphan every live
 /// subscription.
-fn revalidate(service: &Arc<Opencode2Service>, may_spawn: bool) -> anyhow::Result<bool> {
+fn revalidate(service: &Arc<OpenCodeService>, may_spawn: bool) -> anyhow::Result<bool> {
     if let Some(registration) = read_registration() {
         if let Ok(endpoint) = probe(&registration) {
             service.adopt_registration(registration, endpoint);
@@ -643,6 +663,17 @@ fn revalidate(service: &Arc<Opencode2Service>, may_spawn: bool) -> anyhow::Resul
 /// pid-checked rediscovery below is the only thing that converges both
 /// processes on one service.
 fn spawn_service(binary: &Path) -> anyhow::Result<(ServiceRegistration, Endpoint)> {
+    // A test must never start a service against the real state directory: it
+    // registers a daemon in the user's own tree and leaves it running, which is
+    // exactly what happened when the live tests were run with `--ignored`
+    // before the harness existed. The harness claims a test state root before
+    // anything can reach here, so reaching this without one means a test
+    // bypassed it.
+    #[cfg(test)]
+    assert!(
+        test_state_root().is_some(),
+        "a test reached the real service spawn; use live_service::service()"
+    );
     let mut command = crate::command_env::command(binary);
     command
         .args(["serve", "--service"])
@@ -650,7 +681,7 @@ fn spawn_service(binary: &Path) -> anyhow::Result<(ServiceRegistration, Endpoint
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut child = crate::command_env::spawn(&mut command)
-        .context("failed to start the OpenCode 2 background service")?;
+        .context("failed to start the OpenCode background service")?;
 
     let deadline = Instant::now() + SERVICE_START_BUDGET;
     let mut exit = None;
@@ -673,9 +704,9 @@ fn spawn_service(binary: &Path) -> anyhow::Result<(ServiceRegistration, Endpoint
             // winner's service can still be seconds away from healthy.
             match exit {
                 Some(status) => bail!(
-                    "`opencode2 serve --service` exited ({status}) without registering a healthy service"
+                    "`opencode serve --service` exited ({status}) without registering a healthy service"
                 ),
-                None => bail!("timed out starting the OpenCode 2 background service"),
+                None => bail!("timed out starting the OpenCode background service"),
             }
         }
         thread::sleep(SERVICE_START_POLL);
@@ -685,7 +716,7 @@ fn spawn_service(binary: &Path) -> anyhow::Result<(ServiceRegistration, Endpoint
 /// Drops the slot back to `Vacant` when `service` is still the one it holds,
 /// so the next session start reports a clean failure instead of adopting a
 /// service the reader has already given up on.
-fn vacate(service: &Arc<Opencode2Service>) {
+fn vacate(service: &Arc<OpenCodeService>) {
     let (state, changed) = slot();
     let mut slot = state.lock().unwrap();
     if let SlotState::Running(current) = &*slot {
@@ -703,14 +734,14 @@ fn vacate(service: &Arc<Opencode2Service>) {
 ///
 /// Leaseless by construction: `service` is a `Weak` upgraded only for the
 /// moment it takes to record something. THE RECONNECT LOOP MAY NOT SPAWN — a
-/// user who ran `opencode2 service stop` must not have their daemon
+/// user who ran `opencode service stop` must not have their daemon
 /// resurrected by a reader thread no session needs — and the end of the stream
 /// MUST NEVER become `ProcessExited`, because Waku does not own this process.
 fn run_reader(
     hub: Arc<EventHub>,
     stream: Arc<StreamControl>,
     mut endpoint: Endpoint,
-    service: Weak<Opencode2Service>,
+    service: Weak<OpenCodeService>,
 ) {
     let mut backoff = RECONNECT_MIN_BACKOFF;
     let mut failures = 0_u32;
@@ -778,7 +809,7 @@ fn pump(
     hub: &EventHub,
     stream: &StreamControl,
     endpoint: &Endpoint,
-    service: &Weak<Opencode2Service>,
+    service: &Weak<OpenCodeService>,
     socket: TcpStream,
 ) {
     let Ok(frames) = read_sse_frames(socket, Some(STREAM_READ_TIMEOUT)) else {
@@ -818,7 +849,7 @@ fn pump(
 
 /// Re-reads the descriptor and re-probes after a break, swapping the endpoint
 /// when a CLI upgrade has replaced the service. Never spawns.
-fn rediscover(service: &Weak<Opencode2Service>, endpoint: &mut Endpoint) -> bool {
+fn rediscover(service: &Weak<OpenCodeService>, endpoint: &mut Endpoint) -> bool {
     let Some(registration) = read_registration() else {
         return false;
     };
@@ -839,7 +870,7 @@ fn rediscover(service: &Weak<Opencode2Service>, endpoint: &mut Endpoint) -> bool
 /// Off-thread on purpose: `/api/event` is volatile by contract, so the reader
 /// may not make an HTTP request between two frames — one slow consumer fails
 /// the stream for every session at once.
-fn refresh_model_windows(service: &Weak<Opencode2Service>, endpoint: &Endpoint) {
+fn refresh_model_windows(service: &Weak<OpenCodeService>, endpoint: &Endpoint) {
     let Some(strong) = service.upgrade() else {
         return;
     };
@@ -849,7 +880,7 @@ fn refresh_model_windows(service: &Weak<Opencode2Service>, endpoint: &Endpoint) 
     let endpoint = endpoint.clone();
     let service = service.clone();
     if thread::Builder::new()
-        .name("waku-opencode2-models".into())
+        .name("waku-opencode-models".into())
         .spawn(move || {
             let windows = model_context_windows(&endpoint);
             if let Some(service) = service.upgrade() {
@@ -890,13 +921,14 @@ fn context_windows(response: &Value) -> HashMap<String, u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opencode_api::ServiceIdentity;
     use serde_json::json;
     use std::io::Write as _;
 
     fn registration(pid: u32) -> ServiceRegistration {
         ServiceRegistration {
             id: "796c624d-c94e-4086-b245-0a9560a14019".to_owned(),
-            version: Some("0.0.0-beta-19192".to_owned()),
+            version: Some("2.0.10".to_owned()),
             url: "http://127.0.0.1:49374".to_owned(),
             pid,
             password: "secret".to_owned(),
@@ -1012,31 +1044,44 @@ mod tests {
         assert!(matches!(frames[3], SseFrame::Named { .. }));
     }
 
+    /// Drives the production discovery path against a service this test owns.
+    ///
+    /// It is the regression test for the identity route, which moved four times
+    /// in a fortnight and which a hard-coded spelling silently stops being able
+    /// to answer: probing is on the path that turns a registration into a
+    /// session, so a wrong route fails every task rather than one feature.
     #[test]
-    fn health_is_rejected_when_it_names_a_different_process() {
+    fn live_service_identifies_itself_through_the_production_probe() {
+        let live = crate::live_service::service();
+        let registration = read_registration().expect("the harness must publish a descriptor");
+        assert_eq!(registration.pid, live.registration.pid);
+        let endpoint = probe(&registration).expect("the service must identify itself");
+        let identity =
+            crate::opencode_api::identify(&endpoint).expect("the identity route must answer");
+        assert_eq!(identity.pid, registration.pid);
+        assert_eq!(Some(identity.version), live.registration.version.clone());
+
+        // The same descriptor naming a different process must not be adopted:
+        // a stale one still parses, and its port can already belong to a
+        // listener that is not this service.
+        let stale = ServiceRegistration {
+            pid: registration.pid.wrapping_add(1),
+            ..registration
+        };
+        let error = probe(&stale).expect_err("a foreign pid must not be adopted");
+        assert!(error.to_string().contains("not the process"), "{error}");
+    }
+
+    #[test]
+    fn a_stale_descriptor_cannot_adopt_a_different_process() {
         // A stale descriptor still parses, and its port can already have been
         // reused by a healthy listener that is not this service.
-        assert!(
-            accept_health(
-                &registration(58286),
-                &json!({"healthy": true, "version": "0.0.0-beta-19192", "pid": 99999})
-            )
-            .is_err()
-        );
-        assert!(
-            accept_health(
-                &registration(58286),
-                &json!({"healthy": false, "pid": 58286})
-            )
-            .is_err()
-        );
-        assert!(
-            accept_health(
-                &registration(58286),
-                &json!({"healthy": true, "version": "0.0.0-beta-19192", "pid": 58286})
-            )
-            .is_ok()
-        );
+        let identity = |pid| ServiceIdentity {
+            version: "2.0.10".to_owned(),
+            pid,
+        };
+        assert!(accept_identity(&registration(58286), &identity(99999)).is_err());
+        assert!(accept_identity(&registration(58286), &identity(58286)).is_ok());
     }
 
     #[test]
@@ -1092,18 +1137,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the user's running OpenCode 2 service"]
     fn adopts_the_registered_service() {
-        let registration = read_registration().expect("no OpenCode 2 service is registered");
+        crate::live_service::service();
+        let registration = read_registration().expect("no OpenCode service is registered");
         let endpoint = probe(&registration).expect("the registered service is not healthy");
         assert_eq!(endpoint.host, "127.0.0.1");
         assert!(endpoint.auth.is_some());
         assert!(registration.version.is_some());
 
+        // The catalogue is fetched from models.dev at startup, so this asserts
+        // the route answers and parses; the api-level live test asserts its
+        // contents once they have arrived.
         let response = request_json(&endpoint, "GET", MODEL_ROUTE, None, MODEL_TIMEOUT).unwrap();
-        assert!(
-            !context_windows(&response).is_empty(),
-            "the live catalog should report at least one context window"
-        );
+        assert!(response.get("data").is_some(), "{response}");
     }
 }

@@ -1,4 +1,4 @@
-//! Typed bindings for the OpenCode 2 background service's HTTP API.
+//! Typed bindings for the OpenCode background service's HTTP API.
 //!
 //! Every function here is a free function over an [`Endpoint`], so this module
 //! knows nothing about who owns the service, how it was discovered, or which
@@ -15,7 +15,7 @@
 //! * The response envelope is per-route. `/api/session*`, `/api/model`,
 //!   `/api/agent`, `/api/command` and `/api/skill` wrap their payload in
 //!   `{ data }` (the catalogue routes add `{ location, data }`), while
-//!   `/api/health` and `POST /api/session/{id}/interrupt` answer bare. One
+//!   `/api/info` and `POST /api/session/{id}/interrupt` answer bare. One
 //!   generic `Envelope<T>` would silently turn a bare payload into a decode
 //!   failure, so unwrapping is chosen per route.
 //! * Pagination terminates on an EMPTY `data` array, never on an absent
@@ -36,13 +36,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::http_wire::encode_path_segment;
 use crate::http_wire::{self, Endpoint};
-use crate::opencode_session::encode_path_segment;
 
 /// The service answers a local request in single-digit milliseconds; a budget
 /// this large only ever covers a machine under load.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Health is on the start path, where a hung probe would eat the whole start
+/// Identity is on the start path, where a hung probe would eat the whole start
 /// budget, so it gets its own much tighter bound.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 /// A transcript page and a session export both walk stored messages, which for
@@ -110,14 +110,14 @@ impl std::fmt::Display for ApiError {
                 tag,
                 message,
                 status,
-            } => write!(formatter, "OpenCode 2 {tag} (HTTP {status}): {message}"),
+            } => write!(formatter, "OpenCode {tag} (HTTP {status}): {message}"),
             Self::Http { status, body } if body.trim().is_empty() => {
-                write!(formatter, "OpenCode 2 request failed with HTTP {status}")
+                write!(formatter, "OpenCode request failed with HTTP {status}")
             }
             Self::Http { status, body } => {
                 write!(
                     formatter,
-                    "OpenCode 2 request failed with HTTP {status}: {body}"
+                    "OpenCode request failed with HTTP {status}: {body}"
                 )
             }
             Self::Transport(error) => write!(formatter, "{error}"),
@@ -158,11 +158,38 @@ pub(crate) enum Delivery {
     Queue,
 }
 
+/// The route a v2 service answers with its own identity.
+///
+/// This one moved four times inside a fortnight — `/api/health` on the
+/// preview, `/api/server` on 2.0.0, `/api/status` on 2.0.5, `/api/info` on
+/// 2.0.9+ — and every other route Waku uses moved with it. Waku therefore
+/// drives the CURRENT API and refuses anything older by name, instead of
+/// carrying a compatibility branch per channel: the OpenCode line is in
+/// flux, so a second supported shape would be stale again within days.
+const IDENTITY_ROUTE: &str = "/api/info";
+
+/// What a service says about itself.
+///
+/// The route answers `{version, pid, urls, paths}`; only the first two are
+/// decoded, because the pid is the whole point — a descriptor left behind by a
+/// service that died still parses, and its port can already have been reused
+/// by an unrelated listener that answers 200.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub(crate) struct Health {
-    pub healthy: bool,
+pub(crate) struct ServiceIdentity {
     pub version: String,
     pub pid: u32,
+}
+
+/// Establishes which build is on the other end of an endpoint.
+pub(crate) fn identify(endpoint: &Endpoint) -> Result<ServiceIdentity> {
+    // Bare payload: identity is one of the routes with no `{ data }` envelope.
+    let response = request(endpoint, "GET", IDENTITY_ROUTE, None, HEALTH_TIMEOUT)?;
+    decode(response, "service identity").map_err(|error| {
+        ApiError::Transport(anyhow!(
+            "the OpenCode service on {} did not answer its identity route: {error}",
+            endpoint.address()
+        ))
+    })
 }
 
 /// A model as a session refers to it.
@@ -577,15 +604,16 @@ pub(crate) struct SessionExport {
 
 /// The inbox entry `POST /prompt` answers with.
 ///
-/// The beta build renamed this member from `data` to `payload`; the older name
-/// is gone, not aliased.
+/// The envelope is `{id, sessionID, time: {created}, type, payload, delivery}`
+/// — captured from a live service, and the shape `SessionInbox.User` declares.
+/// Only the id and the effective delivery are read: the timestamp is the
+/// service's own bookkeeping, and carrying it under a guessed name is how this
+/// decode silently stopped matching every prompt.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub(crate) struct InboxUser {
     pub id: String,
     #[serde(rename = "sessionID")]
     pub session_id: String,
-    #[serde(rename = "timeCreated")]
-    pub time_created: f64,
     #[serde(rename = "type")]
     pub kind: String,
     pub payload: Value,
@@ -833,26 +861,26 @@ pub(crate) struct CommandInfo {
 
 /// A skill as the catalogue lists it.
 ///
-/// The response also carries the skill's whole markdown body under `content`.
-/// It is deliberately not decoded: nothing above this layer renders it, and
-/// keeping it would make every skill's file resident for the life of the app.
+/// The catalogue is the only place a skill can be discovered from, and the
+/// current API has no member that marks one user-invocable — the preview's
+/// `slash` flag is gone — so Waku lists the whole catalogue rather than
+/// guessing which half to hide.
+///
+/// `id` is what the user types and what the wire resolves (`Skill not found: …`
+/// names it), while `name` is a display label that can differ: the built-in
+/// report skill is id `report`, name `Report`. Both are carried because a skill
+/// attachment wants both.
+///
+/// The response also carries `path`, `autoinvoke` and the skill's whole
+/// markdown body under `content`. None is decoded: nothing above this layer
+/// renders or decides on them, and keeping `content` would make every skill's
+/// file resident for the life of the app.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub(crate) struct SkillInfo {
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
-    pub slash: Option<bool>,
-    #[serde(default)]
-    pub autoinvoke: Option<bool>,
-    pub location: String,
-}
-
-pub(crate) fn health(endpoint: &Endpoint) -> Result<Health> {
-    // Bare payload: health is one of the routes with no `{ data }` envelope.
-    let response = request(endpoint, "GET", "/api/health", None, HEALTH_TIMEOUT)?;
-    decode(response, "health")
 }
 
 /// Creates a session with a CLIENT-MINTED id.
@@ -880,7 +908,7 @@ pub(crate) fn create_session(
     }
     if let Some(model) = model {
         body["model"] = serde_json::to_value(model).map_err(|error| {
-            ApiError::Transport(anyhow!("could not encode the OpenCode 2 model: {error}"))
+            ApiError::Transport(anyhow!("could not encode the OpenCode model: {error}"))
         })?;
     }
     let response = request(
@@ -907,6 +935,9 @@ pub(crate) fn delete_session(endpoint: &Endpoint, session: &str) -> Result<()> {
 
 /// Runtime-only MCP registration, scoped to one location. This never writes
 /// the shared service's configuration files.
+///
+/// The runtime add/remove routes live under `/api/experimental` in the current
+/// API; the list route below does not.
 pub(crate) fn add_mcp(
     endpoint: &Endpoint,
     directory: &str,
@@ -914,7 +945,7 @@ pub(crate) fn add_mcp(
     config: &Value,
 ) -> Result<()> {
     let path = format!(
-        "/api/mcp/{}{}",
+        "/api/experimental/mcp/{}{}",
         encode_path_segment(server),
         location_query(Some(directory))
     );
@@ -934,7 +965,7 @@ pub(crate) fn list_mcp(endpoint: &Endpoint, directory: &str) -> Result<Vec<Value
 
 pub(crate) fn remove_mcp(endpoint: &Endpoint, directory: &str, server: &str) -> Result<()> {
     let path = format!(
-        "/api/mcp/{}{}",
+        "/api/experimental/mcp/{}{}",
         encode_path_segment(server),
         location_query(Some(directory))
     );
@@ -942,6 +973,9 @@ pub(crate) fn remove_mcp(endpoint: &Endpoint, directory: &str, server: &str) -> 
     Ok(())
 }
 
+/// Durable instruction entries are API-managed session state, so both routes
+/// live under `/api/experimental`, and a change announces at the next step
+/// boundary rather than being spliced into the running turn.
 pub(crate) fn put_instruction_entry(
     endpoint: &Endpoint,
     session: &str,
@@ -949,7 +983,7 @@ pub(crate) fn put_instruction_entry(
     value: &str,
 ) -> Result<()> {
     let path = format!(
-        "/api/session/{}/instructions/entries/{}",
+        "/api/experimental/session/{}/instructions/entries/{}",
         encode_path_segment(session),
         encode_path_segment(key)
     );
@@ -969,7 +1003,7 @@ pub(crate) fn remove_instruction_entry(
     key: &str,
 ) -> Result<()> {
     let path = format!(
-        "/api/session/{}/instructions/entries/{}",
+        "/api/experimental/session/{}/instructions/entries/{}",
         encode_path_segment(session),
         encode_path_segment(key)
     );
@@ -977,10 +1011,15 @@ pub(crate) fn remove_instruction_entry(
     Ok(())
 }
 
+/// Renames a session.
+///
+/// The current API has no `/rename` route: the title is one of the mutable
+/// fields of the session itself, updated with a PATCH of `{ title }`. A title
+/// is also the only field Waku ever changes, so nothing else is sent.
 pub(crate) fn rename_session(endpoint: &Endpoint, session: &str, title: &str) -> Result<()> {
-    let path = format!("/api/session/{}/rename", encode_path_segment(session));
+    let path = format!("/api/session/{}", encode_path_segment(session));
     let body = json!({ "title": title });
-    request(endpoint, "POST", &path, Some(&body), REQUEST_TIMEOUT)?;
+    request(endpoint, "PATCH", &path, Some(&body), REQUEST_TIMEOUT)?;
     Ok(())
 }
 
@@ -1024,7 +1063,7 @@ pub(crate) fn export_session(
     sanitize: bool,
 ) -> Result<SessionExport> {
     let path = format!(
-        "/api/session/{}/export?sanitize={sanitize}",
+        "/api/experimental/session/{}/export?sanitize={sanitize}",
         encode_path_segment(session)
     );
     let response = request(endpoint, "GET", &path, None, TRANSFER_TIMEOUT)?;
@@ -1044,6 +1083,34 @@ pub(crate) fn prompt(
 ) -> Result<InboxUser> {
     let path = format!("/api/session/{}/prompt", encode_path_segment(session));
     let mut body = json!({ "text": text });
+    if let Some(delivery) = delivery {
+        body["delivery"] = json!(delivery);
+    }
+    let response = request(endpoint, "POST", &path, Some(&body), REQUEST_TIMEOUT)?;
+    decode(data(response, "prompt")?, "prompt")
+}
+
+/// Submits a prompt that carries a skill attachment.
+///
+/// A skill cannot be named in prompt TEXT: the service resolves one only
+/// through an attachment, which it then expands into the message it records
+/// (verified against 2.0.10 — an unknown id is refused with `Skill not found`,
+/// a known one comes back as `<skill_content …>` inside the admitted item).
+/// That is what a typed `/skill-id` becomes, so anything the user typed after
+/// the name rides along as the prompt text instead of being dropped.
+pub(crate) fn prompt_with_skill(
+    endpoint: &Endpoint,
+    session: &str,
+    text: &str,
+    skill_id: &str,
+    skill_name: &str,
+    delivery: Option<Delivery>,
+) -> Result<InboxUser> {
+    let path = format!("/api/session/{}/prompt", encode_path_segment(session));
+    let mut body = json!({
+        "text": text,
+        "skills": [{ "id": skill_id, "name": skill_name }],
+    });
     if let Some(delivery) = delivery {
         body["delivery"] = json!(delivery);
     }
@@ -1082,24 +1149,31 @@ pub(crate) fn list_inbox(endpoint: &Endpoint, session: &str) -> Result<Vec<Value
 }
 
 /// Promotes a queued entry so it interrupts the running turn.
+///
+/// Steering and queueing are the same request in the current API: the delivery
+/// mode is a field of the pending item, not a verb of its own.
 pub(crate) fn steer_inbox(endpoint: &Endpoint, session: &str, inbox_id: &str) -> Result<()> {
-    let path = format!(
-        "/api/session/{}/inbox/{}/steer",
-        encode_path_segment(session),
-        encode_path_segment(inbox_id)
-    );
-    request(endpoint, "POST", &path, None, REQUEST_TIMEOUT)?;
-    Ok(())
+    set_inbox_delivery(endpoint, session, inbox_id, Delivery::Steer)
 }
 
 /// Demotes an entry so it waits for the running turn to finish.
 pub(crate) fn queue_inbox(endpoint: &Endpoint, session: &str, inbox_id: &str) -> Result<()> {
+    set_inbox_delivery(endpoint, session, inbox_id, Delivery::Queue)
+}
+
+fn set_inbox_delivery(
+    endpoint: &Endpoint,
+    session: &str,
+    inbox_id: &str,
+    delivery: Delivery,
+) -> Result<()> {
     let path = format!(
-        "/api/session/{}/inbox/{}/queue",
+        "/api/session/{}/inbox/{}",
         encode_path_segment(session),
         encode_path_segment(inbox_id)
     );
-    request(endpoint, "POST", &path, None, REQUEST_TIMEOUT)?;
+    let body = json!({ "delivery": delivery });
+    request(endpoint, "PATCH", &path, Some(&body), REQUEST_TIMEOUT)?;
     Ok(())
 }
 
@@ -1175,7 +1249,7 @@ pub(crate) fn reply_permission(
 ) -> Result<()> {
     if matches!(reply, PermissionReply::Always) {
         return Err(ApiError::Transport(anyhow!(
-            "OpenCode 2 permission replies must not save a persistent rule"
+            "OpenCode permission replies must not save a persistent rule"
         )));
     }
     let path = format!(
@@ -1211,12 +1285,13 @@ pub(crate) fn reply_form(
 }
 
 pub(crate) fn cancel_form(endpoint: &Endpoint, session: &str, form_id: &str) -> Result<()> {
+    // Cancelling a form is a DELETE of the form itself in the current API.
     let path = format!(
-        "/api/session/{}/form/{}/cancel",
+        "/api/session/{}/form/{}",
         encode_path_segment(session),
         encode_path_segment(form_id)
     );
-    request(endpoint, "POST", &path, None, REQUEST_TIMEOUT)?;
+    request(endpoint, "DELETE", &path, None, REQUEST_TIMEOUT)?;
     Ok(())
 }
 
@@ -1235,7 +1310,7 @@ pub(crate) fn active_sessions(endpoint: &Endpoint) -> Result<HashSet<String>> {
     let active = data(response, "active sessions")?;
     let Value::Object(active) = active else {
         return Err(ApiError::Transport(anyhow!(
-            "OpenCode 2 returned an unreadable active session map"
+            "OpenCode returned an unreadable active session map"
         )));
     };
     Ok(active.into_iter().map(|(id, _)| id).collect())
@@ -1249,15 +1324,45 @@ pub(crate) fn list_agents(endpoint: &Endpoint, directory: Option<&str>) -> Resul
     catalogue(endpoint, "/api/agent", directory, "agent catalogue")
 }
 
+pub(crate) fn list_skills(endpoint: &Endpoint, directory: Option<&str>) -> Result<Vec<SkillInfo>> {
+    catalogue(endpoint, "/api/skill", directory, "skill catalogue")
+}
+
 pub(crate) fn list_commands(
     endpoint: &Endpoint,
     directory: Option<&str>,
 ) -> Result<Vec<CommandInfo>> {
-    // A cold location publishes its registry in stages: first empty, then
-    // built-ins, then configured commands and skills. Wait for those plugins
-    // to finish before caching the list. The budget also bounds older builds
-    // whose plugin identifiers or readiness surface differ.
-    let path = format!("/api/command{}", location_query(directory));
+    catalogue(endpoint, "/api/command", directory, "command catalogue")
+}
+
+/// Reads one of the location-scoped catalogues.
+///
+/// Every catalogue is published by a plugin (`opencode.models.dev`,
+/// `opencode.command`, `opencode.config.skill`, …), so a location the service
+/// has not opened yet answers empty and answers its real contents a moment
+/// later. A single read taken inside that window looks like "this location has
+/// nothing": the model picker fell back to its disk cache, and the first
+/// session in a fresh workspace resolved no agent, from a location that had
+/// both.
+///
+/// `/api/plugin` is the readiness surface the service publishes for exactly
+/// this, so wait for the location's registries and read again. The wait is
+/// bounded by [`REQUEST_TIMEOUT`] and the newest catalogue wins if the budget
+/// runs out; a location whose registries are up returns on its first read even
+/// when its catalogue is legitimately empty, so an empty answer costs nothing
+/// once the location is warm. A build that answers without a plugin surface at
+/// all reports `None` from the readiness check, and then a non-empty catalogue
+/// is the only evidence the location is up.
+///
+/// The catalogue routes differ only in their element type: each answers
+/// `{ location, data }` and each scopes by deepObject `location[directory]`.
+fn catalogue<T: DeserializeOwned>(
+    endpoint: &Endpoint,
+    route: &str,
+    directory: Option<&str>,
+    what: &str,
+) -> Result<Vec<T>> {
+    let path = format!("{route}{}", location_query(directory));
     let plugins_path = format!("/api/plugin{}", location_query(directory));
     let deadline = Instant::now() + REQUEST_TIMEOUT;
     let mut latest = Vec::new();
@@ -1268,12 +1373,12 @@ pub(crate) fn list_commands(
         let ready = request(endpoint, "GET", &plugins_path, None, remaining)
             .ok()
             .as_ref()
-            .and_then(command_plugins_ready);
+            .and_then(location_registries_ready);
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return Ok(latest);
         };
         let response = request(endpoint, "GET", &path, None, remaining)?;
-        latest = decode(data(response, "command catalogue")?, "command catalogue")?;
+        latest = decode(data(response, what)?, what)?;
         if ready == Some(true) || (ready.is_none() && !latest.is_empty()) {
             return Ok(latest);
         }
@@ -1283,7 +1388,13 @@ pub(crate) fn list_commands(
     }
 }
 
-fn command_plugins_ready(response: &Value) -> Option<bool> {
+/// Whether a location's registries have finished their staged publication.
+///
+/// The members are the three the command catalogue converges from; they load
+/// in one pass with every other registry, so they also answer for the model,
+/// agent and skill catalogues. A build that never reports them keeps the
+/// non-empty fallback rather than failing.
+fn location_registries_ready(response: &Value) -> Option<bool> {
     let plugins = response.get("data")?.as_array()?;
     Some(
         [
@@ -1307,23 +1418,6 @@ fn command_plugins_ready(response: &Value) -> Option<bool> {
     )
 }
 
-pub(crate) fn list_skills(endpoint: &Endpoint, directory: Option<&str>) -> Result<Vec<SkillInfo>> {
-    catalogue(endpoint, "/api/skill", directory, "skill catalogue")
-}
-
-/// The catalogue routes differ only in their element type: each answers
-/// `{ location, data }` and each scopes by deepObject `location[directory]`.
-fn catalogue<T: DeserializeOwned>(
-    endpoint: &Endpoint,
-    route: &str,
-    directory: Option<&str>,
-    what: &str,
-) -> Result<Vec<T>> {
-    let path = format!("{route}{}", location_query(directory));
-    let response = request(endpoint, "GET", &path, None, REQUEST_TIMEOUT)?;
-    decode(data(response, what)?, what)
-}
-
 fn request(
     endpoint: &Endpoint,
     method: &str,
@@ -1337,22 +1431,22 @@ fn request(
 /// Unwraps the `{ data }` envelope.
 ///
 /// Called per route rather than from [`request`], because the envelope is not
-/// universal: `/api/health` and `POST …/interrupt` answer bare, and wrapping
+/// universal: `/api/info` and `POST …/interrupt` answer bare, and wrapping
 /// those would turn a good response into a decode failure.
 fn data(response: Value, what: &str) -> Result<Value> {
     match response {
         Value::Object(mut fields) => fields.remove("data").ok_or_else(|| {
-            ApiError::Transport(anyhow!("OpenCode 2 returned no {what} in its response"))
+            ApiError::Transport(anyhow!("OpenCode returned no {what} in its response"))
         }),
         _ => Err(ApiError::Transport(anyhow!(
-            "OpenCode 2 returned an unreadable {what} response"
+            "OpenCode returned an unreadable {what} response"
         ))),
     }
 }
 
 fn decode<T: DeserializeOwned>(response: Value, what: &str) -> Result<T> {
     serde_json::from_value(response).map_err(|error| {
-        ApiError::Transport(anyhow!("OpenCode 2 returned an invalid {what}: {error}"))
+        ApiError::Transport(anyhow!("OpenCode returned an invalid {what}: {error}"))
     })
 }
 
@@ -1543,6 +1637,21 @@ mod tests {
         Endpoint::local(port)
     }
 
+    /// Wraps canned JSON bodies as the HTTP responses the catalogue reader
+    /// consumes in request order.
+    fn canned(values: Vec<serde_json::Value>) -> Vec<String> {
+        values
+            .into_iter()
+            .map(|value| {
+                let body = value.to_string();
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn command_catalog_waits_for_cold_location_builtins() {
         let responses = [
@@ -1574,6 +1683,65 @@ mod tests {
                 .map(|command| command.name.as_str())
                 .collect::<Vec<_>>(),
             ["init", "review", "custom"]
+        );
+    }
+
+    /// The same staged publication for a catalogue the command plugins do not
+    /// own: a cold location answers no models until its registries are up, and
+    /// a reader that takes that first answer reports "no models" for a
+    /// location that has them.
+    #[test]
+    fn model_catalog_waits_for_cold_location_registries() {
+        let responses = canned(vec![
+            json!({"data": []}),
+            json!({"data": []}),
+            json!({"data": [{"id": "opencode.models.dev", "state": {"status": "active"}}]}),
+            json!({"data": []}),
+            json!({"data": [
+                {"id": "opencode.command", "state": {"status": "active"}},
+                {"id": "opencode.config.command", "state": {"status": "active"}},
+                {"id": "opencode.config.skill", "state": {"status": "active"}}
+            ]}),
+            json!({"data": [{
+                "id": "gpt-5", "modelID": "gpt-5", "providerID": "openai",
+                "name": "GPT-5", "status": "active", "enabled": true,
+                "limit": {"context": 400000, "output": 128000}
+            }]}),
+        ]);
+        let endpoint = serve_responses(responses);
+        let models = list_models(&endpoint, Some("/cold-workspace")).unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-5"]
+        );
+    }
+
+    /// A warm location answers the truth when that truth is "nothing here":
+    /// the wait must not make a location that genuinely has no models pay the
+    /// whole budget on every read.
+    #[test]
+    fn a_warm_location_with_no_catalogue_answers_at_once() {
+        let responses = canned(vec![
+            json!({"data": [
+                {"id": "opencode.command", "state": {"status": "active"}},
+                {"id": "opencode.config.command", "state": {"status": "active"}},
+                {"id": "opencode.config.skill", "state": {"status": "active"}}
+            ]}),
+            json!({"data": []}),
+        ]);
+        let endpoint = serve_responses(responses);
+        let started = Instant::now();
+        assert!(
+            list_models(&endpoint, Some("/empty-workspace"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            started.elapsed() < REQUEST_TIMEOUT / 2,
+            "an empty catalogue from a warm location must not wait for a second answer"
         );
     }
 
@@ -1650,12 +1818,12 @@ mod tests {
         let requests: Vec<_> = received.try_iter().collect();
         assert_eq!(
             requests[0].0,
-            "PUT /api/mcp/waku_js_repl_test?location%5Bdirectory%5D=%2Fwork%2Fproject%20with%20space HTTP/1.1\r\n"
+            "PUT /api/experimental/mcp/waku_js_repl_test?location%5Bdirectory%5D=%2Fwork%2Fproject%20with%20space HTTP/1.1\r\n"
         );
         assert_eq!(requests[0].1, json!({"config":config}));
         assert_eq!(
             requests[1].0,
-            "PUT /api/session/ses_test/instructions/entries/waku-computer-use HTTP/1.1\r\n"
+            "PUT /api/experimental/session/ses_test/instructions/entries/waku-computer-use HTTP/1.1\r\n"
         );
         assert_eq!(
             requests[1].1,
@@ -1663,13 +1831,11 @@ mod tests {
         );
         assert_eq!(
             requests[2].0,
-            "DELETE /api/session/ses_test/instructions/entries/waku-computer-use HTTP/1.1\r\n"
+            "DELETE /api/experimental/session/ses_test/instructions/entries/waku-computer-use HTTP/1.1\r\n"
         );
-        assert!(
-            requests[3]
-                .0
-                .starts_with("DELETE /api/mcp/waku_js_repl_test?location%5Bdirectory%5D=")
-        );
+        assert!(requests[3].0.starts_with(
+            "DELETE /api/experimental/mcp/waku_js_repl_test?location%5Bdirectory%5D="
+        ));
     }
 
     #[test]
@@ -1892,14 +2058,15 @@ mod tests {
         assert!(session.parent_id.is_none());
     }
 
-    /// The inbox entry's payload member is `payload` on this build; the older
-    /// `data` name is gone rather than aliased.
+    /// The inbox envelope is the one the service actually sends. Getting this
+    /// wrong does not degrade a feature — it fails every prompt, because the
+    /// route's answer is decoded before the turn is even announced.
     #[test]
-    fn inbox_user_reads_the_payload_member() {
+    fn inbox_user_reads_the_live_envelope() {
         let entry: InboxUser = serde_json::from_value(json!({
             "id": "msg_1",
             "sessionID": "ses_1",
-            "timeCreated": 1.0,
+            "time": { "created": 1789867729597_u64 },
             "type": "user",
             "payload": { "text": "hi" },
             "delivery": "steer",
@@ -1985,8 +2152,12 @@ mod tests {
     /// bodyless 500, which is a bad workspace rather than a server fault.
     #[test]
     fn a_bodyless_500_reads_as_an_unresolvable_workspace() {
-        let endpoint =
-            serve_once("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        // The readiness probe answers first: a catalogue read settles its
+        // location before it asks for the catalogue itself.
+        let mut responses = canned(vec![json!({"data": []})]);
+        responses
+            .push("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_owned());
+        let endpoint = serve_responses(responses);
         let error = list_models(&endpoint, Some("/nope/nope")).unwrap_err();
         assert!(error.is_unresolvable_location(), "{error:?}");
         assert_eq!(error.status(), Some(500));
@@ -2001,56 +2172,199 @@ mod tests {
         assert_eq!(active, HashSet::from(["ses_a".to_owned()]));
     }
 
-    /// Reads the user's own running service. Kept out of the default run
-    /// because it depends on a daemon this test must never start.
+    /// The API this file drives answers `/api/info`, and a bare payload is
+    /// one of the routes with no `{ data }` envelope.
     #[test]
-    #[ignore = "requires a running opencode2 service"]
-    fn live_service_answers_health_and_catalogues() {
-        let registration = std::fs::read_to_string(
-            dirs::state_dir()
-                .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))
-                .expect("a state directory")
-                .join("opencode/service.json"),
-        )
-        .expect("a registered opencode2 service");
-        let registration: Value = serde_json::from_str(&registration).unwrap();
-        let endpoint = Endpoint::basic(
-            registration["url"].as_str().unwrap(),
-            "opencode",
-            registration["password"].as_str().unwrap(),
+    fn identity_decodes_the_current_route_and_reports_its_version() {
+        let body = json!({
+            "version": "2.0.10",
+            "pid": 78540,
+            "urls": ["http://127.0.0.1:49374"],
+            "paths": {"tmp": "/tmp"},
+        });
+        let identity: ServiceIdentity = serde_json::from_value(body).unwrap();
+        assert_eq!(identity.version, "2.0.10");
+        assert_eq!(identity.pid, 78540);
+    }
+
+    /// A route that moved, or a listener on a reused port, must not look like
+    /// a service: the pid and version are both required, not defaulted.
+    #[test]
+    fn identity_rejects_a_payload_that_is_not_a_service() {
+        for body in [json!({}), json!({"healthy": true}), json!({"urls": []})] {
+            assert!(
+                serde_json::from_value::<ServiceIdentity>(body.clone()).is_err(),
+                "{body} must not identify a service"
+            );
+        }
+    }
+
+    /// The startup path and every route the current API moved, against a real
+    /// service.
+    ///
+    /// It costs no model turn: the inbox envelope is exercised with a
+    /// synthetic note, which the service admits without starting execution and
+    /// which carries the same `{id, sessionID, time, type, payload, delivery}`
+    /// shape a prompt answers with.
+    #[test]
+    fn live_service_answers_the_startup_path_and_the_moved_routes() {
+        let live = crate::live_service::service();
+        let endpoint = live.endpoint.clone();
+        // Exactly the string the harness waits on: the service compares
+        // location directories by exact string equality.
+        let directory = live.workspace.to_string_lossy().into_owned();
+
+        let id = format!("ses_{}", uuid::Uuid::new_v4().simple());
+        create_session(&endpoint, &id, None, None, &directory).unwrap();
+
+        // Everything the pickers read. Skills are listed beside commands, and
+        // the harness planted one so the shape is asserted rather than assumed.
+        live.wait_for_agents();
+        assert!(!list_agents(&endpoint, Some(&directory)).unwrap().is_empty());
+        live.wait_for_models();
+        assert!(!list_models(&endpoint, Some(&directory)).unwrap().is_empty());
+        assert!(
+            !list_commands(&endpoint, Some(&directory))
+                .unwrap()
+                .is_empty()
+        );
+        let skills = list_skills(&endpoint, Some(&directory)).unwrap();
+        let probe = skills
+            .iter()
+            .find(|skill| skill.id == crate::live_service::PROBE_SKILL)
+            .expect("the planted skill must be in the catalogue");
+        assert_eq!(probe.name, crate::live_service::PROBE_SKILL);
+        assert!(probe.description.is_some());
+        active_sessions(&endpoint).unwrap();
+
+        // The routes a freshly created session answers.
+        let (sessions, _) =
+            list_sessions(&endpoint, Some(&directory), None, Order::Desc, 50, None).unwrap();
+        assert!(sessions.iter().any(|session| session.id == id));
+        assert!(
+            list_messages(&endpoint, &id, Order::Asc, None, None)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        assert!(list_permissions(&endpoint, &id).unwrap().is_empty());
+        assert!(list_forms(&endpoint, &id).unwrap().is_empty());
+
+        let admitted: InboxUser = decode(
+            data(
+                request(
+                    &endpoint,
+                    "POST",
+                    &format!("/api/session/{id}/synthetic"),
+                    Some(&json!({
+                        "text": "waku route check",
+                        "description": "route check",
+                        "resume": false,
+                    })),
+                    REQUEST_TIMEOUT,
+                )
+                .unwrap(),
+                "synthetic",
+            )
+            .unwrap(),
+            "synthetic",
         )
         .unwrap();
+        assert_eq!(admitted.kind, "synthetic");
+        assert_eq!(admitted.delivery, Delivery::Steer);
+        assert_eq!(list_inbox(&endpoint, &id).unwrap().len(), 1);
 
-        let health = health(&endpoint).unwrap();
-        assert!(health.healthy);
-        assert_eq!(health.pid, registration["pid"].as_u64().unwrap() as u32);
+        // Delivery is a PATCH of the pending item, and cancelling is a DELETE
+        // of it: neither is a verb of its own in the current API.
+        queue_inbox(&endpoint, &id, &admitted.id).unwrap();
+        cancel_inbox(&endpoint, &id, &admitted.id).unwrap();
+        assert!(list_inbox(&endpoint, &id).unwrap().is_empty());
 
-        let directory = std::env::current_dir().unwrap();
-        let directory = std::fs::canonicalize(directory).unwrap();
-        let directory = directory.to_str().unwrap();
-        // The model catalogue is refreshed from models.dev in the background
-        // and is briefly empty across a refresh, so only its decode is
-        // asserted; the built-in agents are always there.
-        let _ = list_models(&endpoint, Some(directory)).unwrap();
-        assert!(!list_agents(&endpoint, Some(directory)).unwrap().is_empty());
-        let _ = list_commands(&endpoint, Some(directory)).unwrap();
-        let _ = list_skills(&endpoint, Some(directory)).unwrap();
-        let _ = active_sessions(&endpoint).unwrap();
+        // Renaming moved onto the session itself.
+        rename_session(&endpoint, &id, "waku route check").unwrap();
+        assert_eq!(
+            get_session(&endpoint, &id).unwrap().title.as_deref(),
+            Some("waku route check")
+        );
 
-        let (sessions, _) =
-            list_sessions(&endpoint, Some(directory), None, Order::Desc, 5, None).unwrap();
-        if let Some(session) = sessions.first() {
-            assert_eq!(get_session(&endpoint, &session.id).unwrap().id, session.id);
-            let (messages, _) =
-                list_messages(&endpoint, &session.id, Order::Asc, Some(5), None).unwrap();
-            assert!(
-                messages
-                    .iter()
-                    .all(|message| *message != MessageInfo::Unknown)
-            );
-            assert!(list_permissions(&endpoint, &session.id).is_ok());
-            assert!(list_forms(&endpoint, &session.id).is_ok());
-            assert!(list_inbox(&endpoint, &session.id).is_ok());
+        // Export moved under /api/experimental.
+        let export = export_session(&endpoint, &id, true).unwrap();
+        assert_eq!(export.info.id, id);
+
+        // Instruction entries — the Computer Use attachment — moved too.
+        put_instruction_entry(&endpoint, &id, "waku-route-check", "{\"ok\":true}").unwrap();
+        remove_instruction_entry(&endpoint, &id, "waku-route-check").unwrap();
+
+        // A typed `/skill` is a prompt carrying an attachment, not a command:
+        // the service resolves the id and expands the body into the message it
+        // records. `resume: false` keeps the probe from spending a model turn —
+        // the route admits the prompt either way, which is all this asserts.
+        let admitted: InboxUser = decode(
+            data(
+                request(
+                    &endpoint,
+                    "POST",
+                    &format!("/api/session/{id}/prompt"),
+                    Some(&json!({
+                        "text": "look at this",
+                        "skills": [{ "id": probe.id, "name": probe.name }],
+                        "resume": false,
+                    })),
+                    REQUEST_TIMEOUT,
+                )
+                .unwrap(),
+                "prompt",
+            )
+            .unwrap(),
+            "prompt",
+        )
+        .unwrap();
+        assert_eq!(admitted.kind, "user");
+        assert!(
+            admitted.payload["skills"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("<skill_content")),
+            "the service expands the skill into the admitted prompt: {}",
+            admitted.payload
+        );
+        // An id the service does not know is refused outright, which is what
+        // makes the assertion above about the real shape rather than a typo.
+        let missing =
+            prompt_with_skill(&endpoint, &id, "", "waku-no-such-skill", "x", None).unwrap_err();
+        assert!(missing.to_string().contains("Skill not found"), "{missing}");
+
+        // Nothing is running, so this is the idle no-op.
+        assert!(!interrupt(&endpoint, &id).unwrap());
+
+        // The MCP runtime routes moved under /api/experimental. Registering a
+        // server that cannot connect is still a ROUTABLE request, so a 404
+        // here would mean the path is wrong rather than the config — and when
+        // the service does accept it, removing it exercises the paired route.
+        let config = json!({"type": "local", "command": ["/nonexistent-waku-route-check"]});
+        match add_mcp(&endpoint, &directory, "waku-route-check", &config) {
+            Ok(()) => remove_mcp(&endpoint, &directory, "waku-route-check").unwrap(),
+            Err(error) => assert_ne!(error.status(), Some(404), "{error}"),
         }
+
+        delete_session(&endpoint, &id).unwrap();
+    }
+
+    /// A location the service has never opened, read the way the picker reads
+    /// it: one call, no harness warm-up.
+    ///
+    /// Every other live catalogue test reads a location the harness has
+    /// already polled, so none of them can see the window this guards — a cold
+    /// location answers empty first and its real contents a moment later.
+    #[test]
+    fn live_catalogues_settle_a_cold_location() {
+        let live = crate::live_service::service();
+        let endpoint = live.endpoint.clone();
+        let directory = live.cold_workspace();
+        let directory = directory.to_string_lossy().into_owned();
+        assert!(
+            !list_models(&endpoint, Some(&directory)).unwrap().is_empty(),
+            "a cold location has models, so the first empty answer is not the truth"
+        );
+        assert!(!list_agents(&endpoint, Some(&directory)).unwrap().is_empty());
     }
 }

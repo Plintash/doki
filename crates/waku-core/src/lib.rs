@@ -41,12 +41,12 @@ mod http_wire;
 pub mod i18n;
 pub mod identity;
 pub mod kimi_session;
+#[cfg(test)]
+mod live_service;
 pub mod model;
 pub mod model_catalog;
-pub mod opencode2_api;
-pub mod opencode2_service;
-pub mod opencode2_session;
-pub mod opencode_pool;
+pub mod opencode_api;
+pub mod opencode_service;
 pub mod opencode_session;
 pub mod persistence;
 pub mod pi_session;

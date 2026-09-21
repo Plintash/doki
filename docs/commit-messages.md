@@ -75,7 +75,7 @@ argument**; `NO_COLOR=1` and `CI=1` are set for all of them.
 | Cursor CLI | `cursor-agent` | `--print --output-format text --mode ask --sandbox enabled --trust` | `--model` | — |
 | DeepSeek Harness | `dsh` | `--profile headless` | — | — |
 | Fx | `fx ask` | `--no-save --no-color --` | — | — |
-| OpenCode | `opencode run` | `--pure --agent plan` | `--model` | `--variant` |
+| OpenCode | `opencode run` | `--standalone --agent plan` | `--model` | `#variant` on the model |
 | Grok Build | `grok` | `--single <prompt> --output-format plain --permission-mode plan --tools "" --no-memory --no-subagents --disable-web-search --verbatim` | `--model` | `--reasoning-effort` |
 | Pi | `pi` | `--print --no-session --no-tools --no-context-files --no-extensions --no-skills --no-prompt-templates --no-approve` | `--model` | `--thinking` |
 | Oh My Pi | `omp` | `--print --no-session --no-tools --no-rules --no-extensions --no-skills` | `--model` | `--thinking` |
