@@ -16,6 +16,9 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [26.9.21]
+
+- Annotate part of an assistant reply and attach a comment to each span, then send it with your next message
 - Support the current OpenCode CLI as the one OpenCode provider: it attaches to the background service you already run, and the retired OpenCode 1 support is gone
 
 ## [0.1.19]
