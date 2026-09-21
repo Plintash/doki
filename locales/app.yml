@@ -931,6 +931,12 @@ permission.agent_asks_for_permission:
   en: The agent is asking for permission
 permission.agent_wants_to:
   en: The agent wants to %{action}
+permission.declined_tool_call:
+  en: You declined this tool call
+permission.deny_note_placeholder:
+  en: Tell OpenCode what to do instead (optional)
+permission.deny_note_hint:
+  en: An explanation keeps the turn running; an empty one just denies
 common.close:
   en: Close
 common.default:

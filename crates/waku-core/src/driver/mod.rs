@@ -118,6 +118,18 @@ impl DriverHandle {
         self.inner.respond(request_id, option_id);
     }
 
+    /// Answers a request with an optional explanation. Only transports whose
+    /// provider has a use for the note forward it; the default drops it.
+    pub fn respond_with_message(
+        &self,
+        request_id: String,
+        option_id: String,
+        message: Option<String>,
+    ) {
+        self.inner
+            .respond_with_message(request_id, option_id, message);
+    }
+
     pub fn respond_user_input(&self, request_id: String, answers: Vec<UserInputAnswer>) {
         self.inner.respond_user_input(request_id, answers);
     }
@@ -163,6 +175,18 @@ pub trait DriverControl: Send + Sync {
     fn refresh_background_work(&self) {}
     fn stop_background_work(&self, _key: BackgroundWorkKey, _control_id: String) {}
     fn respond(&self, request_id: String, option_id: String);
+    /// Answer with an optional explanation. A provider that can hand the note
+    /// to its model (OpenCode turns a denial's note into feedback the agent
+    /// continues from) overrides this; elsewhere the note is dropped rather
+    /// than added to a payload that has no field for it.
+    fn respond_with_message(
+        &self,
+        request_id: String,
+        option_id: String,
+        _message: Option<String>,
+    ) {
+        self.respond(request_id, option_id);
+    }
     fn respond_user_input(&self, _request_id: String, _answers: Vec<UserInputAnswer>) {}
     /// Providers without persisted goals ignore the request; the UI only
     /// offers goal controls where the provider reports one.

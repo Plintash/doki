@@ -565,10 +565,25 @@ id: the frame reaches exactly the subscriber that owns the session, the whole
 dropped too.
 
 **Approvals** — `POST /api/session/{id}/permission/{requestID}/reply` with
-`once` or `reject`. `always` never goes on the wire: it writes into
-`/api/permission/saved`, a global store shared with the user's own terminal, so
-durable choices stay in the driver's own state and every provider reply is
-one-shot.
+`{decision: "once" | "reject"}`. The field is `decision`, not the `reply` the
+`permission.replied` event carries — the event names the answer, the request
+names the choice, and the event's spelling is a schema 400. `always` never goes
+on the wire: it writes into `/api/permission/saved`, a global store shared with
+the user's own terminal, so durable choices stay in the driver's own state and
+every provider reply is one-shot. A reply the service refuses for any reason
+other than the request no longer existing puts the approval card back rather
+than consuming the request, so a refused reply cannot leave a turn blocked
+with nothing to answer.
+
+A denial has two shapes, and OpenCode treats them differently. A plain `reject`
+fails the awaiting call with `Permission.DeclinedError`, which becomes a fiber
+interrupt whose reason defaults to `shutdown` — the same token a service
+restart produces — so Waku classifies it from the rejection it just sent and
+ends the turn the way its Stop button does, with no interrupt reason ever
+reaching the transcript. A `reject` that carries `message` fails the call with
+`Permission.CorrectedError` instead: the agent reads the explanation and the
+turn continues, which is why the card offers a note field on OpenCode sessions.
+An empty note is the plain deny.
 
 **Rewind and branch** — `POST /api/session/{id}/fork` with a boundary, sent
 through the resident service so a second OpenCode process never contends for the

@@ -565,6 +565,7 @@ async fn run_sdk_connection(
                         ) {
                             let _ = events.send(DriverEvent::Error(error.to_string()));
                             let _ = events.send(DriverEvent::TurnFinished {
+                                interrupted: false,
                                 success: false,
                                 summary: None,
                             });
@@ -1412,6 +1413,7 @@ fn finish_prompt(
         Err(error) => {
             let _ = events.send(DriverEvent::Error(error.to_string()));
             let _ = events.send(DriverEvent::TurnFinished {
+                interrupted: false,
                 success: false,
                 summary: None,
             });
@@ -1425,6 +1427,7 @@ fn finish_prompt(
     if let Some(failure) = native_failure {
         let _ = events.send(DriverEvent::Error(failure));
         let _ = events.send(DriverEvent::TurnFinished {
+            interrupted: false,
             success: false,
             summary: None,
         });
@@ -1446,7 +1449,11 @@ fn finish_prompt(
             Some(tr!("session.agent_stopped_reason", reason = "unknown")),
         ),
     };
-    let _ = events.send(DriverEvent::TurnFinished { success, summary });
+    let _ = events.send(DriverEvent::TurnFinished {
+        success,
+        summary,
+        interrupted: false,
+    });
     success
 }
 
@@ -2451,6 +2458,7 @@ mod tests {
         assert!(matches!(
             event_rx.try_recv().unwrap(),
             DriverEvent::TurnFinished {
+                interrupted: false,
                 success: true,
                 summary: None
             }
@@ -2478,6 +2486,7 @@ mod tests {
         assert!(matches!(
             event_rx.try_recv().unwrap(),
             DriverEvent::TurnFinished {
+                interrupted: false,
                 success: false,
                 summary: None
             }
@@ -2495,6 +2504,7 @@ mod tests {
         assert!(matches!(
             event_rx.try_recv().unwrap(),
             DriverEvent::TurnFinished {
+                interrupted: false,
                 success: true,
                 summary: None
             }

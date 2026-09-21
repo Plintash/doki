@@ -282,6 +282,10 @@ pub(super) struct OpenCodePermissionRequest {
     pub(super) permission: String,
     pub(super) patterns: Vec<String>,
     pub(super) always: Vec<String>,
+    /// The provider's own explanation, which the card's detail line prefers.
+    /// Carried here so a card re-emitted after a refused reply says exactly
+    /// what the first one said.
+    pub(super) message: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -295,9 +299,38 @@ pub(super) struct OpenCodePermissionState {
     pub(super) pending: HashMap<String, OpenCodePermissionRequest>,
     pub(super) responding: HashSet<String>,
     pub(super) approved: HashSet<OpenCodePermissionRule>,
+    /// Set when a plain rejection the service accepted is on its way, and
+    /// consumed by the interrupt that rejection causes. OpenCode aborts the
+    /// execution on a rejection WITHOUT an explanation, and its interrupt
+    /// carries the same default `shutdown` reason a service restart uses; this
+    /// is the only thing separating the two. A rejection that carries an
+    /// explanation is not recorded: the service hands the note to the agent
+    /// and the turn continues.
+    denied: bool,
 }
 
 impl OpenCodePermissionState {
+    /// Records that the rejection just sent will abort the turn, if the
+    /// provider accepts the reply.
+    pub(super) fn remember_denial(&mut self) {
+        self.denied = true;
+    }
+
+    /// Whether a rejection is on its way, without consuming it: both the tool
+    /// row for the declined call and the interrupt it causes need to read it,
+    /// and only the turn settling clears it.
+    pub(super) fn has_denial(&self) -> bool {
+        self.denied
+    }
+
+    /// Drops an unclaimed denial. Called when a turn begins, so a rejection
+    /// whose interrupt never arrived cannot reclassify a later turn. A denial
+    /// outlives the turn it belongs to on purpose: the aborted step's own
+    /// failure can be decoded after the turn already settled.
+    pub(super) fn forget_denial(&mut self) {
+        self.denied = false;
+    }
+
     pub(super) fn is_approved(&self, request: &OpenCodePermissionRequest) -> bool {
         !request.patterns.is_empty()
             && request.patterns.iter().all(|pattern| {
@@ -525,6 +558,7 @@ mod tests {
                 permission: "bash".into(),
                 patterns: vec!["cargo test".into()],
                 always: Vec::new(),
+                message: None,
             },
         );
 
@@ -542,6 +576,7 @@ mod tests {
             permission: "bash".into(),
             patterns: patterns.iter().map(|pattern| (*pattern).into()).collect(),
             always: vec!["cargo *".into()],
+            message: None,
         };
         permissions
             .pending

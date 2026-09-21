@@ -7,6 +7,23 @@ fn retain_runtime_after_cancel(provider: ProviderKind) -> bool {
     !matches!(provider, ProviderKind::Codex | ProviderKind::Amp)
 }
 
+/// The answer a confirmed denial sends: the card's own deny option and the
+/// trimmed note. An empty note is the plain deny, which is what makes the
+/// field optional — and what tells OpenCode to abort rather than continue
+/// with feedback.
+pub(super) fn denial_answer(
+    permission: &PendingPermission,
+    note: &str,
+) -> Option<(String, String, Option<String>)> {
+    let option_id = permission
+        .options
+        .iter()
+        .find(|option| !option.allow)
+        .map(|option| option.id.clone())?;
+    let message = (!note.trim().is_empty()).then(|| note.trim().to_owned());
+    Some((permission.request_id.clone(), option_id, message))
+}
+
 fn new_task_runtime_mode(current: Option<&AgentSession>, remembered: RuntimeMode) -> RuntimeMode {
     current
         .map(|session| session.runtime_mode)
@@ -1250,19 +1267,82 @@ impl Waku {
         &mut self,
         request_id: String,
         option_id: String,
+        message: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let Some(session_id) = self.state.selected_session else {
             return;
         };
         if let Some(runtime) = self.runtimes.get_mut(&session_id) {
-            runtime.driver.respond(request_id, option_id);
+            runtime
+                .driver
+                .respond_with_message(request_id, option_id, message);
             runtime.pending_permission = None;
+            runtime.permission_note_open = false;
         }
         if let Some(session) = self.selected_session_mut() {
             session.status = SessionStatus::Working;
         }
         cx.notify();
+    }
+
+    /// Opens the approval card's denial-note field.
+    ///
+    /// Only a provider whose rejection accepts an explanation gets the field:
+    /// OpenCode hands the note to its agent and keeps the turn alive, while a
+    /// note sent to any other transport would be silently dropped.
+    pub(super) fn open_permission_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_id) = self.state.selected_session else {
+            return;
+        };
+        if !self
+            .selected_session()
+            .is_some_and(|session| session.provider == ProviderKind::OpenCode)
+        {
+            return;
+        }
+        let Some(runtime) = self.runtimes.get_mut(&session_id) else {
+            return;
+        };
+        if runtime.pending_permission.is_none() {
+            return;
+        }
+        runtime.permission_note_open = true;
+        self.permission_note.update(cx, |input, cx| input.clear(cx));
+        let focus = self.permission_note.read(cx).focus();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Closes the denial-note field without answering.
+    pub(super) fn cancel_permission_note(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.state.selected_session else {
+            return;
+        };
+        if let Some(runtime) = self.runtimes.get_mut(&session_id) {
+            runtime.permission_note_open = false;
+        }
+        cx.notify();
+    }
+
+    /// Answers the open approval with its deny option and the note (if any).
+    pub(super) fn confirm_permission_note(&mut self, note: Option<String>, cx: &mut Context<Self>) {
+        let Some(session_id) = self.state.selected_session else {
+            return;
+        };
+        let Some(answer) = self.runtimes.get_mut(&session_id).and_then(|runtime| {
+            if !runtime.permission_note_open {
+                return None;
+            }
+            let pending = runtime.pending_permission.as_ref()?;
+            let answer = denial_answer(pending, note.as_deref().unwrap_or_default())?;
+            runtime.permission_note_open = false;
+            Some(answer)
+        }) else {
+            return;
+        };
+        let (request_id, option_id, message) = answer;
+        self.respond_permission(request_id, option_id, message, cx);
     }
 
     pub(super) fn sync_user_input_answer(&mut self, cx: &mut Context<Self>) {

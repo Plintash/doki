@@ -85,48 +85,99 @@ impl Waku {
         if let Some(permission) = self.selected_runtime()?.pending_computer_approval.as_ref() {
             return Some(self.render_computer_permission(permission, cx));
         }
-        let permission = self.selected_runtime()?.pending_permission.as_ref()?;
+        let runtime = self.selected_runtime()?;
+        let permission = runtime.pending_permission.as_ref()?;
+        let note_open = runtime.permission_note_open;
         let theme = Theme::current(cx);
         let request_id = permission.request_id.clone();
-        let mut buttons = div().flex().items_center().gap(px(8.0)).mt(px(10.0));
-        for option in &permission.options {
-            let request_id = request_id.clone();
-            let option_id = option.id.clone();
-            let allow = option.allow;
-            buttons = buttons.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "permission-{}-{}",
-                        permission.request_id, option.id
-                    )))
-                    .h(px(28.0))
-                    .px(px(13.0))
-                    .rounded(px(7.0))
-                    .flex()
-                    .items_center()
-                    .cursor_default()
-                    .text_size(sp(12.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .when(allow, |element| {
-                        element
-                            .bg(theme.inverse)
-                            .text_color(theme.on_inverse)
-                            .hover(|element| element.opacity(0.9))
-                    })
-                    .when(!allow, |element| {
-                        element
-                            .border_1()
-                            .border_color(theme.border_strong)
-                            .text_color(theme.text_secondary)
-                            .hover(|element| element.bg(theme.overlay).text_color(theme.text))
-                    })
-                    .active(|element| element.opacity(0.8))
-                    .child(SharedString::from(option.label.clone()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.respond_permission(request_id.clone(), option_id.clone(), cx);
-                    })),
-            );
-        }
+        // Only a provider whose rejection accepts an explanation gets the
+        // note: OpenCode hands it to its agent and keeps the turn alive, while
+        // a note sent to any other transport would be silently dropped.
+        let note_supported = self
+            .selected_session()
+            .is_some_and(|session| session.provider == ProviderKind::OpenCode);
+        let actions = if note_open && note_supported {
+            self.render_permission_note(&request_id, cx)
+        } else {
+            let mut buttons = div().flex().items_center().gap(px(8.0)).mt(px(10.0));
+            for option in &permission.options {
+                let request_id = request_id.clone();
+                let option_id = option.id.clone();
+                let allow = option.allow;
+                // The note field is reachable without a pointer, so the
+                // buttons that open it must be too.
+                let focus = self.transcript_control_focus(
+                    format!("permission-{}-{}", permission.request_id, option.id),
+                    cx,
+                );
+                let click_request_id = request_id.clone();
+                let click_option_id = option_id.clone();
+                let key_request_id = request_id.clone();
+                let key_option_id = option_id.clone();
+                buttons = buttons.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "permission-{}-{}",
+                            permission.request_id, option.id
+                        )))
+                        .track_focus(&focus)
+                        .tab_index(0)
+                        .tab_stop(true)
+                        .h(px(28.0))
+                        .px(px(13.0))
+                        .rounded(px(7.0))
+                        .flex()
+                        .items_center()
+                        .cursor_default()
+                        .text_size(sp(12.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .when(allow, |element| {
+                            element
+                                .bg(theme.inverse)
+                                .text_color(theme.on_inverse)
+                                .hover(|element| element.opacity(0.9))
+                        })
+                        .when(!allow, |element| {
+                            element
+                                .border_1()
+                                .border_color(theme.border_strong)
+                                .text_color(theme.text_secondary)
+                                .hover(|element| element.bg(theme.overlay).text_color(theme.text))
+                        })
+                        .focus_visible(|style| style.border_1().border_color(theme.accent))
+                        .active(|element| element.opacity(0.8))
+                        .child(SharedString::from(option.label.clone()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if !allow && note_supported {
+                                this.open_permission_note(window, cx);
+                            } else {
+                                this.respond_permission(
+                                    click_request_id.clone(),
+                                    click_option_id.clone(),
+                                    None,
+                                    cx,
+                                );
+                            }
+                        }))
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                if !allow && note_supported {
+                                    this.open_permission_note(window, cx);
+                                } else {
+                                    this.respond_permission(
+                                        key_request_id.clone(),
+                                        key_option_id.clone(),
+                                        None,
+                                        cx,
+                                    );
+                                }
+                                cx.stop_propagation();
+                            }
+                        })),
+                );
+            }
+            buttons
+        };
         Some(
             div().px(px(20.0)).pb(px(8.0)).child(
                 div()
@@ -169,9 +220,125 @@ impl Waku {
                             .whitespace_normal()
                             .child(SharedString::from(permission.detail.clone())),
                     )
-                    .child(buttons),
+                    .child(actions),
             ),
         )
+    }
+
+    /// The denial note row: the explanation field with its Deny confirm and
+    /// the way back to the plain options. An empty note is the plain deny.
+    fn render_permission_note(&self, request_id: &str, cx: &mut Context<Self>) -> Div {
+        let theme = Theme::current(cx);
+        let confirm_focus =
+            self.transcript_control_focus(format!("permission-note-confirm-{request_id}"), cx);
+        let close_focus =
+            self.transcript_control_focus(format!("permission-note-close-{request_id}"), cx);
+        let request_id = request_id.to_owned();
+        div()
+            .mt(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(10.0))
+                            .py(px(4.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(theme.accent.opacity(0.34))
+                            .bg(theme.overlay)
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .text_size(sp(12.5))
+                            .line_height(sp(16.0))
+                            .child(self.permission_note.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "permission-note-confirm-{request_id}"
+                            )))
+                            .track_focus(&confirm_focus)
+                            .tab_index(0)
+                            .tab_stop(true)
+                            .h(px(28.0))
+                            .px(px(13.0))
+                            .rounded(px(7.0))
+                            .flex()
+                            .items_center()
+                            .cursor_default()
+                            .text_size(sp(12.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .border_1()
+                            .border_color(theme.border_strong)
+                            .text_color(theme.text_secondary)
+                            .focus_visible(|style| style.border_color(theme.accent))
+                            .hover(|element| element.bg(theme.overlay).text_color(theme.text))
+                            .active(|element| element.opacity(0.8))
+                            .child(tr!("common.deny"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let note = this.permission_note.read(cx).content().to_owned();
+                                this.confirm_permission_note(Some(note), cx);
+                            }))
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    let note = this.permission_note.read(cx).content().to_owned();
+                                    this.confirm_permission_note(Some(note), cx);
+                                    cx.stop_propagation();
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "permission-note-close-{request_id}"
+                            )))
+                            .track_focus(&close_focus)
+                            .tab_index(0)
+                            .tab_stop(true)
+                            .h(px(28.0))
+                            .px(px(10.0))
+                            .rounded(px(7.0))
+                            .flex()
+                            .items_center()
+                            .cursor_default()
+                            .text_size(sp(12.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text_tertiary)
+                            .focus_visible(|style| style.border_1().border_color(theme.accent))
+                            .hover(|element| {
+                                element.bg(theme.overlay).text_color(theme.text_secondary)
+                            })
+                            .child(tr!("common.close"))
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_permission_note(cx)))
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    this.cancel_permission_note(cx);
+                                    cx.stop_propagation();
+                                }
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(sp(11.5))
+                    .text_color(theme.text_ghost)
+                    .child(tr!("permission.deny_note_hint")),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.cancel_permission_note(cx);
+                    cx.stop_propagation();
+                }
+            }))
     }
 
     fn render_user_input(&self, pending: PendingUserInput, cx: &mut Context<Self>) -> Div {

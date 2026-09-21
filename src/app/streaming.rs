@@ -1,6 +1,35 @@
 use super::*;
 
 impl Waku {
+    /// How a finished turn presents. An interrupted turn is a user stop — the
+    /// Stop button, or a provider-side stop such as a denied permission — and
+    /// settles exactly like the local Stop: idle and interrupted, never a red
+    /// failure and never a queued follow-up drain.
+    pub(super) fn turn_settlement(
+        success: bool,
+        interrupted: bool,
+    ) -> (SessionStatus, TurnStatus, BackgroundWorkStatus) {
+        if interrupted {
+            (
+                SessionStatus::Idle,
+                TurnStatus::Interrupted,
+                BackgroundWorkStatus::Stopped,
+            )
+        } else if success {
+            (
+                SessionStatus::Idle,
+                TurnStatus::Completed,
+                BackgroundWorkStatus::Completed,
+            )
+        } else {
+            (
+                SessionStatus::Failed,
+                TurnStatus::Failed,
+                BackgroundWorkStatus::Failed,
+            )
+        }
+    }
+
     pub(super) fn finish_streaming_assistant(&mut self, session_id: Uuid) {
         if let Some(session) = self.state.session_mut(session_id) {
             for message in &mut session.messages {
@@ -443,6 +472,7 @@ impl Waku {
                 options,
             } => {
                 if self.accepts_turn_output(session_id) {
+                    runtime.permission_note_open = false;
                     runtime.pending_permission = Some(PendingPermission {
                         request_id,
                         title,
@@ -600,15 +630,14 @@ impl Waku {
                     self.state.mark_session_dirty(session_id);
                 }
             }
-            DriverEvent::TurnFinished { success, summary } => {
-                self.settle_foreground_work(
-                    session_id,
-                    if success {
-                        BackgroundWorkStatus::Completed
-                    } else {
-                        BackgroundWorkStatus::Failed
-                    },
-                );
+            DriverEvent::TurnFinished {
+                success,
+                summary,
+                interrupted,
+            } => {
+                let (session_status, turn_status, background_status) =
+                    Self::turn_settlement(success, interrupted);
+                self.settle_foreground_work(session_id, background_status);
                 let previous_kinds = self.snapshot_selected_transcript_rows(session_id);
                 runtime.last_driver_error = None;
                 // A settled turn moved the account's rate-limit needles; ask
@@ -659,33 +688,28 @@ impl Waku {
                 runtime.park_announced = false;
                 let needs_fallback = !self.turn_has_assistant_message(session_id);
                 if let Some(session) = self.state.session_mut(session_id) {
-                    session.status = if success {
-                        SessionStatus::Idle
-                    } else {
-                        SessionStatus::Failed
-                    };
+                    // A provider-side user stop — the Stop button, or a denied
+                    // permission the provider aborted on — settles like the
+                    // app's own Stop: idle, never a red failure.
+                    session.status = session_status;
                     if needs_fallback {
-                        session.push_message(
-                            MessageRole::Assistant,
+                        let fallback = if interrupted {
+                            tr!("session.stopped")
+                        } else {
                             summary.unwrap_or_else(|| {
                                 if success {
                                     tr!("session.turn_completed")
                                 } else {
                                     tr!("session.stopped_before_response")
                                 }
-                            }),
-                        );
+                            })
+                        };
+                        session.push_message(MessageRole::Assistant, fallback);
                     }
                 }
-                self.finish_active_turn(
-                    session_id,
-                    if success {
-                        TurnStatus::Completed
-                    } else {
-                        TurnStatus::Failed
-                    },
-                );
+                self.finish_active_turn(session_id, turn_status);
                 runtime.pending_permission = None;
+                runtime.permission_note_open = false;
                 runtime.pending_user_input = None;
                 runtime.pending_computer_approval = None;
                 runtime.driver.cancel_computer_use();
@@ -759,6 +783,7 @@ impl Waku {
                 self.complete_turn_blocks(session_id);
                 runtime.stream_phase = None;
                 runtime.pending_permission = None;
+                runtime.permission_note_open = false;
                 runtime.pending_user_input = None;
                 runtime.pending_computer_approval = None;
                 runtime.driver.cancel_computer_use();

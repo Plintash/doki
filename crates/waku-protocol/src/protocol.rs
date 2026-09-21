@@ -110,6 +110,11 @@ pub enum Command {
     Respond {
         request_id: String,
         option_id: String,
+        /// An optional explanation to send with the answer. OpenCode forwards
+        /// a rejection's note to the agent as feedback and keeps the turn
+        /// alive; transports without that notion drop it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
     RespondUserInput {
         request_id: String,

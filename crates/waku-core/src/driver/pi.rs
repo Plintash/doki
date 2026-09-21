@@ -444,6 +444,7 @@ impl PiDriver {
                             error = error
                         )));
                         let _ = writer_events.send(DriverEvent::TurnFinished {
+                            interrupted: false,
                             success: false,
                             summary: Some(tr!(
                                 "errors.provider_initialize_session",
@@ -459,6 +460,7 @@ impl PiDriver {
                         provider = flavor.display_name()
                     )));
                     let _ = writer_events.send(DriverEvent::TurnFinished {
+                        interrupted: false,
                         success: false,
                         summary: Some(tr!(
                             "errors.provider_initialize_session",
@@ -530,6 +532,7 @@ impl PiDriver {
                                     error = error
                                 )));
                                 let _ = writer_events.send(DriverEvent::TurnFinished {
+                                    interrupted: false,
                                     success: false,
                                     summary: Some(tr!(
                                         "errors.provider_rejected_prompt",
@@ -1307,6 +1310,7 @@ fn handle_pi_message(
                 let _ = events.send(DriverEvent::Error(error.clone()));
             }
             let _ = events.send(DriverEvent::TurnFinished {
+                interrupted: false,
                 success,
                 summary: error,
             });
@@ -1361,6 +1365,7 @@ fn handle_pi_message(
                 .retain(|_, response| matches!(response, PendingResponse::Request(_)));
             let success = !state.failed;
             let _ = events.send(DriverEvent::TurnFinished {
+                interrupted: false,
                 success,
                 summary: (!success).then(|| {
                     tr!(

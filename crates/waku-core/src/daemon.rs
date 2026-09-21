@@ -1728,7 +1728,8 @@ fn handle_driver_command(
         Command::Respond {
             request_id,
             option_id,
-        } => driver.respond(request_id, option_id),
+            message,
+        } => driver.respond_with_message(request_id, option_id, message),
         Command::RespondUserInput {
             request_id,
             answers,
@@ -1929,9 +1930,17 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         ),
         DriverEvent::PlanUsageUpdated(usage) => ("planUsageUpdated", serde_json::to_value(usage)?),
         DriverEvent::GoalUpdated(goal) => ("goalUpdated", serde_json::to_value(goal)?),
-        DriverEvent::TurnFinished { success, summary } => (
+        DriverEvent::TurnFinished {
+            success,
+            summary,
+            interrupted,
+        } => (
             "turnFinished",
-            json!({ "success": success, "summary": summary }),
+            json!({
+                "success": success,
+                "summary": summary,
+                "interrupted": interrupted,
+            }),
         ),
         DriverEvent::Error(error) => ("error", Value::String(error)),
         DriverEvent::ProcessExited => ("processExited", Value::Null),
@@ -2024,6 +2033,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
             DriverEvent::TurnFinished {
                 success: finished.success,
                 summary: finished.summary,
+                interrupted: finished.interrupted,
             }
         }
         "error" => DriverEvent::Error(serde_json::from_value(payload)?),
@@ -2097,6 +2107,8 @@ struct UsageWire {
 struct TurnFinishedWire {
     success: bool,
     summary: Option<String>,
+    #[serde(default)]
+    interrupted: bool,
 }
 
 #[cfg(test)]

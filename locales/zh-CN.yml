@@ -448,6 +448,9 @@ permission.allow_named_permission: 是否授予“%{permission}”权限？
 permission.agent_asks_for_named_permission: 智能体正在请求“%{permission}”权限
 permission.agent_asks_for_permission: 智能体正在请求权限
 permission.agent_wants_to: 智能体想要执行 %{action}
+permission.declined_tool_call: 你拒绝了这个工具调用
+permission.deny_note_placeholder: 告诉 OpenCode 该怎么做（可选）
+permission.deny_note_hint: 写说明会让本轮继续；留空则直接拒绝
 common.close: 关闭
 common.default: 默认
 composer.no_providers: 请安装或启用一个服务商后再发送

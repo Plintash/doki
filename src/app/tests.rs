@@ -4,6 +4,7 @@ use super::composer::{
     merged_submission, next_picker_highlight, visible_branch_entries,
 };
 use super::runtime::{merge_remote_session_catalog, session_has_active_provider_turn};
+use super::sessions::denial_answer;
 use super::settings::visible_settings_pages;
 use super::{
     ESCAPE_STOP_CONFIRMATION_TIMEOUT, EscapeStopConfirmation, EscapeStopPress, EscapeStopTarget,
@@ -27,8 +28,8 @@ use crate::git_branch::BranchEntry;
 use crate::model::{
     ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget, Checkpoint,
     CheckpointFile, CheckpointStatus, DriverEvent, Message, MessageAnnotation, MessageRole,
-    ProviderKind, ReasoningBlock, RuntimeEventCursor, SessionStatus, TextSpan, TranscriptBlock,
-    TurnStatus, UserInputOption, UserInputQuestion,
+    PendingPermission, PermissionOption, ProviderKind, ReasoningBlock, RuntimeEventCursor,
+    SessionStatus, TextSpan, TranscriptBlock, TurnStatus, UserInputOption, UserInputQuestion,
 };
 
 #[test]
@@ -45,6 +46,112 @@ fn a_blank_comment_field_stores_no_comment() {
         annotation_comment_value("  fix 2  "),
         Some("  fix 2  ".to_owned())
     );
+}
+
+/// A confirmed denial sends the card's own deny option, and an empty note is
+/// the plain deny — the distinction that makes OpenCode abort the turn rather
+/// than continue with feedback.
+#[test]
+fn a_denial_answer_uses_the_cards_deny_option_and_trims_the_note() {
+    let permission = PendingPermission {
+        request_id: "per_1".into(),
+        title: "curl https://example.com".into(),
+        detail: "external directory".into(),
+        options: vec![
+            PermissionOption {
+                id: "once".into(),
+                label: "Allow once".into(),
+                allow: true,
+            },
+            PermissionOption {
+                id: "always".into(),
+                label: "Always allow".into(),
+                allow: true,
+            },
+            PermissionOption {
+                id: "reject".into(),
+                label: "Deny".into(),
+                allow: false,
+            },
+        ],
+    };
+    assert_eq!(
+        denial_answer(&permission, "  use the cached copy  "),
+        Some((
+            "per_1".to_owned(),
+            "reject".to_owned(),
+            Some("use the cached copy".to_owned()),
+        ))
+    );
+    assert_eq!(
+        denial_answer(&permission, "   "),
+        Some(("per_1".to_owned(), "reject".to_owned(), None))
+    );
+    let allows_only = PendingPermission {
+        request_id: "per_2".into(),
+        title: "no deny option".into(),
+        detail: String::new(),
+        options: vec![PermissionOption {
+            id: "once".into(),
+            label: "Allow once".into(),
+            allow: true,
+        }],
+    };
+    assert_eq!(denial_answer(&allows_only, "x"), None);
+}
+
+/// A provider-side stop settles the way the Stop button does: idle and
+/// interrupted, never a red failure. The handler's `success` gate also keeps
+/// the queued-follow-up drain off, because an interrupted turn reports
+/// `success: false`.
+#[test]
+fn an_interrupted_turn_settles_the_way_the_stop_button_does() {
+    use crate::model::BackgroundWorkStatus;
+
+    for (success, interrupted, expected) in [
+        (
+            true,
+            false,
+            (
+                SessionStatus::Idle,
+                TurnStatus::Completed,
+                BackgroundWorkStatus::Completed,
+            ),
+        ),
+        (
+            false,
+            false,
+            (
+                SessionStatus::Failed,
+                TurnStatus::Failed,
+                BackgroundWorkStatus::Failed,
+            ),
+        ),
+        (
+            false,
+            true,
+            (
+                SessionStatus::Idle,
+                TurnStatus::Interrupted,
+                BackgroundWorkStatus::Stopped,
+            ),
+        ),
+        (
+            true,
+            true,
+            (
+                SessionStatus::Idle,
+                TurnStatus::Interrupted,
+                BackgroundWorkStatus::Stopped,
+            ),
+        ),
+    ] {
+        assert_eq!(
+            super::Waku::turn_settlement(success, interrupted),
+            expected,
+            "success={success} interrupted={interrupted}"
+        );
+    }
 }
 
 /// The hover panel is the Codex-style detail: each card jumps to its span and

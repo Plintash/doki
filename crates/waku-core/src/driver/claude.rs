@@ -471,6 +471,7 @@ impl ClaudeDriver {
                         // Nothing will settle a turn whose prompt never landed.
                         if std::mem::take(&mut *writer_turn.lock()) {
                             let _ = writer_events.send(DriverEvent::TurnFinished {
+                                interrupted: false,
                                 success: false,
                                 summary: Some(tr!(
                                     "errors.provider_receive_prompt",
@@ -1606,6 +1607,7 @@ fn handle_message(
             state.parked = false;
             *turn_active.lock() = false;
             let _ = events.send(DriverEvent::TurnFinished {
+                interrupted: false,
                 success: !failed,
                 summary: None,
             });

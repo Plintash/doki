@@ -77,6 +77,18 @@ impl DriverHandle {
         self.inner.respond(request_id, option_id);
     }
 
+    /// Answers a request with an optional explanation. Only transports whose
+    /// provider has a use for the note forward it; the default drops it.
+    pub fn respond_with_message(
+        &self,
+        request_id: String,
+        option_id: String,
+        message: Option<String>,
+    ) {
+        self.inner
+            .respond_with_message(request_id, option_id, message);
+    }
+
     pub fn respond_user_input(&self, request_id: String, answers: Vec<UserInputAnswer>) {
         self.inner.respond_user_input(request_id, answers);
     }
@@ -123,6 +135,17 @@ pub trait DriverControl: Send + Sync {
     fn refresh_background_work(&self) {}
     fn stop_background_work(&self, _key: BackgroundWorkKey, _control_id: String) {}
     fn respond(&self, request_id: String, option_id: String);
+    /// Answer with an optional explanation. The daemon forwards it to
+    /// transports whose provider has a use for it (OpenCode turns a denial's
+    /// note into feedback the agent continues from) and drops it otherwise.
+    fn respond_with_message(
+        &self,
+        request_id: String,
+        option_id: String,
+        _message: Option<String>,
+    ) {
+        self.respond(request_id, option_id);
+    }
     fn respond_user_input(&self, _request_id: String, _answers: Vec<UserInputAnswer>) {}
     fn goal(&self, _operation: GoalOperation) {}
     fn run_computer_tool(&self, _request: ComputerToolRequest) {}

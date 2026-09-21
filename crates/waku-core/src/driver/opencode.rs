@@ -116,6 +116,10 @@ enum DriverCommand {
     Respond {
         request_id: String,
         option_id: String,
+        /// An optional explanation to send with the answer. Only a rejection
+        /// has a use for it: the service hands it to the agent as feedback
+        /// and keeps the turn alive.
+        message: Option<String>,
     },
     RespondUserInput {
         request_id: String,
@@ -193,6 +197,10 @@ struct StepState {
 struct TurnOutcome {
     success: bool,
     summary: Option<String>,
+    /// The user stopped the turn — the app's Stop button, or a provider-side
+    /// stop such as a denied permission. Clients present this as an
+    /// interruption rather than a failure.
+    interrupted: bool,
 }
 
 /// `session.execution.*` arms the outcome and then settles the turn. Settling
@@ -283,12 +291,29 @@ impl StreamState {
             return;
         }
         self.turn = TurnState::Running { outcome: None };
+        self.permissions.forget_denial();
         let _ = events.send(DriverEvent::TurnStarted);
     }
 
     fn arm(&mut self, success: bool, summary: Option<String>) {
         if let TurnState::Running { outcome } = &mut self.turn {
-            outcome.get_or_insert(TurnOutcome { success, summary });
+            outcome.get_or_insert(TurnOutcome {
+                success,
+                summary,
+                interrupted: false,
+            });
+        }
+    }
+
+    /// Arms the turn as a user-caused stop: no provider reason is spoken into
+    /// the transcript, and the client may end it as an interruption.
+    fn arm_interrupted(&mut self) {
+        if let TurnState::Running { outcome } = &mut self.turn {
+            outcome.get_or_insert(TurnOutcome {
+                success: false,
+                summary: None,
+                interrupted: true,
+            });
         }
     }
 
@@ -301,10 +326,12 @@ impl StreamState {
         let outcome = outcome.or(fallback).unwrap_or(TurnOutcome {
             success: true,
             summary: None,
+            interrupted: false,
         });
         let _ = events.send(DriverEvent::TurnFinished {
             success: outcome.success,
             summary: outcome.summary,
+            interrupted: outcome.interrupted,
         });
     }
 
@@ -643,9 +670,14 @@ impl DriverControl for OpenCodeDriver {
     }
 
     fn respond(&self, request_id: String, option_id: String) {
+        self.respond_with_message(request_id, option_id, None);
+    }
+
+    fn respond_with_message(&self, request_id: String, option_id: String, message: Option<String>) {
         let _ = self.commands.send(DriverCommand::Respond {
             request_id,
             option_id,
+            message,
         });
     }
 
@@ -965,6 +997,7 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
                         Some(TurnOutcome {
                             success: false,
                             summary: Some(tr!("errors.provider_start_turn", provider = "OpenCode")),
+                            interrupted: false,
                         }),
                     );
                 }
@@ -1021,28 +1054,32 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
         DriverCommand::Respond {
             request_id,
             option_id,
+            message,
         } => {
-            for (request_id, option_id) in
-                support::permission_responses(&mut state.permissions, &request_id, &option_id)
-            {
-                let reply = match option_id.as_str() {
-                    "reject" => PermissionReply::Reject,
-                    // Never `always`: see the module doc.
-                    _ => PermissionReply::Once,
-                };
-                if let Err(error) = opencode_api::reply_permission(
-                    &endpoint,
-                    &worker.session_id,
-                    &request_id,
-                    reply,
-                ) {
-                    let _ = events.send(DriverEvent::Error(tr!(
-                        "errors.answer_provider_permission",
-                        provider = "OpenCode",
-                        error = error
-                    )));
-                }
-            }
+            // Captured before the resolution consumes it: a reply the service
+            // refuses must be able to put the same request, with the same
+            // explanation, back in front of the user.
+            let answered = state.permissions.pending.get(&request_id).cloned();
+            let responses =
+                support::permission_responses(&mut state.permissions, &request_id, &option_id);
+            send_permission_responses(
+                &mut state.permissions,
+                answered
+                    .as_ref()
+                    .map(|request| (request_id.as_str(), request)),
+                message,
+                responses,
+                events,
+                &mut |request_id, reply, message| {
+                    opencode_api::reply_permission(
+                        &endpoint,
+                        &worker.session_id,
+                        request_id,
+                        reply,
+                        message,
+                    )
+                },
+            );
         }
         DriverCommand::RespondUserInput {
             request_id,
@@ -1072,6 +1109,70 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
         DriverCommand::Shutdown => return false,
     }
     true
+}
+
+/// Sends the one-shot replies [`support::permission_responses`] resolved.
+///
+/// A reply the service refuses must not consume the request: the app dropped
+/// its card the moment the user clicked, and the driver's own pending/
+/// responding dedupe would suppress every later ask — including the
+/// reconcile after a stream break. So the id is released from `responding`,
+/// and any error except "no such request" restores the request and offers it
+/// again. A 404 is settled elsewhere — another client answered it, or the
+/// turn ended — so there is nothing to ask.
+///
+/// The `always` extra ids are released too but never restored: their rule is
+/// already remembered, so the next `permission.asked` or reconcile
+/// auto-answers them through `is_approved` rather than asking the user a
+/// question the policy already answered.
+///
+/// A plain rejection that the service accepts is recorded as a denial: the
+/// provider aborts the turn for it, and the interrupt that follows would
+/// otherwise look exactly like a service shutdown. A rejection that carries
+/// an explanation is NOT recorded — the service hands the note to the agent
+/// and the turn continues.
+fn send_permission_responses(
+    permissions: &mut OpenCodePermissionState,
+    answered: Option<(&str, &OpenCodePermissionRequest)>,
+    message: Option<String>,
+    responses: Vec<(String, String)>,
+    events: &impl DriverEventSink,
+    send: &mut impl FnMut(&str, PermissionReply, Option<&str>) -> opencode_api::Result<()>,
+) {
+    for (request_id, option_id) in responses {
+        let reply = match option_id.as_str() {
+            "reject" => PermissionReply::Reject,
+            // Never `always`: see the module doc.
+            _ => PermissionReply::Once,
+        };
+        // Only the request the user actually answered can carry the note; the
+        // extra ids an `always` resolution covered are one-shot replies.
+        let note = answered
+            .filter(|(answered_id, _)| *answered_id == request_id)
+            .and(message.as_deref())
+            .filter(|note| !note.trim().is_empty());
+        let Err(error) = send(&request_id, reply, note) else {
+            if reply == PermissionReply::Reject && note.is_none() {
+                permissions.remember_denial();
+            }
+            continue;
+        };
+        permissions.responding.remove(&request_id);
+        if !error.is_not_found()
+            && let Some((answered_id, request)) = answered
+            && answered_id == request_id
+        {
+            permissions
+                .pending
+                .insert(request_id.clone(), request.clone());
+            emit_permission(&request_id, request, events);
+        }
+        let _ = events.send(DriverEvent::Error(tr!(
+            "errors.answer_provider_permission",
+            provider = "OpenCode",
+            error = error
+        )));
+    }
 }
 
 fn apply_options(
@@ -1249,6 +1350,7 @@ fn reconcile(worker: &Worker, state: &mut StreamState, generation: u64) {
             Some(TurnOutcome {
                 success: !failed,
                 summary: None,
+                interrupted: false,
             }),
         );
     }
@@ -1421,7 +1523,14 @@ fn handle_event(
             emit_usage(data.get("tokens"), state, events, service);
         }
         "session.step.failed" => {
-            let _ = events.send(DriverEvent::Error(error_message(data.get("error"))));
+            // A step the user's own denial aborted is not a provider error: the
+            // turn ending already says what happened, and the declined call's
+            // row carries the decline. Surfacing the abort here is the
+            // "Step interrupted" toast the denial caused.
+            let error = data.get("error");
+            if !(state.permissions.has_denial() && is_abort(error)) {
+                let _ = events.send(DriverEvent::Error(error_message(error)));
+            }
         }
         "session.execution.succeeded" => {
             state.arm(true, None);
@@ -1434,18 +1543,23 @@ fn handle_event(
             state.finish_turn(events);
         }
         "session.execution.interrupted" => {
-            let reason = data
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("user")
-                .to_owned();
-            // `shutdown` means the service itself is going away: the stream
-            // will break and the reconnect path repairs this session. Failing
-            // the turn here would report a provider error the user never
-            // caused. A user or superseded interrupt did stop the work, and
-            // says so.
-            let success = reason == "shutdown";
-            state.arm(success, Some(reason));
+            let reason = data.get("reason").and_then(Value::as_str).unwrap_or("user");
+            // `shutdown` is OpenCode's DEFAULT interrupt reason: the service
+            // emits it both when it is going away and when a plain permission
+            // rejection aborts the run, so the reason alone cannot tell the
+            // two apart. The denial record Waku kept is what classifies it.
+            // No reason ever reaches the transcript: these are machine
+            // tokens, not a turn's outcome.
+            if state.permissions.has_denial() || reason != "shutdown" {
+                // A stop the user caused: the app ends it the way its own
+                // Stop button does.
+                state.arm_interrupted();
+            } else {
+                // The service is going away: the stream will break and the
+                // reconnect path repairs this session. Failing the turn here
+                // would report a provider error the user never caused.
+                state.arm(true, None);
+            }
             state.finish_turn(events);
         }
         // The service does not emit `session.idle`, so this is only a belt for
@@ -1778,6 +1892,15 @@ fn inbox_event_id(data: &Value) -> Option<&str> {
     data.get("inboxID").and_then(Value::as_str)
 }
 
+/// Whether an OpenCode error marks an aborted call or step rather than a
+/// genuine failure. Both a user stop and a denied permission abort through it.
+fn is_abort(error: Option<&Value>) -> bool {
+    error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        == Some("aborted")
+}
+
 fn error_message(error: Option<&Value>) -> String {
     error
         .and_then(|error| {
@@ -1899,11 +2022,31 @@ fn complete_tool(
         slot.metadata = Some(metadata);
     }
     let output = if failed {
-        stripped(data.get("error")).or_else(|| stripped(data.get("content")))
+        data.get("error")
+            .filter(|error| !error.is_null())
+            .and_then(|error| tool_error_output(error, state.permissions.has_denial()))
+            .or_else(|| stripped(data.get("content")))
     } else {
         stripped(data.get("content"))
     };
     emit_tool(events, &id, &slot, output.as_ref(), failed, true);
+}
+
+/// The content of a failed call's row.
+///
+/// OpenCode reports a failure as a `{type, message}` envelope, so
+/// pretty-printing it put the envelope's opening brace on the row where the
+/// message belongs. A call the user just declined is reported in Waku's own
+/// words instead of the provider's English copy.
+fn tool_error_output(error: &Value, declined: bool) -> Option<Value> {
+    if declined && error.get("type").and_then(Value::as_str) == Some("aborted") {
+        return Some(Value::String(tr!("permission.declined_tool_call")));
+    }
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(|message| Value::String(message.to_owned()))
+        .or_else(|| stripped(Some(error)))
 }
 
 /// Every tool row goes through the shared normalizer, so the 16 000-character
@@ -2209,6 +2352,12 @@ fn request_permission(
             .to_owned(),
         patterns: strings("resources"),
         always: strings("save"),
+        message: data
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .map(str::to_owned),
     };
 
     if state.permissions.pending.contains_key(request_id)
@@ -2223,6 +2372,7 @@ fn request_permission(
         let _ = commands.send(DriverCommand::Respond {
             request_id: request_id.to_owned(),
             option_id: "once".into(),
+            message: None,
         });
         return;
     }
@@ -2232,6 +2382,18 @@ fn request_permission(
         .pending
         .insert(request_id.to_owned(), request.clone());
 
+    emit_permission(request_id, &request, events);
+}
+
+/// Emits the approval card for one request.
+///
+/// One builder for both the first card and the card re-emitted after a
+/// refused reply, so the two cannot drift in title, detail or options.
+fn emit_permission(
+    request_id: &str,
+    request: &OpenCodePermissionRequest,
+    events: &impl DriverEventSink,
+) {
     let action = if request.permission.is_empty() {
         tr!("permission.run_a_tool_lower")
     } else {
@@ -2246,37 +2408,36 @@ fn request_permission(
                 permission = action.as_str()
             )
         }),
-        detail: data
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|message| !message.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| match resources {
-                Some(_) => tr!(
-                    "permission.agent_asks_for_named_permission",
-                    permission = action.as_str()
-                ),
-                None => tr!("permission.agent_asks_for_permission"),
-            }),
-        options: vec![
-            PermissionOption {
-                id: "once".into(),
-                label: tr!("permission.allow_once"),
-                allow: true,
-            },
-            PermissionOption {
-                id: "always".into(),
-                label: tr!("permission.always_allow"),
-                allow: true,
-            },
-            PermissionOption {
-                id: "reject".into(),
-                label: tr!("common.deny"),
-                allow: false,
-            },
-        ],
+        detail: request.message.clone().unwrap_or_else(|| match resources {
+            Some(_) => tr!(
+                "permission.agent_asks_for_named_permission",
+                permission = action.as_str()
+            ),
+            None => tr!("permission.agent_asks_for_permission"),
+        }),
+        options: permission_options(),
     });
+}
+
+/// The three answers every OpenCode approval offers.
+fn permission_options() -> Vec<PermissionOption> {
+    vec![
+        PermissionOption {
+            id: "once".into(),
+            label: tr!("permission.allow_once"),
+            allow: true,
+        },
+        PermissionOption {
+            id: "always".into(),
+            label: tr!("permission.always_allow"),
+            allow: true,
+        },
+        PermissionOption {
+            id: "reject".into(),
+            label: tr!("common.deny"),
+            allow: false,
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -2331,6 +2492,19 @@ mod tests {
                 "assistantMessageID": message_id,
                 "agent": "build",
                 "model": {"id": "claude-sonnet-4-5", "providerID": "anthropic"}
+            }
+        })
+    }
+
+    /// One approval request as the service asks it.
+    fn permission_asked(id: &str) -> Value {
+        json!({
+            "type": "permission.asked",
+            "data": {
+                "id": id,
+                "sessionID": "ses_1",
+                "action": "bash",
+                "resources": ["cargo test"]
             }
         })
     }
@@ -2590,14 +2764,17 @@ mod tests {
             &seen[2],
             DriverEvent::TurnFinished {
                 success: false,
-                summary: Some(summary)
+                summary: Some(summary),
+                ..
             } if summary == "provider refused"
         ));
         assert_eq!(seen.len(), 3);
     }
 
-    /// A service going down is a reconnect, not a failed turn: the stream
-    /// breaks and the `Resync` reconcile repairs the session.
+    /// `shutdown` is OpenCode's DEFAULT interrupt reason: the service emits it
+    /// both when it is going away and when a plain denial aborts the run, so
+    /// only the denial record Waku kept can tell them apart. No reason is ever
+    /// spoken into the transcript either way.
     #[test]
     fn a_shutdown_interrupt_does_not_fail_the_turn() {
         let mut harness = Harness::new(RuntimeMode::FullAccess);
@@ -2609,18 +2786,216 @@ mod tests {
         let seen = harness.drain();
         assert!(matches!(
             &seen[1],
-            DriverEvent::TurnFinished { success: true, .. }
+            DriverEvent::TurnFinished {
+                success: true,
+                interrupted: false,
+                ..
+            }
         ));
 
-        let mut cancelled = Harness::new(RuntimeMode::FullAccess);
-        cancelled.feed(json!({"type": "session.execution.started", "data": {}}));
-        cancelled
-            .feed(json!({"type": "session.execution.interrupted", "data": {"reason": "user"}}));
-        cancelled.feed(json!({"type": "session.idle", "data": {}}));
-        assert!(matches!(
-            &cancelled.drain()[1],
-            DriverEvent::TurnFinished { success: false, summary: Some(summary) } if summary == "user"
-        ));
+        // The same reason right after a plain rejection is the user's stop,
+        // not the service going away.
+        let mut denied = Harness::new(RuntimeMode::Ask);
+        denied.feed(json!({"type": "session.execution.started", "data": {}}));
+        denied.feed(permission_asked("per_denied"));
+        let _ = denied.drain();
+        let answered = denied.state.permissions.pending.get("per_denied").cloned();
+        let responses =
+            support::permission_responses(&mut denied.state.permissions, "per_denied", "reject");
+        let mut accepted = |_: &str, _: PermissionReply, _: Option<&str>| Ok(());
+        send_permission_responses(
+            &mut denied.state.permissions,
+            answered.as_ref().map(|request| ("per_denied", request)),
+            None,
+            responses,
+            &denied.events,
+            &mut accepted,
+        );
+        assert!(denied.state.permissions.has_denial());
+        denied
+            .feed(json!({"type": "session.execution.interrupted", "data": {"reason": "shutdown"}}));
+        let seen = denied.drain();
+        assert!(
+            matches!(
+                seen.last(),
+                Some(DriverEvent::TurnFinished {
+                    success: false,
+                    summary: None,
+                    interrupted: true,
+                })
+            ),
+            "{seen:?}"
+        );
+    }
+
+    /// Every non-default interrupt reason is a stop the user caused — the
+    /// provider's own client interrupt, a superseding message, inactivity —
+    /// and none of them belongs in the transcript as text.
+    #[test]
+    fn a_provider_side_interrupt_is_a_stop() {
+        for reason in ["user", "superseded", "inactivity"] {
+            let mut harness = Harness::new(RuntimeMode::FullAccess);
+            harness.feed(json!({"type": "session.execution.started", "data": {}}));
+            harness
+                .feed(json!({"type": "session.execution.interrupted", "data": {"reason": reason}}));
+            let seen = harness.drain();
+            assert!(
+                matches!(
+                    &seen[1],
+                    DriverEvent::TurnFinished {
+                        success: false,
+                        summary: None,
+                        interrupted: true,
+                    }
+                ),
+                "{reason}: {seen:?}"
+            );
+        }
+    }
+
+    /// A denial that carries an explanation does not abort the turn: the
+    /// service hands the note to the agent, so the reply must carry it and no
+    /// stop may be armed.
+    #[test]
+    fn a_noted_denial_keeps_the_turn_and_sends_the_note() {
+        let mut harness = Harness::new(RuntimeMode::Ask);
+        harness.feed(permission_asked("per_note"));
+        let _ = harness.drain();
+        let answered = harness.state.permissions.pending.get("per_note").cloned();
+        let responses =
+            support::permission_responses(&mut harness.state.permissions, "per_note", "reject");
+        let mut sent = Vec::new();
+        let mut accepted = |request_id: &str, reply: PermissionReply, note: Option<&str>| {
+            sent.push((request_id.to_owned(), reply, note.map(str::to_owned)));
+            Ok(())
+        };
+        send_permission_responses(
+            &mut harness.state.permissions,
+            answered.as_ref().map(|request| ("per_note", request)),
+            Some("use the cached copy instead".into()),
+            responses,
+            &harness.events,
+            &mut accepted,
+        );
+        assert_eq!(
+            sent,
+            [(
+                "per_note".to_owned(),
+                PermissionReply::Reject,
+                Some("use the cached copy instead".to_owned()),
+            )]
+        );
+        assert!(
+            !harness.state.permissions.has_denial(),
+            "a noted denial is not a turn abort"
+        );
+        assert!(harness.drain().is_empty());
+    }
+
+    /// The declined call's row says what happened in Waku's own words, not the
+    /// provider's `{type, message}` envelope.
+    #[test]
+    fn a_declined_tool_row_states_the_decline() {
+        let mut harness = Harness::new(RuntimeMode::Ask);
+        harness.feed(json!({"type": "session.tool.input.started", "data": {
+            "assistantMessageID": "msg_1", "id": "call_1", "name": "bash"
+        }}));
+        harness.feed(json!({"type": "session.tool.called", "data": {
+            "assistantMessageID": "msg_1", "id": "call_1",
+            "input": {"command": "curl https://example.com"}
+        }}));
+        harness.state.permissions.remember_denial();
+        harness.feed(json!({"type": "session.tool.failed", "data": {
+            "assistantMessageID": "msg_1", "id": "call_1",
+            "error": {"type": "aborted", "message": "The user declined this tool call"}
+        }}));
+
+        let seen = harness.drain();
+        let declined = seen
+            .iter()
+            .find_map(|event| match event {
+                DriverEvent::RichActivity(item) if item.complete => Some(item),
+                _ => None,
+            })
+            .expect("the failed call completes on its row");
+        assert!(declined.failed);
+        assert_eq!(
+            declined.detail.as_deref(),
+            Some(tr!("permission.declined_tool_call").as_str())
+        );
+    }
+
+    /// A failure envelope without a known denial still shows its message
+    /// instead of the pretty-printed JSON that starts with a brace.
+    #[test]
+    fn a_tool_failure_envelope_renders_its_message() {
+        let mut harness = Harness::new(RuntimeMode::Ask);
+        harness.feed(json!({"type": "session.tool.input.started", "data": {
+            "assistantMessageID": "msg_1", "id": "call_1", "name": "bash"
+        }}));
+        harness.feed(json!({"type": "session.tool.failed", "data": {
+            "assistantMessageID": "msg_1", "id": "call_1",
+            "error": {"type": "tool.execution", "message": "boom"}
+        }}));
+
+        let seen = harness.drain();
+        let failed = seen
+            .iter()
+            .find_map(|event| match event {
+                DriverEvent::RichActivity(item) if item.complete => Some(item),
+                _ => None,
+            })
+            .expect("the failed call completes on its row");
+        assert_eq!(failed.detail.as_deref(), Some("boom"));
+    }
+
+    /// The abort OpenCode raises for a denied permission is not a provider
+    /// error: reporting it put a "Step interrupted" toast on top of the stop
+    /// the user asked for. A genuine step failure still reports.
+    #[test]
+    fn a_denied_step_abort_is_not_an_error() {
+        let mut harness = Harness::new(RuntimeMode::Ask);
+        harness.feed(json!({"type": "session.execution.started", "data": {}}));
+        harness.feed(permission_asked("per_aborted"));
+        let _ = harness.drain();
+        let answered = harness
+            .state
+            .permissions
+            .pending
+            .get("per_aborted")
+            .cloned();
+        let responses =
+            support::permission_responses(&mut harness.state.permissions, "per_aborted", "reject");
+        let mut accepted = |_: &str, _: PermissionReply, _: Option<&str>| Ok(());
+        send_permission_responses(
+            &mut harness.state.permissions,
+            answered.as_ref().map(|request| ("per_aborted", request)),
+            None,
+            responses,
+            &harness.events,
+            &mut accepted,
+        );
+
+        harness.feed(json!({"type": "session.step.failed", "data": {
+            "sessionID": "ses_1", "assistantMessageID": "msg_1",
+            "error": {"type": "aborted", "message": "Step interrupted"}
+        }}));
+        assert!(
+            harness.drain().is_empty(),
+            "the denied step's abort must not become an error event"
+        );
+
+        harness.feed(json!({"type": "session.step.failed", "data": {
+            "sessionID": "ses_1", "assistantMessageID": "msg_2",
+            "error": {"type": "provider.server", "message": "upstream exploded"}
+        }}));
+        assert!(
+            matches!(
+                harness.drain().as_slice(),
+                [DriverEvent::Error(message)] if message == "upstream exploded"
+            ),
+            "a genuine step failure must still report"
+        );
     }
 
     /// The id asymmetry is real: `permission.asked` carries `data.id` and the
@@ -2693,6 +3068,223 @@ mod tests {
             "data": {"sessionID": "ses_1", "requestID": "per_def", "reply": "once"}
         }));
         assert!(!harness.state.permissions.responding.contains("per_def"));
+    }
+
+    /// The app drops its card the instant the user clicks, so a reply the
+    /// service refuses must put the request back: otherwise the driver's own
+    /// `responding` set suppresses every later ask — including the reconcile
+    /// after a stream break — and the turn is blocked with nothing to answer.
+    #[test]
+    fn a_refused_permission_reply_is_offered_again() {
+        let mut harness = Harness::new(RuntimeMode::Ask);
+        harness.feed(json!({
+            "type": "permission.asked",
+            "data": {
+                "id": "per_1",
+                "sessionID": "ses_1",
+                "action": "bash",
+                "resources": ["cargo test"],
+                "message": "run the test suite"
+            }
+        }));
+        let first = harness.drain();
+        assert_eq!(first.len(), 1, "the request must be asked first: {first:?}");
+
+        let answered = harness.state.permissions.pending.get("per_1").cloned();
+        let responses =
+            support::permission_responses(&mut harness.state.permissions, "per_1", "once");
+        assert!(harness.state.permissions.responding.contains("per_1"));
+        let mut refused = |_: &str, _: PermissionReply, _: Option<&str>| {
+            Err::<(), _>(opencode_api::ApiError::Http {
+                status: 500,
+                body: "refused".into(),
+            })
+        };
+        send_permission_responses(
+            &mut harness.state.permissions,
+            answered.as_ref().map(|request| ("per_1", request)),
+            None,
+            responses,
+            &harness.events,
+            &mut refused,
+        );
+
+        assert!(
+            harness.state.permissions.pending.contains_key("per_1"),
+            "a refused reply must not consume the request"
+        );
+        assert!(
+            !harness.state.permissions.responding.contains("per_1"),
+            "a refused reply must not keep the request suppressed"
+        );
+        let seen = harness.drain();
+        assert_eq!(seen.len(), 2, "one card and one error: {seen:?}");
+        let DriverEvent::Permission {
+            request_id,
+            title,
+            detail,
+            options,
+        } = &seen[0]
+        else {
+            panic!("the refused request must be offered again: {seen:?}");
+        };
+        assert_eq!(request_id, "per_1");
+        assert_eq!(title, "cargo test");
+        assert_eq!(
+            detail, "run the test suite",
+            "the retry card must carry the provider's own explanation"
+        );
+        assert_eq!(options.len(), 3);
+        assert!(matches!(&seen[1], DriverEvent::Error(_)));
+
+        // Answering the retried card reaches the provider again, exactly once.
+        let answered = harness.state.permissions.pending.get("per_1").cloned();
+        let responses =
+            support::permission_responses(&mut harness.state.permissions, "per_1", "once");
+        let mut sent = Vec::new();
+        let mut accepted = |request_id: &str, reply: PermissionReply, _: Option<&str>| {
+            sent.push((request_id.to_owned(), reply));
+            Ok(())
+        };
+        send_permission_responses(
+            &mut harness.state.permissions,
+            answered.as_ref().map(|request| ("per_1", request)),
+            None,
+            responses,
+            &harness.events,
+            &mut accepted,
+        );
+        assert_eq!(sent, [("per_1".to_owned(), PermissionReply::Once)]);
+        assert!(harness.drain().is_empty());
+    }
+
+    /// A 404 means another client answered the request, or the turn ended, so
+    /// it is settled: re-offering a dead card would ask a question the
+    /// provider can no longer resolve.
+    #[test]
+    fn a_stale_permission_reply_is_settled_without_re_asking() {
+        let mut harness = Harness::new(RuntimeMode::Ask);
+        harness.feed(json!({
+            "type": "permission.asked",
+            "data": {"id": "per_gone", "sessionID": "ses_1", "action": "bash", "resources": ["x"]}
+        }));
+        let _ = harness.drain();
+
+        let answered = harness.state.permissions.pending.get("per_gone").cloned();
+        let responses =
+            support::permission_responses(&mut harness.state.permissions, "per_gone", "once");
+        let mut stale = |_: &str, _: PermissionReply, _: Option<&str>| {
+            Err::<(), _>(opencode_api::ApiError::Tagged {
+                tag: "PermissionNotFoundError".into(),
+                message: "Permission request not found: per_gone".into(),
+                status: 404,
+            })
+        };
+        send_permission_responses(
+            &mut harness.state.permissions,
+            answered.as_ref().map(|request| ("per_gone", request)),
+            None,
+            responses,
+            &harness.events,
+            &mut stale,
+        );
+
+        assert!(harness.state.permissions.pending.is_empty());
+        assert!(harness.state.permissions.responding.is_empty());
+        let seen = harness.drain();
+        assert!(
+            matches!(seen.as_slice(), [DriverEvent::Error(_)]),
+            "a stale request is cleared, never asked twice: {seen:?}"
+        );
+    }
+
+    /// An `always` answer also resolves the already-pending requests its rule
+    /// covers, and those replies are one-shot too. A refused one must not be
+    /// put back in front of the user: the rule is remembered, so the next ask
+    /// auto-answers it through `is_approved`.
+    #[test]
+    fn a_refused_always_reply_does_not_re_ask_the_requests_it_covered() {
+        let mut harness = Harness::new(RuntimeMode::Ask);
+        for (id, resource) in [("per_first", "cargo test"), ("per_matching", "cargo check")] {
+            harness.feed(json!({
+                "type": "permission.asked",
+                "data": {
+                    "id": id,
+                    "sessionID": "ses_1",
+                    "action": "bash",
+                    "resources": [resource],
+                    "save": ["cargo *"]
+                }
+            }));
+        }
+        let _ = harness.drain();
+
+        let answered = harness.state.permissions.pending.get("per_first").cloned();
+        let responses =
+            support::permission_responses(&mut harness.state.permissions, "per_first", "always");
+        assert_eq!(responses.len(), 2, "the rule covers the second request too");
+        let mut refused = |_: &str, _: PermissionReply, _: Option<&str>| {
+            Err::<(), _>(opencode_api::ApiError::Http {
+                status: 500,
+                body: "refused".into(),
+            })
+        };
+        send_permission_responses(
+            &mut harness.state.permissions,
+            answered.as_ref().map(|request| ("per_first", request)),
+            None,
+            responses,
+            &harness.events,
+            &mut refused,
+        );
+
+        assert!(
+            !harness
+                .state
+                .permissions
+                .pending
+                .contains_key("per_matching"),
+            "a covered request the remembered rule answers must not be asked again"
+        );
+        let seen = harness.drain();
+        let re_asked = seen
+            .iter()
+            .filter_map(|event| match event {
+                DriverEvent::Permission { request_id, .. } => Some(request_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(re_asked, ["per_first"], "{seen:?}");
+        assert_eq!(
+            seen.iter()
+                .filter(|event| matches!(event, DriverEvent::Error(_)))
+                .count(),
+            2,
+            "both refused replies are reported: {seen:?}"
+        );
+
+        // The remembered rule answers the covered request on its next ask.
+        harness.feed(json!({
+            "type": "permission.asked",
+            "data": {
+                "id": "per_matching_again",
+                "sessionID": "ses_1",
+                "action": "bash",
+                "resources": ["cargo check"],
+                "save": ["cargo *"]
+            }
+        }));
+        let Ok(DriverCommand::Respond {
+            request_id,
+            option_id,
+            ..
+        }) = harness.issued.try_recv()
+        else {
+            panic!("the remembered rule should answer without asking again");
+        };
+        assert_eq!(request_id, "per_matching_again");
+        assert_eq!(option_id, "once");
+        assert!(harness.drain().is_empty());
     }
 
     #[test]
