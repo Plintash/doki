@@ -1,37 +1,67 @@
-//! OpenCode server lifecycle and native-session helpers.
+//! Cold-path OpenCode 2 helpers: the resume catalog, transcript import,
+//! conversation forking, and the model/agent catalog.
+//!
+//! Everything here goes through [`opencode2_service::attached`], never
+//! [`opencode2_service::shared`]. Opening the Resume picker or refreshing the
+//! model catalog must not start the user's background daemon, so an absent
+//! service is an empty catalog — not a spawn, and not a 20s start poll. (This
+//! is the deliberate divergence from `opencode_session::list_provider_sessions`,
+//! which starts a server and then blocks up to 5s killing it again.)
+//!
+//! Every call blocks on a socket, so every caller must already be off the UI
+//! thread; one of these is several frames of budget.
+//!
+//! Two traps are encoded here rather than left to callers:
+//!
+//! * `GET …/export?sanitize=true` is a SHARE sanitizer, not a state stripper.
+//!   Verified against beta-19192: it replaces the user's prompt, the
+//!   assistant's prose, reasoning, tool input, tool output and tool metadata
+//!   alike with `[redacted:…:msg_…]` placeholders, so importing a sanitized
+//!   export yields a transcript of nothing but placeholders. Waku exports
+//!   unsanitized and drops the private parts itself — see
+//!   [`strip_provider_state`].
+//! * One agent STEP is one assistant message. A three-tool turn is four
+//!   assistant messages (three `finish: "tool-calls"` then one
+//!   `finish: "stop"`), so the import folds every assistant message between
+//!   two user messages into a single visual turn.
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow, bail};
-use parking_lot::Mutex;
-use serde_json::{Value, json};
+use uuid::Uuid;
 
-use crate::model::{ProviderKind, ProviderResumeCursor, ProviderSessionSummary};
+use crate::http_wire::Endpoint;
+use crate::model::{
+    AgentTurn, Message, MessageRole, ProviderAgentPreset, ProviderKind, ProviderModel,
+    ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary, TurnStatus,
+};
+use crate::opencode2_api::{
+    self, AgentInfo, AgentMode, AssistantContent, ForkRequestBoundary, MessageInfo, ModelInfo,
+    Order, SessionInfo, ToolState,
+};
+use crate::opencode2_service;
 
-const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-/// Forking copies every retained message and part into a new native session.
-/// A long task can legitimately take longer than the ordinary request budget;
-/// this operation already runs off the UI thread.
-const FORK_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
-/// The server binds its port about a second before the app behind it starts
-/// answering, and a request accepted in that window is never answered at all.
-/// A startup probe caught there must give up quickly and retry — at the full
-/// `HTTP_TIMEOUT` one hung probe would eat the whole start budget.
-const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Matches `acp_session`: a catalog that needs more than this many pages is
+/// either enormous or looping, and both deserve the same bound.
+const MAX_PAGES: usize = 20;
+/// The service caps nothing, so the page size is Waku's choice. Large enough
+/// that an ordinary catalog is one round trip.
+const PAGE_SIZE: usize = 100;
+/// `GET /api/session` lists subagent children too. The literal string `null`
+/// is how the route asks for roots only; it is echoed back inside the opaque
+/// cursor as `"parentID":"null"`, so it survives pagination.
+const ROOT_SESSIONS_ONLY: &str = "null";
+/// OpenCode 2's own default primary agent. A session created without one comes
+/// back with `agent: "build"`, and the roster carries no `isDefault` marker.
+#[allow(dead_code)]
+const DEFAULT_AGENT: &str = "build";
 
-/// Lists OpenCode's root sessions across every project, newest first.
+/// Lists the adopted service's root sessions across every workspace, newest
+/// first.
 ///
-/// ACP `session/list` is project-scoped: OpenCode resolves the request `cwd`,
-/// or the process cwd without one, to a project and lists only that project's
-/// sessions, so a catalog launched from Waku's isolated temp directory saw
-/// nothing but the "global" project. The server's `/experimental/session`
-/// route is the one cross-project listing OpenCode exposes, and each entry
-/// carries the directory the session was started in.
+/// Returns an empty catalog when no service is registered or healthy. That is
+/// the whole point of the attach-only rule: the Resume picker must never be
+/// the thing that starts the user's daemon.
 pub fn list_provider_sessions(
     binary: &Path,
     limit: usize,
@@ -39,352 +69,651 @@ pub fn list_provider_sessions(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let server = match crate::opencode_pool::any_live(binary) {
-        Some(server) => server,
-        None => crate::opencode_pool::acquire(
-            binary,
-            &crate::acp_session::catalog_working_directory()?,
-        )?,
+    let Some(service) = opencode2_service::attached(binary)? else {
+        return Ok(Vec::new());
     };
-    let response = server.request(
-        "GET",
-        &format!("/experimental/session?roots=true&limit={limit}"),
-        None,
-    )?;
-    Ok(session_summaries(&response))
+    let endpoint = service.endpoint();
+    let mut summaries = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let (sessions, next) = opencode2_api::list_sessions(
+            &endpoint,
+            None,
+            Some(ROOT_SESSIONS_ONLY),
+            Order::Desc,
+            PAGE_SIZE.min(limit.max(1)),
+            cursor.as_deref(),
+        )
+        .context("OpenCode 2 could not list its sessions")?;
+        summaries.extend(sessions.iter().filter_map(session_summary));
+        if summaries.len() >= limit {
+            break;
+        }
+        // `cursor.next` is minted on every page including the last; the api
+        // layer already collapses the empty page into an absent cursor.
+        let Some(next) = next else { break };
+        cursor = Some(next);
+    }
+    summaries.truncate(limit);
+    Ok(summaries)
 }
 
-fn session_summaries(response: &Value) -> Vec<ProviderSessionSummary> {
-    response
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(session_summary)
-        .collect()
-}
-
-fn session_summary(session: &Value) -> Option<ProviderSessionSummary> {
-    let session_id = session.get("id")?.as_str()?.trim();
+fn session_summary(session: &SessionInfo) -> Option<ProviderSessionSummary> {
+    let session_id = session.id.trim();
     if session_id.is_empty() {
         return None;
     }
-    let cwd = PathBuf::from(session.get("directory")?.as_str()?);
+    let cwd = PathBuf::from(session.location.directory.trim());
     if !cwd.is_absolute() {
         return None;
     }
-    let time = session.get("time");
-    let created_at = unix_seconds(time.and_then(|time| time.get("created")));
-    let updated_at = unix_seconds(time.and_then(|time| time.get("updated"))).max(created_at);
+    let created_at = unix_seconds(session.time.created);
     Some(ProviderSessionSummary {
-        cursor: ProviderResumeCursor::OpenCode {
+        cursor: ProviderResumeCursor::OpenCode2 {
             session_id: session_id.to_owned(),
+            // Kept verbatim: the list filter and `location.directory` on
+            // create are compared by exact string equality, so a resume must
+            // reuse the very string the service stored.
+            directory: Some(session.location.directory.clone()),
         },
         title: crate::acp_session::session_title(
-            ProviderKind::OpenCode,
-            session.get("title").and_then(Value::as_str),
+            ProviderKind::OpenCode2,
+            session.title.as_deref(),
             session_id,
         ),
         cwd,
         created_at,
-        updated_at,
+        updated_at: unix_seconds(session.time.updated).max(created_at),
     })
 }
 
-/// OpenCode stamps sessions in Unix milliseconds; the catalog sorts in seconds.
-fn unix_seconds(value: Option<&Value>) -> u64 {
-    value.and_then(Value::as_u64).unwrap_or_default() / 1000
+/// OpenCode 2 stamps time in Unix milliseconds as a JSON number; the catalog
+/// sorts in seconds.
+fn unix_seconds(millis: f64) -> u64 {
+    if millis.is_finite() && millis > 0.0 {
+        (millis / 1000.0) as u64
+    } else {
+        0
+    }
 }
 
+/// Imports a native session's user-visible transcript.
+///
+/// One `GET …/export` covers the whole conversation, unlike the paged message
+/// route. It is fetched UNSANITIZED on purpose — see the module doc — and the
+/// private provider state is dropped here before anything is built from it.
+pub fn provider_session_history(
+    binary: &Path,
+    session_id: &str,
+    visible_turn_limit: usize,
+) -> anyhow::Result<ProviderSessionHistory> {
+    if session_id.trim().is_empty() || visible_turn_limit == 0 {
+        return Ok(ProviderSessionHistory::default());
+    }
+    let service = opencode2_service::attached(binary)?
+        .ok_or_else(|| anyhow!("the OpenCode 2 background service is not running"))?;
+    let mut export = opencode2_api::export_session(&service.endpoint(), session_id, false)
+        .with_context(|| format!("OpenCode 2 could not export session {session_id}"))?;
+    strip_provider_state(&mut export.messages);
+    let mut history = history_from_messages(&export.messages);
+    retain_recent_messages(&mut history, visible_turn_limit);
+    Ok(history)
+}
+
+/// Drops every private provider control marker from a decoded transcript.
+///
+/// Belt and braces. `providerState` and `providerResultState` never survive
+/// the typed decode, but a part's `state` does, and CLAUDE.md forbids ever
+/// surfacing those in the transcript. They are also the bulk of an export's
+/// memory: a single reasoning blob runs to multiple kilobytes, and the tool
+/// state carries whole tool inputs and outputs an imported transcript never
+/// renders. Doing it unconditionally means a change in what the server
+/// chooses to redact cannot leak anything into Waku.
+fn strip_provider_state(messages: &mut [MessageInfo]) {
+    for message in messages {
+        let MessageInfo::Assistant { content, .. } = message else {
+            continue;
+        };
+        for part in content {
+            match part {
+                AssistantContent::Text { state, .. }
+                | AssistantContent::Reasoning { state, .. } => *state = None,
+                AssistantContent::Tool { state, .. } => *state = ToolState::Unknown,
+                AssistantContent::Unknown => {}
+            }
+        }
+    }
+}
+
+/// Projects stored messages onto Waku's turn model.
+///
+/// Only `user` and assistant TEXT survive: reasoning is dropped from an
+/// imported transcript the way `acp_session` drops it, and every other message
+/// kind — synthetic, system, skill, shell, compaction and the three
+/// `*-switched` records — is provider bookkeeping rather than conversation.
+fn history_from_messages(messages: &[MessageInfo]) -> ProviderSessionHistory {
+    let mut history = ProviderSessionHistory::default();
+    let mut turn_id = None;
+    // Whether the last pushed message is this turn's assistant message, and so
+    // whether the next step's text folds into it instead of starting one.
+    let mut assistant_open = false;
+
+    for message in messages {
+        match message {
+            MessageInfo::User { text, .. } => {
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let id = Uuid::new_v4();
+                history.turns.push(AgentTurn {
+                    id,
+                    turn_count: history.turns.len() + 1,
+                    status: TurnStatus::Completed,
+                    provider_turn_started: true,
+                    provider_resume_at: None,
+                    started_at: 0,
+                    completed_at: Some(0),
+                    checkpoint: None,
+                });
+                history
+                    .messages
+                    .push(Message::new_for_turn(MessageRole::User, text, id));
+                turn_id = Some(id);
+                assistant_open = false;
+            }
+            MessageInfo::Assistant { content, .. } => {
+                // Assistant activity before the first user message belongs to
+                // no visible turn; a forked session can legitimately start
+                // that way.
+                let Some(id) = turn_id else { continue };
+                for part in content {
+                    let AssistantContent::Text { text, .. } = part else {
+                        continue;
+                    };
+                    let text = text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    match history.messages.last_mut().filter(|_| assistant_open) {
+                        Some(message) => {
+                            message.content.push_str("\n\n");
+                            message.content.push_str(text);
+                        }
+                        None => {
+                            history.messages.push(Message::new_for_turn(
+                                MessageRole::Assistant,
+                                text,
+                                id,
+                            ));
+                            assistant_open = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    history
+}
+
+/// Keeps every turn shell so provider turn numbering stays exact, but bounds
+/// the imported display text to the most recent turns.
+fn retain_recent_messages(history: &mut ProviderSessionHistory, limit: usize) {
+    let retained = history
+        .turns
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|turn| turn.id)
+        .collect::<std::collections::HashSet<_>>();
+    history
+        .messages
+        .retain(|message| message.turn_id.is_some_and(|id| retained.contains(&id)));
+}
+
+/// Branches a cold session, keeping its first `retained_turns` native turns.
+///
+/// Attach-only, like everything else here: rewinding an imported task after a
+/// relaunch must not start the daemon.
 pub fn fork_session_at_turn(
     binary: &Path,
-    cwd: &Path,
     session_id: &str,
     retained_turns: usize,
 ) -> anyhow::Result<ProviderResumeCursor> {
-    // Shares the workspace's resident server when one is live; a transient
-    // one is started and killed with the handle otherwise.
-    let server = crate::opencode_pool::acquire(binary, cwd)?;
-    fork_session_at_turn_on_server(&server, session_id, retained_turns)
+    let service = opencode2_service::attached(binary)?
+        .ok_or_else(|| anyhow!("the OpenCode 2 background service is not running"))?;
+    let endpoint = service.endpoint();
+    let message_ids = native_user_message_ids(&endpoint, session_id)?;
+    fork_at_boundary(&endpoint, session_id, &message_ids, retained_turns)
 }
 
-/// Forks through the task's resident OpenCode server.
+/// Branches a session by dropping its last `turns_to_remove` native turns.
 ///
-/// Starting a second `opencode serve` against the same workspace can contend
-/// with the live process for OpenCode's local resources. Rewinds with a live
-/// driver use this path instead, while cold sessions still use the standalone
-/// helper above.
-pub(crate) fn fork_session_at_turn_on_server(
-    server: &OpenCodeServer,
-    session_id: &str,
-    retained_turns: usize,
-) -> anyhow::Result<ProviderResumeCursor> {
-    let message_ids = native_user_message_ids(server, session_id)?;
-    fork_session_with_message_ids(server, session_id, &message_ids, retained_turns)
-}
-
-pub(crate) fn fork_session_removing_turns_on_server(
-    server: &OpenCodeServer,
+/// Deliberately NOT built on `POST …/revert/stage|commit|clear`: revert
+/// mutates the same session, writes files, and answers 409 `SessionBusyError`
+/// while a turn is running, whereas Waku's contract here is "drop the last N
+/// turns and hand back a cursor for the continuing conversation". Revert is
+/// real headroom — it survives reconnect via `Session.Info.revert` and carries
+/// per-file patches — and wants its own affordance rather than this one.
+// Reached once the driver's rewind path lands; see the step plan.
+#[allow(dead_code)]
+pub(crate) fn fork_session_removing_turns(
+    endpoint: &Endpoint,
     session_id: &str,
     turns_to_remove: usize,
 ) -> anyhow::Result<ProviderResumeCursor> {
-    let message_ids = native_user_message_ids(server, session_id)?;
+    let message_ids = native_user_message_ids(endpoint, session_id)?;
     let retained_turns = retained_turn_count(message_ids.len(), turns_to_remove)?;
-    fork_session_with_message_ids(server, session_id, &message_ids, retained_turns)
+    fork_at_boundary(endpoint, session_id, &message_ids, retained_turns)
+}
+
+/// The ids of the session's real user turns, oldest first.
+///
+/// `synthetic`, `system`, `skill`, `shell`, `compaction` and the three
+/// `*-switched` records all sit in the same message list, and counting any of
+/// them as a turn would fork at the wrong boundary.
+pub(crate) fn native_user_message_ids(
+    endpoint: &Endpoint,
+    session_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let (messages, next) = opencode2_api::list_messages(
+            endpoint,
+            session_id,
+            Order::Asc,
+            Some(PAGE_SIZE),
+            cursor.as_deref(),
+        )
+        .with_context(|| format!("OpenCode 2 could not list messages for {session_id}"))?;
+        ids.extend(messages.iter().filter_map(native_user_message_id));
+        let Some(next) = next else { break };
+        cursor = Some(next);
+    }
+    Ok(ids)
+}
+
+fn native_user_message_id(message: &MessageInfo) -> Option<String> {
+    match message {
+        MessageInfo::User { id, .. } if !id.trim().is_empty() => Some(id.clone()),
+        _ => None,
+    }
+}
+
+fn fork_at_boundary(
+    endpoint: &Endpoint,
+    session_id: &str,
+    message_ids: &[String],
+    retained_turns: usize,
+) -> anyhow::Result<ProviderResumeCursor> {
+    let boundary = fork_boundary(message_ids, retained_turns)?;
+    let fork = opencode2_api::fork(endpoint, session_id, &boundary)
+        .with_context(|| format!("OpenCode 2 could not fork session {session_id}"))?;
+    if fork.id.trim().is_empty() {
+        bail!("OpenCode 2 returned no forked session ID");
+    }
+    Ok(ProviderResumeCursor::OpenCode2 {
+        session_id: fork.id,
+        directory: Some(fork.location.directory),
+    })
+}
+
+/// The boundary that keeps exactly `retained_turns` user turns.
+///
+/// `before` names the first EXCLUDED user message; keeping everything has no
+/// message id at all and is `through`. The read and write shapes differ here —
+/// `ForkBoundary` always echoes a `messageID` back, including for `through` —
+/// which is why they are separate types.
+fn fork_boundary(
+    message_ids: &[String],
+    retained_turns: usize,
+) -> anyhow::Result<ForkRequestBoundary> {
+    if retained_turns > message_ids.len() {
+        bail!(
+            "OpenCode 2 has only {} native turns, but Waku needs {retained_turns}",
+            message_ids.len()
+        );
+    }
+    Ok(match message_ids.get(retained_turns) {
+        Some(message_id) => ForkRequestBoundary::Before {
+            message_id: message_id.clone(),
+        },
+        None => ForkRequestBoundary::Through,
+    })
 }
 
 fn retained_turn_count(total_turns: usize, turns_to_remove: usize) -> anyhow::Result<usize> {
     total_turns.checked_sub(turns_to_remove).ok_or_else(|| {
         anyhow!(
-            "OpenCode has only {total_turns} native turns, but Waku needs to remove {turns_to_remove}"
+            "OpenCode 2 has only {total_turns} native turns, but Waku needs to remove {turns_to_remove}"
         )
     })
 }
 
-fn native_user_message_ids(
-    server: &OpenCodeServer,
-    session_id: &str,
-) -> anyhow::Result<Vec<String>> {
-    let session_path = format!("/session/{}/message", encode_path_segment(session_id));
-    let messages = server.request_with_timeout("GET", &session_path, None, FORK_HTTP_TIMEOUT)?;
-    Ok(messages
-        .as_array()
-        .ok_or_else(|| anyhow!("OpenCode returned an invalid message list"))?
+/// The service's model and primary-agent catalogs.
+///
+/// Attach-only, so a launch with no service running answers empties and
+/// `model_catalog` falls back to its disk cache rather than starting the
+/// user's daemon just to refresh a picker.
+// Reached once `model_catalog` dispatches OpenCode 2 here.
+#[allow(dead_code)]
+pub(crate) fn discover_catalog(
+    binary: &Path,
+) -> (Vec<ProviderModel>, Option<Vec<ProviderAgentPreset>>) {
+    let Ok(Some(service)) = opencode2_service::attached(binary) else {
+        return (Vec::new(), None);
+    };
+    let endpoint = service.endpoint();
+    // No directory: both catalogs are global, and scoping them would only pin
+    // them to whichever workspace asked first.
+    let models = opencode2_api::list_models(&endpoint, None)
+        .map(|models| catalog_models(&models))
+        .unwrap_or_default();
+    let presets = opencode2_api::list_agents(&endpoint, None)
+        .ok()
+        .map(|agents| agent_presets(&agents));
+    (models, presets)
+}
+
+fn catalog_models(models: &[ModelInfo]) -> Vec<ProviderModel> {
+    models
         .iter()
-        .filter_map(|message| {
-            (is_native_user_turn(message))
-                .then(|| message.pointer("/info/id").and_then(Value::as_str))
-                .flatten()
-                .map(str::to_owned)
+        .filter(|model| model.enabled)
+        .filter_map(|model| {
+            let provider = model.provider_id.trim();
+            let id = model.id.trim();
+            if provider.is_empty() || id.is_empty() {
+                return None;
+            }
+            let name = model.name.trim();
+            let name = if name.is_empty() { id } else { name };
+            let catalog = ProviderModel::new(format!("{provider}/{id}"), name)
+                .sub_provider(crate::model_catalog::display_name_from_slug(provider));
+            // A model's variants ARE its reasoning-effort ladder: the ids are
+            // `low`/`medium`/`high`/`max`/`minimal`/`xhigh`/`none`/`thinking`,
+            // and the chosen one rides on `ModelRef::variant`. Dropping them
+            // left the effort control empty for every OpenCode 2 model.
+            Some(crate::model_catalog::with_variant_efforts(
+                catalog,
+                model.variants.iter().map(|variant| variant.id.as_str()),
+            ))
         })
-        .collect())
+        .collect()
 }
 
-fn fork_session_with_message_ids(
-    server: &OpenCodeServer,
-    session_id: &str,
-    message_ids: &[String],
-    retained_turns: usize,
-) -> anyhow::Result<ProviderResumeCursor> {
-    let fork_at = fork_message_id(&message_ids, retained_turns)?;
-    let body = fork_at.map_or_else(|| json!({}), |message_id| json!({"messageID": message_id}));
-    let fork_path = format!("/session/{}/fork", encode_path_segment(session_id));
-    let fork = server.request_with_timeout("POST", &fork_path, Some(&body), FORK_HTTP_TIMEOUT)?;
-    let fork_id = fork
-        .get("id")
-        .and_then(Value::as_str)
-        .or_else(|| fork.pointer("/data/id").and_then(Value::as_str))
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| anyhow!("OpenCode returned no forked session ID"))?;
-    Ok(ProviderResumeCursor::OpenCode {
-        session_id: fork_id.to_owned(),
-    })
-}
-
-fn fork_message_id(message_ids: &[String], retained_turns: usize) -> anyhow::Result<Option<&str>> {
-    if retained_turns > message_ids.len() {
-        bail!(
-            "OpenCode has only {} native turns, but Waku needs {retained_turns}",
-            message_ids.len()
-        );
-    }
-    Ok(message_ids.get(retained_turns).map(String::as_str))
-}
-
-pub(crate) struct OpenCodeServer {
-    child: Mutex<Child>,
-    pub(crate) port: u16,
-}
-
-impl OpenCodeServer {
-    pub(crate) fn start(binary: &Path, cwd: &Path) -> anyhow::Result<Self> {
-        Self::start_with_env(binary, cwd, &[])
-    }
-
-    /// Starts the server with extra environment, so a caller can hand it the
-    /// Computer Use configuration the same way a one-shot invocation got it.
-    pub(crate) fn start_with_env(
-        binary: &Path,
-        cwd: &Path,
-        environment: &[(String, String)],
-    ) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .context("could not reserve a local port for OpenCode")?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
-
-        let mut command = crate::command_env::command(binary);
-        for (name, value) in environment {
-            command.env(name, value);
-        }
-        let command = command
-            .args([
-                "serve",
-                "--hostname",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-            ])
-            .env("OPENCODE_SERVER_PASSWORD", "")
-            .env("OPENCODE_SERVER_USERNAME", "opencode")
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child =
-            crate::command_env::spawn(command).context("failed to start `opencode serve`")?;
-        let server = Self {
-            child: Mutex::new(child),
-            port,
-        };
-        let started_at = Instant::now();
-        loop {
-            if server
-                .request_with_timeout("GET", "/global/health", None, HEALTH_PROBE_TIMEOUT)
-                .is_ok()
-            {
-                return Ok(server);
+/// Only agents a session can actually be STARTED as.
+///
+/// `subagent` entries are dispatch targets rather than session compositions,
+/// and the hidden primaries (`title`, `summary`, `compaction`) are the
+/// service's own internal agents.
+fn agent_presets(agents: &[AgentInfo]) -> Vec<ProviderAgentPreset> {
+    agents
+        .iter()
+        .filter(|agent| matches!(agent.mode, AgentMode::Primary | AgentMode::All) && !agent.hidden)
+        .filter_map(|agent| {
+            let id = agent.id.trim();
+            if id.is_empty() {
+                return None;
             }
-            if let Some(status) = server.child.lock().try_wait()? {
-                bail!("OpenCode session server exited during startup ({status})");
-            }
-            if started_at.elapsed() >= SERVER_START_TIMEOUT {
-                bail!("timed out starting the OpenCode session server");
-            }
-            thread::sleep(Duration::from_millis(40));
-        }
-    }
-
-    pub(crate) fn request(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<&Value>,
-    ) -> anyhow::Result<Value> {
-        self.request_with_timeout(method, path, body, HTTP_TIMEOUT)
-    }
-
-    pub(crate) fn request_with_timeout(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<&Value>,
-        timeout: Duration,
-    ) -> anyhow::Result<Value> {
-        request_json_on_port(self.port, method, path, body, timeout)
-    }
-
-    /// Whether the server process is still running. `Child::try_wait` both
-    /// observes and reaps an exited child; `kill(pid, 0)` cannot distinguish a
-    /// running process from the unreaped zombie owned by this process.
-    pub(crate) fn is_alive(&self) -> bool {
-        self.child
-            .lock()
-            .try_wait()
-            .is_ok_and(|status| status.is_none())
-    }
-}
-
-fn is_native_user_turn(message: &Value) -> bool {
-    message.pointer("/info/role").and_then(Value::as_str) == Some("user")
-        && message
-            .get("parts")
-            .and_then(Value::as_array)
-            .is_some_and(|parts| {
-                parts.iter().any(|part| {
-                    part.get("type").and_then(Value::as_str) == Some("text")
-                        && part.get("synthetic").and_then(Value::as_bool) != Some(true)
-                })
-            })
-}
-
-impl OpenCodeServer {
-    /// Terminates and reaps the owned child. The timeout is a graceful-exit
-    /// budget; a server that ignores TERM is killed afterward.
-    pub(crate) fn shutdown(&self, timeout: Duration) {
-        let mut child = self.child.lock();
-        if child.try_wait().is_ok_and(|status| status.is_some()) {
-            return;
-        }
-
-        #[cfg(unix)]
-        {
-            let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = child.kill();
-        }
-
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(Duration::from_millis(20)),
-                Err(_) => break,
-            }
-        }
-
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-impl Drop for OpenCodeServer {
-    fn drop(&mut self) {
-        let child = self.child.get_mut();
-        if child.try_wait().is_ok_and(|status| status.is_some()) {
-            return;
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-/// Sends one request to a server identified by port alone. Readers that must
-/// not keep the server alive (they only unblock when it exits) hold the port
-/// instead of a handle and request through this.
-/// Sends one request to a server identified by port alone. Readers that must
-/// not keep the server alive (they only unblock when it exits) hold the port
-/// instead of a handle and request through this.
-pub(crate) fn request_json_on_port(
-    port: u16,
-    method: &str,
-    path: &str,
-    body: Option<&Value>,
-    timeout: Duration,
-) -> anyhow::Result<Value> {
-    crate::http_wire::request_json(
-        &crate::http_wire::Endpoint::local(port),
-        method,
-        path,
-        body,
-        timeout,
-    )
-}
-
-pub(crate) fn encode_path_segment(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
+            let name = agent.name.trim();
+            let mut preset = ProviderAgentPreset::new(id, if name.is_empty() { id } else { name });
+            preset.is_default = id == DEFAULT_AGENT;
+            preset.description = agent
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(str::to_owned);
+            Some(preset)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
 
+    fn sessions(value: Value) -> Vec<SessionInfo> {
+        serde_json::from_value(value).expect("the session list should decode")
+    }
+
+    fn messages(value: Value) -> Vec<MessageInfo> {
+        serde_json::from_value(value).expect("the message list should decode")
+    }
+
+    fn assistant(id: &str, content: Value) -> Value {
+        json!({
+            "id": id,
+            "type": "assistant",
+            "time": {"created": 1_785_784_477_974_u64},
+            "agent": "build",
+            "model": {"id": "muse-spark-1.3", "providerID": "opencode", "variant": "default"},
+            "content": content,
+        })
+    }
+
+    fn user(id: &str, text: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "user",
+            "time": {"created": 1_785_784_473_836_u64},
+            "text": text,
+        })
+    }
+
     #[test]
-    fn selected_fork_message_excludes_the_next_user_turn() {
-        let messages = vec!["one".to_owned(), "two".to_owned(), "three".to_owned()];
-        assert_eq!(fork_message_id(&messages, 0).unwrap(), Some("one"));
-        assert_eq!(fork_message_id(&messages, 2).unwrap(), Some("three"));
-        assert_eq!(fork_message_id(&messages, 3).unwrap(), None);
-        assert!(fork_message_id(&messages, 4).is_err());
+    fn summaries_keep_the_stored_directory_and_convert_millis_to_seconds() {
+        let project_dir = std::env::temp_dir().join("waku-opencode2-project");
+        let untitled_dir = std::env::temp_dir().join("waku-opencode2-untitled");
+        let listed = sessions(json!([
+            {
+                "id": "ses_waku",
+                "projectID": "prj",
+                "cost": 0,
+                "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+                "time": {"created": 1_788_689_510_000_u64, "updated": 1_788_689_514_982_u64},
+                "title": "Review and merge Waku PR #113",
+                "location": {"directory": project_dir}
+            },
+            {
+                "id": " ses_untitled ",
+                "projectID": "global",
+                "cost": 0,
+                "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+                "time": {"created": 1_786_109_016_231_u64, "updated": 0},
+                "location": {"directory": untitled_dir}
+            },
+            {
+                "id": "ses_relative",
+                "projectID": "prj",
+                "cost": 0,
+                "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+                "time": {"created": 1_786_109_016_231_u64, "updated": 0},
+                "location": {"directory": "relative/dir"}
+            }
+        ]));
+
+        let summaries = listed
+            .iter()
+            .filter_map(session_summary)
+            .collect::<Vec<_>>();
+
+        assert_eq!(summaries.len(), 2, "{summaries:#?}");
+        assert_eq!(
+            summaries[0].cursor,
+            ProviderResumeCursor::OpenCode2 {
+                session_id: "ses_waku".into(),
+                directory: Some(project_dir.to_string_lossy().into_owned()),
+            }
+        );
+        assert_eq!(summaries[0].cwd, project_dir);
+        assert_eq!(summaries[1].cwd, untitled_dir);
+        assert_eq!(summaries[0].created_at, 1_788_689_510);
+        assert_eq!(summaries[0].updated_at, 1_788_689_514);
+        // A session the service never updated must not sort before its own
+        // creation.
+        assert_eq!(summaries[1].title, "OpenCode 2 session ses_unti");
+        assert_eq!(summaries[1].updated_at, summaries[1].created_at);
+    }
+
+    #[test]
+    fn consecutive_assistant_steps_fold_into_one_turn() {
+        let transcript = messages(json!([
+            user("msg_a", "draw a dog"),
+            // A three-tool turn is four assistant messages.
+            assistant(
+                "msg_b",
+                json!([{"type": "text", "text": "Loading the skill."}])
+            ),
+            assistant("msg_c", json!([{"type": "text", "text": "Now drawing."}])),
+            assistant("msg_d", json!([{"type": "text", "text": "Done."}])),
+            user("msg_e", "thanks"),
+            assistant("msg_f", json!([{"type": "text", "text": "Any time."}])),
+        ]));
+
+        let history = history_from_messages(&transcript);
+
+        assert_eq!(history.turns.len(), 2);
+        assert_eq!(history.turns[0].turn_count, 1);
+        assert_eq!(history.turns[1].turn_count, 2);
+        assert_eq!(history.messages.len(), 4);
+        assert_eq!(history.messages[1].role, MessageRole::Assistant);
+        assert_eq!(
+            history.messages[1].content,
+            "Loading the skill.\n\nNow drawing.\n\nDone."
+        );
+        assert_eq!(history.messages[1].turn_id, Some(history.turns[0].id));
+        assert_eq!(history.messages[3].turn_id, Some(history.turns[1].id));
+    }
+
+    #[test]
+    fn import_drops_reasoning_tools_and_provider_bookkeeping() {
+        let transcript = messages(json!([
+            {"id": "msg_switch", "type": "agent-switched", "time": {"created": 1.0}, "agent": "build"},
+            {"id": "msg_sys", "type": "system", "time": {"created": 1.0}, "text": "system prompt"},
+            user("msg_a", "hello"),
+            assistant(
+                "msg_b",
+                json!([
+                    {"type": "reasoning", "text": "The user wants a dog."},
+                    {"type": "tool", "id": "call_1", "name": "bash", "time": {"created": 1.0},
+                     "state": {"status": "completed", "input": {}, "content": [{"type": "text", "text": "out"}]}},
+                    {"type": "text", "text": "Hi."}
+                ])
+            ),
+            {"id": "msg_synth", "type": "synthetic", "time": {"created": 1.0}, "text": "continue"},
+            {"id": "msg_shell", "type": "shell", "time": {"created": 1.0}, "shellID": "sh_1",
+             "command": "ls", "status": "exited", "exit": "NaN"},
+        ]));
+
+        let history = history_from_messages(&transcript);
+
+        assert_eq!(history.turns.len(), 1);
+        let content = history
+            .messages
+            .iter()
+            .map(|message| (message.role, message.content.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            content,
+            vec![
+                (MessageRole::User, "hello"),
+                (MessageRole::Assistant, "Hi.")
+            ]
+        );
+    }
+
+    /// The private markers must be gone before anything is built from the
+    /// export, not merely unread.
+    #[test]
+    fn provider_state_is_stripped_from_every_part() {
+        let mut transcript = messages(json!([assistant(
+            "msg_b",
+            json!([
+                {"type": "text", "text": "Hi.", "state": {"providerMetadata": {"secret": 1}}},
+                {"type": "reasoning", "text": "think", "state": {"reasoningEncryptedContent": "blob"}},
+                {"type": "tool", "id": "call_1", "name": "bash", "time": {"created": 1.0},
+                 "state": {"status": "completed", "input": {"command": "ls"},
+                           "content": [{"type": "text", "text": "out"}],
+                           "metadata": {"private": true}}}
+            ])
+        )]));
+
+        strip_provider_state(&mut transcript);
+
+        let MessageInfo::Assistant { content, .. } = &transcript[0] else {
+            panic!("expected an assistant message");
+        };
+        assert_eq!(
+            content[0],
+            AssistantContent::Text {
+                text: "Hi.".into(),
+                state: None
+            }
+        );
+        let AssistantContent::Reasoning { state, .. } = &content[1] else {
+            panic!("expected a reasoning part");
+        };
+        assert!(state.is_none());
+        let AssistantContent::Tool { state, .. } = &content[2] else {
+            panic!("expected a tool part");
+        };
+        assert_eq!(*state, ToolState::Unknown);
+    }
+
+    #[test]
+    fn only_real_user_messages_count_as_native_turns() {
+        let transcript = messages(json!([
+            user("msg_user", "hello"),
+            {"id": "msg_synth", "type": "synthetic", "time": {"created": 1.0}, "text": "continue"},
+            {"id": "msg_sys", "type": "system", "time": {"created": 1.0}, "text": "prompt"},
+            {"id": "msg_skill", "type": "skill", "time": {"created": 1.0}, "skill": "s", "name": "S", "text": "t"},
+            {"id": "msg_shell", "type": "shell", "time": {"created": 1.0}, "shellID": "sh",
+             "command": "ls", "status": "exited"},
+            {"id": "msg_compact", "type": "compaction", "time": {"created": 1.0},
+             "status": "completed", "reason": "auto"},
+            {"id": "msg_agent", "type": "agent-switched", "time": {"created": 1.0}, "agent": "plan"},
+            {"id": "msg_model", "type": "model-switched", "time": {"created": 1.0},
+             "model": {"id": "m", "providerID": "p"}},
+            {"id": "msg_loc", "type": "location-switched", "time": {"created": 1.0},
+             "location": {"directory": "/tmp"}},
+            assistant("msg_assist", json!([{"type": "text", "text": "Hi."}])),
+            user("msg_user2", "again"),
+        ]));
+
+        let ids = transcript
+            .iter()
+            .filter_map(native_user_message_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["msg_user".to_owned(), "msg_user2".to_owned()]);
+    }
+
+    #[test]
+    fn fork_boundary_excludes_the_next_user_turn() {
+        let ids = vec!["msg_1".to_owned(), "msg_2".to_owned(), "msg_3".to_owned()];
+        assert_eq!(
+            fork_boundary(&ids, 0).unwrap(),
+            ForkRequestBoundary::Before {
+                message_id: "msg_1".into()
+            }
+        );
+        assert_eq!(
+            fork_boundary(&ids, 2).unwrap(),
+            ForkRequestBoundary::Before {
+                message_id: "msg_3".into()
+            }
+        );
+        // Retaining everything has no first-excluded message at all.
+        assert_eq!(
+            fork_boundary(&ids, 3).unwrap(),
+            ForkRequestBoundary::Through
+        );
+        assert!(fork_boundary(&ids, 4).is_err());
     }
 
     #[test]
@@ -395,157 +724,178 @@ mod tests {
     }
 
     #[test]
-    fn native_turn_filter_ignores_compaction_and_synthetic_user_messages() {
-        assert!(is_native_user_turn(&json!({
-            "info": {"role": "user"},
-            "parts": [{"type": "text", "text": "hello"}]
-        })));
-        assert!(!is_native_user_turn(&json!({
-            "info": {"role": "user"},
-            "parts": [{"type": "compaction", "auto": true}]
-        })));
-        assert!(!is_native_user_turn(&json!({
-            "info": {"role": "user"},
-            "parts": [{"type": "text", "text": "continue", "synthetic": true}]
-        })));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn liveness_probe_reaps_an_exited_child() {
-        let child = std::process::Command::new("/usr/bin/true")
-            .spawn()
-            .expect("the probe child should start");
-        let server = OpenCodeServer {
-            child: Mutex::new(child),
-            port: 0,
-        };
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && server.is_alive() {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(!server.is_alive(), "the exited child should be reaped");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shutdown_waits_for_and_reaps_the_owned_child() {
-        let child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("the probe child should start");
-        let server = OpenCodeServer {
-            child: Mutex::new(child),
-            port: 0,
-        };
-        let started = Instant::now();
-        server.shutdown(Duration::from_secs(3));
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "a TERM-responsive child should not consume the shutdown budget"
-        );
-        assert!(!server.is_alive());
-    }
-
-    #[test]
-    fn global_session_list_maps_root_sessions_across_projects() {
-        let catalog_root = std::env::temp_dir().join("waku-opencode-session-catalog");
-        let waku_directory = catalog_root.join("dev").join("waku");
-        let response = json!([
+    fn catalog_models_are_addressed_by_provider_and_id() {
+        let models: Vec<ModelInfo> = serde_json::from_value(json!([
             {
-                "id": "ses_waku",
-                "title": "Review and merge Waku PR #113",
-                "directory": waku_directory,
-                "time": { "created": 1_787_000_000_123_u64, "updated": 1_787_000_100_999_u64 },
-                "project": { "id": "prj_waku", "worktree": waku_directory }
+                "id": "gemini-3.8-flash",
+                "modelID": "gemini-3.8-flash",
+                "providerID": "github-copilot",
+                "name": "Gemini 3.8 Flash",
+                "status": "active",
+                "enabled": true,
+                "limit": {"context": 1_048_576, "output": 65_536}
             },
             {
-                "id": " ses_untitled ",
-                "directory": catalog_root,
-                "time": { "created": 1_786_000_000_000_u64 },
-                "project": { "id": "global", "worktree": catalog_root }
+                "id": "deepseek-v4-flash-vision-exp",
+                "modelID": "deepseek-v4-flash-vision-exp",
+                "providerID": "deepseek",
+                "name": "DeepSeek V4 Flash Vision Exp",
+                "status": "beta",
+                "enabled": true,
+                "limit": {"context": 128_000, "output": 8_000}
             },
-            { "id": "ses_relative", "title": "skipped", "directory": "relative/dir" },
-            { "title": "no id", "directory": catalog_root },
-            { "id": "", "directory": catalog_root }
-        ]);
-
-        let sessions = session_summaries(&response);
-
-        assert_eq!(sessions.len(), 2, "{sessions:#?}");
-        assert_eq!(
-            sessions[0].cursor,
-            ProviderResumeCursor::OpenCode {
-                session_id: "ses_waku".into()
+            {
+                "id": "retired",
+                "modelID": "retired",
+                "providerID": "opencode",
+                "name": "Retired",
+                "status": "active",
+                "enabled": false,
+                "limit": {"context": 0, "output": 0}
             }
+        ]))
+        .expect("the model catalogue should decode");
+
+        let models = catalog_models(&models);
+
+        assert_eq!(models.len(), 2, "{models:#?}");
+        assert_eq!(models[0].id, "github-copilot/gemini-3.8-flash");
+        assert_eq!(models[0].name, "Gemini 3.8 Flash");
+        assert_eq!(models[0].sub_provider.as_deref(), Some("Github Copilot"));
+        // A beta model is still selectable; only a disabled one is not.
+        assert_eq!(models[1].id, "deepseek/deepseek-v4-flash-vision-exp");
+    }
+
+    #[test]
+    fn agent_presets_keep_only_startable_primaries() {
+        let agents: Vec<AgentInfo> = serde_json::from_value(json!([
+            {"id": "build", "name": "Build", "mode": "primary", "hidden": false,
+             "description": "The default agent."},
+            {"id": "plan", "name": "Plan", "mode": "primary", "hidden": false},
+            {"id": "general", "name": "General", "mode": "subagent", "hidden": false},
+            {"id": "title", "name": "Title", "mode": "primary", "hidden": true},
+            {"id": "review", "name": "Review", "mode": "all", "hidden": false}
+        ]))
+        .expect("the agent roster should decode");
+
+        let presets = agent_presets(&agents);
+
+        assert_eq!(
+            presets
+                .iter()
+                .map(|preset| preset.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["build", "plan", "review"]
         );
-        assert_eq!(sessions[0].title, "Review and merge Waku PR #113");
-        assert_eq!(sessions[0].cwd, waku_directory);
-        assert_eq!(sessions[0].created_at, 1_787_000_000);
-        assert_eq!(sessions[0].updated_at, 1_787_000_100);
-        assert_eq!(sessions[1].title, "OpenCode session ses_unti");
-        assert_eq!(sessions[1].cwd, catalog_root);
-        assert_eq!(sessions[1].updated_at, sessions[1].created_at);
+        assert!(presets[0].is_default);
+        assert_eq!(
+            presets[0].description.as_deref(),
+            Some("The default agent.")
+        );
+        assert!(!presets[1].is_default);
     }
 
+    /// The whole point of the attach-only rule. A missing service must not
+    /// spawn one, and the picker must not fail either.
     #[test]
-    fn global_session_list_tolerates_a_non_array_response() {
-        assert!(session_summaries(&Value::Null).is_empty());
-        assert!(session_summaries(&json!({ "error": "nope" })).is_empty());
+    fn a_missing_service_lists_nothing_and_starts_nothing() {
+        let binary = std::env::temp_dir().join("waku-opencode2-absent");
+        assert!(list_provider_sessions(&binary, 0).unwrap().is_empty());
+        assert_eq!(
+            provider_session_history(&binary, "ses_x", 0)
+                .unwrap()
+                .messages
+                .len(),
+            0
+        );
     }
 
-    /// The catalog must come from OpenCode's cross-project store, not the
-    /// project the server happens to run in: every entry keeps its own
-    /// directory, and nothing is a subagent child.
+    /// Exercises the real catalog against the user's own service. Read-only:
+    /// it lists sessions and never creates, prompts or deletes.
     #[test]
-    #[ignore = "requires an installed opencode"]
-    fn lists_sessions_across_projects_on_a_real_server() {
-        let binary =
-            crate::command_env::find_executable("opencode").expect("opencode is not installed");
+    fn lists_real_root_sessions_across_workspaces() {
+        let binary = crate::live_service::binary();
+        crate::live_service::service();
         let sessions = list_provider_sessions(&binary, 50).expect("the catalog should load");
         assert!(sessions.iter().all(|session| session.cwd.is_absolute()));
         assert!(
             sessions
                 .windows(2)
                 .all(|pair| pair[0].updated_at >= pair[1].updated_at),
-            "OpenCode lists newest first"
+            "OpenCode 2 lists newest first"
         );
     }
 
-    /// Exercises the same cold-session path used when an edited message is
-    /// submitted after Waku has relaunched. The source session is supplied by
-    /// the caller so this never creates provider traffic; it only forks the
-    /// already-completed native transcript and removes the test fork again.
+    /// The service is the only source of the v2 catalog, and both halves have
+    /// to arrive together or the picker degrades to the disk cache.
     #[test]
-    #[ignore = "requires an installed opencode and WAKU_OPENCODE_TEST_SESSION_ID"]
-    fn forks_away_a_real_single_turn_session() {
+    fn discovers_the_real_model_and_agent_catalog() {
+        let binary = crate::live_service::binary();
+        crate::live_service::service().wait_for_models();
+        let (models, presets) = discover_catalog(&binary);
+        assert!(!models.is_empty(), "the service should expose models");
+        assert!(models.iter().all(|model| model.id.contains('/')));
+        let presets = presets.expect("the service should expose agents");
+        assert!(presets.iter().any(|preset| preset.id == DEFAULT_AGENT));
+    }
+
+    /// Guards the sanitize trap: an unsanitized export carries real prose,
+    /// while `sanitize=true` replaces even the user's own prompt with a
+    /// `[redacted:…]` placeholder.
+    #[test]
+    #[ignore = "requires a running opencode2 background service and WAKU_OPENCODE2_TEST_SESSION_ID"]
+    fn imports_a_real_transcript_without_redaction_placeholders() {
         let binary =
-            crate::command_env::find_executable("opencode").expect("opencode is not installed");
-        let session_id = std::env::var("WAKU_OPENCODE_TEST_SESSION_ID")
-            .expect("set WAKU_OPENCODE_TEST_SESSION_ID to a completed one-turn session");
-        let cwd = std::env::current_dir().expect("the test working directory should exist");
-        let server = OpenCodeServer::start(&binary, &cwd).expect("the server should start");
-        let ProviderResumeCursor::OpenCode {
-            session_id: fork_id,
-        } = fork_session_at_turn_on_server(&server, &session_id, 0)
-            .expect("the first turn should be excluded from the fork")
-        else {
-            panic!("expected an OpenCode cursor");
-        };
-        let messages = server
-            .request(
-                "GET",
-                &format!("/session/{}/message", encode_path_segment(&fork_id)),
-                None,
-            )
-            .expect("the fork should be readable");
-        assert_eq!(messages.as_array().map(Vec::len), Some(0));
-        server
-            .request(
-                "DELETE",
-                &format!("/session/{}", encode_path_segment(&fork_id)),
-                None,
-            )
-            .expect("the test fork should be removed");
+            crate::command_env::find_executable("opencode2").expect("opencode2 is not installed");
+        let session_id = std::env::var("WAKU_OPENCODE2_TEST_SESSION_ID")
+            .expect("set WAKU_OPENCODE2_TEST_SESSION_ID to a completed session");
+        let history =
+            provider_session_history(&binary, &session_id, 100).expect("the import should work");
+        assert!(!history.messages.is_empty());
+        assert!(
+            history
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("[redacted:")),
+            "the import must not go through the share sanitizer"
+        );
+    }
+}
+
+#[cfg(test)]
+mod discovery_smoke {
+    /// Proves the picker is actually populated against a live service, which a
+    /// unit test over canned JSON cannot.
+    #[test]
+    fn discovers_models_from_the_adopted_service() {
+        crate::live_service::service().wait_for_models();
+        let (models, presets) = super::discover_catalog(&crate::live_service::binary());
+        println!(
+            "models={} presets={:?}",
+            models.len(),
+            presets.as_ref().map(Vec::len)
+        );
+        let with_efforts: Vec<_> = models
+            .iter()
+            .filter(|model| !model.reasoning_efforts.is_empty())
+            .collect();
+        println!("with efforts={}", with_efforts.len());
+        for model in with_efforts.iter().take(4) {
+            println!(
+                "  {} -> {:?} (default {:?})",
+                model.id,
+                model
+                    .reasoning_efforts
+                    .iter()
+                    .map(|effort| effort.id.as_str())
+                    .collect::<Vec<_>>(),
+                model.default_reasoning_effort
+            );
+        }
+        assert!(!models.is_empty(), "expected a non-empty model catalog");
+        assert!(
+            !with_efforts.is_empty(),
+            "expected some models to expose variants"
+        );
     }
 }

@@ -1858,7 +1858,8 @@ fn normalize_computer_app_grants(grants: &mut Vec<ComputerAppGrant>) {
 mod tests {
     use super::*;
     use crate::model::{
-        ActivityItem, ActivityKind, FavoriteModel, MessageRole, ReasoningBlock, TranscriptBlock,
+        ActivityItem, ActivityKind, AnnotationSpan, FavoriteModel, MessageRole, ReasoningBlock,
+        TranscriptBlock,
     };
     use base64::Engine as _;
 
