@@ -1,4 +1,4 @@
-//! Typed bindings for the OpenCode 2 background service's HTTP API.
+//! Typed bindings for the OpenCode background service's HTTP API.
 //!
 //! Every function here is a free function over an [`Endpoint`], so this module
 //! knows nothing about who owns the service, how it was discovered, or which
@@ -36,8 +36,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::http_wire::encode_path_segment;
 use crate::http_wire::{self, Endpoint};
-use crate::opencode_session::encode_path_segment;
 
 /// The service answers a local request in single-digit milliseconds; a budget
 /// this large only ever covers a machine under load.
@@ -110,14 +110,14 @@ impl std::fmt::Display for ApiError {
                 tag,
                 message,
                 status,
-            } => write!(formatter, "OpenCode 2 {tag} (HTTP {status}): {message}"),
+            } => write!(formatter, "OpenCode {tag} (HTTP {status}): {message}"),
             Self::Http { status, body } if body.trim().is_empty() => {
-                write!(formatter, "OpenCode 2 request failed with HTTP {status}")
+                write!(formatter, "OpenCode request failed with HTTP {status}")
             }
             Self::Http { status, body } => {
                 write!(
                     formatter,
-                    "OpenCode 2 request failed with HTTP {status}: {body}"
+                    "OpenCode request failed with HTTP {status}: {body}"
                 )
             }
             Self::Transport(error) => write!(formatter, "{error}"),
@@ -164,7 +164,7 @@ pub(crate) enum Delivery {
 /// preview, `/api/server` on 2.0.0, `/api/status` on 2.0.5, `/api/info` on
 /// 2.0.9+ — and every other route Waku uses moved with it. Waku therefore
 /// drives the CURRENT API and refuses anything older by name, instead of
-/// carrying a compatibility branch per channel: the OpenCode 2 line is in
+/// carrying a compatibility branch per channel: the OpenCode line is in
 /// flux, so a second supported shape would be stale again within days.
 const IDENTITY_ROUTE: &str = "/api/info";
 
@@ -186,7 +186,7 @@ pub(crate) fn identify(endpoint: &Endpoint) -> Result<ServiceIdentity> {
     let response = request(endpoint, "GET", IDENTITY_ROUTE, None, HEALTH_TIMEOUT)?;
     decode(response, "service identity").map_err(|error| {
         ApiError::Transport(anyhow!(
-            "the OpenCode 2 service on {} did not answer its identity route: {error}",
+            "the OpenCode service on {} did not answer its identity route: {error}",
             endpoint.address()
         ))
     })
@@ -908,7 +908,7 @@ pub(crate) fn create_session(
     }
     if let Some(model) = model {
         body["model"] = serde_json::to_value(model).map_err(|error| {
-            ApiError::Transport(anyhow!("could not encode the OpenCode 2 model: {error}"))
+            ApiError::Transport(anyhow!("could not encode the OpenCode model: {error}"))
         })?;
     }
     let response = request(
@@ -1249,7 +1249,7 @@ pub(crate) fn reply_permission(
 ) -> Result<()> {
     if matches!(reply, PermissionReply::Always) {
         return Err(ApiError::Transport(anyhow!(
-            "OpenCode 2 permission replies must not save a persistent rule"
+            "OpenCode permission replies must not save a persistent rule"
         )));
     }
     let path = format!(
@@ -1310,7 +1310,7 @@ pub(crate) fn active_sessions(endpoint: &Endpoint) -> Result<HashSet<String>> {
     let active = data(response, "active sessions")?;
     let Value::Object(active) = active else {
         return Err(ApiError::Transport(anyhow!(
-            "OpenCode 2 returned an unreadable active session map"
+            "OpenCode returned an unreadable active session map"
         )));
     };
     Ok(active.into_iter().map(|(id, _)| id).collect())
@@ -1436,17 +1436,17 @@ fn request(
 fn data(response: Value, what: &str) -> Result<Value> {
     match response {
         Value::Object(mut fields) => fields.remove("data").ok_or_else(|| {
-            ApiError::Transport(anyhow!("OpenCode 2 returned no {what} in its response"))
+            ApiError::Transport(anyhow!("OpenCode returned no {what} in its response"))
         }),
         _ => Err(ApiError::Transport(anyhow!(
-            "OpenCode 2 returned an unreadable {what} response"
+            "OpenCode returned an unreadable {what} response"
         ))),
     }
 }
 
 fn decode<T: DeserializeOwned>(response: Value, what: &str) -> Result<T> {
     serde_json::from_value(response).map_err(|error| {
-        ApiError::Transport(anyhow!("OpenCode 2 returned an invalid {what}: {error}"))
+        ApiError::Transport(anyhow!("OpenCode returned an invalid {what}: {error}"))
     })
 }
 

@@ -193,44 +193,11 @@ fn assemble_slash_commands(
                 scan_skill_files(provider, &home.join(".codex/skills"), &mut commands);
             }
         }
-        // OpenCode 2 publishes commands and skills over its v2 API
+        // OpenCode publishes commands and skills over the service's API
         // (`GET /api/command`, `GET /api/skill`), so it seeds nothing from
         // the filesystem here. The shared `.agents/skills` + `.waku/commands`
         // layer below still applies.
-        ProviderKind::OpenCode2 => {}
-        ProviderKind::OpenCode => {
-            scan_command_files(
-                &project_root.join(".opencode/command"),
-                CommandScope::Project,
-                false,
-                &mut commands,
-            );
-            scan_skill_files(
-                provider,
-                &project_root.join(".opencode/skills"),
-                &mut commands,
-            );
-            // OpenCode also loads Claude-compatible skill trees.
-            scan_skill_files(
-                provider,
-                &project_root.join(".claude/skills"),
-                &mut commands,
-            );
-            if let Some(home) = home.as_deref() {
-                scan_command_files(
-                    &home.join(".config/opencode/command"),
-                    CommandScope::User,
-                    false,
-                    &mut commands,
-                );
-                scan_skill_files(
-                    provider,
-                    &home.join(".config/opencode/skills"),
-                    &mut commands,
-                );
-                scan_skill_files(provider, &home.join(".claude/skills"), &mut commands);
-            }
-        }
+        ProviderKind::OpenCode => {}
         ProviderKind::Cursor => {
             scan_command_files(
                 &project_root.join(".cursor/commands"),
@@ -1321,28 +1288,34 @@ mod tests {
     fn opencode_commands_use_native_dispatch_while_waku_templates_still_expand() {
         let root =
             std::env::temp_dir().join(format!("waku-native-commands-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(root.join(".opencode/command")).unwrap();
         std::fs::create_dir_all(root.join(".waku/commands")).unwrap();
-        std::fs::write(
-            root.join(".opencode/command/native-review.md"),
-            "Review $ARGUMENTS",
-        )
-        .unwrap();
         std::fs::write(
             root.join(".waku/commands/waku-review.md"),
             "Review $ARGUMENTS",
         )
         .unwrap();
+        // Native commands arrive from the service catalogue rather than the
+        // filesystem: the provider reads them over the API, so they are the
+        // discovered half of the index here.
         let commands = assemble_slash_commands(
             ProviderKind::OpenCode,
             &root,
-            vec![SlashCommand {
-                name: "init".into(),
-                description: "Initialize".into(),
-                scope: CommandScope::Builtin,
-                argument_hint: None,
-                template: None,
-            }],
+            vec![
+                SlashCommand {
+                    name: "init".into(),
+                    description: "Initialize".into(),
+                    scope: CommandScope::Builtin,
+                    argument_hint: None,
+                    template: None,
+                },
+                SlashCommand {
+                    name: "native-review".into(),
+                    description: "Review".into(),
+                    scope: CommandScope::Builtin,
+                    argument_hint: None,
+                    template: None,
+                },
+            ],
         );
         assert_eq!(
             resolved_submission(ProviderKind::OpenCode, "/native-review changes", &commands),
@@ -1417,7 +1390,6 @@ mod tests {
             (ProviderKind::Codex, ".codex/skills"),
             (ProviderKind::Cursor, ".cursor/skills"),
             (ProviderKind::Fx, "skills"),
-            (ProviderKind::OpenCode, ".opencode/skills"),
             (ProviderKind::Pi, ".pi/skills"),
             (ProviderKind::OhMyPi, ".omp/skills"),
         ] {

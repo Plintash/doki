@@ -1,4 +1,4 @@
-//! A private OpenCode 2 service for the tests that need a live one.
+//! A private OpenCode service for the tests that need a live one.
 //!
 //! The API routes are a moving target, and a canned fixture cannot notice a
 //! rename — the identity route alone moved four times in a fortnight, and every
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::http_wire::Endpoint;
 use crate::model::ProviderKind;
-use crate::opencode2_service::ServiceRegistration;
+use crate::opencode_service::ServiceRegistration;
 
 /// How long the server may take to answer its identity route.
 const START_BUDGET: Duration = Duration::from_secs(30);
@@ -66,7 +66,7 @@ impl LiveService {
     pub(crate) fn wait_for_models(&self) {
         self.wait_for("model catalogue", || {
             self.catalogue(&self.endpoint, |endpoint, directory| {
-                crate::opencode2_api::list_models(endpoint, Some(directory))
+                crate::opencode_api::list_models(endpoint, Some(directory))
             })
         });
     }
@@ -79,7 +79,7 @@ impl LiveService {
     pub(crate) fn wait_for_agents(&self) {
         self.wait_for("agent catalogue", || {
             self.catalogue(&self.endpoint, |endpoint, directory| {
-                crate::opencode2_api::list_agents(endpoint, Some(directory))
+                crate::opencode_api::list_agents(endpoint, Some(directory))
             })
         });
     }
@@ -87,7 +87,7 @@ impl LiveService {
     fn catalogue<T>(
         &self,
         endpoint: &Endpoint,
-        read: impl Fn(&Endpoint, &str) -> crate::opencode2_api::Result<Vec<T>>,
+        read: impl Fn(&Endpoint, &str) -> crate::opencode_api::Result<Vec<T>>,
     ) -> bool {
         let directory = self.workspace.to_string_lossy().into_owned();
         read(endpoint, &directory).is_ok_and(|items| !items.is_empty())
@@ -131,9 +131,9 @@ impl LiveService {
 /// A missing CLI is not a reason to skip quietly: the whole point of these
 /// tests is that the provider's assumptions get checked against a real service.
 pub(crate) fn binary() -> PathBuf {
-    crate::model::provider_binary(ProviderKind::OpenCode2).expect(
-        "the live OpenCode 2 tests need the v2 CLI installed: either `opencode2`, or `opencode` \
-         2.x. Skip them with `cargo test -p waku-core -- --skip opencode2`",
+    crate::model::provider_binary(ProviderKind::OpenCode).expect(
+        "the live OpenCode tests need the v2 CLI installed: either `opencode`, or `opencode` \
+         2.x. Skip them with `cargo test -p waku-core -- --skip opencode`",
     )
 }
 
@@ -144,7 +144,7 @@ pub(crate) fn service() -> &'static LiveService {
 
 fn start() -> LiveService {
     let binary = binary();
-    let root = std::env::temp_dir().join(format!("waku-live-opencode2-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("waku-live-opencode-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let data = root.join("data");
     let state = root.join("state");
@@ -198,8 +198,8 @@ fn start() -> LiveService {
     };
     // Point the production discovery path at this service, then publish the
     // descriptor exactly as a real one is published.
-    crate::opencode2_service::use_test_state_root(state);
-    let registration_path = crate::opencode2_service::state_directory().join("service.json");
+    crate::opencode_service::use_test_state_root(state);
+    let registration_path = crate::opencode_service::state_directory().join("service.json");
     std::fs::write(
         &registration_path,
         serde_json::json!({
@@ -230,10 +230,10 @@ fn start() -> LiveService {
 fn wait_for_identity(
     endpoint: &Endpoint,
     child: &mut Child,
-) -> crate::opencode2_api::ServiceIdentity {
+) -> crate::opencode_api::ServiceIdentity {
     let deadline = Instant::now() + START_BUDGET;
     loop {
-        match crate::opencode2_api::identify(endpoint) {
+        match crate::opencode_api::identify(endpoint) {
             Ok(identity) => return identity,
             Err(error) => {
                 if let Some(status) = child.try_wait().ok().flatten() {

@@ -20,21 +20,17 @@ pub fn provider_probe(provider: ProviderKind, binary_override: Option<&str>) -> 
 
 /// Where a provider's CLI lives when the user has not named one.
 ///
-/// OpenCode 2 is the only provider whose installed name moved inside the
-/// window Waku supports. The beta channel shipped `opencode2`, while every
-/// later channel — the 2.0.x stable line and its Homebrew formula — installs
-/// `opencode`, which is ALSO OpenCode 1's name. `opencode2` is tried first
-/// because it can only ever be OpenCode 2; the shared name is accepted only
-/// after the binary reports a 2.x version, so a machine with OpenCode 1 alone
-/// never advertises its CLI as OpenCode 2 (v1's `serve` takes no `--service`,
-/// so accepting it would surface as a start failure instead).
+/// OpenCode is the only provider whose installed name is shared with an older
+/// line. Every 2.x channel installs `opencode` — which is also OpenCode 1's
+/// name — so the binary is accepted only when it reports a 2.x version: v1's
+/// `serve` takes no `--service`, and its API is not the one this provider
+/// speaks, so accepting it would surface as a start failure instead of the
+/// provider being absent.
 pub(crate) fn provider_binary(provider: ProviderKind) -> Option<std::path::PathBuf> {
-    if provider != ProviderKind::OpenCode2 {
+    if provider != ProviderKind::OpenCode {
         return crate::command_env::find_executable(provider.command());
     }
-    crate::command_env::find_executable("opencode2").or_else(|| {
-        crate::command_env::find_executable("opencode").filter(|path| is_opencode_v2(path))
-    })
+    crate::command_env::find_executable("opencode").filter(|path| is_opencode_v2(path))
 }
 
 fn is_opencode_v2(binary: &Path) -> bool {

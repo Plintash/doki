@@ -161,7 +161,7 @@ settings.general_keywords:
 settings.appearance_keywords:
   en: appearance theme system light dark language english chinese simplified font size text editor
 settings.providers_keywords:
-  en: providers agents models cli version install detect claude codex cursor opencode opencode2 amp grok pi
+  en: providers agents models cli version install detect claude codex cursor opencode amp grok pi
 settings.skills:
   en: Skills
 settings.skills_keywords:
@@ -421,7 +421,7 @@ providers.checked_hours_ago:
 computer_use.allow_apps:
   en: Let Doki use apps
 computer_use.availability:
-  en: Computer Use is available with Codex, OpenCode, OpenCode 2, Grok, and Pi
+  en: Computer Use is available with Codex, OpenCode, OpenCode, Grok, and Pi
 computer_use.desktop_access:
   en: Desktop access
 computer_use.windows_access_description:

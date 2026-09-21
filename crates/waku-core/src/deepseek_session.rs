@@ -566,7 +566,7 @@ impl DeepSeekServer {
             "method": method,
             "payload": payload,
         });
-        let response = crate::opencode_session::request_json_on_port(
+        let response = crate::http_wire::request_json_on_port(
             self.port,
             "POST",
             &format!("/api/{method}"),
@@ -587,7 +587,7 @@ impl DeepSeekServer {
             "rpcId": rpc_id,
             "result": {"ok": true, "value": value},
         });
-        let response = crate::opencode_session::request_json_on_port(
+        let response = crate::http_wire::request_json_on_port(
             self.port,
             "POST",
             "/api/respond",
@@ -616,7 +616,7 @@ impl DeepSeekServer {
                 "error": {"code": "cancelled", "message": message, "details": {}}
             },
         });
-        let response = crate::opencode_session::request_json_on_port(
+        let response = crate::http_wire::request_json_on_port(
             self.port,
             "POST",
             "/api/respond",

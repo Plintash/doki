@@ -78,7 +78,7 @@ settings.daemon: 守护进程
 settings.computer_use: 电脑操作
 settings.general_keywords: 通用 本地 项目 对话 隐私 更新 自动 版本 数学 公式 表达式 math latex
 settings.appearance_keywords: 外观 主题 系统 浅色 深色 语言 英语 中文 简体 字号 字体 大小 编辑器
-settings.providers_keywords: 服务商 智能体 模型 命令行 版本 安装 检测 claude codex cursor opencode opencode2 amp grok pi
+settings.providers_keywords: 服务商 智能体 模型 命令行 版本 安装 检测 claude codex cursor opencode amp grok pi
 settings.skills: 技能
 settings.skills_keywords: 技能 技能库 智能体 禁用 启用 删除 claude codex cursor opencode pi amp 共享
 settings.usage_keywords: 用量 令牌 费用 支出 缓存 每日 图表 模型 明细 历史 claude codex
@@ -206,7 +206,7 @@ providers.checked_just_now: 刚刚检查过
 providers.checked_minutes_ago: "%{count} 分钟前检查过"
 providers.checked_hours_ago: "%{count} 小时前检查过"
 computer_use.allow_apps: 允许 Doki 操作其他应用
-computer_use.availability: Codex、OpenCode、OpenCode 2、Grok 和 Pi 支持电脑操作功能
+computer_use.availability: Codex、OpenCode、OpenCode、Grok 和 Pi 支持电脑操作功能
 computer_use.macos_access: macOS 权限
 computer_use.helper_access: 请向 Doki 的独立控制助手 %{helper} 授予权限
 computer_use.screen_recording: 屏幕录制

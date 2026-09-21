@@ -1,8 +1,8 @@
-//! Cold-path OpenCode 2 helpers: the resume catalog, transcript import,
+//! Cold-path OpenCode helpers: the resume catalog, transcript import,
 //! conversation forking, and the model/agent catalog.
 //!
-//! Everything here goes through [`opencode2_service::attached`], never
-//! [`opencode2_service::shared`]. Opening the Resume picker or refreshing the
+//! Everything here goes through [`opencode_service::attached`], never
+//! [`opencode_service::shared`]. Opening the Resume picker or refreshing the
 //! model catalog must not start the user's background daemon, so an absent
 //! service is an empty catalog — not a spawn, and not a 20s start poll. (This
 //! is the deliberate divergence from `opencode_session::list_provider_sessions`,
@@ -35,11 +35,11 @@ use crate::model::{
     AgentTurn, Message, MessageRole, ProviderAgentPreset, ProviderKind, ProviderModel,
     ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary, TurnStatus,
 };
-use crate::opencode2_api::{
+use crate::opencode_api::{
     self, AgentInfo, AgentMode, AssistantContent, ForkRequestBoundary, MessageInfo, ModelInfo,
     Order, SessionInfo, ToolState,
 };
-use crate::opencode2_service;
+use crate::opencode_service;
 
 /// Matches `acp_session`: a catalog that needs more than this many pages is
 /// either enormous or looping, and both deserve the same bound.
@@ -51,7 +51,7 @@ const PAGE_SIZE: usize = 100;
 /// is how the route asks for roots only; it is echoed back inside the opaque
 /// cursor as `"parentID":"null"`, so it survives pagination.
 const ROOT_SESSIONS_ONLY: &str = "null";
-/// OpenCode 2's own default primary agent. A session created without one comes
+/// OpenCode's own default primary agent. A session created without one comes
 /// back with `agent: "build"`, and the roster carries no `isDefault` marker.
 #[allow(dead_code)]
 const DEFAULT_AGENT: &str = "build";
@@ -69,14 +69,14 @@ pub fn list_provider_sessions(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let Some(service) = opencode2_service::attached(binary)? else {
+    let Some(service) = opencode_service::attached(binary)? else {
         return Ok(Vec::new());
     };
     let endpoint = service.endpoint();
     let mut summaries = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_PAGES {
-        let (sessions, next) = opencode2_api::list_sessions(
+        let (sessions, next) = opencode_api::list_sessions(
             &endpoint,
             None,
             Some(ROOT_SESSIONS_ONLY),
@@ -84,7 +84,7 @@ pub fn list_provider_sessions(
             PAGE_SIZE.min(limit.max(1)),
             cursor.as_deref(),
         )
-        .context("OpenCode 2 could not list its sessions")?;
+        .context("OpenCode could not list its sessions")?;
         summaries.extend(sessions.iter().filter_map(session_summary));
         if summaries.len() >= limit {
             break;
@@ -109,7 +109,7 @@ fn session_summary(session: &SessionInfo) -> Option<ProviderSessionSummary> {
     }
     let created_at = unix_seconds(session.time.created);
     Some(ProviderSessionSummary {
-        cursor: ProviderResumeCursor::OpenCode2 {
+        cursor: ProviderResumeCursor::OpenCode {
             session_id: session_id.to_owned(),
             // Kept verbatim: the list filter and `location.directory` on
             // create are compared by exact string equality, so a resume must
@@ -117,7 +117,7 @@ fn session_summary(session: &SessionInfo) -> Option<ProviderSessionSummary> {
             directory: Some(session.location.directory.clone()),
         },
         title: crate::acp_session::session_title(
-            ProviderKind::OpenCode2,
+            ProviderKind::OpenCode,
             session.title.as_deref(),
             session_id,
         ),
@@ -127,7 +127,7 @@ fn session_summary(session: &SessionInfo) -> Option<ProviderSessionSummary> {
     })
 }
 
-/// OpenCode 2 stamps time in Unix milliseconds as a JSON number; the catalog
+/// OpenCode stamps time in Unix milliseconds as a JSON number; the catalog
 /// sorts in seconds.
 fn unix_seconds(millis: f64) -> u64 {
     if millis.is_finite() && millis > 0.0 {
@@ -150,10 +150,10 @@ pub fn provider_session_history(
     if session_id.trim().is_empty() || visible_turn_limit == 0 {
         return Ok(ProviderSessionHistory::default());
     }
-    let service = opencode2_service::attached(binary)?
-        .ok_or_else(|| anyhow!("the OpenCode 2 background service is not running"))?;
-    let mut export = opencode2_api::export_session(&service.endpoint(), session_id, false)
-        .with_context(|| format!("OpenCode 2 could not export session {session_id}"))?;
+    let service = opencode_service::attached(binary)?
+        .ok_or_else(|| anyhow!("the OpenCode background service is not running"))?;
+    let mut export = opencode_api::export_session(&service.endpoint(), session_id, false)
+        .with_context(|| format!("OpenCode could not export session {session_id}"))?;
     strip_provider_state(&mut export.messages);
     let mut history = history_from_messages(&export.messages);
     retain_recent_messages(&mut history, visible_turn_limit);
@@ -281,8 +281,8 @@ pub fn fork_session_at_turn(
     session_id: &str,
     retained_turns: usize,
 ) -> anyhow::Result<ProviderResumeCursor> {
-    let service = opencode2_service::attached(binary)?
-        .ok_or_else(|| anyhow!("the OpenCode 2 background service is not running"))?;
+    let service = opencode_service::attached(binary)?
+        .ok_or_else(|| anyhow!("the OpenCode background service is not running"))?;
     let endpoint = service.endpoint();
     let message_ids = native_user_message_ids(&endpoint, session_id)?;
     fork_at_boundary(&endpoint, session_id, &message_ids, retained_turns)
@@ -320,14 +320,14 @@ pub(crate) fn native_user_message_ids(
     let mut ids = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_PAGES {
-        let (messages, next) = opencode2_api::list_messages(
+        let (messages, next) = opencode_api::list_messages(
             endpoint,
             session_id,
             Order::Asc,
             Some(PAGE_SIZE),
             cursor.as_deref(),
         )
-        .with_context(|| format!("OpenCode 2 could not list messages for {session_id}"))?;
+        .with_context(|| format!("OpenCode could not list messages for {session_id}"))?;
         ids.extend(messages.iter().filter_map(native_user_message_id));
         let Some(next) = next else { break };
         cursor = Some(next);
@@ -349,12 +349,12 @@ fn fork_at_boundary(
     retained_turns: usize,
 ) -> anyhow::Result<ProviderResumeCursor> {
     let boundary = fork_boundary(message_ids, retained_turns)?;
-    let fork = opencode2_api::fork(endpoint, session_id, &boundary)
-        .with_context(|| format!("OpenCode 2 could not fork session {session_id}"))?;
+    let fork = opencode_api::fork(endpoint, session_id, &boundary)
+        .with_context(|| format!("OpenCode could not fork session {session_id}"))?;
     if fork.id.trim().is_empty() {
-        bail!("OpenCode 2 returned no forked session ID");
+        bail!("OpenCode returned no forked session ID");
     }
-    Ok(ProviderResumeCursor::OpenCode2 {
+    Ok(ProviderResumeCursor::OpenCode {
         session_id: fork.id,
         directory: Some(fork.location.directory),
     })
@@ -372,7 +372,7 @@ fn fork_boundary(
 ) -> anyhow::Result<ForkRequestBoundary> {
     if retained_turns > message_ids.len() {
         bail!(
-            "OpenCode 2 has only {} native turns, but Waku needs {retained_turns}",
+            "OpenCode has only {} native turns, but Waku needs {retained_turns}",
             message_ids.len()
         );
     }
@@ -387,7 +387,7 @@ fn fork_boundary(
 fn retained_turn_count(total_turns: usize, turns_to_remove: usize) -> anyhow::Result<usize> {
     total_turns.checked_sub(turns_to_remove).ok_or_else(|| {
         anyhow!(
-            "OpenCode 2 has only {total_turns} native turns, but Waku needs to remove {turns_to_remove}"
+            "OpenCode has only {total_turns} native turns, but Waku needs to remove {turns_to_remove}"
         )
     })
 }
@@ -397,21 +397,21 @@ fn retained_turn_count(total_turns: usize, turns_to_remove: usize) -> anyhow::Re
 /// Attach-only, so a launch with no service running answers empties and
 /// `model_catalog` falls back to its disk cache rather than starting the
 /// user's daemon just to refresh a picker.
-// Reached once `model_catalog` dispatches OpenCode 2 here.
+// Reached once `model_catalog` dispatches OpenCode here.
 #[allow(dead_code)]
 pub(crate) fn discover_catalog(
     binary: &Path,
 ) -> (Vec<ProviderModel>, Option<Vec<ProviderAgentPreset>>) {
-    let Ok(Some(service)) = opencode2_service::attached(binary) else {
+    let Ok(Some(service)) = opencode_service::attached(binary) else {
         return (Vec::new(), None);
     };
     let endpoint = service.endpoint();
     // No directory: both catalogs are global, and scoping them would only pin
     // them to whichever workspace asked first.
-    let models = opencode2_api::list_models(&endpoint, None)
+    let models = opencode_api::list_models(&endpoint, None)
         .map(|models| catalog_models(&models))
         .unwrap_or_default();
-    let presets = opencode2_api::list_agents(&endpoint, None)
+    let presets = opencode_api::list_agents(&endpoint, None)
         .ok()
         .map(|agents| agent_presets(&agents));
     (models, presets)
@@ -434,7 +434,7 @@ fn catalog_models(models: &[ModelInfo]) -> Vec<ProviderModel> {
             // A model's variants ARE its reasoning-effort ladder: the ids are
             // `low`/`medium`/`high`/`max`/`minimal`/`xhigh`/`none`/`thinking`,
             // and the chosen one rides on `ModelRef::variant`. Dropping them
-            // left the effort control empty for every OpenCode 2 model.
+            // left the effort control empty for every OpenCode model.
             Some(crate::model_catalog::with_variant_efforts(
                 catalog,
                 model.variants.iter().map(|variant| variant.id.as_str()),
@@ -507,8 +507,8 @@ mod tests {
 
     #[test]
     fn summaries_keep_the_stored_directory_and_convert_millis_to_seconds() {
-        let project_dir = std::env::temp_dir().join("waku-opencode2-project");
-        let untitled_dir = std::env::temp_dir().join("waku-opencode2-untitled");
+        let project_dir = std::env::temp_dir().join("waku-opencode-project");
+        let untitled_dir = std::env::temp_dir().join("waku-opencode-untitled");
         let listed = sessions(json!([
             {
                 "id": "ses_waku",
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(summaries.len(), 2, "{summaries:#?}");
         assert_eq!(
             summaries[0].cursor,
-            ProviderResumeCursor::OpenCode2 {
+            ProviderResumeCursor::OpenCode {
                 session_id: "ses_waku".into(),
                 directory: Some(project_dir.to_string_lossy().into_owned()),
             }
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(summaries[0].updated_at, 1_788_689_514);
         // A session the service never updated must not sort before its own
         // creation.
-        assert_eq!(summaries[1].title, "OpenCode 2 session ses_unti");
+        assert_eq!(summaries[1].title, "OpenCode session ses_unti");
         assert_eq!(summaries[1].updated_at, summaries[1].created_at);
     }
 
@@ -799,7 +799,7 @@ mod tests {
     /// spawn one, and the picker must not fail either.
     #[test]
     fn a_missing_service_lists_nothing_and_starts_nothing() {
-        let binary = std::env::temp_dir().join("waku-opencode2-absent");
+        let binary = std::env::temp_dir().join("waku-opencode-absent");
         assert!(list_provider_sessions(&binary, 0).unwrap().is_empty());
         assert_eq!(
             provider_session_history(&binary, "ses_x", 0)
@@ -822,7 +822,7 @@ mod tests {
             sessions
                 .windows(2)
                 .all(|pair| pair[0].updated_at >= pair[1].updated_at),
-            "OpenCode 2 lists newest first"
+            "OpenCode lists newest first"
         );
     }
 
@@ -843,12 +843,12 @@ mod tests {
     /// while `sanitize=true` replaces even the user's own prompt with a
     /// `[redacted:…]` placeholder.
     #[test]
-    #[ignore = "requires a running opencode2 background service and WAKU_OPENCODE2_TEST_SESSION_ID"]
+    #[ignore = "requires a running opencode background service and WAKU_OPENCODE_TEST_SESSION_ID"]
     fn imports_a_real_transcript_without_redaction_placeholders() {
         let binary =
-            crate::command_env::find_executable("opencode2").expect("opencode2 is not installed");
-        let session_id = std::env::var("WAKU_OPENCODE2_TEST_SESSION_ID")
-            .expect("set WAKU_OPENCODE2_TEST_SESSION_ID to a completed session");
+            crate::command_env::find_executable("opencode").expect("opencode is not installed");
+        let session_id = std::env::var("WAKU_OPENCODE_TEST_SESSION_ID")
+            .expect("set WAKU_OPENCODE_TEST_SESSION_ID to a completed session");
         let history =
             provider_session_history(&binary, &session_id, 100).expect("the import should work");
         assert!(!history.messages.is_empty());

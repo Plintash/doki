@@ -1,7 +1,7 @@
-//! OpenCode 2 sessions over the one adopted background service.
+//! OpenCode sessions over the one adopted background service.
 //!
 //! Everything structural about this driver follows from a single fact: Waku
-//! does not own an OpenCode 2 process. `opencode2_service` finds the daemon
+//! does not own an OpenCode process. `opencode_service` finds the daemon
 //! the user's own terminal already started, and every Waku task rides the one
 //! `GET /api/event` stream it exposes. Dropping a driver unsubscribes and
 //! sends `Shutdown`; the worker releases its optional Computer Use attachment
@@ -48,7 +48,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::activity;
-use super::opencode2_computer_use::{INSTRUCTION_KEY, OpenCode2ComputerUse};
+use super::opencode_computer_use::{INSTRUCTION_KEY, OpenCodeComputerUse};
 use super::support::{self, OpenCodePermissionRequest, OpenCodePermissionState};
 use crate::driver::{
     DriverControl, DriverEventSender, DriverEventSink, DriverStartOptions, SessionOptions,
@@ -59,12 +59,12 @@ use crate::model::{
     BackgroundWorkStatus, DriverEvent, PermissionOption, ProviderResumeCursor, ReportedCommand,
     RuntimeMode, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
-use crate::opencode2_api::{
+use crate::opencode_api::{
     self, ApiError, AssistantContent, Delivery, ForkRequestBoundary, FormAnswer, FormField,
     FormInfo, FormValue, MessageInfo, ModelRef, Order, PermissionReply, SessionOutcome, TokenUsage,
     ToolContent, ToolState,
 };
-use crate::opencode2_service::{self, HubFrame, Opencode2Service, Subscription};
+use crate::opencode_service::{self, HubFrame, OpenCodeService, Subscription};
 
 /// A one-shot user action posted onto the worker waits this long before Waku
 /// gives up on it. Comfortably past the API layer's own fork budget, so a slow
@@ -96,7 +96,7 @@ pub(super) trait ContextWindows {
     fn context_window(&self, key: &str) -> Option<u64>;
 }
 
-impl ContextWindows for Arc<Opencode2Service> {
+impl ContextWindows for Arc<OpenCodeService> {
     fn context_window(&self, key: &str) -> Option<u64> {
         self.model_context_window(key)
     }
@@ -324,7 +324,7 @@ impl StreamState {
 
 /// Everything the worker needs to talk back to the service and the app.
 struct Worker {
-    service: Arc<Opencode2Service>,
+    service: Arc<OpenCodeService>,
     session_id: String,
     /// The canonicalized workspace path, reused verbatim for `?directory=`:
     /// the server compares those by exact string equality.
@@ -336,14 +336,14 @@ struct Worker {
     skills: HashMap<String, String>,
     events: DriverEventSender,
     commands: Sender<DriverCommand>,
-    computer_use: Option<Arc<OpenCode2ComputerUse>>,
+    computer_use: Option<Arc<OpenCodeComputerUse>>,
 }
 
-pub(super) struct OpenCode2Driver {
+pub(super) struct OpenCodeDriver {
     /// The service object is permanent and this is never a lease over the
     /// user's process: nothing about dropping a driver can reach it.
     #[allow(dead_code)]
-    service: Arc<Opencode2Service>,
+    service: Arc<OpenCodeService>,
     /// Dropped before `Shutdown` is sent, so the hub stops fanning frames out
     /// to a worker that is on its way out.
     subscription: Option<Subscription>,
@@ -355,13 +355,13 @@ pub(super) struct OpenCode2Driver {
     mode: RuntimeMode,
     commands: Sender<DriverCommand>,
     supports_steer: bool,
-    computer_use: Option<Arc<OpenCode2ComputerUse>>,
+    computer_use: Option<Arc<OpenCodeComputerUse>>,
 }
 
-impl OpenCode2Driver {
+impl OpenCodeDriver {
     /// Runs on the daemon request thread. Blocking is allowed here, but every
     /// wait is bounded: discovery and the health probe live in
-    /// `opencode2_service`, and everything below is one local HTTP call.
+    /// `opencode_service`, and everything below is one local HTTP call.
     pub(super) fn start(
         options: DriverStartOptions,
         events: DriverEventSender,
@@ -380,12 +380,12 @@ impl OpenCode2Driver {
         } = options;
 
         let resumed = match provider_cursor {
-            Some(ProviderResumeCursor::OpenCode2 { session_id, .. }) => {
+            Some(ProviderResumeCursor::OpenCode { session_id, .. }) => {
                 (!session_id.is_empty()).then_some(session_id)
             }
             Some(cursor) => {
                 return Err(anyhow!(
-                    "cannot resume OpenCode 2 from a {} cursor",
+                    "cannot resume OpenCode from a {} cursor",
                     cursor.provider().display_name()
                 ));
             }
@@ -401,14 +401,14 @@ impl OpenCode2Driver {
         let directory = std::fs::canonicalize(&cwd)
             .with_context(|| {
                 format!(
-                    "OpenCode 2 needs a resolvable workspace directory, but {} could not be canonicalized",
+                    "OpenCode needs a resolvable workspace directory, but {} could not be canonicalized",
                     cwd.display()
                 )
             })?
             .to_string_lossy()
             .into_owned();
 
-        let service = opencode2_service::shared(&binary)?;
+        let service = opencode_service::shared(&binary)?;
         let endpoint = service.endpoint();
         let resuming = resumed.is_some();
         let session_id = resumed.unwrap_or_else(|| format!("ses_{}", Uuid::new_v4().simple()));
@@ -420,7 +420,7 @@ impl OpenCode2Driver {
         let frames = subscription.rx.clone();
 
         let agents = catalogue_or_report(
-            opencode2_api::list_agents(&endpoint, Some(&directory)),
+            opencode_api::list_agents(&endpoint, Some(&directory)),
             "agent",
             &events,
         );
@@ -429,24 +429,24 @@ impl OpenCode2Driver {
         let model = model_ref(model.as_deref(), reasoning_effort.as_deref());
 
         let create = || {
-            opencode2_api::create_session(
+            opencode_api::create_session(
                 &endpoint,
                 &session_id,
                 Some(&agent),
                 model.as_ref(),
                 &directory,
             )
-            .map_err(|error| anyhow!("could not open an OpenCode 2 session: {error}"))
+            .map_err(|error| anyhow!("could not open an OpenCode session: {error}"))
         };
         let session = match resuming {
             // A cursor can outlive the session it names — the user's own
             // client can delete it — so a resume that 404s starts fresh under
             // the same id rather than failing the task.
-            true => match opencode2_api::get_session(&endpoint, &session_id) {
+            true => match opencode_api::get_session(&endpoint, &session_id) {
                 Ok(session) => session,
                 Err(error) if error.is_not_found() => create()?,
                 Err(error) => {
-                    return Err(anyhow!("could not read the OpenCode 2 session: {error}"));
+                    return Err(anyhow!("could not read the OpenCode session: {error}"));
                 }
             },
             false => create()?,
@@ -459,7 +459,7 @@ impl OpenCode2Driver {
         let agent = if resuming {
             match requested_agent {
                 Some(_) if session.agent.as_deref() != Some(agent.as_str()) => {
-                    let _ = opencode2_api::switch_agent(&endpoint, &session_id, &agent);
+                    let _ = opencode_api::switch_agent(&endpoint, &session_id, &agent);
                     agent
                 }
                 _ => session.agent.clone().unwrap_or(agent),
@@ -471,17 +471,17 @@ impl OpenCode2Driver {
             && let Some(model) = model.as_ref()
             && session.model.as_ref() != Some(model)
         {
-            let _ = opencode2_api::switch_model(&endpoint, &session_id, model);
+            let _ = opencode_api::switch_model(&endpoint, &session_id, model);
         }
 
         let computer_use = if computer_use_enabled {
             let attached =
-                OpenCode2ComputerUse::start(&service, &directory, &session_id, events.clone());
+                OpenCodeComputerUse::start(&service, &directory, &session_id, events.clone());
             match attached {
                 Ok(runtime) => Some(Arc::new(runtime)),
                 Err(error) => {
                     if !resuming {
-                        let _ = opencode2_api::delete_session(&endpoint, &session_id);
+                        let _ = opencode_api::delete_session(&endpoint, &session_id);
                     }
                     return Err(error);
                 }
@@ -489,8 +489,7 @@ impl OpenCode2Driver {
         } else {
             // A resumed task may retain our instructions after an interrupted
             // host shutdown. Remove only Waku's own entry when disabled.
-            let _ =
-                opencode2_api::remove_instruction_entry(&endpoint, &session_id, INSTRUCTION_KEY);
+            let _ = opencode_api::remove_instruction_entry(&endpoint, &session_id, INSTRUCTION_KEY);
             None
         };
 
@@ -510,7 +509,7 @@ impl OpenCode2Driver {
         }
 
         let _ = events.send(DriverEvent::Connected {
-            provider_cursor: Some(ProviderResumeCursor::OpenCode2 {
+            provider_cursor: Some(ProviderResumeCursor::OpenCode {
                 session_id: session_id.clone(),
                 directory: Some(directory.clone()),
             }),
@@ -524,12 +523,12 @@ impl OpenCode2Driver {
         // indistinguishable from a route that no longer exists, and that is
         // exactly how the last round of API drift went unnoticed.
         let native_commands = catalogue_or_report(
-            opencode2_api::list_commands(&endpoint, Some(&directory)),
+            opencode_api::list_commands(&endpoint, Some(&directory)),
             "command",
             &events,
         );
         let skills = catalogue_or_report(
-            opencode2_api::list_skills(&endpoint, Some(&directory)),
+            opencode_api::list_skills(&endpoint, Some(&directory)),
             "skill",
             &events,
         );
@@ -560,7 +559,7 @@ impl OpenCode2Driver {
         let generation = service.generation();
         let mut state = StreamState::new(session_id.clone(), mode, session_model, generation);
         thread::Builder::new()
-            .name(format!("waku-opencode2-{session_id}"))
+            .name(format!("waku-opencode-{session_id}"))
             .spawn(move || {
                 // The snapshot runs in the same sequential position as the
                 // event loop, before a single frame is decoded. Deferring it
@@ -619,7 +618,7 @@ impl OpenCode2Driver {
     }
 }
 
-impl DriverControl for OpenCode2Driver {
+impl DriverControl for OpenCodeDriver {
     fn prompt(&self, prompt: String) {
         let _ = self.commands.send(DriverCommand::Prompt(prompt));
     }
@@ -686,14 +685,14 @@ impl DriverControl for OpenCode2Driver {
                 turns: turns_to_remove,
                 reply,
             })
-            .map_err(|_| anyhow!("the OpenCode 2 driver is shutting down"))?;
+            .map_err(|_| anyhow!("the OpenCode driver is shutting down"))?;
         answer
             .recv_timeout(ACTION_TIMEOUT)
-            .map_err(|_| anyhow!("OpenCode 2 did not answer the fork request"))?
+            .map_err(|_| anyhow!("OpenCode did not answer the fork request"))?
     }
 }
 
-impl Drop for OpenCode2Driver {
+impl Drop for OpenCodeDriver {
     fn drop(&mut self) {
         // No socket surgery, no process signal, no exit budget: the clean
         // consequence of owning no server. Unsubscribe first so the hub stops
@@ -731,10 +730,10 @@ fn model_ref(model: Option<&str>, reasoning_effort: Option<&str>) -> Option<Mode
 /// Waku's access modes do not name an agent — v2 has no read-only product mode
 /// in this tree — so the choice is the user's own preset when the service
 /// still lists it as a selectable primary, and `build` otherwise.
-fn resolve_agent(preset: Option<&str>, agents: &[opencode2_api::AgentInfo]) -> String {
+fn resolve_agent(preset: Option<&str>, agents: &[opencode_api::AgentInfo]) -> String {
     let selectable = |name: &str| {
         agents.iter().any(|agent| {
-            agent.id == name && !agent.hidden && agent.mode != opencode2_api::AgentMode::Subagent
+            agent.id == name && !agent.hidden && agent.mode != opencode_api::AgentMode::Subagent
         })
     };
     match preset {
@@ -772,7 +771,7 @@ fn context_tokens(tokens: &TokenUsage) -> Option<u64> {
 /// `None`, which the meter already degrades gracefully to.
 fn resumed_context_tokens(endpoint: &Endpoint, session_id: &str) -> Option<u64> {
     let Ok((messages, _)) =
-        opencode2_api::list_messages(endpoint, session_id, Order::Desc, Some(20), None)
+        opencode_api::list_messages(endpoint, session_id, Order::Desc, Some(20), None)
     else {
         return None;
     };
@@ -806,7 +805,7 @@ fn generated_title(title: Option<&str>) -> Option<String> {
 /// The session still starts: a missing catalogue costs one feature, while
 /// refusing to start would cost the task.
 fn catalogue_or_report<T>(
-    result: opencode2_api::Result<Vec<T>>,
+    result: opencode_api::Result<Vec<T>>,
     catalogue: &str,
     events: &impl DriverEventSink,
 ) -> Vec<T> {
@@ -815,7 +814,7 @@ fn catalogue_or_report<T>(
         Err(error) => {
             let _ = events.send(DriverEvent::Error(tr!(
                 "errors.provider_catalogue_unavailable",
-                provider = "OpenCode 2",
+                provider = "OpenCode",
                 catalogue = catalogue,
                 error = error
             )));
@@ -825,8 +824,8 @@ fn catalogue_or_report<T>(
 }
 
 fn reported_commands(
-    commands: Vec<opencode2_api::CommandInfo>,
-    skills: Vec<opencode2_api::SkillInfo>,
+    commands: Vec<opencode_api::CommandInfo>,
+    skills: Vec<opencode_api::SkillInfo>,
 ) -> Vec<ReportedCommand> {
     let mut seen = HashSet::new();
     commands
@@ -922,25 +921,17 @@ fn submit_prompt(
     endpoint: &Endpoint,
     text: &str,
     delivery: Option<Delivery>,
-) -> Result<Option<opencode2_api::InboxUser>, ApiError> {
+) -> Result<Option<opencode_api::InboxUser>, ApiError> {
     if let Some(computer_use) = worker.computer_use.as_ref() {
         computer_use.ensure_connected().map_err(ApiError::from)?;
     }
     if let Some((name, arguments)) = native_command_invocation(text, &worker.command_names) {
-        opencode2_api::command(endpoint, &worker.session_id, name, arguments, delivery)
-            .map(|_| None)
+        opencode_api::command(endpoint, &worker.session_id, name, arguments, delivery).map(|_| None)
     } else if let Some((id, name, arguments)) = skill_invocation(text, &worker.skills) {
-        opencode2_api::prompt_with_skill(
-            endpoint,
-            &worker.session_id,
-            arguments,
-            id,
-            name,
-            delivery,
-        )
-        .map(Some)
+        opencode_api::prompt_with_skill(endpoint, &worker.session_id, arguments, id, name, delivery)
+            .map(Some)
     } else {
-        opencode2_api::prompt(endpoint, &worker.session_id, text, delivery).map(Some)
+        opencode_api::prompt(endpoint, &worker.session_id, text, delivery).map(Some)
     }
 }
 
@@ -964,7 +955,7 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
                 Err(error) => {
                     let _ = events.send(DriverEvent::Error(tr!(
                         "errors.provider_rejected_prompt_detail",
-                        provider = "OpenCode 2",
+                        provider = "OpenCode",
                         error = error
                     )));
                     // `session.idle` never arrives for a turn that never
@@ -973,10 +964,7 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
                         events,
                         Some(TurnOutcome {
                             success: false,
-                            summary: Some(tr!(
-                                "errors.provider_start_turn",
-                                provider = "OpenCode 2"
-                            )),
+                            summary: Some(tr!("errors.provider_start_turn", provider = "OpenCode")),
                         }),
                     );
                 }
@@ -986,7 +974,7 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
             if matches!(state.turn, TurnState::Idle) {
                 let _ = events.send(DriverEvent::SteerRejected {
                     message: text,
-                    reason: tr!("errors.provider_no_active_turn", provider = "OpenCode 2"),
+                    reason: tr!("errors.provider_no_active_turn", provider = "OpenCode"),
                 });
                 return true;
             }
@@ -995,8 +983,7 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
                     // A server that queued the message anyway is promoted, so
                     // "steer" means the same thing on both paths.
                     if inbox.delivery != Delivery::Steer {
-                        let _ =
-                            opencode2_api::steer_inbox(&endpoint, &worker.session_id, &inbox.id);
+                        let _ = opencode_api::steer_inbox(&endpoint, &worker.session_id, &inbox.id);
                     }
                     state.pending_input = Some(PendingInput {
                         inbox_id: inbox.id,
@@ -1015,7 +1002,7 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
                         message: text,
                         reason: tr!(
                             "errors.provider_rejected_steer",
-                            provider = "OpenCode 2",
+                            provider = "OpenCode",
                             error = error
                         ),
                     });
@@ -1023,10 +1010,10 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
             }
         }
         DriverCommand::Cancel => {
-            if let Err(error) = opencode2_api::interrupt(&endpoint, &worker.session_id) {
+            if let Err(error) = opencode_api::interrupt(&endpoint, &worker.session_id) {
                 let _ = events.send(DriverEvent::Error(tr!(
                     "errors.stop_provider",
-                    provider = "OpenCode 2",
+                    provider = "OpenCode",
                     error = error
                 )));
             }
@@ -1036,14 +1023,14 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
             option_id,
         } => {
             for (request_id, option_id) in
-                support::permission_responses_in(&mut state.permissions, &request_id, &option_id)
+                support::permission_responses(&mut state.permissions, &request_id, &option_id)
             {
                 let reply = match option_id.as_str() {
                     "reject" => PermissionReply::Reject,
                     // Never `always`: see the module doc.
                     _ => PermissionReply::Once,
                 };
-                if let Err(error) = opencode2_api::reply_permission(
+                if let Err(error) = opencode_api::reply_permission(
                     &endpoint,
                     &worker.session_id,
                     &request_id,
@@ -1051,7 +1038,7 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
                 ) {
                     let _ = events.send(DriverEvent::Error(tr!(
                         "errors.answer_provider_permission",
-                        provider = "OpenCode 2",
+                        provider = "OpenCode",
                         error = error
                     )));
                 }
@@ -1066,11 +1053,11 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
             };
             let answer = form_answer(&fields, &answers);
             if let Err(error) =
-                opencode2_api::reply_form(&endpoint, &worker.session_id, &request_id, &answer)
+                opencode_api::reply_form(&endpoint, &worker.session_id, &request_id, &answer)
             {
                 let _ = events.send(DriverEvent::Error(tr!(
                     "errors.answer_provider_question",
-                    provider = "OpenCode 2",
+                    provider = "OpenCode",
                     error = error
                 )));
             }
@@ -1099,7 +1086,7 @@ fn apply_options(
     );
     if model != state.model
         && let Some(model) = model.as_ref()
-        && opencode2_api::switch_model(endpoint, &worker.session_id, model).is_err()
+        && opencode_api::switch_model(endpoint, &worker.session_id, model).is_err()
     {
         return false;
     }
@@ -1123,7 +1110,7 @@ fn fork_session(
         .checked_sub(turns_to_remove)
         .ok_or_else(|| {
             anyhow!(
-                "OpenCode 2 has only {} native turns, but Waku needs to remove {turns_to_remove}",
+                "OpenCode has only {} native turns, but Waku needs to remove {turns_to_remove}",
                 user_messages.len()
             )
         })?;
@@ -1133,9 +1120,9 @@ fn fork_session(
         },
         None => ForkRequestBoundary::Through,
     };
-    let fork = opencode2_api::fork(endpoint, &worker.session_id, &boundary)
-        .map_err(|error| anyhow!("could not fork the OpenCode 2 session: {error}"))?;
-    Ok(ProviderResumeCursor::OpenCode2 {
+    let fork = opencode_api::fork(endpoint, &worker.session_id, &boundary)
+        .map_err(|error| anyhow!("could not fork the OpenCode session: {error}"))?;
+    Ok(ProviderResumeCursor::OpenCode {
         session_id: fork.id,
         directory: Some(worker.directory.clone()),
     })
@@ -1148,8 +1135,8 @@ fn user_message_ids(endpoint: &Endpoint, session_id: &str) -> anyhow::Result<Vec
         // Ascending: the server defaults to `desc` on `/message`, and a fork
         // boundary is meaningless without conversation order.
         let (messages, next) =
-            opencode2_api::list_messages(endpoint, session_id, Order::Asc, None, cursor.as_deref())
-                .map_err(|error| anyhow!("could not read the OpenCode 2 transcript: {error}"))?;
+            opencode_api::list_messages(endpoint, session_id, Order::Asc, None, cursor.as_deref())
+                .map_err(|error| anyhow!("could not read the OpenCode transcript: {error}"))?;
         for message in &messages {
             if let MessageInfo::User { id, .. } = message {
                 ids.push(id.clone());
@@ -1178,13 +1165,13 @@ fn reconcile(worker: &Worker, state: &mut StreamState, generation: u64) {
     let endpoint = worker.service.endpoint();
     let events = &worker.events;
 
-    let session = match opencode2_api::get_session(&endpoint, &worker.session_id) {
+    let session = match opencode_api::get_session(&endpoint, &worker.session_id) {
         Ok(session) => Some(session),
         Err(error) if error.is_not_found() => {
             // A foreign client deleting this session is authoritative.
             let _ = events.send(DriverEvent::Error(tr!(
                 "errors.provider_reported_error",
-                provider = "OpenCode 2"
+                provider = "OpenCode"
             )));
             let _ = events.send(DriverEvent::ProcessExited);
             return;
@@ -1215,7 +1202,7 @@ fn reconcile(worker: &Worker, state: &mut StreamState, generation: u64) {
     // resumed turn is live, and the three-state dedupe absorbs the overlap
     // with frames already buffered in the hub channel.
     let mut blocked = false;
-    if let Ok(pending) = opencode2_api::list_permissions(&endpoint, &worker.session_id) {
+    if let Ok(pending) = opencode_api::list_permissions(&endpoint, &worker.session_id) {
         blocked = !pending.is_empty();
         for request in pending {
             // `PermissionRequest` is a read type; the decoder wants the wire
@@ -1230,13 +1217,13 @@ fn reconcile(worker: &Worker, state: &mut StreamState, generation: u64) {
             request_permission(&value, state, events, &worker.commands);
         }
     }
-    if let Ok(forms) = opencode2_api::list_forms(&endpoint, &worker.session_id) {
+    if let Ok(forms) = opencode_api::list_forms(&endpoint, &worker.session_id) {
         blocked = blocked || !forms.is_empty();
         for form in forms {
             surface_form(form, state, events);
         }
     }
-    if let Ok(inbox) = opencode2_api::list_inbox(&endpoint, &worker.session_id) {
+    if let Ok(inbox) = opencode_api::list_inbox(&endpoint, &worker.session_id) {
         let undelivered = state.pending_input.as_ref().is_some_and(|pending| {
             inbox
                 .iter()
@@ -1247,7 +1234,7 @@ fn reconcile(worker: &Worker, state: &mut StreamState, generation: u64) {
         }
     }
 
-    let draining = opencode2_api::active_sessions(&endpoint)
+    let draining = opencode_api::active_sessions(&endpoint)
         .map(|active| active.contains(&worker.session_id))
         .unwrap_or(false);
     if draining || blocked {
@@ -1276,7 +1263,7 @@ fn gap_fill(endpoint: &Endpoint, worker: &Worker, state: &mut StreamState) {
         return;
     };
     let Ok((messages, _)) =
-        opencode2_api::list_messages(endpoint, &worker.session_id, Order::Desc, Some(1), None)
+        opencode_api::list_messages(endpoint, &worker.session_id, Order::Desc, Some(1), None)
     else {
         return;
     };
@@ -1594,7 +1581,7 @@ fn handle_event(
             if pending.steer {
                 let _ = events.send(DriverEvent::SteerRejected {
                     message: pending.message.clone(),
-                    reason: tr!("errors.provider_rejected_prompt", provider = "OpenCode 2"),
+                    reason: tr!("errors.provider_rejected_prompt", provider = "OpenCode"),
                 });
             }
             state.pending_input = None;
@@ -1717,7 +1704,7 @@ fn handle_event(
         "session.deleted" => {
             let _ = events.send(DriverEvent::Error(tr!(
                 "errors.provider_reported_error",
-                provider = "OpenCode 2"
+                provider = "OpenCode"
             )));
             // Terminal, and always last: the runtime is not reinserted after
             // it.
@@ -1800,7 +1787,7 @@ fn error_message(error: Option<&Value>) -> String {
                 .or_else(|| error.as_str())
         })
         .map(str::to_owned)
-        .unwrap_or_else(|| tr!("errors.provider_reported_error", provider = "OpenCode 2"))
+        .unwrap_or_else(|| tr!("errors.provider_reported_error", provider = "OpenCode"))
 }
 
 fn emit_usage(
@@ -1944,7 +1931,7 @@ fn emit_tool(
     if let Some((server, tool)) = slot
         .tool_name
         .as_deref()
-        .and_then(super::opencode2_computer_use::tool_identity)
+        .and_then(super::opencode_computer_use::tool_identity)
     {
         item = item
             .with_tool_name(Some(tool))
@@ -2185,7 +2172,7 @@ fn field_key(field: &FormField) -> Option<&str> {
     }
 }
 
-fn field_options(field: &FormField) -> &[opencode2_api::FormOption] {
+fn field_options(field: &FormField) -> &[opencode_api::FormOption] {
     match field {
         FormField::String { options, .. } => options.as_deref().unwrap_or_default(),
         FormField::Multiselect { options, .. } => options,
@@ -2649,7 +2636,7 @@ mod tests {
         assert!(harness.issued.try_recv().is_err());
 
         assert_eq!(
-            support::permission_responses_in(&mut harness.state.permissions, "per_abc", "always"),
+            support::permission_responses(&mut harness.state.permissions, "per_abc", "always"),
             [("per_abc".to_owned(), "once".to_owned())],
             "a durable choice must never go on the wire"
         );
@@ -2964,19 +2951,19 @@ mod tests {
     #[test]
     fn only_selectable_primary_agents_override_the_build_default() {
         let agents = vec![
-            opencode2_api::AgentInfo {
+            opencode_api::AgentInfo {
                 id: "plan".into(),
                 name: "Plan".into(),
                 description: None,
-                mode: opencode2_api::AgentMode::Primary,
+                mode: opencode_api::AgentMode::Primary,
                 hidden: false,
                 model: None,
             },
-            opencode2_api::AgentInfo {
+            opencode_api::AgentInfo {
                 id: "title".into(),
                 name: "Title".into(),
                 description: None,
-                mode: opencode2_api::AgentMode::Primary,
+                mode: opencode_api::AgentMode::Primary,
                 hidden: true,
                 model: None,
             },
@@ -2991,18 +2978,18 @@ mod tests {
     #[test]
     fn reported_commands_are_the_registered_names_and_skills() {
         let reported = reported_commands(
-            vec![opencode2_api::CommandInfo {
+            vec![opencode_api::CommandInfo {
                 name: "review".into(),
                 description: Some("Review the diff".into()),
             }],
             vec![
-                opencode2_api::SkillInfo {
+                opencode_api::SkillInfo {
                     id: "report".into(),
                     name: "Report".into(),
                     description: Some("File an issue".into()),
                 },
                 // A skill with no description still needs a readable row.
-                opencode2_api::SkillInfo {
+                opencode_api::SkillInfo {
                     id: "opencode".into(),
                     name: "OpenCode".into(),
                     description: None,
@@ -3070,18 +3057,18 @@ mod tests {
         );
         assert_eq!(generated_title(Some("  ")), None);
         assert_eq!(
-            generated_title(Some("Wire OpenCode 2")).as_deref(),
-            Some("Wire OpenCode 2")
+            generated_title(Some("Wire OpenCode")).as_deref(),
+            Some("Wire OpenCode")
         );
     }
 
     /// Drives a real service through the real driver.
     #[test]
-    fn opencode2_session_against_the_adopted_service() {
+    fn opencode_session_against_the_adopted_service() {
         let binary = crate::live_service::binary();
         let live = crate::live_service::service();
         let (events, event_rx) = crate::driver::test_event_channel();
-        let driver = OpenCode2Driver::start(
+        let driver = OpenCodeDriver::start(
             DriverStartOptions {
                 binary,
                 cwd: live.workspace.clone(),
@@ -3103,13 +3090,13 @@ mod tests {
             .expect("the driver should report its cursor");
         let DriverEvent::Connected {
             provider_cursor:
-                Some(ProviderResumeCursor::OpenCode2 {
+                Some(ProviderResumeCursor::OpenCode {
                     session_id,
                     directory,
                 }),
         } = connected
         else {
-            panic!("expected an OpenCode 2 cursor, got {connected:?}");
+            panic!("expected an OpenCode cursor, got {connected:?}");
         };
         assert!(session_id.starts_with("ses_"));
         assert!(directory.is_some_and(|directory| !directory.ends_with('/')));
@@ -3119,24 +3106,24 @@ mod tests {
     /// Nonvisual integration check: only reads Cua configuration and emits a
     /// synthetic image. Requires the signed app through WAKU_APP_EXECUTABLE.
     #[test]
-    #[ignore = "requires a configured OpenCode 2 model and a packaged Waku app"]
-    fn opencode2_computer_use_against_the_adopted_service() {
+    #[ignore = "requires a configured OpenCode model and a packaged Waku app"]
+    fn opencode_computer_use_against_the_adopted_service() {
         struct Cleanup {
-            service: Arc<Opencode2Service>,
+            service: Arc<OpenCodeService>,
             sessions: Vec<String>,
             directory: std::path::PathBuf,
         }
         impl Drop for Cleanup {
             fn drop(&mut self) {
                 for session in &self.sessions {
-                    let _ = opencode2_api::delete_session(&self.service.endpoint(), session);
+                    let _ = opencode_api::delete_session(&self.service.endpoint(), session);
                 }
                 let _ = std::fs::remove_dir_all(&self.directory);
             }
         }
-        let binary = crate::command_env::find_executable("opencode2").unwrap();
-        let service = opencode2_service::shared(&binary).unwrap();
-        let directory = std::env::temp_dir().join(format!("waku-opencode2-cua-{}", Uuid::new_v4()));
+        let binary = crate::command_env::find_executable("opencode").unwrap();
+        let service = opencode_service::shared(&binary).unwrap();
+        let directory = std::env::temp_dir().join(format!("waku-opencode-cua-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let mut cleanup = Cleanup {
             service,
@@ -3146,7 +3133,7 @@ mod tests {
         let test_directory = cleanup.directory.clone();
         let start = || {
             let (events, received) = crate::driver::test_event_channel();
-            let driver = OpenCode2Driver::start(
+            let driver = OpenCodeDriver::start(
                 DriverStartOptions {
                     binary: binary.clone(),
                     cwd: test_directory.clone(),
@@ -3172,7 +3159,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let servers = opencode2_api::list_mcp(&cleanup.service.endpoint(), &directory).unwrap();
+        let servers = opencode_api::list_mcp(&cleanup.service.endpoint(), &directory).unwrap();
         let owned: Vec<_> = servers
             .iter()
             .filter(|server| {
@@ -3187,7 +3174,7 @@ mod tests {
             "one connection should serve both Waku tasks"
         );
         let server = owned[0]["name"].as_str().unwrap();
-        let run = |driver: &OpenCode2Driver, events: &Receiver<DriverEvent>, code: &str| {
+        let run = |driver: &OpenCodeDriver, events: &Receiver<DriverEvent>, code: &str| {
             events.try_iter().for_each(drop);
             driver.prompt(format!("Integration test. Call the js tool on MCP server {server} exactly once with this JavaScript, then reply Done. Do not perform any other operations.\n\n{code}"));
             let deadline = std::time::Instant::now() + Duration::from_secs(120);
@@ -3195,7 +3182,7 @@ mod tests {
             loop {
                 let event = events
                     .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                    .expect("OpenCode 2 integration turn timed out");
+                    .expect("OpenCode integration turn timed out");
                 match event {
                     DriverEvent::RichActivity(item)
                         if item.complete && item.mcp_server.as_deref() == Some(server) =>
@@ -3206,7 +3193,7 @@ mod tests {
                         assert!(success);
                         break;
                     }
-                    DriverEvent::Error(error) => panic!("OpenCode 2 integration failed: {error}"),
+                    DriverEvent::Error(error) => panic!("OpenCode integration failed: {error}"),
                     _ => {}
                 }
             }
@@ -3265,7 +3252,7 @@ mod tests {
         drop(b);
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
-            let servers = opencode2_api::list_mcp(&cleanup.service.endpoint(), &directory).unwrap();
+            let servers = opencode_api::list_mcp(&cleanup.service.endpoint(), &directory).unwrap();
             if servers.iter().all(|entry| entry["name"] != server) {
                 break;
             }

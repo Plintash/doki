@@ -46,9 +46,9 @@ and Linux use Cua's native overlay thread. Cursor movement, action animations,
 themes, and reduced-motion handling use the same implementation as standalone
 Cua Driver. Headless hosts still report unavailable graphics facilities.
 
-## OpenCode 2
+## OpenCode
 
-OpenCode 2 uses the existing shared service. Waku registers one temporary MCP
+OpenCode uses the existing shared service. Waku registers one temporary MCP
 connection per workspace through `/api/experimental/mcp` and attaches a session
 instruction entry through
 `/api/experimental/session/{id}/instructions/entries/{key}` (OpenCode limits

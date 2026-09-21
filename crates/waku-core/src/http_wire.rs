@@ -1,9 +1,9 @@
 //! Minimal blocking HTTP/1.1 and server-sent-event wire shared by the OpenCode
-//! providers.
+//! provider and the DeepSeek Harness session.
 //!
-//! Both OpenCode majors are driven over a local HTTP server rather than stdio,
-//! and both hit the same two traps, so the wire lives here once instead of
-//! being copied per major:
+//! OpenCode is driven over a local HTTP server rather than stdio, and both
+//! callers hit the same two traps, so the wire lives here once instead of
+//! being copied per caller:
 //!
 //! * A keep-alive server never EOFs, so response completion is detected at the
 //!   protocol's own body boundary (`Content-Length` or the terminating chunk).
@@ -39,7 +39,8 @@ pub(crate) struct Endpoint {
 }
 
 impl Endpoint {
-    /// An unauthenticated loopback server, as OpenCode v1 serves.
+    /// An unauthenticated loopback server: what a local agent server serves
+    /// before it has issued a credential, and what the wire tests stand up.
     pub(crate) fn local(port: u16) -> Self {
         Self {
             host: "127.0.0.1".to_owned(),
@@ -75,7 +76,7 @@ impl Endpoint {
 /// Sends one request and returns the decoded JSON body.
 ///
 /// A 204/205/304 — or any empty success body — answers `Value::Null`, matching
-/// what routes like OpenCode v1's `prompt_async` return.
+/// what routes that acknowledge without content return.
 pub(crate) fn request_json(
     endpoint: &Endpoint,
     method: &str,
@@ -90,6 +91,32 @@ pub(crate) fn request_json(
     }
     serde_json::from_slice(&response)
         .with_context(|| format!("OpenCode returned invalid JSON for {method} {path}"))
+}
+
+/// Sends one request to a server identified by port alone. A caller that must
+/// not keep the server alive (it only unblocks when the server exits) holds
+/// the port instead of a handle and requests through this.
+pub(crate) fn request_json_on_port(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    request_json(&Endpoint::local(port), method, path, body, timeout)
+}
+
+/// Percent-encodes one path segment, leaving the unreserved set alone.
+pub(crate) fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 pub(crate) fn http_request(
@@ -394,7 +421,7 @@ pub(crate) fn open_event_stream(
 pub(crate) enum SseFrame {
     /// A frame with only `data:` lines, which is every ordinary event.
     Data(String),
-    /// A frame carrying an `event:` field. OpenCode 2 uses this solely to
+    /// A frame carrying an `event:` field. OpenCode uses this solely to
     /// report that the stream itself failed
     /// (`event: effect/httpapi/stream/failure`), so a reader that ignores the
     /// field sits blind on a dead stream until its read timeout fires.
