@@ -2,15 +2,22 @@
 
 ## Why
 
-The OpenCode 2 provider was written against the first spelling of a preview API
+The OpenCode provider was written against the first spelling of a preview API
 that then moved under it, and every move fails quietly. The identity route alone
 went `/api/health` → `/api/server` → `/api/status` → `/api/info` inside a
-fortnight, and the probe hard-coded the first one: on a current 2.0.10 build it
-answers 404 and **no OpenCode 2 task can start at all**, while the provider still
-looks like an ordinary choice in the picker. The same drift took the prompt
-answer's shape, reshaped the session routes at 2.0.4, and removed the member
-`/api/skill` used to mark a skill user-invocable, so even a provider that
-launched would lose its palette and its model list without saying so.
+fortnight, and the probe hard-coded the first one: on the current 2.x CLI it
+answers 404 and **no OpenCode task can start**, while the provider still looks
+like an ordinary choice in the picker. The same drift took the prompt answer's
+shape, reshaped the session routes at 2.0.4, and removed the member `/api/skill`
+used to mark a skill user-invocable, so even a provider that launched would lose
+its palette and its model list without saying so.
+
+At the same time Waku carried two OpenCode entries while the CLI only ever
+installs one name: the preview shipped `opencode2`, while the npm, zip and
+Homebrew channels install `opencode`, which is also OpenCode 1's name. A machine
+could therefore list two provider rows for one binary, one of them broken. The
+two lines cannot coexist either — v1's `serve` takes no `--service` and speaks a
+different API — and the current line is where the CLI is going.
 
 The repair exists (branch `fix/opencode-v2-stable`), but nothing in the repo
 states what the provider must do. That absence is how the drift went unnoticed:
@@ -20,11 +27,17 @@ happened to have running.
 
 ## What Changes
 
-- **Identity and launch** — identify with `GET /api/info` and its pid check, and
-  accept the CLI as `opencode2` or as `opencode` only when that binary reports a
-  2.x version, because Homebrew and the standalone zip install the second name
-  and OpenCode 1 uses it too. Nothing branches on the reported version: the
-  route either answers or it does not.
+- **One entry, the current line** — `OpenCode` is the only OpenCode in the
+  provider list. The OpenCode 1 transport is deleted (its resident-server pool,
+  session import and fork, driver, filesystem catalogue scanning and
+  `models --verbose` discovery); the wire enums, the generated TypeScript and
+  the apps carry a single `openCode`; and state written under the retired tag
+  still decodes. The `opencode` binary is accepted only when it reports a 2.x
+  version, so a machine with OpenCode 1 alone sees the provider as absent rather
+  than broken.
+- **Identity and launch** — identify with `GET /api/info` and its pid check
+  against the descriptor the service itself publishes. Nothing branches on the
+  reported version: the route either answers or it does not.
 - **Prompt and session shape** — decode the prompt answer
   `{id, sessionID, time: {created}, type, payload, delivery}`; rename by
   patching the session; change a pending message's delivery by patching that
@@ -41,23 +54,20 @@ happened to have running.
   harness starts on an ephemeral port with its own XDG tree, through the
   production discovery path, so a route that moves fails the suite rather than
   the user.
-- **Landing** — rebase the branch onto `main` and record the change in
-  `CHANGELOG.md`.
+- **Landing** — rebase onto `main` and record the change in `CHANGELOG.md`.
 
-**BREAKING**: a preview-era 2.x build is no longer driven. Its routes are gone
-from the current line, and rather than carrying a branch per channel — which
-would be stale within days — Waku drives what the service answers today and
-refuses the rest by failing to identify it. OpenCode 1 keeps its own transport
-and is unaffected.
+**BREAKING**: OpenCode 1 is no longer supported, and neither is a preview-era
+2.x build. The CLI's name is shared between the lines; the API is not, and Waku
+will not half-drive a build whose routes have moved.
 
 ## Capabilities
 
 ### New Capabilities
 
-- `opencode2-provider`: what Waku's OpenCode 2 transport must do — adopt the
-  user's own background service without signalling it, identify what it finds
-  and refuse what it cannot drive, decode the current routes and event stream
-  into the driver contract, and read the service's location-scoped catalogues.
+- `opencode-provider`: what Waku's OpenCode transport must do — adopt the user's
+  own background service without signalling it, identify what it finds and
+  refuse what it cannot drive, decode the current routes and event stream into
+  the driver contract, and read the service's location-scoped catalogues.
 
 ### Modified Capabilities
 
@@ -65,14 +75,17 @@ and is unaffected.
 
 ## Impact
 
-- **Code**: `crates/waku-core/src/opencode2_api.rs`,
-  `opencode2_service.rs`, `opencode2_session.rs`, `live_service.rs`,
-  `model.rs`, `slash_command_catalog.rs`,
-  `driver/opencode2.rs`, `driver/opencode2_computer_use.rs`; docs
-  `docs/providers.md` and `docs/computer-use.md`; one new error string in
-  `locales/app.yml`.
-- **Compatibility**: the provider refuses builds whose routes have moved, as
-  above; the OpenCode 1 provider keeps its own server pool and is untouched. A
-  machine that has only OpenCode 1 never advertises it as OpenCode 2.
-- **Status**: implemented on `fix/opencode-v2-stable` (`c05a52d` aligns the API,
-  `b3e4695` settles a cold location); not yet on `main`.
+- **Code**: `crates/waku-core/src/opencode_api.rs`, `opencode_service.rs`,
+  `opencode_session.rs`, `live_service.rs`, `model.rs`, `model_catalog.rs`,
+  `slash_command_catalog.rs`, `composer_complete.rs`, `git_commit.rs`,
+  `daemon.rs`, `driver/opencode.rs`, `driver/opencode_computer_use.rs`,
+  `driver/support.rs`; docs `providers.md`, `computer-use.md`,
+  `commit-messages.md`; the provider icon set and the locale keyword lists.
+- **Wire and state**: `ProviderKind` and `ProviderResumeCursor` lose their
+  `openCode2` members, `packages/waku-client`'s generated types are regenerated,
+  and the apps carry one OpenCode entry. Sessions, cursors and settings written
+  while both lines existed still decode through a serde alias.
+- **Removed**: `driver/opencode.rs` (v1), `opencode_pool.rs`,
+  `opencode_session.rs` (v1), the OpenCode 1 Computer Use path, the
+  `opencode2` binary alias, and the second provider icon.
+- **Status**: implemented on `fix/opencode-v2-stable`; not yet on `main`.

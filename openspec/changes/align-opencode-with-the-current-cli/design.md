@@ -5,10 +5,13 @@
 See [proposal.md](proposal.md) for motivation. The constraints that shape the
 approach:
 
-- **Waku does not own the process.** OpenCode 2 is one background service the
+- **Waku does not own the process.** OpenCode is one background service the
   user's own terminal usually started first, and its CLI's own `serve --service`
   is idempotent against a healthy incumbent. It is discovered through a
   descriptor in the user's state directory that the service itself watches.
+- **One CLI name, two incompatible lines.** Every channel installs `opencode`:
+  the v2 line and the retired v1 line, whose `serve` takes no `--service` and
+  whose API is a different one. Nothing can tell them apart before asking.
 - **The API moves between builds.** The identity route relocated four times
   inside a fortnight, the prompt answer changed shape, and the session routes
   were reshaped at 2.0.4. Anything written against one build decays.
@@ -24,10 +27,10 @@ approach:
   `#[ignore]`d and pointed at whatever service was running, which is why the
   drift went in unnoticed.
 
-The branch's layering, which this change keeps: `opencode2_service` owns
-discovery, adoption and lifetime; `opencode2_api` is typed route bindings that
-know nothing about ownership; `opencode2_session` reads session history off the
-service; `driver/opencode2.rs` holds the session, the subscription and the
+The branch's layering, which this change keeps: `opencode_service` owns
+discovery, adoption and lifetime; `opencode_api` is typed route bindings that
+know nothing about ownership; `opencode_session` reads session history off the
+service; `driver/opencode.rs` holds the session, the subscription and the
 stream; `live_service` is the test harness.
 
 ## Goals / Non-Goals
@@ -48,9 +51,20 @@ stream; `live_service` is the test harness.
   descriptor, no signalling.
 - Subagent child transcripts; only the parent's tool row and its synthetic note
   are rendered.
-- Changing the OpenCode 1 provider, which keeps its own resident-server pool.
+- Replacing or emulating OpenCode 1. Its transport is deleted rather than kept
+  behind the same entry: two incompatible APIs behind one name is what produced
+  two broken provider rows in the first place.
 
 ## Decisions
+
+**One entry, one line.** The provider list holds a single `OpenCode`, and it
+speaks the current line only. Two entries could not work — Homebrew and the zip
+install the same `opencode` binary for v2 that v1 also uses, so both rows
+detected the same CLI and one of them was always wrong — and hiding two
+transports behind one row would only move the ambiguity into a version branch
+that decays as fast as the API does. The binary is accepted only when it reports
+a 2.x version, which turns "OpenCode 1 is installed" into an honest absence
+rather than a session that fails at start.
 
 **Adopt the service; start one only for a task.** A per-session process would
 contend with the user's own terminal for the same local resources and would lose
@@ -115,17 +129,21 @@ Waku canonicalizes once and reuses that string for creation and every read.
   saved-permission store) are both explicitly not written to.
 - **An unchecked provider is not noticed** → the live tests are not ignored and
   cover the startup path plus every route the provider calls.
+- **Dropping OpenCode 1 strands its users** → it is a visible absence in the
+  provider list rather than a session that fails at start, the CHANGELOG entry
+  says so, and the two lines could not have coexisted on one binary anyway.
 
 ## Migration Plan
 
-- The implementation is the branch `fix/opencode-v2-stable` (`c05a52d` aligns
-  the API, `b3e4695` settles a cold location). `main` has not touched the
-  OpenCode 2 files since the branch's base, and the only file both sides change
-  is `locales/app.yml`, where the two insert at different points, so the rebase
-  is expected to apply cleanly.
-- Rollback is reverting the merge: the provider is chosen per session, and
-  OpenCode 1 keeps its own transport, so nothing else depends on it.
-- A CHANGELOG entry records the provider fix for users of the released app.
+- The implementation is the branch `fix/opencode-v2-stable`: the API alignment,
+  the cold-location settle, and the collapse to one provider. State written
+  while both lines existed keeps decoding — `ProviderKind` and
+  `ProviderResumeCursor` carry a serde alias for the retired tag, so a stored
+  session resumes with the `directory` its cursor already held and no database
+  rewrite is needed.
+- Rollback is reverting the merge. The provider is one entry either way, and
+  nothing outside the OpenCode code paths depends on the removed transport.
+- A CHANGELOG entry records the new provider for users of the released app.
 
 ## Open Questions
 

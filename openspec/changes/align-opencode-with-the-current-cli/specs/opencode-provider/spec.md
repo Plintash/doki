@@ -1,8 +1,8 @@
-# opencode2-provider
+# opencode-provider
 
 ## Purpose
 
-Drive the OpenCode 2 background service the user already runs — adopting its
+Drive the OpenCode background service the user already runs — adopting its
 process, speaking its current HTTP and event API, and reading its
 location-scoped catalogues — without ever becoming its owner.
 
@@ -10,7 +10,7 @@ location-scoped catalogues — without ever becoming its owner.
 
 ### Requirement: Adopt the user's own service, never own it
 
-Waku SHALL discover OpenCode 2 through the service descriptor the CLI publishes
+Waku SHALL discover OpenCode through the service descriptor the CLI publishes
 in the user's state directory, and SHALL read that descriptor read-only: the
 service watches the file and self-terminates when it changes, so repairing or
 rewriting it would kill the user's daemon. Teardown SHALL stop at cancelling
@@ -38,10 +38,10 @@ the same service.
 
 Waku SHALL identify a service through the current identity route and SHALL
 accept it only when the process it reports matches the descriptor it was found
-through. The CLI SHALL be taken as `opencode2`, or as `opencode` when that
-binary reports a 2.x version, because the second name is also OpenCode 1's. A
-machine with only OpenCode 1 MUST NOT advertise it as OpenCode 2. Waku MUST NOT
-branch on the reported version: either the routes answer or the build is
+through. The CLI SHALL be taken as `opencode` and accepted only when it reports
+a 2.x version, because that name is also the retired OpenCode 1 line's. A
+machine with only OpenCode 1 MUST NOT offer the provider as installed. Waku MUST
+NOT branch on the reported version: either the routes answer or the build is
 refused with an error that names the service.
 
 #### Scenario: A descriptor for another process is not adoption
@@ -54,10 +54,33 @@ refused with an error that names the service.
 - **WHEN** the identity route does not answer
 - **THEN** the provider reports the failure instead of starting a session or silently degrading
 
-#### Scenario: OpenCode 1 is not offered as OpenCode 2
+#### Scenario: OpenCode 1 is not offered at all
 
 - **WHEN** only OpenCode 1's `opencode` binary is installed
-- **THEN** the OpenCode 2 provider reports itself as not installed
+- **THEN** the provider reports itself as not installed
+
+### Requirement: One provider entry, the current line only
+
+The provider list SHALL contain exactly one OpenCode entry, named OpenCode, and
+it SHALL drive the current CLI line only: the retired OpenCode 1 transport MUST
+NOT be reachable in any build. A session, cursor or setting written under the
+retired name while Waku exposed both lines SHALL still decode and resume, so an
+upgrade never strands a conversation.
+
+#### Scenario: One row, one OpenCode
+
+- **WHEN** the provider list is built
+- **THEN** OpenCode appears exactly once, and every OpenCode surface — session list, model picker, palette, icon, wire enum — names the same provider
+
+#### Scenario: State from the two-entry era still opens
+
+- **WHEN** a stored session or resume cursor carries the retired OpenCode name
+- **THEN** it decodes as the OpenCode provider and resumes with the workspace its cursor recorded
+
+#### Scenario: Sessions never use the retired protocol
+
+- **WHEN** the provider starts a session
+- **THEN** it speaks the current service API, because no code path can select the OpenCode 1 server protocol
 
 ### Requirement: Sessions are client-minted and location-exact
 
