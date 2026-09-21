@@ -31,5 +31,5 @@
 
 - [x] 5.1 Rebase `fix/opencode-v2-stable` onto `main` and confirm the suite is green on the rebased tree; verified by `cargo test --workspace` (the rebase also repairs main's missing `AnnotationSpan` test import, which had left `main`'s test build broken)
 - [x] 5.2 Record the provider in `CHANGELOG.md`; verified by the entry sitting under `[unreleased]`
-- [ ] 5.3 Validate in the freshly rebuilt debug app against OpenCode 2: start a task in a workspace the service has never opened, and confirm the model picker and the composer palette are populated on first open rather than after a second probe
-- [ ] 5.4 Archive the change with `openspec archive align-opencode-with-the-current-cli` after the rebase has landed, and confirm `openspec validate --all` passes with `opencode-provider` in `openspec/specs/`
+- [ ] 5.3 Validate in the freshly rebuilt app against OpenCode 2: start a task in a workspace the service has never opened, and confirm the model picker and the composer palette are populated on first open rather than after a second probe — **owned by the user**, who runs the app-level check by hand; the live service tests cover the same discovery path headlessly
+- [x] 5.4 Archive the change with `openspec archive align-opencode-with-the-current-cli` after the rebase has landed, and confirm `openspec validate --all` passes with `opencode-provider` in `openspec/specs/`
