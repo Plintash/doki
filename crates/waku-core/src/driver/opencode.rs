@@ -60,9 +60,9 @@ use crate::model::{
     RuntimeMode, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
 use crate::opencode_api::{
-    self, ApiError, AssistantContent, Delivery, ForkRequestBoundary, FormAnswer, FormField,
-    FormInfo, FormValue, MessageInfo, ModelRef, Order, PermissionReply, SessionOutcome, TokenUsage,
-    ToolContent, ToolState,
+    self, ApiError, AssistantContent, CommandInfo, Delivery, ForkRequestBoundary, FormAnswer,
+    FormField, FormInfo, FormValue, MessageInfo, ModelRef, Order, PermissionReply, SessionOutcome,
+    TokenUsage, ToolContent, ToolState,
 };
 use crate::opencode_service::{self, HubFrame, OpenCodeService, Subscription};
 
@@ -2333,6 +2333,37 @@ mod tests {
                 "model": {"id": "claude-sonnet-4-5", "providerID": "anthropic"}
             }
         })
+    }
+
+    /// A catalogue that cannot be read is announced on the session rather than
+    /// degrading into an empty palette or an agent-less session: the two look
+    /// identical in the UI, and that is exactly how the last round of route
+    /// drift went unnoticed.
+    #[test]
+    fn a_failed_catalogue_reads_as_an_error_not_an_empty_palette() {
+        let harness = Harness::new(RuntimeMode::FullAccess);
+        let commands = catalogue_or_report::<CommandInfo>(
+            Err(opencode_api::ApiError::Transport(anyhow!(
+                "OpenCode returned no command catalogue in its response"
+            ))),
+            "command",
+            &harness.events,
+        );
+        assert!(
+            commands.is_empty(),
+            "a failed read yields nothing to report"
+        );
+
+        let seen = harness.drain();
+        let message = seen
+            .iter()
+            .find_map(|event| match event {
+                DriverEvent::Error(message) => Some(message.clone()),
+                _ => None,
+            })
+            .expect("a failed catalogue must be reported on the session");
+        assert!(message.contains("command"), "{message}");
+        assert!(message.contains("OpenCode"), "{message}");
     }
 
     /// The regression that shipped: the service emits NO `session.idle`, so a

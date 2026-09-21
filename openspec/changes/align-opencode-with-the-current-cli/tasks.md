@@ -6,7 +6,7 @@
 - [x] 1.2 Decode the current prompt answer and move rename onto a session PATCH, inbox delivery onto a pending-item PATCH, and export, instruction entries and MCP under `/api/experimental`; verified by `live_service_answers_the_startup_path_and_the_moved_routes` passing against a real 2.x service
 - [x] 1.3 Match pending inbox items by the `inboxID` the stream names and the `id` the admitting route answers; verified by the enqueue/deliver/cancel round trip inside the same live test
 - [x] 1.4 Drive the palette from `/api/command` and `/api/skill`; verified by `opencode_catalog_lists_commands_and_skills_together` and `opencode_builtin_catalog_against_a_real_service` passing
-- [ ] 1.5 Cover the catalogue-failure announcement with a test: a failed catalogue read must emit the provider-catalogue error on the session rather than degrading into an empty palette; verified by that test failing when the error path is removed
+- [x] 1.5 Cover the catalogue-failure announcement with a test: a failed catalogue read must emit the provider-catalogue error on the session rather than degrading into an empty palette; verified by `a_failed_catalogue_reads_as_an_error_not_an_empty_palette` passing
 
 ## 2. Cold-location catalogue reads (implemented on `fix/opencode-v2-stable`)
 
