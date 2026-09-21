@@ -18,12 +18,12 @@ const appName = "Doki";
 const executableName = "Doki";
 const jsReplExecutableName = "waku_js_repl";
 const daemonExecutableName = "waku-daemon";
-const computerUseHelperName = "Waku Computer Use";
+const computerUseHelperName = "Doki Computer Use";
 const packageName = "waku";
 const defaultNotaryProfile = "NOTARY";
 const projectRoot = resolve(import.meta.dir, "..");
 
-const help = `Build, notarize, and publish a production release of Waku.
+const help = `Build, notarize, and publish a production release of Doki.
 
 Usage:
   bun run release [options]
@@ -37,7 +37,7 @@ Options:
   --local                       Build, notarize, and write the DMG + zip
                                 without publishing to R2
   --force                       Publish even if this version is already in R2
-  --output <path>               DMG output path (default: dist/Waku-<version>.dmg)
+  --output <path>               DMG output path (default: dist/Doki-<version>.dmg)
   --signing-identity <name>     Developer ID Application identity selector
                                 (or WAKU_SIGNING_IDENTITY; required unless --adhoc)
   --notary-profile <name>       notarytool keychain profile
@@ -45,7 +45,7 @@ Options:
   --build-number <number>       CFBundleVersion override (or WAKU_BUILD_NUMBER;
                                 default derives a monotonic number from the
                                 Cargo version)
-  --volume-name <name>          Mounted DMG name (default: Waku)
+  --volume-name <name>          Mounted DMG name (default: Doki)
   --skip-build                  Reuse target/release/waku, waku_js_repl, and
                                 waku-daemon
   --skip-notarize               Unnotarized signed DMG (implies --local)
@@ -657,7 +657,7 @@ try {
     logStep("Uploading appcast.xml");
     await $`rclone copyto ${join(updatesDirectory, "appcast.xml")} ${`${r2Destination}/appcast.xml`} ${rcloneFlags} --header-upload ${"Cache-Control: public, max-age=300, must-revalidate"}`;
 
-    console.log(`\nWaku ${version} (build ${buildNumber}) is live:`);
+    console.log(`\nDoki ${version} (build ${buildNumber}) is live:`);
     console.log(`  download : ${downloadUrlPrefix}${dmgName}`);
     console.log(`  update   : ${downloadUrlPrefix}${zipName}`);
     console.log(`  feed     : ${downloadUrlPrefix}appcast.xml`);
