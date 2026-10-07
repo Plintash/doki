@@ -30,6 +30,52 @@ impl Waku {
         }
     }
 
+    /// Hand back the queued messages a settlement took out of the provider's
+    /// queue. They never reached the conversation, so they leave the transcript
+    /// and their text returns to the user — the composer when this session is
+    /// the one on screen, and its stored draft when it is not, so a background
+    /// session's message cannot land in someone else's input. A turn that
+    /// existed only for them goes with them, rather than settling as an
+    /// answerless turn.
+    fn return_retracted_messages(
+        &mut self,
+        session_id: Uuid,
+        texts: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let selected = self.state.selected_session == Some(session_id);
+        let previous_kinds = self.snapshot_selected_transcript_rows(session_id);
+        if selected {
+            // The visible composer reaches its draft slot on a debounce, and the
+            // returned text has to land beside the newest keystrokes rather than
+            // behind them.
+            self.capture_current_composer_draft(cx);
+        }
+        let Some(returned) = self
+            .state
+            .session_mut(session_id)
+            .map(|session| session.take_retracted_queue_messages(texts))
+        else {
+            return;
+        };
+        if returned.is_empty() {
+            return;
+        }
+        let key = crate::persistence::ComposerDraftKey::Session(session_id);
+        let draft = returned_messages_draft(self.composer_drafts.get(key), &returned);
+        if self.composer_drafts.set(key, draft) {
+            self.schedule_composer_draft_save(cx);
+        }
+        if selected {
+            self.restore_selected_composer_draft(cx);
+        }
+        self.state.mark_session_dirty(session_id);
+        if let Some(previous_kinds) = previous_kinds.as_deref() {
+            self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
+        }
+        cx.notify();
+    }
+
     pub(super) fn finish_streaming_assistant(&mut self, session_id: Uuid) {
         if let Some(session) = self.state.session_mut(session_id) {
             for message in &mut session.messages {
@@ -580,6 +626,25 @@ impl Waku {
                     self.enqueue_follow_up_submission(session_id, submission, cx);
                 }
             }
+            DriverEvent::ProviderQueue {
+                steering,
+                follow_up,
+            } => {
+                // The provider's own queue is the truth about what is still on
+                // its way: a message in it is queued, and one it leaves out has
+                // been delivered.
+                if let Some(session) = self.state.session_mut(session_id)
+                    && session.mark_provider_queue(&steering, &follow_up)
+                {
+                    self.state.mark_session_dirty(session_id);
+                }
+            }
+            DriverEvent::QueuedMessagesRetracted { messages } => {
+                // No run will carry these, so they leave the transcript and
+                // their text goes back to the user. The settle that caused it
+                // arrives next.
+                self.return_retracted_messages(session_id, &messages, cx);
+            }
             DriverEvent::PlanUsageUpdated(usage) => {
                 if let Some(provider) = self
                     .state
@@ -892,6 +957,42 @@ impl Waku {
         }
         runtime.computer_use_previews.push(preview);
     }
+}
+
+/// The composer state a returned submission restores: the text the settlement
+/// handed back, in front of whatever the draft already held, with the
+/// returned message's own attachments and annotations kept alongside.
+pub(super) fn returned_messages_draft(
+    existing: Option<&crate::persistence::ComposerDraft>,
+    returned: &[Message],
+) -> crate::persistence::ComposerDraft {
+    let mut draft = existing.cloned().unwrap_or_default();
+    let returned_text = returned
+        .iter()
+        .map(|message| message.visible_content().trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let existing_text = std::mem::take(&mut draft.text);
+    draft.text = match (returned_text.is_empty(), existing_text.is_empty()) {
+        (true, _) => existing_text,
+        (false, true) => returned_text,
+        (false, false) => format!("{returned_text}\n\n{existing_text}"),
+    };
+    let mut attachments = returned
+        .iter()
+        .flat_map(|message| message.attachments.iter())
+        .map(super::drafts::draft_attachment)
+        .collect::<Vec<_>>();
+    attachments.extend(draft.attachments);
+    draft.attachments = attachments;
+    let mut annotations = returned
+        .iter()
+        .flat_map(|message| message.annotations.iter().cloned())
+        .collect::<Vec<_>>();
+    annotations.extend(draft.annotations);
+    draft.annotations = annotations;
+    draft
 }
 
 /// Foreground output is stronger evidence of a started provider turn than a

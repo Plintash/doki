@@ -1580,6 +1580,10 @@ fn message_from_row(row: MessageColumns) -> Option<Message> {
             .unwrap_or_default(),
         created_at: created_at as u64,
         streaming: streaming != 0,
+        // Whether the provider still holds a message is live-transport state,
+        // not transcript history: a restored session starts delivered and the
+        // provider's next report is what would say otherwise.
+        pending: false,
     })
 }
 

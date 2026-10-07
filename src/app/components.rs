@@ -968,6 +968,24 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                             }),
                     );
                 }
+                if message.pending {
+                    // The message is in the provider's queue and has not run
+                    // yet. The marker pairs an icon with text rather than
+                    // leaning on colour, and stays visible: the footer below
+                    // is a hover reveal.
+                    column = column.child(
+                        div()
+                            .mr(px(2.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .text_size(sp(12.0))
+                            .line_height(sp(15.0))
+                            .text_color(theme.text_tertiary)
+                            .child(icon("icons/hourglass.svg", 11.0, theme.text_tertiary))
+                            .child(tr!("composer.queued_pending")),
+                    );
+                }
                 column = column.child(render_message_footer(
                     theme,
                     message,

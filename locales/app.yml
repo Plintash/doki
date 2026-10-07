@@ -1176,6 +1176,8 @@ composer.remove_followup:
   en: Remove from queue
 composer.queued_message_actions:
   en: Follow-up actions
+composer.queued_pending:
+  en: Waiting to be delivered
 user_input.other_placeholder:
   en: Type another answer
 user_input.back:
