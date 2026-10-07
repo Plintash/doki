@@ -3168,6 +3168,80 @@ impl Waku {
         row
     }
 
+    /// The extension surfaces that belong against the composer.
+    ///
+    /// Pi's `setStatus` is a live progress line the extension keeps until it
+    /// clears the key, and `setWidget` is a block of text it asks for above or
+    /// below the editor. Both are session state, so they follow the session
+    /// they were published for. Nothing here is drawn when the session keeps
+    /// none of them, which is the common case.
+    pub(super) fn render_extension_surfaces(
+        &self,
+        placement: ExtensionWidgetPlacement,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let session = self.selected_session()?;
+        let theme = Theme::current(cx);
+        let mut strip = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .py(px(4.0))
+            .px(px(12.0));
+        let mut rows = 0;
+
+        // The status line sits closest to the transcript, ahead of the
+        // widgets an extension pins against the editor's own edge.
+        if placement == ExtensionWidgetPlacement::AboveEditor {
+            for entry in &session.extension_status {
+                rows += 1;
+                strip = strip.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "extension-status-{}",
+                            entry.key
+                        )))
+                        .min_w_0()
+                        .text_size(sp(12.5))
+                        .text_color(theme.text_tertiary)
+                        .child(SharedString::from(entry.text.clone())),
+                );
+            }
+        }
+
+        for widget in session
+            .extension_widgets
+            .iter()
+            .filter(|widget| widget.placement == placement)
+        {
+            rows += 1;
+            let mut lines = div().flex().flex_col();
+            for line in &widget.lines {
+                lines = lines.child(
+                    div()
+                        .min_w_0()
+                        .text_size(sp(11.5))
+                        .line_height(sp(15.0))
+                        .font_family(md::render::MONO_FAMILY)
+                        .text_color(theme.text_secondary)
+                        .child(SharedString::from(line.clone())),
+                );
+            }
+            strip = strip.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "extension-widget-{}",
+                        widget.key
+                    )))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(lines),
+            );
+        }
+
+        (rows > 0).then_some(strip)
+    }
+
     /// The pending follow-up queue between the transcript and the composer: a
     /// single card tucked against the composer's top edge, one row per queued
     /// message. A row pulls its text back into the composer on click and

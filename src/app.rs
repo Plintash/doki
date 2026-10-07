@@ -33,11 +33,12 @@ use crate::model::{
     ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget,
     BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind,
     BackgroundWorkStatus, Checkpoint, CheckpointStatus, ContextUsage, DriverEvent,
-    ExtensionMessage, FavoriteModel, Message, MessageAnnotation, MessageAttachment, MessageRole,
-    PendingPermission, Project, ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode,
-    SessionStatus, SessionWorkspace, TextSpan, TranscriptBlock, TurnStatus, UserInputAnswer,
-    UserInputQuestion, compact_path, unix_time, unix_time_millis,
+    ExtensionMessage, ExtensionStatusEntry, ExtensionWidget, ExtensionWidgetPlacement,
+    FavoriteModel, Message, MessageAnnotation, MessageAttachment, MessageRole,
+    NotificationSeverity, PendingPermission, Project, ProviderKind, ProviderModel, ProviderProbe,
+    ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary, QueuedMessage,
+    ReasoningBlock, RuntimeMode, SessionStatus, SessionWorkspace, TextSpan, TranscriptBlock,
+    TurnStatus, UserInputAnswer, UserInputQuestion, compact_path, unix_time, unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -282,8 +283,23 @@ struct ToastState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ToastTone {
+    /// The app's own alert tone, which is also what a notification the provider
+    /// calls an error uses: `notifyType` speaks the same three severities, and
+    /// each keeps its own icon and colour rather than collapsing into one
+    /// "something happened" mark.
     Alert,
+    Warning,
+    Info,
     Success,
+}
+
+/// The tone an extension's notification takes on the notice surface.
+fn extension_notification_tone(severity: NotificationSeverity) -> ToastTone {
+    match severity {
+        NotificationSeverity::Error => ToastTone::Alert,
+        NotificationSeverity::Warning => ToastTone::Warning,
+        NotificationSeverity::Info => ToastTone::Info,
+    }
 }
 
 fn paused_toast_duration(remaining: Duration, elapsed: Duration) -> Duration {
@@ -1584,6 +1600,11 @@ pub struct Waku {
     header_drag_armed: bool,
     toast: Option<ToastState>,
     toast_generation: u64,
+    /// The extension window title the platform is currently showing, and the
+    /// platform's own title to put back when the session on screen has none.
+    /// Both are cached so a frame only touches the platform on a real change.
+    applied_extension_window_title: Option<String>,
+    platform_window_title: Option<String>,
     copied_control_feedback: HashMap<String, u64>,
     copied_control_generation: u64,
     copied_message_feedback: HashMap<Uuid, u64>,
@@ -3097,6 +3118,8 @@ impl Waku {
                     hovered: false,
                 }),
                 toast_generation: 0,
+                applied_extension_window_title: None,
+                platform_window_title: None,
                 copied_control_feedback: HashMap::new(),
                 copied_control_generation: 0,
                 copied_message_feedback: HashMap::new(),

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::ComposerSubmission;
+use super::ToastTone;
 use super::composer::{
     ComposerSubmitAction, annotation_comment_value, composer_submit_action, dropped_file_mention,
     merged_submission, next_picker_highlight, visible_branch_entries,
@@ -8,19 +8,21 @@ use super::composer::{
 use super::runtime::{merge_remote_session_catalog, session_has_active_provider_turn};
 use super::sessions::denial_answer;
 use super::settings::visible_settings_pages;
+use super::{ComposerAttachment, ComposerSubmission};
 use super::{
     ESCAPE_STOP_CONFIRMATION_TIMEOUT, EscapeStopConfirmation, EscapeStopPress, EscapeStopTarget,
     NAVIGATION_RAIL_TICK_HEIGHT, NAVIGATION_RAIL_TURN_HEIGHT, PendingUserInput, SessionNavigation,
     StreamDeltaKind, TranscriptRowKind::*, active_navigation_turn_index,
     append_text_delta_to_session, assistant_response_footer, assistant_response_footer_index,
     assistant_response_footer_time, begin_provider_initiated_turn, compact_driver_error,
-    disclosure_leading_space, fenced_code, fitted_file_tree_width, fitted_panel_widths,
-    folded_transcript_row_kinds, format_worked_duration, format_working_elapsed,
-    maintain_transcript_anchor, message_opens_turn, message_starts_followup_turn,
-    navigation_preview_snippet, navigation_rail_fade_visibility, navigation_rail_height,
-    navigation_rail_scale, paused_toast_duration, pop_stream_batch, push_transcript_activity,
-    record_extension_message, response_footer_message_index, response_row_turn_id,
-    returned_messages_draft, session_accepts_turn_output, session_is_reapable,
+    disclosure_leading_space, extension_editor_text_draft, extension_notification_tone,
+    fenced_code, fitted_file_tree_width, fitted_panel_widths, folded_transcript_row_kinds,
+    format_worked_duration, format_working_elapsed, maintain_transcript_anchor, message_opens_turn,
+    message_starts_followup_turn, navigation_preview_snippet, navigation_rail_fade_visibility,
+    navigation_rail_height, navigation_rail_scale, paused_toast_duration, pop_stream_batch,
+    push_transcript_activity, record_extension_message, response_footer_message_index,
+    response_row_turn_id, returned_messages_draft, session_accepts_turn_output,
+    session_is_reapable, set_extension_status, set_extension_widget, set_extension_window_title,
     should_refresh_branch_after_activity, should_show_navigation_rail,
     should_show_scroll_to_bottom, task_id_from_notification_tag, task_notification_tag,
     transcript_anchor_end_space, transcript_navigation_turns, transcript_rests_at_tail,
@@ -30,10 +32,10 @@ use super::{
 use crate::git_branch::BranchEntry;
 use crate::model::{
     ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget, Checkpoint,
-    CheckpointFile, CheckpointStatus, DriverEvent, Message, MessageAnnotation, MessageAttachment,
-    MessageRole, PendingPermission, PermissionOption, ProviderKind, ReasoningBlock,
-    RuntimeEventCursor, SessionStatus, TextSpan, TranscriptBlock, TurnStatus, UserInputOption,
-    UserInputQuestion,
+    CheckpointFile, CheckpointStatus, DriverEvent, ExtensionStatusEntry, ExtensionWidgetPlacement,
+    Message, MessageAnnotation, MessageAttachment, MessageRole, NotificationSeverity,
+    PendingPermission, PermissionOption, ProviderKind, ReasoningBlock, RuntimeEventCursor,
+    SessionStatus, TextSpan, TranscriptBlock, TurnStatus, UserInputOption, UserInputQuestion,
 };
 
 #[test]
@@ -2563,5 +2565,176 @@ fn a_visible_extension_message_becomes_a_transcript_notice() {
     assert_eq!(
         folded_transcript_row_kinds(&session, &HashSet::new()),
         [Message(0)]
+    );
+}
+
+/// An extension's status is keyed, and it lives on the session: it shows while
+/// the extension keeps it and goes away when the extension clears that key.
+#[test]
+fn an_extension_status_shows_while_it_is_kept_and_goes_when_it_is_cleared() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+
+    set_extension_status(
+        &mut session,
+        "subagent-slash".into(),
+        Some("running...".into()),
+    );
+    assert_eq!(session.extension_status.len(), 1);
+    assert_eq!(session.extension_status[0].key, "subagent-slash");
+    assert_eq!(session.extension_status[0].text, "running...");
+
+    // Pi keys the entries, so a second set on the same key replaces that
+    // entry instead of stacking another line.
+    set_extension_status(
+        &mut session,
+        "subagent-slash".into(),
+        Some("2 live | 12 tools".into()),
+    );
+    assert_eq!(session.extension_status.len(), 1);
+    assert_eq!(session.extension_status[0].text, "2 live | 12 tools");
+
+    // Another key is another entry, and clearing one leaves the other alone.
+    set_extension_status(
+        &mut session,
+        "subagent-slash-text".into(),
+        Some("inspecting".into()),
+    );
+    set_extension_status(&mut session, "subagent-slash".into(), None);
+    assert_eq!(session.extension_status.len(), 1);
+    assert_eq!(session.extension_status[0].key, "subagent-slash-text");
+}
+
+/// A widget is keyed like a status entry and keeps both its lines and the side
+/// of the composer it asked for; clearing the key takes it down.
+#[test]
+fn an_extension_widget_keeps_its_lines_and_placement_until_it_is_cleared() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+
+    set_extension_widget(
+        &mut session,
+        "subagent-fleet".into(),
+        Some(vec!["--- fleet ---".into(), "2 running".into()]),
+        ExtensionWidgetPlacement::BelowEditor,
+    );
+    assert_eq!(session.extension_widgets.len(), 1);
+    assert_eq!(session.extension_widgets[0].key, "subagent-fleet");
+    assert_eq!(
+        session.extension_widgets[0].lines,
+        ["--- fleet ---", "2 running"]
+    );
+    assert_eq!(
+        session.extension_widgets[0].placement,
+        ExtensionWidgetPlacement::BelowEditor
+    );
+
+    // Setting the key again replaces the widget, placement included: one
+    // widget can move, it does not become two.
+    set_extension_widget(
+        &mut session,
+        "subagent-fleet".into(),
+        Some(vec!["1 running".into()]),
+        ExtensionWidgetPlacement::AboveEditor,
+    );
+    assert_eq!(session.extension_widgets.len(), 1);
+    assert_eq!(session.extension_widgets[0].lines, ["1 running"]);
+    assert_eq!(
+        session.extension_widgets[0].placement,
+        ExtensionWidgetPlacement::AboveEditor
+    );
+
+    set_extension_widget(
+        &mut session,
+        "subagent-fleet".into(),
+        None,
+        ExtensionWidgetPlacement::AboveEditor,
+    );
+    assert!(session.extension_widgets.is_empty());
+}
+
+/// Text an extension puts in the composer replaces the text that was there and
+/// leaves the user's own chips and annotations alone.
+#[test]
+fn extension_editor_text_replaces_the_draft_text_and_keeps_what_it_did_not_touch() {
+    let annotation = MessageAnnotation {
+        id: Uuid::new_v4(),
+        target: AnnotationTarget::MessageSpan {
+            message_id: Uuid::new_v4(),
+            spans: Vec::new(),
+            quote: "quoted".into(),
+            block: "block".into(),
+        },
+        comment: Some("keep this".into()),
+    };
+    let attachment = ComposerAttachment {
+        path: PathBuf::from("/tmp/report.pdf"),
+        client_preview_image: None,
+        mention: "@report.pdf".into(),
+        name: "report.pdf".into(),
+        is_dir: false,
+        is_image: false,
+        blob_reference: None,
+    };
+    let existing = crate::persistence::ComposerDraft {
+        text: "half-written".into(),
+        attachments: vec![crate::persistence::ComposerDraftAttachment::from(
+            &attachment,
+        )],
+        annotations: vec![annotation.clone()],
+    };
+
+    let draft = extension_editor_text_draft(Some(&existing), "review the diff".into());
+    assert_eq!(draft.text, "review the diff");
+    assert_eq!(draft.attachments.len(), 1);
+    assert_eq!(draft.attachments[0].name, "report.pdf");
+    assert_eq!(draft.annotations, vec![annotation.clone()]);
+
+    // Clearing the editor clears the text, not the chips beside it.
+    let draft = extension_editor_text_draft(Some(&existing), String::new());
+    assert!(draft.text.is_empty());
+    assert_eq!(draft.attachments.len(), 1);
+
+    // A session that has never been typed into simply takes the text.
+    let draft = extension_editor_text_draft(None, "review the diff".into());
+    assert_eq!(draft.text, "review the diff");
+    assert!(draft.attachments.is_empty());
+    assert!(draft.annotations.is_empty());
+}
+
+/// The window carries the selected session's extension title, and nothing of
+/// its own once that session has none.
+#[test]
+fn the_window_title_comes_from_the_selected_sessions_extension_title() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    assert!(session.extension_window_title.is_none());
+
+    set_extension_window_title(&mut session, "pi - waku-pi1-wt/t16".into());
+    assert_eq!(
+        session.extension_window_title.as_deref(),
+        Some("pi - waku-pi1-wt/t16")
+    );
+
+    // An empty title is how an extension takes its own title back down, and
+    // the window then carries the platform's own title as it did before.
+    set_extension_window_title(&mut session, String::new());
+    assert!(session.extension_window_title.is_none());
+    set_extension_window_title(&mut session, "   ".into());
+    assert!(session.extension_window_title.is_none());
+}
+
+/// A notification's severity is what the notice surface shows: a failure that
+/// arrives looking like an informational line is the defect this answers.
+#[test]
+fn an_extension_notifications_severity_reaches_the_notice_surface() {
+    assert_eq!(
+        extension_notification_tone(NotificationSeverity::Error),
+        ToastTone::Alert
+    );
+    assert_eq!(
+        extension_notification_tone(NotificationSeverity::Warning),
+        ToastTone::Warning
+    );
+    assert_eq!(
+        extension_notification_tone(NotificationSeverity::Info),
+        ToastTone::Info
     );
 }

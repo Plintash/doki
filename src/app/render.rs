@@ -238,6 +238,7 @@ impl Render for Waku {
         // whether each native browser webview belongs on screen this frame —
         // it floats above everything GPUI paints.
         self.sync_browser_webviews(cx);
+        self.sync_extension_window_title(window);
         if self.fps_counter_visible {
             self.tick_fps(window);
         }
@@ -372,8 +373,16 @@ impl Render for Waku {
                     .children(permission)
                     .when(self.selected_project().is_some(), |element| {
                         element
+                            .children(self.render_extension_surfaces(
+                                ExtensionWidgetPlacement::AboveEditor,
+                                cx,
+                            ))
                             .children(self.render_queued_messages(cx))
                             .child(self.render_composer(window, cx))
+                            .children(self.render_extension_surfaces(
+                                ExtensionWidgetPlacement::BelowEditor,
+                                cx,
+                            ))
                             .child(self.render_workspace_footer(cx))
                     })
                     .relative()
@@ -442,6 +451,33 @@ mod tests {
 }
 
 impl Waku {
+    /// Carry an extension's window title (`setTitle`) onto the real window.
+    ///
+    /// The title belongs to the session that is showing, so a session switch
+    /// carries the new one with it. The platform's own title is captured
+    /// before the first extension title replaces it, so a session with none
+    /// leaves the window as the app had it. Both sides are cached because this
+    /// runs every frame: the platform is touched only on a real change.
+    fn sync_extension_window_title(&mut self, window: &mut Window) {
+        let current = self
+            .selected_session()
+            .and_then(|session| session.extension_window_title.as_deref());
+        if current == self.applied_extension_window_title.as_deref() {
+            return;
+        }
+        let desired = current.map(str::to_owned);
+        let restore = match self.platform_window_title.clone() {
+            Some(title) => title,
+            None => {
+                let title = window.window_title();
+                self.platform_window_title = Some(title.clone());
+                title
+            }
+        };
+        window.set_window_title(desired.as_deref().unwrap_or(&restore));
+        self.applied_extension_window_title = desired;
+    }
+
     /// Arm the dismiss timer and build the floating toast layer, if a toast
     /// is active. Every full-window surface (workspace and settings alike)
     /// must include this, or a toast raised there stays invisible until the
@@ -468,6 +504,8 @@ impl Waku {
         let theme = Theme::current(cx);
         let (status_icon, status_color) = match tone {
             ToastTone::Alert => ("icons/alert.svg", theme.danger),
+            ToastTone::Warning => ("icons/alert.svg", theme.warning),
+            ToastTone::Info => ("icons/info.svg", theme.text_secondary),
             ToastTone::Success => ("icons/check.svg", theme.success),
         };
         let palette = MarkdownPalette::from_theme(&theme);

@@ -26,7 +26,8 @@ use crate::driver::{
 };
 use crate::model::{
     ActivityKind, BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKind,
-    BackgroundWorkStatus, DriverEvent, ProviderResumeCursor, ReportedCommand, RuntimeMode,
+    BackgroundWorkStatus, DriverEvent, ExtensionWidgetPlacement, NotificationSeverity,
+    ProviderResumeCursor, ReportedCommand, RuntimeMode,
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1719,16 +1720,91 @@ fn handle_pi_message(
         "extension_ui_request" => {
             let method = value.get("method").and_then(Value::as_str);
             let id = value.get("id").and_then(Value::as_str);
-            if matches!(method, Some("select" | "confirm" | "input" | "editor"))
-                && let Some(id) = id
-            {
-                let _ = commands.send(CommandMessage::CancelExtensionRequest(id.to_owned()));
+            match method {
+                // A dialog blocks the extension until it is answered, which is
+                // the client's question to ask rather than this transport's;
+                // until it can be, the provider is told not to wait.
+                Some("select" | "confirm" | "input" | "editor") => {
+                    if let Some(id) = id {
+                        let _ =
+                            commands.send(CommandMessage::CancelExtensionRequest(id.to_owned()));
+                    }
+                }
+                // The rest are the extension's own status surfaces: none
+                // expects an answer, so each is forwarded to the app instead
+                // of being dropped.
+                Some("notify") => {
+                    if let Some(message) = value.get("message").and_then(Value::as_str) {
+                        let _ = events.send(DriverEvent::ExtensionNotification {
+                            message: message.to_owned(),
+                            severity: pi_notification_severity(value.get("notifyType")),
+                        });
+                    }
+                }
+                Some("setStatus") => {
+                    if let Some(key) = value.get("statusKey").and_then(Value::as_str) {
+                        let _ = events.send(DriverEvent::ExtensionStatus {
+                            key: key.to_owned(),
+                            text: value
+                                .get("statusText")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                        });
+                    }
+                }
+                Some("setWidget") => {
+                    if let Some(key) = value.get("widgetKey").and_then(Value::as_str) {
+                        let _ = events.send(DriverEvent::ExtensionWidget {
+                            key: key.to_owned(),
+                            // Pi sends the lines themselves in RPC mode, and
+                            // their absence is the extension's own clear.
+                            lines: value.get("widgetLines").and_then(Value::as_array).map(
+                                |lines| {
+                                    lines
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_owned)
+                                        .collect()
+                                },
+                            ),
+                            placement: match value.get("widgetPlacement").and_then(Value::as_str) {
+                                Some("belowEditor") => ExtensionWidgetPlacement::BelowEditor,
+                                _ => ExtensionWidgetPlacement::AboveEditor,
+                            },
+                        });
+                    }
+                }
+                Some("setTitle") => {
+                    if let Some(title) = value.get("title").and_then(Value::as_str) {
+                        let _ = events.send(DriverEvent::ExtensionTitle {
+                            title: title.to_owned(),
+                        });
+                    }
+                }
+                Some("set_editor_text") => {
+                    if let Some(text) = value.get("text").and_then(Value::as_str) {
+                        let _ = events.send(DriverEvent::ExtensionEditorText {
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+                _ => {}
             }
         }
         "extension_error" => {
             let _ = events.send(DriverEvent::Error(pi_error_message(flavor, &value)));
         }
         _ => {}
+    }
+}
+
+/// The severity of an extension's notification. `notifyType` is optional, and
+/// an omission means the same thing to Pi as it does here: informational.
+fn pi_notification_severity(notify_type: Option<&Value>) -> NotificationSeverity {
+    match notify_type.and_then(Value::as_str) {
+        Some("warning") => NotificationSeverity::Warning,
+        Some("error") => NotificationSeverity::Error,
+        _ => NotificationSeverity::Info,
     }
 }
 
@@ -2642,6 +2718,22 @@ mod tests {
         )
     }
 
+    /// Drives one `extension_ui_request` frame through the inbound stream and
+    /// returns the events it produced, in order.
+    fn extension_ui_events(request: Value) -> Vec<DriverEvent> {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            request,
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        event_rx.try_iter().collect()
+    }
+
     /// The commands a writer produced, in the order the provider reads them.
     fn wire_lines(wire: &[u8]) -> Vec<Value> {
         std::str::from_utf8(wire)
@@ -3471,6 +3563,162 @@ mod tests {
                 if custom_type == "subagent-compaction-resume"
                     && text == "Context compaction resumed."
                     && !display
+        ));
+    }
+
+    #[test]
+    fn an_extension_notification_carries_its_severity() {
+        // pi-subagents reports a failed child through `notify`, and the
+        // severity is what tells the user whether anything went wrong: the
+        // app's own notice surface shows the difference.
+        let events = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-5",
+            "method": "notify",
+            "message": "Subagent failed: **code-auditor**",
+            "notifyType": "error"
+        }));
+
+        assert!(matches!(
+            events.as_slice(),
+            [DriverEvent::ExtensionNotification { message, severity }]
+                if message == "Subagent failed: **code-auditor**"
+                    && *severity == NotificationSeverity::Error
+        ));
+    }
+
+    #[test]
+    fn an_extension_status_lives_on_its_key_and_clears_when_the_extension_clears_it() {
+        // Pi keys its status entries by the extension's own key, and reports a
+        // clear as the same method with no text. Both halves have to reach the
+        // client: the first is the progress line the user watches, the second
+        // is what takes it down again.
+        let set = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-7",
+            "method": "setStatus",
+            "statusKey": "subagent-slash",
+            "statusText": "running..."
+        }));
+        assert!(matches!(
+            set.as_slice(),
+            [DriverEvent::ExtensionStatus { key, text }]
+                if key == "subagent-slash" && text.as_deref() == Some("running...")
+        ));
+
+        let cleared = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-8",
+            "method": "setStatus",
+            "statusKey": "subagent-slash"
+        }));
+        assert!(matches!(
+            cleared.as_slice(),
+            [DriverEvent::ExtensionStatus { key, text }]
+                if key == "subagent-slash" && text.is_none()
+        ));
+    }
+
+    #[test]
+    fn a_notification_without_a_severity_is_informational() {
+        // `notifyType` is optional, and an omission means to Pi exactly what it
+        // means here.
+        let events = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-6",
+            "method": "notify",
+            "message": "Model registry refreshed."
+        }));
+
+        assert!(matches!(
+            events.as_slice(),
+            [DriverEvent::ExtensionNotification { severity, .. }]
+                if *severity == NotificationSeverity::Info
+        ));
+    }
+
+    #[test]
+    fn an_extension_widget_keeps_its_lines_and_its_placement() {
+        let set = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-9",
+            "method": "setWidget",
+            "widgetKey": "subagent-fleet",
+            "widgetLines": ["--- fleet ---", "2 running"],
+            "widgetPlacement": "belowEditor"
+        }));
+        let [event] = set.as_slice() else {
+            panic!("a widget update must be the only event its request produces")
+        };
+        let DriverEvent::ExtensionWidget {
+            key,
+            lines,
+            placement,
+        } = event
+        else {
+            panic!("a setWidget request must reach the client as a widget update")
+        };
+        assert_eq!(key, "subagent-fleet");
+        assert_eq!(
+            lines.as_deref(),
+            Some(["--- fleet ---".to_owned(), "2 running".to_owned()].as_slice())
+        );
+        assert_eq!(*placement, ExtensionWidgetPlacement::BelowEditor);
+
+        // Pi defaults the placement to the editor's own edge.
+        let defaulted = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-10",
+            "method": "setWidget",
+            "widgetKey": "subagent-fleet",
+            "widgetLines": ["1 running"]
+        }));
+        let [DriverEvent::ExtensionWidget { placement, .. }] = defaulted.as_slice() else {
+            panic!("a widget update must be the only event its request produces")
+        };
+        assert_eq!(*placement, ExtensionWidgetPlacement::AboveEditor);
+    }
+
+    #[test]
+    fn an_extension_widget_lives_on_its_key_and_clears_when_the_extension_clears_it() {
+        let events = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-11",
+            "method": "setWidget",
+            "widgetKey": "subagent-fleet"
+        }));
+
+        assert!(matches!(
+            events.as_slice(),
+            [DriverEvent::ExtensionWidget { key, lines, .. }]
+                if key == "subagent-fleet" && lines.is_none()
+        ));
+    }
+
+    #[test]
+    fn an_extension_title_and_editor_text_reach_the_client() {
+        // Neither surface has a fallback in the transport: the app is the only
+        // place they can be shown.
+        let titled = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-12",
+            "method": "setTitle",
+            "title": "pi - waku-pi1-wt/t16"
+        }));
+        assert!(matches!(
+            titled.as_slice(),
+            [DriverEvent::ExtensionTitle { title }] if title == "pi - waku-pi1-wt/t16"
+        ));
+
+        let edited = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-13",
+            "method": "set_editor_text",
+            "text": "review the diff"
+        }));
+        assert!(matches!(
+            edited.as_slice(),
+            [DriverEvent::ExtensionEditorText { text }] if text == "review the diff"
         ));
     }
 }

@@ -19,8 +19,9 @@ use crate::attachments::AttachmentStore;
 use crate::computer_use::{ComputerTarget, ComputerUsePhase, ComputerUseState};
 use crate::driver::{self, DriverHandle, DriverStartOptions, SessionOptions};
 use crate::model::{
-    ActivityKind, AgentSession, Checkpoint, CheckpointStatus, DriverEvent, PermissionOption,
-    Project, ProviderKind, ProviderResumeCursor, SessionStatus,
+    ActivityKind, AgentSession, Checkpoint, CheckpointStatus, DriverEvent,
+    ExtensionWidgetPlacement, NotificationSeverity, PermissionOption, Project, ProviderKind,
+    ProviderResumeCursor, SessionStatus,
 };
 use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
 use crate::settings::DaemonSettingsStore;
@@ -1880,6 +1881,29 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             "extensionMessage",
             json!({ "customType": custom_type, "text": text, "display": display }),
         ),
+        DriverEvent::ExtensionNotification { message, severity } => (
+            "extensionNotification",
+            json!({ "message": message, "severity": encode_enum(severity)? }),
+        ),
+        DriverEvent::ExtensionStatus { key, text } => {
+            ("extensionStatus", json!({ "key": key, "text": text }))
+        }
+        DriverEvent::ExtensionWidget {
+            key,
+            lines,
+            placement,
+        } => (
+            "extensionWidget",
+            json!({
+                "key": key,
+                "lines": lines,
+                "placement": encode_enum(placement)?,
+            }),
+        ),
+        DriverEvent::ExtensionTitle { title } => ("extensionTitle", json!({ "title": title })),
+        DriverEvent::ExtensionEditorText { text } => {
+            ("extensionEditorText", json!({ "text": text }))
+        }
         DriverEvent::Permission {
             request_id,
             title,
@@ -1999,6 +2023,36 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
                 display: message.display,
             }
         }
+        "extensionNotification" => {
+            let notification: ExtensionNotificationWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionNotification {
+                message: notification.message,
+                severity: notification.severity,
+            }
+        }
+        "extensionStatus" => {
+            let status: ExtensionStatusWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionStatus {
+                key: status.key,
+                text: status.text,
+            }
+        }
+        "extensionWidget" => {
+            let widget: ExtensionWidgetWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionWidget {
+                key: widget.key,
+                lines: widget.lines,
+                placement: widget.placement,
+            }
+        }
+        "extensionTitle" => {
+            let title: ExtensionTitleWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionTitle { title: title.title }
+        }
+        "extensionEditorText" => {
+            let editor: ExtensionEditorTextWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionEditorText { text: editor.text }
+        }
         "permission" => {
             let permission: PermissionWire = serde_json::from_value(payload)?;
             DriverEvent::Permission {
@@ -2108,6 +2162,56 @@ struct ExtensionMessageWire {
     /// behaves as one the provider marked for display.
     #[serde(default = "default_true")]
     display: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionNotificationWire {
+    message: String,
+    /// Absent on a payload written before the field existed; Pi's own default
+    /// for a notification that does not say how serious it is.
+    #[serde(default = "default_notification_severity")]
+    severity: NotificationSeverity,
+}
+
+fn default_notification_severity() -> NotificationSeverity {
+    NotificationSeverity::Info
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionStatusWire {
+    key: String,
+    /// Absent or null on a payload that clears the entry.
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionWidgetWire {
+    key: String,
+    /// Absent or null on a payload that clears the widget.
+    #[serde(default)]
+    lines: Option<Vec<String>>,
+    #[serde(default = "default_widget_placement")]
+    placement: ExtensionWidgetPlacement,
+}
+
+fn default_widget_placement() -> ExtensionWidgetPlacement {
+    ExtensionWidgetPlacement::AboveEditor
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionTitleWire {
+    title: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionEditorTextWire {
+    text: String,
 }
 
 fn default_true() -> bool {
