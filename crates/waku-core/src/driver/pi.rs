@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -293,6 +294,8 @@ impl PiDriver {
 
         let (commands, command_rx) = unbounded();
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let run = RunLiveness::default();
+        let reader_run = run.clone();
         let reader_pending = pending.clone();
         let reader_commands = commands.clone();
         let reader_events = events.clone();
@@ -300,7 +303,10 @@ impl PiDriver {
             thread::Builder::new()
                 .name("waku-pi-reader".into())
                 .spawn(move || {
-                    let mut stream_state = PiStreamState::default();
+                    let mut stream_state = PiStreamState {
+                        run: reader_run,
+                        ..PiStreamState::default()
+                    };
                     let mut chunks = ChunkAssembly::default();
                     for line in BufReader::new(stdout).lines() {
                         match line {
@@ -548,24 +554,14 @@ impl PiDriver {
                             }
                         }
                         CommandMessage::Steer(prompt) => {
-                            let result = send_request(
+                            send_steer(
                                 &mut stdin,
                                 &writer_pending,
                                 &mut next_request_id,
-                                json!({"type": "steer", "message": prompt}),
+                                &writer_events,
+                                &run,
+                                prompt,
                             );
-                            match result {
-                                Ok(_) => {
-                                    let _ = writer_events
-                                        .send(DriverEvent::SteerAccepted { message: prompt });
-                                }
-                                Err(error) => {
-                                    let _ = writer_events.send(DriverEvent::SteerRejected {
-                                        message: prompt,
-                                        reason: error,
-                                    });
-                                }
-                            }
                         }
                         CommandMessage::Cancel => {
                             if stop_session(&mut stdin, &writer_events, flavor).is_err() {
@@ -927,6 +923,50 @@ fn send_prompt(
         return Err(format!("transport write failed: {error}"));
     }
     Ok(())
+}
+
+/// Hands a steering message to the provider.
+///
+/// The provider queues a steer whether or not a run is open, and a message it
+/// parks there is spliced into the boundary of whatever turn runs next — a
+/// message landing in the middle of a conversation it did not belong to. So the
+/// steer record is written only for the run that is still live; with no run to
+/// join, the message takes the prompt path and is delivered as the next turn
+/// instead. Both flavors acknowledge the same way: accepted once the message is
+/// with the provider, rejected when the write failed. A converted steer is
+/// acknowledged as accepted too, because that is what the app needs to keep the
+/// message in the transcript — reporting it as a rejected steer would have the
+/// app submit the same text a second time.
+fn send_steer(
+    stdin: &mut impl Write,
+    pending: &PendingResponses,
+    next_request_id: &mut u64,
+    events: &impl DriverEventSink,
+    run: &RunLiveness,
+    prompt: String,
+) {
+    let delivered = if run.is_live() {
+        send_request(
+            stdin,
+            pending,
+            next_request_id,
+            json!({"type": "steer", "message": prompt}),
+        )
+        .map(|_| ())
+    } else {
+        send_prompt(stdin, pending, next_request_id, &prompt)
+    };
+    match delivered {
+        Ok(_) => {
+            let _ = events.send(DriverEvent::SteerAccepted { message: prompt });
+        }
+        Err(error) => {
+            let _ = events.send(DriverEvent::SteerRejected {
+                message: prompt,
+                reason: error,
+            });
+        }
+    }
 }
 
 fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()> {
@@ -1320,9 +1360,33 @@ fn clone_ohmypi_session(
     result
 }
 
+/// Whether the provider has a run open right now.
+///
+/// The reader thread owns the value — the provider's own run-start and
+/// settlement events are what change it — and the writer thread holds a clone,
+/// because only a live run may be offered a steering message.
+#[derive(Clone, Default)]
+struct RunLiveness(Arc<AtomicBool>);
+
+impl RunLiveness {
+    fn is_live(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn open(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn close(&self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 #[derive(Default)]
 struct PiStreamState {
-    run_started: bool,
+    /// The provider's run. Shared with the writer thread, so a reset of the
+    /// per-run stream state keeps the same handle rather than a fresh one.
+    run: RunLiveness,
     message_saw_text: bool,
     message_saw_reasoning: bool,
     failed: bool,
@@ -1330,6 +1394,18 @@ struct PiStreamState {
     /// The messages the provider's last queue report still held, in the order
     /// it reported them. Empty on a provider that reports no queue.
     queued: Vec<String>,
+}
+
+impl PiStreamState {
+    /// Clears the per-run stream state between runs. The run handle survives,
+    /// because the writer thread reads liveness through its own clone of it.
+    fn reset(&mut self) {
+        let run = self.run.clone();
+        *self = Self {
+            run,
+            ..Self::default()
+        };
+    }
 }
 
 fn handle_pi_message(
@@ -1385,7 +1461,11 @@ fn handle_pi_message(
                 success,
                 summary: error,
             });
-            *state = PiStreamState::default();
+            // No run stands behind this answer — a refusal, or an extension
+            // command that consumed the prompt — so nothing is live until the
+            // provider announces a run of its own.
+            state.run.close();
+            state.reset();
             return;
         }
         let Some(PendingResponse::Request(response)) = pending.lock().remove(id) else {
@@ -1430,7 +1510,7 @@ fn handle_pi_message(
         if value.get("isTerminal").and_then(Value::as_bool) == Some(false) {
             return;
         }
-        if state.run_started {
+        if state.run.is_live() {
             pending
                 .lock()
                 .retain(|_, response| matches!(response, PendingResponse::Request(_)));
@@ -1459,7 +1539,9 @@ fn handle_pi_message(
                 }),
             });
         }
-        *state = PiStreamState::default();
+        // The run is over, so a steering message has nothing left to join.
+        state.run.close();
+        state.reset();
         return;
     }
 
@@ -1481,8 +1563,8 @@ fn handle_pi_message(
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
             {
-                if !state.run_started {
-                    state.run_started = true;
+                if !state.run.is_live() {
+                    state.run.open();
                     let _ = events.send(DriverEvent::TurnStarted);
                 }
                 // Each command_output is a complete output block, unlike
@@ -1491,8 +1573,8 @@ fn handle_pi_message(
             }
         }
         "agent_start" | "turn_start" => {
-            if !state.run_started {
-                state.run_started = true;
+            if !state.run.is_live() {
+                state.run.open();
                 state.failed = false;
                 let _ = events.send(DriverEvent::TurnStarted);
             }
@@ -1866,7 +1948,7 @@ mod tests {
         assert!(
             matches!(event_rx.recv().unwrap(), DriverEvent::AvailableCommands(commands) if commands.is_empty())
         );
-        assert!(!state.run_started);
+        assert!(!state.run.is_live());
     }
 
     #[test]
@@ -2252,6 +2334,244 @@ mod tests {
         assert!(pending.lock().is_empty());
         assert_eq!(String::from_utf8(wire).unwrap().lines().count(), 2);
     }
+
+    #[test]
+    fn a_steer_that_misses_the_run_is_delivered_as_a_prompt() {
+        // The provider queues a steer whether or not a run is open — measured
+        // against pi 1.0.0, a message steered into an idle session waits in
+        // the steering queue and is spliced into the boundary of whatever turn
+        // runs next. A steer for a run that has already settled therefore goes
+        // out as a prompt for the next turn instead, and still reaches the app
+        // as an accepted message.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { .. }
+        ));
+
+        let mut wire = Vec::new();
+        let mut next_request_id = 0;
+        send_steer(
+            &mut wire,
+            &pending,
+            &mut next_request_id,
+            &events,
+            &state.run,
+            "stop doing that".to_owned(),
+        );
+
+        let frames = wire_frames(&wire);
+        assert_eq!(
+            frames.len(),
+            1,
+            "a steer the provider would park is never written"
+        );
+        assert_eq!(frames[0]["type"], "prompt");
+        assert_eq!(frames[0]["message"], "stop doing that");
+        assert_eq!(
+            frames[0]["streamingBehavior"], "followUp",
+            "the next turn's prompt waits for the settled run the provider still owes"
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerAccepted { message } if message == "stop doing that"
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_steer_into_the_live_run_is_written_as_a_steer() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+
+        let frames = steered_frames(&pending, &events, &state.run, "stop doing that");
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["type"], "steer");
+        assert_eq!(frames[0]["message"], "stop doing that");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerAccepted { message } if message == "stop doing that"
+        ));
+    }
+
+    #[test]
+    fn oh_my_pi_keeps_its_steering_and_gates_on_its_own_run() {
+        // The second flavor's steering is untouched: a steer into its live run
+        // is the same record and the same acknowledgement it gets today. Its
+        // run lifecycle is spelled differently (`agent_end`), and the gate
+        // reads that lifecycle too, so a steer arriving after its run settled
+        // takes the prompt path instead of waiting in the provider's queue.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::OhMyPi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+
+        let live = steered_frames(&pending, &events, &state.run, "stop doing that");
+        assert_eq!(live[0]["type"], "steer");
+        assert_eq!(live[0]["message"], "stop doing that");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerAccepted { message } if message == "stop doing that"
+        ));
+
+        handle_pi_message(
+            PiFlavor::OhMyPi,
+            json!({"type": "agent_end", "messages": []}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { .. }
+        ));
+        let mut wire = Vec::new();
+        let mut next_request_id = 0;
+        send_steer(
+            &mut wire,
+            &pending,
+            &mut next_request_id,
+            &events,
+            &state.run,
+            "never mind".to_owned(),
+        );
+        let frames = wire_frames(&wire);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["type"], "prompt");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerAccepted { message } if message == "never mind"
+        ));
+    }
+
+    fn wire_frames(wire: &[u8]) -> Vec<Value> {
+        String::from_utf8(wire.to_vec())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// What one steering message writes to the transport. The provider answers
+    /// a request the way its RPC does, so the writer's own wait is satisfied.
+    fn steered_frames(
+        pending: &PendingResponses,
+        events: &Sender<DriverEvent>,
+        run: &RunLiveness,
+        prompt: &str,
+    ) -> Vec<Value> {
+        let (wire_tx, wire_rx) = unbounded();
+        let writer_pending = pending.clone();
+        let writer_events = events.clone();
+        let writer_run = run.clone();
+        let writer_prompt = prompt.to_owned();
+        let writer = thread::spawn(move || {
+            let mut wire = WireRecorder::new(wire_tx);
+            let mut next_request_id = 0;
+            send_steer(
+                &mut wire,
+                &writer_pending,
+                &mut next_request_id,
+                &writer_events,
+                &writer_run,
+                writer_prompt,
+            );
+        });
+        let mut frames = Vec::new();
+        while let Ok(bytes) = wire_rx.recv() {
+            let frame: Value = serde_json::from_slice(&bytes).unwrap();
+            if let Some(id) = frame.get("id").and_then(Value::as_str)
+                && let Some(PendingResponse::Request(response)) = pending.lock().remove(id)
+            {
+                let _ = response.send(Ok(json!({
+                    "type": "response",
+                    "id": id,
+                    "success": true,
+                    "data": {"disposition": "queued"},
+                })));
+            }
+            frames.push(frame);
+        }
+        writer.join().unwrap();
+        frames
+    }
+
+    /// Collects the lines a writer sends, so a test can answer them.
+    struct WireRecorder {
+        lines: Sender<Vec<u8>>,
+        partial: Vec<u8>,
+    }
+
+    impl WireRecorder {
+        fn new(lines: Sender<Vec<u8>>) -> Self {
+            Self {
+                lines,
+                partial: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for WireRecorder {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            // One frame is one line, but the transport writes it in as many
+            // calls as it likes.
+            self.partial.extend_from_slice(buffer);
+            while let Some(end) = self.partial.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.partial.drain(..=end).collect();
+                let _ = self.lines.send(line[..line.len() - 1].to_vec());
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn harness() -> (
         PendingResponses,
         Sender<CommandMessage>,
@@ -3002,7 +3322,7 @@ mod tests {
             event_rx.try_recv().is_err(),
             "one completion must produce exactly one surface update"
         );
-        assert!(!state.run_started);
+        assert!(!state.run.is_live());
     }
 
     #[test]
