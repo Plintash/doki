@@ -1190,6 +1190,8 @@ user_input.submit:
   en: Submit
 user_input.progress:
   en: "%{current} of %{total}"
+user_input.dismiss:
+  en: Dismiss
 composer.preparing_task:
   en: Preparing task…
 composer.queue_followup:

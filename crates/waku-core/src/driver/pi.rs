@@ -27,7 +27,8 @@ use crate::driver::{
 use crate::model::{
     ActivityKind, BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKind,
     BackgroundWorkStatus, DriverEvent, ExtensionWidgetPlacement, NotificationSeverity,
-    ProviderResumeCursor, ReportedCommand, RuntimeMode,
+    ProviderResumeCursor, ReportedCommand, RuntimeMode, UserInputAnswer, UserInputOption,
+    UserInputQuestion,
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -163,6 +164,10 @@ enum CommandMessage {
     /// its answer; the reader owns stdout and cannot block on a response.
     RetractQueuedMessages,
     CancelExtensionRequest(String),
+    /// A dialog answer already in the `extension_ui_response` shape the
+    /// provider reads. The reader owns stdout, so the answer travels the same
+    /// way every other write does.
+    ExtensionUiResponse(Value),
     Options(SessionOptions),
     Rollback {
         turns: usize,
@@ -186,7 +191,125 @@ pub struct PiDriver {
     flavor: PiFlavor,
     commands: Sender<CommandMessage>,
     computer_use: Option<computer_use_runtime::ComputerUseRuntime>,
+    /// The dialogs still waiting for the user, keyed by the provider's request
+    /// id, shared with the reader thread that opened them. The stored method is
+    /// what tells the answer which `extension_ui_response` shape it must take.
+    dialogs: PiDialogs,
 }
+
+/// The dialogs the transport has handed to the client and not yet answered.
+type PiDialogs = Arc<Mutex<HashMap<String, PiExtensionDialog>>>;
+
+/// The dialog methods whose answers travel back as an `extension_ui_response`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PiExtensionDialog {
+    Select,
+    Confirm,
+    Input,
+    Editor,
+}
+
+impl PiExtensionDialog {
+    /// `None` for a method Pi does not document: its answer shape is unknown,
+    /// so it is cancelled rather than presented.
+    fn from_method(method: &str) -> Option<Self> {
+        match method {
+            "select" => Some(Self::Select),
+            "confirm" => Some(Self::Confirm),
+            "input" => Some(Self::Input),
+            "editor" => Some(Self::Editor),
+            _ => None,
+        }
+    }
+
+    /// The one question the client asks for this dialog. The question id is
+    /// the provider's request id, so the answer needs no other correlation.
+    fn question(self, id: &str, request: &Value) -> UserInputQuestion {
+        let title = request
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let text = |field: &str| {
+            request
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(title)
+        };
+        let (header, question, options) = match self {
+            // Pi's select, input and editor carry only a title; it is the
+            // question, so the card leads with it rather than an empty label.
+            Self::Select => {
+                let options = request
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|options| {
+                        options
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|label| UserInputOption {
+                                label: label.to_owned(),
+                                description: None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ("", title, options)
+            }
+            Self::Confirm => (
+                title,
+                text("message"),
+                [(PI_CONFIRM_ACCEPT, None), (PI_CONFIRM_DECLINE, None)]
+                    .into_iter()
+                    .map(|(label, description)| UserInputOption {
+                        label: label.to_owned(),
+                        description: description.map(str::to_owned),
+                    })
+                    .collect(),
+            ),
+            // The placeholder and prefill Pi sends for these have no home on
+            // the question card; the typed answer is what the provider gets.
+            Self::Input | Self::Editor => ("", title, Vec::new()),
+        };
+        UserInputQuestion {
+            id: id.to_owned(),
+            header: header.to_owned(),
+            question: question.to_owned(),
+            options,
+            multi_select: false,
+        }
+    }
+
+    /// The `extension_ui_response` for the labels the client chose. No label is
+    /// the dismissal, which is Pi's cancellation: the extension receives
+    /// `undefined` for a value dialog and `false` for a confirmation.
+    fn response(self, id: &str, answers: &[String]) -> Value {
+        let answer = answers.iter().find(|answer| !answer.trim().is_empty());
+        match (self, answer) {
+            (_, None) => json!({
+                "type": "extension_ui_response",
+                "id": id,
+                "cancelled": true,
+            }),
+            (Self::Confirm, Some(answer)) => json!({
+                "type": "extension_ui_response",
+                "id": id,
+                "confirmed": answer == PI_CONFIRM_ACCEPT,
+            }),
+            (_, Some(answer)) => json!({
+                "type": "extension_ui_response",
+                "id": id,
+                "value": answer,
+            }),
+        }
+    }
+}
+
+/// The labels of the confirm dialog's two answers. They are the card's text and
+/// the transport's signal at once, so `response` compares the answer to the
+/// accept label rather than trusting the order Pi never guaranteed.
+const PI_CONFIRM_ACCEPT: &str = "Yes";
+const PI_CONFIRM_DECLINE: &str = "No";
 
 fn configure_pi_computer_use_command(
     command: &mut std::process::Command,
@@ -300,12 +423,15 @@ impl PiDriver {
         let reader_pending = pending.clone();
         let reader_commands = commands.clone();
         let reader_events = events.clone();
+        let dialogs: PiDialogs = Arc::new(Mutex::new(HashMap::new()));
+        let reader_dialogs = dialogs.clone();
         let reader_thread =
             thread::Builder::new()
                 .name("waku-pi-reader".into())
                 .spawn(move || {
                     let mut stream_state = PiStreamState {
                         run: reader_run,
+                        dialogs: reader_dialogs,
                         ..PiStreamState::default()
                     };
                     let mut chunks = ChunkAssembly::default();
@@ -656,6 +782,11 @@ impl PiDriver {
                                 break;
                             }
                         }
+                        CommandMessage::ExtensionUiResponse(response) => {
+                            if write_json_line(&mut stdin, &response).is_err() {
+                                break;
+                            }
+                        }
                         CommandMessage::Rollback { turns, response } => {
                             let result = fork_pi_session(
                                 flavor,
@@ -744,6 +875,7 @@ impl PiDriver {
             flavor,
             commands,
             computer_use,
+            dialogs,
         })
     }
 }
@@ -772,6 +904,23 @@ impl DriverControl for PiDriver {
     }
 
     fn respond(&self, _request_id: String, _option_id: String) {}
+
+    fn respond_user_input(&self, request_id: String, answers: Vec<UserInputAnswer>) {
+        // Only a dialog the user is looking at can be answered. An answer to
+        // anything else, or a second answer to the same request, is dropped
+        // rather than written as a response the provider never asked for.
+        let Some(dialog) = self.dialogs.lock().remove(&request_id) else {
+            return;
+        };
+        let labels = answers
+            .into_iter()
+            .find(|answer| answer.question_id == request_id)
+            .map(|answer| answer.answers)
+            .unwrap_or_default();
+        let _ = self.commands.send(CommandMessage::ExtensionUiResponse(
+            dialog.response(&request_id, &labels),
+        ));
+    }
 
     fn apply_options(&self, options: SessionOptions) -> bool {
         // Both flavors have setters for the model and thinking level, so those
@@ -1389,6 +1538,9 @@ struct PiStreamState {
     /// The provider's run. Shared with the writer thread, so a reset of the
     /// per-run stream state keeps the same handle rather than a fresh one.
     run: RunLiveness,
+    /// The extension dialogs still unanswered, shared with the driver handle
+    /// that answers them; like the run handle it outlives a run's reset.
+    dialogs: PiDialogs,
     message_saw_text: bool,
     message_saw_reasoning: bool,
     failed: bool,
@@ -1399,12 +1551,16 @@ struct PiStreamState {
 }
 
 impl PiStreamState {
-    /// Clears the per-run stream state between runs. The run handle survives,
-    /// because the writer thread reads liveness through its own clone of it.
+    /// Clears the per-run stream state between runs. The run handle and the
+    /// dialogs survive, because the writer thread reads liveness through its
+    /// own clone of the run and a dialog the client has not answered yet must
+    /// not be forgotten.
     fn reset(&mut self) {
         let run = self.run.clone();
+        let dialogs = self.dialogs.clone();
         *self = Self {
             run,
+            dialogs,
             ..Self::default()
         };
     }
@@ -1550,8 +1706,12 @@ fn handle_pi_message(
                 }),
             });
         }
-        // The run is over, so a steering message has nothing left to join.
+        // The run is over, so a steering message has nothing left to join,
+        // and a dialog that was still unanswered belonged to it: the provider
+        // resolves an abandoned dialog on its own timeout, and that request is
+        // no longer answerable.
         state.run.close();
+        state.dialogs.lock().clear();
         state.reset();
         return;
     }
@@ -1720,16 +1880,21 @@ fn handle_pi_message(
         "extension_ui_request" => {
             let method = value.get("method").and_then(Value::as_str);
             let id = value.get("id").and_then(Value::as_str);
+            // A dialog blocks the extension until the user answers it. It
+            // becomes an ordinary user-input request; the answer comes back
+            // through the transport's own response method, and the provider's
+            // own timeout dismisses an abandoned one.
+            if let (Some(dialog), Some(id)) = (method.and_then(PiExtensionDialog::from_method), id)
+            {
+                let question = dialog.question(id, &value);
+                state.dialogs.lock().insert(id.to_owned(), dialog);
+                let _ = events.send(DriverEvent::UserInputRequested {
+                    request_id: id.to_owned(),
+                    questions: vec![question],
+                });
+                return;
+            }
             match method {
-                // A dialog blocks the extension until it is answered, which is
-                // the client's question to ask rather than this transport's;
-                // until it can be, the provider is told not to wait.
-                Some("select" | "confirm" | "input" | "editor") => {
-                    if let Some(id) = id {
-                        let _ =
-                            commands.send(CommandMessage::CancelExtensionRequest(id.to_owned()));
-                    }
-                }
                 // The rest are the extension's own status surfaces: none
                 // expects an answer, so each is forwarded to the app instead
                 // of being dropped.
@@ -1788,7 +1953,16 @@ fn handle_pi_message(
                         });
                     }
                 }
-                _ => {}
+                // A method the client does not know is not one it can present,
+                // and if it is a dialog the provider is blocking on it. Cancel
+                // it so the extension continues instead of waiting out its
+                // timeout; nothing else Pi sends needs an answer.
+                _ => {
+                    if let Some(id) = id {
+                        let _ =
+                            commands.send(CommandMessage::CancelExtensionRequest(id.to_owned()));
+                    }
+                }
             }
         }
         "extension_error" => {
@@ -2718,6 +2892,78 @@ mod tests {
         )
     }
 
+    /// A driver handle and the reader state that share one dialog store, so a
+    /// dialog the reader opens is the one the handle answers, and the reply
+    /// travels the transport's own command channel.
+    struct DialogHarness {
+        driver: PiDriver,
+        pending: PendingResponses,
+        commands: Sender<CommandMessage>,
+        command_rx: crossbeam_channel::Receiver<CommandMessage>,
+        events: Sender<DriverEvent>,
+        event_rx: crossbeam_channel::Receiver<DriverEvent>,
+        state: PiStreamState,
+    }
+
+    impl DialogHarness {
+        fn new() -> Self {
+            let (commands, command_rx) = unbounded();
+            let dialogs: PiDialogs = Arc::new(Mutex::new(HashMap::new()));
+            let (events, event_rx) = unbounded();
+            let driver = PiDriver {
+                flavor: PiFlavor::Pi,
+                commands: commands.clone(),
+                computer_use: None,
+                dialogs: dialogs.clone(),
+            };
+            Self {
+                driver,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                commands,
+                command_rx,
+                events,
+                event_rx,
+                state: PiStreamState {
+                    dialogs,
+                    ..PiStreamState::default()
+                },
+            }
+        }
+
+        /// Feeds one inbound frame the way the reader thread does.
+        fn open(&mut self, request: Value) {
+            handle_pi_message(
+                PiFlavor::Pi,
+                request,
+                &self.pending,
+                &self.commands,
+                &self.events,
+                &mut self.state,
+            );
+        }
+
+        /// The single question the last `open` put in front of the client.
+        fn question(&mut self) -> UserInputQuestion {
+            let event = self
+                .event_rx
+                .try_recv()
+                .expect("the dialog must reach the client");
+            let DriverEvent::UserInputRequested {
+                request_id,
+                mut questions,
+            } = event
+            else {
+                panic!("a dialog must arrive as a user-input request")
+            };
+            assert_eq!(questions.len(), 1, "a dialog is one question");
+            assert_eq!(
+                questions[0].id, request_id,
+                "the question id is the provider's request id, so the answer correlates"
+            );
+            questions.remove(0)
+        }
+    }
+
     /// Drives one `extension_ui_request` frame through the inbound stream and
     /// returns the events it produced, in order.
     fn extension_ui_events(request: Value) -> Vec<DriverEvent> {
@@ -2816,6 +3062,7 @@ mod tests {
             flavor: PiFlavor::Pi,
             commands,
             computer_use: None,
+            dialogs: PiDialogs::default(),
         };
         let options = |mode| SessionOptions {
             mode,
@@ -3720,5 +3967,269 @@ mod tests {
             edited.as_slice(),
             [DriverEvent::ExtensionEditorText { text }] if text == "review the diff"
         ));
+    }
+
+    #[test]
+    fn a_dialog_reaches_the_client_instead_of_being_cancelled_on_arrival() {
+        // The provider blocks the extension until the question is answered, so
+        // cancelling it on arrival is what made every dialog unusable. It has
+        // to become a request the user can see; nothing is written back until
+        // they answer or dismiss it.
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-1",
+            "method": "select",
+            "title": "Allow dangerous command?",
+            "options": ["Allow", "Block"]
+        }));
+
+        let question = harness.question();
+        assert_eq!(question.question, "Allow dangerous command?");
+        assert_eq!(
+            question
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Allow", "Block"]
+        );
+        assert!(
+            harness.command_rx.try_recv().is_err(),
+            "no response is written before the user answers"
+        );
+    }
+
+    #[test]
+    fn an_unknown_method_is_cancelled_so_the_provider_is_not_left_waiting() {
+        // A method the client cannot present is answered immediately: if it is
+        // a dialog the extension is blocked on it, and the client has no way
+        // to show it.
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-9",
+            "method": "custom",
+            "title": "Pick a canvas"
+        }));
+
+        assert!(
+            harness.event_rx.try_recv().is_err(),
+            "an unknown method has no surface"
+        );
+        assert!(matches!(
+            harness.command_rx.try_recv(),
+            Ok(CommandMessage::CancelExtensionRequest(id)) if id == "uuid-9"
+        ));
+    }
+
+    #[test]
+    fn answering_a_dialog_returns_the_value_the_provider_expects() {
+        // select, input and editor all answer with `value`; the chosen option
+        // label is what Pi compares against its own option list.
+        for (request, answer, expected) in [
+            (
+                json!({
+                    "type": "extension_ui_request",
+                    "id": "uuid-1",
+                    "method": "select",
+                    "title": "Allow dangerous command?",
+                    "options": ["Allow", "Block"]
+                }),
+                "Block",
+                "Block",
+            ),
+            (
+                json!({
+                    "type": "extension_ui_request",
+                    "id": "uuid-3",
+                    "method": "input",
+                    "title": "Enter a value",
+                    "placeholder": "type something..."
+                }),
+                "deploy to preview",
+                "deploy to preview",
+            ),
+            (
+                json!({
+                    "type": "extension_ui_request",
+                    "id": "uuid-4",
+                    "method": "editor",
+                    "title": "Edit some text",
+                    "prefill": "Line 1"
+                }),
+                "Line 1\nedited",
+                "Line 1\nedited",
+            ),
+        ] {
+            let id = request["id"].as_str().unwrap().to_owned();
+            let mut harness = DialogHarness::new();
+            harness.open(request);
+            let _ = harness.question();
+            harness.driver.respond_user_input(
+                id.clone(),
+                vec![UserInputAnswer {
+                    question_id: id.clone(),
+                    answers: vec![answer.to_owned()],
+                }],
+            );
+            assert!(
+                matches!(
+                    harness.command_rx.try_recv(),
+                    Ok(CommandMessage::ExtensionUiResponse(value))
+                        if value == json!({
+                            "type": "extension_ui_response",
+                            "id": id,
+                            "value": expected,
+                        })
+                ),
+                "{answer:?} must answer as {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_confirmation_answers_with_a_boolean() {
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-2",
+            "method": "confirm",
+            "title": "Clear session?",
+            "message": "All messages will be lost."
+        }));
+        let question = harness.question();
+        assert_eq!(question.question, "All messages will be lost.");
+        let labels: Vec<&str> = question
+            .options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect();
+        assert_eq!(labels, ["Yes", "No"]);
+
+        harness.driver.respond_user_input(
+            "uuid-2".into(),
+            vec![UserInputAnswer {
+                question_id: "uuid-2".into(),
+                answers: vec!["No".into()],
+            }],
+        );
+        assert!(matches!(
+            harness.command_rx.try_recv(),
+            Ok(CommandMessage::ExtensionUiResponse(value))
+                if value == json!({
+                    "type": "extension_ui_response",
+                    "id": "uuid-2",
+                    "confirmed": false,
+                })
+        ));
+    }
+
+    #[test]
+    fn dismissing_a_dialog_cancels_it_with_the_provider() {
+        // Dismissing is the cancellation the extension reads as `undefined`,
+        // not a value from an option the user never chose.
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-1",
+            "method": "select",
+            "title": "Allow dangerous command?",
+            "options": ["Allow", "Block"]
+        }));
+        let _ = harness.question();
+
+        harness.driver.respond_user_input(
+            "uuid-1".into(),
+            vec![UserInputAnswer {
+                question_id: "uuid-1".into(),
+                answers: Vec::new(),
+            }],
+        );
+        assert!(matches!(
+            harness.command_rx.try_recv(),
+            Ok(CommandMessage::ExtensionUiResponse(value))
+                if value == json!({
+                    "type": "extension_ui_response",
+                    "id": "uuid-1",
+                    "cancelled": true,
+                })
+        ));
+    }
+
+    #[test]
+    fn an_answer_to_a_dialog_that_is_not_open_is_dropped() {
+        // The provider correlates responses by id; one for a request it never
+        // sent, or a second answer to the same one, would be a reply to a
+        // question that is no longer being asked.
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-1",
+            "method": "select",
+            "title": "Allow dangerous command?",
+            "options": ["Allow", "Block"]
+        }));
+        let _ = harness.question();
+        let answer = |answers: Vec<String>| {
+            vec![UserInputAnswer {
+                question_id: "uuid-1".into(),
+                answers,
+            }]
+        };
+
+        harness
+            .driver
+            .respond_user_input("uuid-other".into(), answer(vec!["Allow".into()]));
+        harness
+            .driver
+            .respond_user_input("uuid-1".into(), answer(vec!["Allow".into()]));
+        assert!(matches!(
+            harness.command_rx.try_recv(),
+            Ok(CommandMessage::ExtensionUiResponse(value))
+                if value == json!({
+                    "type": "extension_ui_response",
+                    "id": "uuid-1",
+                    "value": "Allow",
+                })
+        ));
+
+        harness
+            .driver
+            .respond_user_input("uuid-1".into(), answer(vec!["Block".into()]));
+        assert!(
+            harness.command_rx.try_recv().is_err(),
+            "a dialog is answered once"
+        );
+    }
+
+    #[test]
+    fn a_dialog_the_run_settled_without_answering_is_no_longer_answerable() {
+        // A settlement ends the run the dialog belonged to. Whatever the
+        // client still shows for it, the provider has moved on (its own
+        // timeout resolves an abandoned dialog), so an answer must not be
+        // written back as if the question were still open.
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-1",
+            "method": "confirm",
+            "title": "Clear session?",
+            "message": "All messages will be lost."
+        }));
+        let _ = harness.question();
+
+        harness.open(json!({"type": "agent_settled"}));
+        harness.driver.respond_user_input(
+            "uuid-1".into(),
+            vec![UserInputAnswer {
+                question_id: "uuid-1".into(),
+                answers: vec!["Yes".into()],
+            }],
+        );
+        assert!(
+            harness.command_rx.try_recv().is_err(),
+            "the settled run's dialog is not answered afterwards"
+        );
     }
 }

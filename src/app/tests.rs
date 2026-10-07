@@ -327,7 +327,7 @@ fn structured_user_input_preserves_question_order_and_custom_answer_precedence()
             multi_select: false,
         },
     ];
-    let mut pending = PendingUserInput::new("request-1".into(), questions);
+    let mut pending = PendingUserInput::new("request-1".into(), questions, false);
     pending
         .selections
         .insert("environment".into(), vec!["Preview".into()]);
@@ -343,6 +343,68 @@ fn structured_user_input_preserves_question_order_and_custom_answer_precedence()
     assert_eq!(answers[0].answers, ["Preview"]);
     assert_eq!(answers[1].question_id, "notes");
     assert_eq!(answers[1].answers, ["Use the EU region"]);
+}
+
+/// An extension's dialog is the same question surface with one extra move:
+/// dismissing it sends no answer at all, which the transport turns into the
+/// cancellation the provider reads as \"the user did not choose\".
+#[test]
+fn a_dismissible_dialog_answers_with_its_choice_or_dismisses_with_nothing() {
+    let question = UserInputQuestion {
+        id: "uuid-1".into(),
+        header: String::new(),
+        question: "Allow dangerous command?".into(),
+        options: vec![
+            UserInputOption {
+                label: "Allow".into(),
+                description: None,
+            },
+            UserInputOption {
+                label: "Block".into(),
+                description: None,
+            },
+        ],
+        multi_select: false,
+    };
+    let mut pending = PendingUserInput::new("uuid-1".into(), vec![question], true);
+    assert!(pending.dismissible);
+
+    pending
+        .selections
+        .insert("uuid-1".into(), vec!["Block".into()]);
+    let answers = pending.answers();
+    assert_eq!(answers[0].question_id, "uuid-1");
+    assert_eq!(answers[0].answers, ["Block"]);
+
+    // Dismissing discards any selection: a cancellation must not carry a value
+    // the user never confirmed by submitting.
+    let dismissal = pending.dismissal();
+    assert_eq!(dismissal[0].question_id, "uuid-1");
+    assert!(
+        dismissal[0].answers.is_empty(),
+        "a dismissal sends no answer for the provider to read as a choice"
+    );
+}
+
+/// Only a provider whose transport carries a cancellation gets the dismiss
+/// move; a structured question has no way to be taken back.
+#[test]
+fn only_a_transport_with_a_cancellation_gets_a_dismissible_question() {
+    assert!(ProviderKind::Pi.supports_user_input_cancellation());
+    assert!(ProviderKind::OhMyPi.supports_user_input_cancellation());
+    for provider in [
+        ProviderKind::Claude,
+        ProviderKind::Codex,
+        ProviderKind::OpenCode,
+        ProviderKind::Cursor,
+        ProviderKind::DeepSeek,
+        ProviderKind::Amp,
+    ] {
+        assert!(
+            !provider.supports_user_input_cancellation(),
+            "{provider:?} has no cancellation response"
+        );
+    }
 }
 use gpui::{ListAlignment, ListState, Pixels, px};
 use std::{

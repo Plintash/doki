@@ -618,13 +618,27 @@ impl Waku {
                 request_id,
                 questions,
             } => {
-                if self.accepts_turn_output(session_id) && !questions.is_empty() {
-                    runtime.pending_user_input = Some(PendingUserInput::new(request_id, questions));
+                // A provider whose dismissal is a cancellation (Pi's extension
+                // dialogs) can ask outside a turn: an extension command opens
+                // the dialog before any run starts, and dropping it there
+                // would leave the extension blocked. A structured question
+                // still belongs to the turn that asked it.
+                let dismissible = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .is_some_and(|session| session.provider.supports_user_input_cancellation());
+                if !questions.is_empty() && (dismissible || self.accepts_turn_output(session_id)) {
+                    runtime.pending_user_input =
+                        Some(PendingUserInput::new(request_id, questions, dismissible));
                     if self.state.selected_session == Some(session_id) {
                         self.user_input_answer
                             .update(cx, |input, cx| input.clear(cx));
                     }
-                    if let Some(session) = self.state.session_mut(session_id) {
+                    if let Some(session) = self.state.session_mut(session_id)
+                        && session.active_turn_id().is_some()
+                    {
                         session.status = SessionStatus::Waiting;
                     }
                 }

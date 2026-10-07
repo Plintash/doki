@@ -1513,7 +1513,9 @@ impl Waku {
             runtime
                 .driver
                 .respond_user_input(pending.request_id, answers);
-            if let Some(session) = self.state.session_mut(session_id) {
+            if let Some(session) = self.state.session_mut(session_id)
+                && session.active_turn_id().is_some()
+            {
                 session.status = SessionStatus::Working;
             }
             self.user_input_answer
@@ -1521,6 +1523,34 @@ impl Waku {
         } else {
             self.sync_user_input_answer(cx);
         }
+        cx.notify();
+    }
+
+    /// Dismisses the open question without answering it. A provider that takes
+    /// a dismissal back reads the empty answer as its cancellation, so an
+    /// extension blocked on the question continues instead of waiting out its
+    /// own timeout.
+    pub(super) fn dismiss_user_input(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.state.selected_session else {
+            return;
+        };
+        let Some(runtime) = self.runtimes.get_mut(&session_id) else {
+            return;
+        };
+        let Some(pending) = runtime.pending_user_input.take() else {
+            return;
+        };
+        let dismissal = pending.dismissal();
+        runtime
+            .driver
+            .respond_user_input(pending.request_id, dismissal);
+        if let Some(session) = self.state.session_mut(session_id)
+            && session.active_turn_id().is_some()
+        {
+            session.status = SessionStatus::Working;
+        }
+        self.user_input_answer
+            .update(cx, |input, cx| input.clear(cx));
         cx.notify();
     }
 

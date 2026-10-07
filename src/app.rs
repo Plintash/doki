@@ -969,16 +969,21 @@ struct PendingUserInput {
     question_index: usize,
     selections: HashMap<String, Vec<String>>,
     custom_answers: HashMap<String, String>,
+    /// Whether the provider takes a dismissal back as a cancellation. Only a
+    /// provider with a cancellation response (Pi's extension dialogs) offers
+    /// the card a way to dismiss the question without answering it.
+    dismissible: bool,
 }
 
 impl PendingUserInput {
-    fn new(request_id: String, questions: Vec<UserInputQuestion>) -> Self {
+    fn new(request_id: String, questions: Vec<UserInputQuestion>, dismissible: bool) -> Self {
         Self {
             request_id,
             questions,
             question_index: 0,
             selections: HashMap::new(),
             custom_answers: HashMap::new(),
+            dismissible,
         }
     }
 
@@ -986,29 +991,45 @@ impl PendingUserInput {
         self.questions.get(self.question_index)
     }
 
+    /// The answer the provider receives when the user submits: the custom text
+    /// when the user typed one, otherwise the options they selected.
     fn answers(&self) -> Vec<UserInputAnswer> {
         self.questions
             .iter()
-            .map(|question| {
-                let custom = self
-                    .custom_answers
-                    .get(&question.id)
-                    .map(|answer| answer.trim())
-                    .filter(|answer| !answer.is_empty());
-                UserInputAnswer {
-                    question_id: question.id.clone(),
-                    answers: custom.map_or_else(
-                        || {
-                            self.selections
-                                .get(&question.id)
-                                .cloned()
-                                .unwrap_or_default()
-                        },
-                        |answer| vec![answer.to_owned()],
-                    ),
-                }
+            .map(|question| UserInputAnswer {
+                question_id: question.id.clone(),
+                answers: self.answer_for(&question.id),
             })
             .collect()
+    }
+
+    /// The answer a dismissal sends: nothing for every question. A provider
+    /// that takes a dismissal reads the empty answer as its cancellation.
+    fn dismissal(&self) -> Vec<UserInputAnswer> {
+        self.questions
+            .iter()
+            .map(|question| UserInputAnswer {
+                question_id: question.id.clone(),
+                answers: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn answer_for(&self, question_id: &str) -> Vec<String> {
+        let custom = self
+            .custom_answers
+            .get(question_id)
+            .map(|answer| answer.trim())
+            .filter(|answer| !answer.is_empty());
+        custom.map_or_else(
+            || {
+                self.selections
+                    .get(question_id)
+                    .cloned()
+                    .unwrap_or_default()
+            },
+            |answer| vec![answer.to_owned()],
+        )
     }
 }
 
