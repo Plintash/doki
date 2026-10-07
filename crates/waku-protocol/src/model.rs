@@ -2158,7 +2158,10 @@ pub enum DriverEvent {
         questions: Vec<UserInputQuestion>,
     },
     ComputerUseUpdated(crate::computer_use::ComputerUseState),
-    /// The provider accepted a steering message into the running turn.
+    /// The provider accepted a steering message: into the run that was still
+    /// open, or — when that run had already settled — as the prompt that opens
+    /// the next turn. Either way the message is with the provider and belongs
+    /// in the transcript.
     SteerAccepted {
         message: String,
     },
