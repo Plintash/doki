@@ -76,6 +76,29 @@ impl Waku {
         cx.notify();
     }
 
+    /// Hand back the messages the provider still holds, which a stop is about
+    /// to take out of its queue: the transport clears the queue before it
+    /// aborts, so without this the text a stopped turn removed would be gone.
+    /// The stopped messages reach the user through the same retraction a
+    /// settlement performs.
+    pub(super) fn return_stopped_queue_messages(
+        &mut self,
+        session_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        let texts = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.provider_queued_texts())
+            .unwrap_or_default();
+        if texts.is_empty() {
+            return;
+        }
+        self.return_retracted_messages(session_id, &texts, cx);
+    }
+
     pub(super) fn finish_streaming_assistant(&mut self, session_id: Uuid) {
         if let Some(session) = self.state.session_mut(session_id) {
             for message in &mut session.messages {
