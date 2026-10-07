@@ -159,6 +159,14 @@ impl ProviderKind {
                 | Self::Pi
         )
     }
+
+    /// Whether a question this provider asks can be dismissed by cancelling
+    /// it. Pi's extension UI subprotocol is the only one with a cancellation
+    /// response, so only its dialogs offer a dismissal; the structured-input
+    /// transports have no way to take a question back once it is shown.
+    pub fn supports_user_input_cancellation(self) -> bool {
+        matches!(self, Self::OhMyPi | Self::Pi)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
