@@ -15,6 +15,21 @@ impl From<&ComposerAttachment> for crate::persistence::ComposerDraftAttachment {
     }
 }
 
+/// The draft form of a sent message's attachment, so a message the settlement
+/// handed back keeps its attachments when it returns to the composer.
+pub(super) fn draft_attachment(
+    attachment: &MessageAttachment,
+) -> crate::persistence::ComposerDraftAttachment {
+    crate::persistence::ComposerDraftAttachment {
+        path: attachment.path.clone(),
+        mention: attachment.mention.clone(),
+        name: attachment.name.clone(),
+        is_dir: attachment.is_dir,
+        is_image: attachment.is_image,
+        blob_reference: attachment.blob_reference.clone(),
+    }
+}
+
 impl From<crate::persistence::ComposerDraftAttachment> for ComposerAttachment {
     fn from(attachment: crate::persistence::ComposerDraftAttachment) -> Self {
         Self {

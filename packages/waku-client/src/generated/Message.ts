@@ -12,4 +12,11 @@ display_content?: string | null, attachments?: Array<MessageAttachment>,
 /**
  * Spans of this message the user annotated to send with a later message.
  */
-annotations?: Array<MessageAnnotation>, created_at: number, streaming: boolean, };
+annotations?: Array<MessageAnnotation>, created_at: number, streaming: boolean,
+/**
+ * The provider reported this message in its queue and has not delivered
+ * it yet. Live-transport state rather than transcript history: only the
+ * provider's own report sets it, it is never stored with the message, and
+ * an unset flag stays off the wire so an older payload keeps working.
+ */
+pending?: boolean, };

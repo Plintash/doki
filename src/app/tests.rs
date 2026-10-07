@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use super::ComposerSubmission;
 use super::composer::{
     ComposerSubmitAction, annotation_comment_value, composer_submit_action, dropped_file_mention,
@@ -17,20 +19,71 @@ use super::{
     message_starts_followup_turn, navigation_preview_snippet, navigation_rail_fade_visibility,
     navigation_rail_height, navigation_rail_scale, paused_toast_duration, pop_stream_batch,
     push_transcript_activity, response_footer_message_index, response_row_turn_id,
-    session_accepts_turn_output, session_is_reapable, should_refresh_branch_after_activity,
-    should_show_navigation_rail, should_show_scroll_to_bottom, task_id_from_notification_tag,
-    task_notification_tag, transcript_anchor_end_space, transcript_navigation_turns,
-    transcript_rests_at_tail, transcript_row_kinds, transcript_row_splice,
-    transcript_rows_fingerprint, widened_panel_width_for_file_editor,
-    widened_panel_width_for_review,
+    returned_messages_draft, session_accepts_turn_output, session_is_reapable,
+    should_refresh_branch_after_activity, should_show_navigation_rail,
+    should_show_scroll_to_bottom, task_id_from_notification_tag, task_notification_tag,
+    transcript_anchor_end_space, transcript_navigation_turns, transcript_rests_at_tail,
+    transcript_row_kinds, transcript_row_splice, transcript_rows_fingerprint,
+    widened_panel_width_for_file_editor, widened_panel_width_for_review,
 };
 use crate::git_branch::BranchEntry;
 use crate::model::{
     ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget, Checkpoint,
-    CheckpointFile, CheckpointStatus, DriverEvent, Message, MessageAnnotation, MessageRole,
-    PendingPermission, PermissionOption, ProviderKind, ReasoningBlock, RuntimeEventCursor,
-    SessionStatus, TextSpan, TranscriptBlock, TurnStatus, UserInputOption, UserInputQuestion,
+    CheckpointFile, CheckpointStatus, DriverEvent, Message, MessageAnnotation, MessageAttachment,
+    MessageRole, PendingPermission, PermissionOption, ProviderKind, ReasoningBlock,
+    RuntimeEventCursor, SessionStatus, TextSpan, TranscriptBlock, TurnStatus, UserInputOption,
+    UserInputQuestion,
 };
+
+#[test]
+fn a_retracted_message_returns_to_the_composer_in_front_of_its_draft() {
+    // A settlement that takes a queued message back hands the text to the
+    // user: it lands in the composer, in front of whatever was already typed,
+    // with the message's own presentation kept alongside.
+    let attachment = MessageAttachment {
+        path: PathBuf::from("/tmp/report.pdf"),
+        mention: "@report.pdf".into(),
+        name: "report.pdf".into(),
+        is_dir: false,
+        is_image: false,
+        blob_reference: Some("blob-1".into()),
+    };
+    let annotation = MessageAnnotation {
+        id: Uuid::new_v4(),
+        target: AnnotationTarget::MessageSpan {
+            message_id: Uuid::new_v4(),
+            spans: Vec::new(),
+            quote: "quoted".into(),
+            block: "block".into(),
+        },
+        comment: Some("keep this".into()),
+    };
+    let returned = vec![
+        Message::new(MessageRole::User, "@report.pdf and also")
+            .with_presentation(Some("and also".into()), vec![attachment])
+            .with_annotations(vec![annotation.clone()]),
+    ];
+    let existing = crate::persistence::ComposerDraft {
+        text: "half-written".into(),
+        attachments: Vec::new(),
+        annotations: Vec::new(),
+    };
+
+    let draft = returned_messages_draft(Some(&existing), &returned);
+    assert_eq!(draft.text, "and also\n\nhalf-written");
+    assert_eq!(draft.attachments.len(), 1);
+    assert_eq!(draft.attachments[0].name, "report.pdf");
+    assert_eq!(draft.annotations, vec![annotation]);
+
+    // An empty composer simply takes the text.
+    let draft = returned_messages_draft(None, &returned);
+    assert_eq!(draft.text, "and also");
+    assert_eq!(
+        returned_messages_draft(None, &[]).text,
+        "",
+        "nothing returned leaves the draft alone"
+    );
+}
 
 #[test]
 fn a_blank_comment_field_stores_no_comment() {

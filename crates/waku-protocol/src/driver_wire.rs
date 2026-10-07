@@ -103,6 +103,16 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             "steerRejected",
             json!({ "message": message, "reason": reason }),
         ),
+        DriverEvent::ProviderQueue {
+            steering,
+            follow_up,
+        } => (
+            "providerQueue",
+            json!({ "steering": steering, "followUp": follow_up }),
+        ),
+        DriverEvent::QueuedMessagesRetracted { messages } => {
+            ("queuedMessagesRetracted", json!({ "messages": messages }))
+        }
         DriverEvent::UsageUpdated {
             context_tokens,
             context_window,
@@ -204,6 +214,19 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
                 reason: steer.reason,
             }
         }
+        "providerQueue" => {
+            let queue: ProviderQueueWire = serde_json::from_value(payload)?;
+            DriverEvent::ProviderQueue {
+                steering: queue.steering,
+                follow_up: queue.follow_up,
+            }
+        }
+        "queuedMessagesRetracted" => {
+            let retracted: RetractedMessagesWire = serde_json::from_value(payload)?;
+            DriverEvent::QueuedMessagesRetracted {
+                messages: retracted.messages,
+            }
+        }
         "usageUpdated" => {
             let usage: UsageWire = serde_json::from_value(payload)?;
             DriverEvent::UsageUpdated {
@@ -283,6 +306,18 @@ struct RejectedSteerWire {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ProviderQueueWire {
+    steering: Vec<String>,
+    follow_up: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RetractedMessagesWire {
+    messages: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UsageWire {
     context_tokens: Option<u64>,
     context_window: Option<u64>,
@@ -329,6 +364,36 @@ mod tests {
             event_from_wire(cleared).unwrap(),
             DriverEvent::GoalUpdated(None)
         ));
+    }
+
+    #[test]
+    fn the_provider_queue_and_its_retraction_round_trip_through_the_wire() {
+        let queue = event_to_wire(DriverEvent::ProviderQueue {
+            steering: vec!["stop".into()],
+            follow_up: vec!["and also".into()],
+        })
+        .unwrap();
+        assert_eq!(queue.kind, "providerQueue");
+        let DriverEvent::ProviderQueue {
+            steering,
+            follow_up,
+        } = event_from_wire(queue).unwrap()
+        else {
+            panic!("the queue report changed variants on the wire");
+        };
+        assert_eq!(steering, ["stop"]);
+        assert_eq!(follow_up, ["and also"]);
+
+        let retracted = event_to_wire(DriverEvent::QueuedMessagesRetracted {
+            messages: vec!["and also".into()],
+        })
+        .unwrap();
+        assert_eq!(retracted.kind, "queuedMessagesRetracted");
+        let DriverEvent::QueuedMessagesRetracted { messages } = event_from_wire(retracted).unwrap()
+        else {
+            panic!("the retraction changed variants on the wire");
+        };
+        assert_eq!(messages, ["and also"]);
     }
 
     #[test]

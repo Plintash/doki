@@ -154,6 +154,9 @@ enum CommandMessage {
     Prompt(String),
     Steer(String),
     Cancel,
+    /// Take back whatever the provider's queue still holds without waiting for
+    /// its answer; the reader owns stdout and cannot block on a response.
+    RetractQueuedMessages,
     CancelExtensionRequest(String),
     Options(SessionOptions),
     Rollback {
@@ -639,6 +642,14 @@ impl PiDriver {
                                 current_effort = options.reasoning_effort;
                             }
                         }
+                        CommandMessage::RetractQueuedMessages => {
+                            // The queue report already handed the text back, so
+                            // the answer is not read; it only has to leave the
+                            // provider's queue before the next prompt is written.
+                            if write_clear_queue(&mut stdin).is_err() {
+                                break;
+                            }
+                        }
                         CommandMessage::CancelExtensionRequest(id) => {
                             if write_json_line(
                                 &mut stdin,
@@ -928,6 +939,13 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()
     serde_json::to_writer(&mut *writer, value)?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+/// Takes back the messages the provider's queue still holds and returns their
+/// text. No request id: the answer is not awaited, because the reader thread
+/// owns stdout and would otherwise deadlock waiting for it.
+fn write_clear_queue(writer: &mut impl Write) -> std::io::Result<()> {
+    write_json_line(writer, &json!({"type": "clear_queue"}))
 }
 
 fn fail_pending(pending: &PendingResponses, message: &str) {
@@ -1282,6 +1300,9 @@ struct PiStreamState {
     message_saw_reasoning: bool,
     failed: bool,
     tools: HashMap<String, (ActivityKind, String)>,
+    /// The messages the provider's last queue report still held, in the order
+    /// it reported them. Empty on a provider that reports no queue.
+    queued: Vec<String>,
 }
 
 fn handle_pi_message(
@@ -1311,9 +1332,7 @@ fn handle_pi_message(
             // acknowledgement, then a second response carrying
             // `agentInvoked: false` — which keeps that field as one more
             // locally-handled signal.
-            let handled_locally = value
-                .pointer("/data/disposition")
-                .and_then(Value::as_str)
+            let handled_locally = value.pointer("/data/disposition").and_then(Value::as_str)
                 == Some("handled")
                 || value.pointer("/data/agentInvoked").and_then(Value::as_bool) == Some(false);
             if success && !handled_locally {
@@ -1388,6 +1407,19 @@ fn handle_pi_message(
             pending
                 .lock()
                 .retain(|_, response| matches!(response, PendingResponse::Request(_)));
+            // A settlement must not leave text parked in the provider's queue.
+            // Measured against pi 1.0.0: an aborted run settles without
+            // draining its queue, and pi does not run that message afterwards
+            // — it splices it into whatever the user sends next. So the queue
+            // is taken back and its text handed to the user, and the turn
+            // still settles here, once and at once.
+            let retracted = std::mem::take(&mut state.queued);
+            if !retracted.is_empty() {
+                let _ = commands.send(CommandMessage::RetractQueuedMessages);
+                let _ = events.send(DriverEvent::QueuedMessagesRetracted {
+                    messages: retracted,
+                });
+            }
             let success = !state.failed;
             let _ = events.send(DriverEvent::TurnFinished {
                 interrupted: false,
@@ -1405,6 +1437,17 @@ fn handle_pi_message(
     }
 
     match event_type {
+        "queue_update" => {
+            // Each report is the provider's complete queue, so the client's
+            // pending list is the provider's own rather than a guess.
+            let steering = message_texts(value.get("steering"));
+            let follow_up = message_texts(value.get("followUp"));
+            state.queued = steering.iter().chain(&follow_up).cloned().collect();
+            let _ = events.send(DriverEvent::ProviderQueue {
+                steering,
+                follow_up,
+            });
+        }
         "command_output" => {
             if let Some(text) = value
                 .get("text")
@@ -1556,6 +1599,21 @@ fn handle_pi_message(
         }
         _ => {}
     }
+}
+
+/// The text entries of one queue in a `queue_update` report. Anything that is
+/// not a string is not a message the client can show.
+fn message_texts(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn publish_commands(
@@ -1803,6 +1861,147 @@ mod tests {
             DriverEvent::TurnFinished { success: true, .. }
         ));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_provider_queue_report_reaches_the_stream() {
+        // The client's pending list is the provider's own queue, so every
+        // report is forwarded — each one is the complete queue, so the last
+        // report wins.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "queue_update", "steering": ["stop"], "followUp": ["and also"]}),
+            json!({"type": "queue_update", "steering": [], "followUp": []}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        let DriverEvent::ProviderQueue {
+            steering,
+            follow_up,
+        } = event_rx.recv().unwrap()
+        else {
+            panic!("the provider's queue report should reach the stream");
+        };
+        assert_eq!(steering, ["stop"]);
+        assert_eq!(follow_up, ["and also"]);
+        let DriverEvent::ProviderQueue {
+            steering,
+            follow_up,
+        } = event_rx.recv().unwrap()
+        else {
+            panic!("the drained report should reach the stream too");
+        };
+        assert!(steering.is_empty() && follow_up.is_empty());
+        assert!(event_rx.try_recv().is_err(), "a report is one event");
+    }
+
+    #[test]
+    fn retracting_a_queue_asks_the_provider_to_clear_it() {
+        // `clear_queue` is what takes a parked message out of the provider's
+        // queue. It carries no request id: the driver's reader thread owns
+        // stdout, so the answer can never be awaited from there.
+        let mut wire = Vec::new();
+        write_clear_queue(&mut wire).unwrap();
+        let request: Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(request["type"], "clear_queue");
+        assert!(request.get("id").is_none());
+    }
+
+    #[test]
+    fn a_settlement_that_still_holds_a_queued_message_hands_it_back() {
+        // Measured against pi 1.0.0: an aborted run settles without draining
+        // its queue, and pi never runs that message afterwards — it splices
+        // it into whatever the user sends next. A settlement therefore may
+        // not leave text parked in the queue: it is cleared and handed back
+        // to the user, and the turn still settles once, immediately.
+        let (pending, commands, command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "queue_update", "steering": [], "followUp": ["and also"]}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::ProviderQueue { .. }
+        ));
+        let DriverEvent::QueuedMessagesRetracted { messages } = event_rx.recv().unwrap() else {
+            panic!("the settlement takes the queued message back")
+        };
+        assert_eq!(messages, ["and also"]);
+        let DriverEvent::TurnFinished { success, .. } = event_rx.recv().unwrap() else {
+            panic!("the turn still settles")
+        };
+        assert!(success, "the interruption is not a failure of this turn");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the turn settles once, immediately"
+        );
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            CommandMessage::RetractQueuedMessages
+        ));
+    }
+
+    #[test]
+    fn a_message_delivered_at_the_boundary_is_never_retracted() {
+        // The normal case: pi drains the queue into the running turn before it
+        // settles, so the settlement sees no queue and touches nothing.
+        let (pending, commands, command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "queue_update", "steering": [], "followUp": ["and also"]}),
+            json!({"type": "turn_start"}),
+            json!({"type": "queue_update", "steering": [], "followUp": []}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::ProviderQueue { follow_up, .. } if follow_up == ["and also"]
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::ProviderQueue { ref steering, ref follow_up } if steering.is_empty() && follow_up.is_empty()
+        ));
+        let DriverEvent::TurnFinished { success, .. } = event_rx.recv().unwrap() else {
+            panic!("the delivered message's turn still settles");
+        };
+        assert!(success);
+        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]

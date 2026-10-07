@@ -1918,6 +1918,16 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             "steerRejected",
             json!({ "message": message, "reason": reason }),
         ),
+        DriverEvent::ProviderQueue {
+            steering,
+            follow_up,
+        } => (
+            "providerQueue",
+            json!({ "steering": steering, "followUp": follow_up }),
+        ),
+        DriverEvent::QueuedMessagesRetracted { messages } => {
+            ("queuedMessagesRetracted", json!({ "messages": messages }))
+        }
         DriverEvent::UsageUpdated {
             context_tokens,
             context_window,
@@ -2019,6 +2029,19 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
                 reason: steer.reason,
             }
         }
+        "providerQueue" => {
+            let queue: ProviderQueueWire = serde_json::from_value(payload)?;
+            DriverEvent::ProviderQueue {
+                steering: queue.steering,
+                follow_up: queue.follow_up,
+            }
+        }
+        "queuedMessagesRetracted" => {
+            let retracted: RetractedMessagesWire = serde_json::from_value(payload)?;
+            DriverEvent::QueuedMessagesRetracted {
+                messages: retracted.messages,
+            }
+        }
         "usageUpdated" => {
             let usage: UsageWire = serde_json::from_value(payload)?;
             DriverEvent::UsageUpdated {
@@ -2094,6 +2117,18 @@ struct AcceptedSteerWire {
 struct RejectedSteerWire {
     message: String,
     reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderQueueWire {
+    steering: Vec<String>,
+    follow_up: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RetractedMessagesWire {
+    messages: Vec<String>,
 }
 
 #[derive(Deserialize)]
