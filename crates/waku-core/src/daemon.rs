@@ -1872,6 +1872,14 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         ),
         DriverEvent::RichActivity(activity) => ("richActivity", serde_json::to_value(activity)?),
         DriverEvent::BackgroundWork(work) => ("backgroundWork", serde_json::to_value(work)?),
+        DriverEvent::ExtensionMessage {
+            custom_type,
+            text,
+            display,
+        } => (
+            "extensionMessage",
+            json!({ "customType": custom_type, "text": text, "display": display }),
+        ),
         DriverEvent::Permission {
             request_id,
             title,
@@ -1973,6 +1981,14 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         }
         "richActivity" => DriverEvent::RichActivity(serde_json::from_value(payload)?),
         "backgroundWork" => DriverEvent::BackgroundWork(serde_json::from_value(payload)?),
+        "extensionMessage" => {
+            let message: ExtensionMessageWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionMessage {
+                custom_type: message.custom_type,
+                text: message.text,
+                display: message.display,
+            }
+        }
         "permission" => {
             let permission: PermissionWire = serde_json::from_value(payload)?;
             DriverEvent::Permission {
@@ -2058,6 +2074,21 @@ struct ActivityWire {
     title: String,
     detail: Option<String>,
     complete: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionMessageWire {
+    custom_type: String,
+    text: String,
+    /// Absent on a payload written before the field existed; the message then
+    /// behaves as one the provider marked for display.
+    #[serde(default = "default_true")]
+    display: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]

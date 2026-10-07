@@ -1007,6 +1007,11 @@ pub struct AgentSession {
     /// Read-only compatibility field for v1 state files. New saves omit it.
     #[serde(default, skip_serializing)]
     pub provider_session_id: Option<String>,
+    /// The provider's own extension messages, in the order it appended them.
+    /// Kept so the local session view stays identical to the provider's tree
+    /// even for the records the provider marks as not for display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_messages: Vec<ExtensionMessage>,
     /// Not stored in the session JSON — these are rows in the `messages`
     /// table, reattached when the session is hydrated.
     #[serde(default)]
@@ -1062,6 +1067,7 @@ impl AgentSession {
             context_usage: None,
             runtime_event_cursor: None,
             provider_session_id: None,
+            extension_messages: Vec::new(),
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
             turns: Vec::new(),
@@ -1098,6 +1104,7 @@ impl AgentSession {
             context_usage: None,
             runtime_event_cursor: None,
             provider_session_id: None,
+            extension_messages: Vec::new(),
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
             turns: Vec::new(),
@@ -1803,6 +1810,23 @@ pub struct Message {
     pub streaming: bool,
 }
 
+/// An extension message from the provider's own session tree (`role:
+/// "custom"`).
+///
+/// The provider records these itself, so the session keeps every one —
+/// including the ones it marks as not for display — and the transcript renders
+/// only the ones marked for display. Dropping the rest would leave the local
+/// view shorter than the provider's tree.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionMessage {
+    pub custom_type: String,
+    pub text: String,
+    /// Whether the provider intends this message to be shown. A message with
+    /// `display: false` is stored and never rendered.
+    pub display: bool,
+}
+
 impl Message {
     pub fn new(role: MessageRole, content: impl Into<String>) -> Self {
         Self {
@@ -2009,6 +2033,16 @@ pub enum DriverEvent {
     /// deliberately separate from transcript activities: completing a turn
     /// must not make a detached process or subagent look complete.
     BackgroundWork(BackgroundWorkEvent),
+    /// An extension message the provider appended to its own session tree
+    /// (`role: "custom"`). `custom_type` is the provider's kind — for
+    /// pi-subagents, a child or background notification — and `display` is
+    /// whether the provider intends it to be shown. Detached-work
+    /// notifications arrive as [`Self::BackgroundWork`] instead.
+    ExtensionMessage {
+        custom_type: String,
+        text: String,
+        display: bool,
+    },
     Permission {
         request_id: String,
         title: String,
