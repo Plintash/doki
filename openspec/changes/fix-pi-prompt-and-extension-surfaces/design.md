@@ -144,11 +144,15 @@ diverge).
 **D9 — Extension UI records map onto existing app surfaces.** `notify` becomes
 the app's notice/toast channel with its `notifyType`; `setStatus` a per-session
 status line; `set_editor_text` fills the composer; `setTitle` the window title;
-`setWidget` shows its text in the same place a background-work item shows its
-own output. Dialogs become answerable requests with the ordinary `cancel`
-response as the dismissal, and an unanswered dialog is bounded by the timeout Pi
-itself sends when it has one. What stays cancelled is what Pi's RPC cannot carry
-at all (`custom`, `onTerminalInput`).
+`setWidget` a strip beside the composer, which is where the provider itself puts
+a widget (`aboveEditor`/`belowEditor`) and where the client's own queued-message
+card already lives. It does not belong on the detached-work surface: those
+entries are provider work with a key, a status, a stop affordance and a part in
+a parked turn's decisions, and a block of text an extension keeps and clears
+would masquerade as running work. Dialogs become answerable requests with the
+ordinary `cancel` response as the dismissal, and an unanswered dialog is bounded
+by the timeout Pi itself sends when it has one. What stays cancelled is what Pi's
+RPC cannot carry at all (`custom`, `onTerminalInput`).
 
 **D10 — Verification is a live process, not a fixture.** The driver's live tests
 already spawn a real `pi --mode rpc` (`pi_context_usage_against_the_real_rpc`), so
