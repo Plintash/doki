@@ -391,20 +391,7 @@ impl Waku {
                         // a `/goal` began: the provider's start confirms it.
                         session.mark_active_turn_provider_started();
                         session.status = SessionStatus::Working;
-                    } else if matches!(
-                        session.provider,
-                        ProviderKind::Codex | ProviderKind::Claude | ProviderKind::OpenCode
-                    ) {
-                        // Some providers start turns on their own: Codex goal
-                        // continuation pursues an active goal whenever the
-                        // thread is idle, and Claude Code re-enters the model
-                        // once a backgrounded command, subagent or monitor
-                        // settles. Give the turn a transcript home — there is
-                        // no user message for it — so its work streams in
-                        // instead of being dropped.
-                        session.begin_provider_turn();
-                        session.mark_active_turn_provider_started();
-                        session.status = SessionStatus::Working;
+                    } else if begin_provider_initiated_turn(session) {
                         self.state.mark_session_dirty(session_id);
                     }
                 }
@@ -510,6 +497,15 @@ impl Waku {
                 // survive a settled or rewound turn and therefore bypasses
                 // `accepts_turn_output` deliberately.
                 self.handle_background_work_event(session_id, event);
+            }
+            DriverEvent::ExtensionMessage {
+                custom_type,
+                text,
+                display,
+            } => {
+                if let Some(session) = self.state.session_mut(session_id) {
+                    record_extension_message(session, custom_type, text, display);
+                }
             }
             DriverEvent::Permission {
                 request_id,
@@ -993,6 +989,64 @@ pub(super) fn returned_messages_draft(
     annotations.extend(draft.annotations);
     draft.annotations = annotations;
     draft
+}
+
+/// Records an extension message from the provider's own session tree.
+///
+/// The provider keeps these records itself, so the session keeps every one —
+/// including the ones it marks as not for display, which must not render. A
+/// message marked for display becomes a transcript notice, the same shape the
+/// app's own system lines take. Recording a message never opens a turn: Pi
+/// announces a run of its own with `agent_start`/`turn_start`, and a notice an
+/// extension appends without one must not fabricate it.
+pub(super) fn record_extension_message(
+    session: &mut AgentSession,
+    custom_type: String,
+    text: String,
+    display: bool,
+) {
+    let rendered = display && !text.trim().is_empty();
+    if rendered {
+        session.push_message(MessageRole::System, text.clone());
+    }
+    session.extension_messages.push(ExtensionMessage {
+        custom_type,
+        text,
+        display,
+    });
+}
+
+/// Whether a provider's own stream may open a turn that no Waku prompt did.
+///
+/// Codex goal continuation pursues an active goal whenever its thread is idle,
+/// Claude Code re-enters the model once a backgrounded command, subagent or
+/// monitor settles, and Pi wakes its session when an extension posts a
+/// turn-triggering message. A provider absent here never gets a turn without a
+/// prompt.
+pub(super) fn provider_starts_turns_on_its_own(provider: ProviderKind) -> bool {
+    matches!(
+        provider,
+        ProviderKind::Codex
+            | ProviderKind::Claude
+            | ProviderKind::OpenCode
+            | ProviderKind::Pi
+            | ProviderKind::OhMyPi
+    )
+}
+
+/// Gives a run the provider started on its own a transcript home.
+///
+/// There is no user message for such a turn, so its work would otherwise be
+/// dropped. Only the provider's own run-start signal calls this, and an
+/// already-open turn is left to its own start report.
+pub(super) fn begin_provider_initiated_turn(session: &mut AgentSession) -> bool {
+    if session.active_turn_id().is_some() || !provider_starts_turns_on_its_own(session.provider) {
+        return false;
+    }
+    session.begin_provider_turn();
+    session.mark_active_turn_provider_started();
+    session.status = SessionStatus::Working;
+    true
 }
 
 /// Foreground output is stronger evidence of a started provider turn than a

@@ -13,12 +13,13 @@ use super::{
     NAVIGATION_RAIL_TICK_HEIGHT, NAVIGATION_RAIL_TURN_HEIGHT, PendingUserInput, SessionNavigation,
     StreamDeltaKind, TranscriptRowKind::*, active_navigation_turn_index,
     append_text_delta_to_session, assistant_response_footer, assistant_response_footer_index,
-    assistant_response_footer_time, compact_driver_error, disclosure_leading_space, fenced_code,
-    fitted_file_tree_width, fitted_panel_widths, folded_transcript_row_kinds,
-    format_worked_duration, format_working_elapsed, maintain_transcript_anchor, message_opens_turn,
-    message_starts_followup_turn, navigation_preview_snippet, navigation_rail_fade_visibility,
-    navigation_rail_height, navigation_rail_scale, paused_toast_duration, pop_stream_batch,
-    push_transcript_activity, response_footer_message_index, response_row_turn_id,
+    assistant_response_footer_time, begin_provider_initiated_turn, compact_driver_error,
+    disclosure_leading_space, fenced_code, fitted_file_tree_width, fitted_panel_widths,
+    folded_transcript_row_kinds, format_worked_duration, format_working_elapsed,
+    maintain_transcript_anchor, message_opens_turn, message_starts_followup_turn,
+    navigation_preview_snippet, navigation_rail_fade_visibility, navigation_rail_height,
+    navigation_rail_scale, paused_toast_duration, pop_stream_batch, push_transcript_activity,
+    record_extension_message, response_footer_message_index, response_row_turn_id,
     returned_messages_draft, session_accepts_turn_output, session_is_reapable,
     should_refresh_branch_after_activity, should_show_navigation_rail,
     should_show_scroll_to_bottom, task_id_from_notification_tag, task_notification_tag,
@@ -2401,4 +2402,102 @@ fn the_rail_draws_only_installed_providers_the_settings_left_on() {
         Some(ProviderKind::Claude),
         ProviderKind::Claude
     ));
+}
+
+/// A Pi run the agent starts on its own — an extension waking the session —
+/// has no user message and no submission. The provider's own start signal is
+/// the only thing that may open its turn, and once open the turn must accept
+/// output exactly as a prompted one does.
+#[test]
+fn a_pi_run_the_agent_starts_opens_a_transcript_home() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    let session_id = session.id;
+
+    assert!(begin_provider_initiated_turn(&mut session));
+    assert!(session.active_turn_id().is_some());
+    assert_eq!(session.status, SessionStatus::Working);
+    let turn_id = session.active_turn_id();
+
+    // Its deltas land in the turn that was opened, exactly as a prompted
+    // turn's would, so the wake's reply reaches the transcript.
+    assert!(session_accepts_turn_output(&mut session));
+    let mut sessions = vec![session];
+    append_text_delta_to_session(&mut sessions, session_id, false, "Waking".into());
+    assert_eq!(sessions[0].messages.len(), 1);
+    assert_eq!(sessions[0].messages[0].role, MessageRole::Assistant);
+    assert_eq!(sessions[0].messages[0].turn_id, turn_id);
+    assert_eq!(sessions[0].messages[0].content, "Waking");
+
+    // A provider whose stream cannot start a turn never fabricates one.
+    let mut other = AgentSession::new(Uuid::new_v4(), ProviderKind::DeepSeek);
+    assert!(!begin_provider_initiated_turn(&mut other));
+    assert!(other.active_turn_id().is_none());
+    assert_eq!(other.status, SessionStatus::Idle);
+}
+
+/// An extension message with no run behind it is appended to the session, not
+/// a turn: nothing about a notice may make the client look busy.
+#[test]
+fn an_extension_message_that_starts_no_run_opens_no_turn() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+
+    record_extension_message(
+        &mut session,
+        "subagent_control_notice".into(),
+        "Workflow paused.".into(),
+        true,
+    );
+
+    assert!(session.active_turn_id().is_none());
+    assert_eq!(session.status, SessionStatus::Idle);
+}
+
+/// The provider hides `display: false` records in its own TUI, but they are
+/// still entries in its session tree. The session keeps the record so the two
+/// views stay the same length, and the transcript shows nothing for it.
+#[test]
+fn a_hidden_extension_message_is_stored_without_a_row() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+
+    record_extension_message(
+        &mut session,
+        "subagent-compaction-resume".into(),
+        "Context compaction resumed.".into(),
+        false,
+    );
+
+    assert_eq!(session.extension_messages.len(), 1);
+    assert_eq!(
+        session.extension_messages[0].custom_type,
+        "subagent-compaction-resume"
+    );
+    assert_eq!(
+        session.extension_messages[0].text,
+        "Context compaction resumed."
+    );
+    assert!(!session.extension_messages[0].display);
+    assert!(session.messages.is_empty(), "nothing is rendered for it");
+    assert!(folded_transcript_row_kinds(&session, &HashSet::new()).is_empty());
+}
+
+/// Everything else the provider marks for display becomes a transcript
+/// notice, the same shape the app's own system lines take.
+#[test]
+fn a_visible_extension_message_becomes_a_transcript_notice() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+
+    record_extension_message(
+        &mut session,
+        "subagent_control_notice".into(),
+        "Workflow paused.".into(),
+        true,
+    );
+
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].role, MessageRole::System);
+    assert_eq!(session.messages[0].content, "Workflow paused.");
+    assert_eq!(
+        folded_transcript_row_kinds(&session, &HashSet::new()),
+        [Message(0)]
+    );
 }

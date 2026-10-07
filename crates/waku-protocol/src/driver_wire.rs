@@ -57,6 +57,14 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         ),
         DriverEvent::RichActivity(activity) => ("richActivity", serde_json::to_value(activity)?),
         DriverEvent::BackgroundWork(work) => ("backgroundWork", serde_json::to_value(work)?),
+        DriverEvent::ExtensionMessage {
+            custom_type,
+            text,
+            display,
+        } => (
+            "extensionMessage",
+            json!({ "customType": custom_type, "text": text, "display": display }),
+        ),
         DriverEvent::Permission {
             request_id,
             title,
@@ -168,6 +176,14 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         }
         "richActivity" => DriverEvent::RichActivity(serde_json::from_value(payload)?),
         "backgroundWork" => DriverEvent::BackgroundWork(serde_json::from_value(payload)?),
+        "extensionMessage" => {
+            let message: ExtensionMessageWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionMessage {
+                custom_type: message.custom_type,
+                text: message.text,
+                display: message.display,
+            }
+        }
         "permission" => {
             let permission: PermissionWire = serde_json::from_value(payload)?;
             DriverEvent::Permission {
@@ -266,6 +282,21 @@ struct ActivityWire {
     title: String,
     detail: Option<String>,
     complete: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionMessageWire {
+    custom_type: String,
+    text: String,
+    /// Absent on a payload written before the field existed; the message then
+    /// behaves as one the provider marked for display.
+    #[serde(default = "default_true")]
+    display: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -394,6 +425,39 @@ mod tests {
             panic!("the retraction changed variants on the wire");
         };
         assert_eq!(messages, ["and also"]);
+    }
+
+    #[test]
+    fn extension_messages_round_trip_and_default_to_displayed() {
+        let wire = event_to_wire(DriverEvent::ExtensionMessage {
+            custom_type: "subagent_control_notice".into(),
+            text: "Workflow paused.".into(),
+            display: false,
+        })
+        .unwrap();
+        assert_eq!(wire.kind, "extensionMessage");
+
+        let DriverEvent::ExtensionMessage {
+            custom_type,
+            text,
+            display,
+        } = event_from_wire(wire).unwrap()
+        else {
+            panic!("the event changed variants during its wire round trip");
+        };
+        assert_eq!(custom_type, "subagent_control_notice");
+        assert_eq!(text, "Workflow paused.");
+        assert!(!display);
+
+        // A payload written before the field existed renders as a notice.
+        let legacy = crate::WireDriverEvent::new(
+            "extensionMessage",
+            json!({ "customType": "notice", "text": "hello" }),
+        );
+        let DriverEvent::ExtensionMessage { display, .. } = event_from_wire(legacy).unwrap() else {
+            panic!("the event changed variants during its wire round trip");
+        };
+        assert!(display);
     }
 
     #[test]

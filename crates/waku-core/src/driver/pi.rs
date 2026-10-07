@@ -23,7 +23,10 @@ use super::{activity, computer_use as computer_use_runtime};
 use crate::driver::{
     DriverControl, DriverEventSender, DriverEventSink, DriverStartOptions, SessionOptions,
 };
-use crate::model::{ActivityKind, DriverEvent, ProviderResumeCursor, ReportedCommand, RuntimeMode};
+use crate::model::{
+    ActivityKind, BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKind,
+    BackgroundWorkStatus, DriverEvent, ProviderResumeCursor, ReportedCommand, RuntimeMode,
+};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1507,16 +1510,28 @@ fn handle_pi_message(
             }
         }
         "message_end" => {
-            if value.pointer("/message/role").and_then(Value::as_str) == Some("assistant") {
-                // This is the context the next call starts from, not the
-                // cumulative billed total for the whole session.
-                if let Some(tokens) = value.get("message").and_then(pi_message_context_tokens) {
-                    let _ = events.send(DriverEvent::UsageUpdated {
-                        context_tokens: Some(tokens),
-                        context_window: None,
-                    });
+            let message = value.get("message");
+            match message
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+            {
+                Some("assistant") => {
+                    // This is the context the next call starts from, not the
+                    // cumulative billed total for the whole session.
+                    if let Some(tokens) = message.and_then(pi_message_context_tokens) {
+                        let _ = events.send(DriverEvent::UsageUpdated {
+                            context_tokens: Some(tokens),
+                            context_window: None,
+                        });
+                    }
+                    emit_completed_message_fallback(message, events, state);
                 }
-                emit_completed_message_fallback(value.get("message"), events, state);
+                Some("custom") => {
+                    if let Some(message) = message {
+                        emit_extension_message(message, events);
+                    }
+                }
+                _ => {}
             }
         }
         "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
@@ -1628,6 +1643,94 @@ fn publish_commands(
         })
         .collect();
     let _ = events.send(DriverEvent::AvailableCommands(commands));
+}
+
+fn emit_extension_message(message: &Value, events: &impl DriverEventSink) {
+    let custom_type = message
+        .get("customType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let text = pi_custom_message_text(message.get("content"));
+    // pi-subagents reports its detached children through its own custom
+    // messages. Those records are the only sign a background child settled,
+    // and the client already has a surface for work that outlives the turn.
+    if let Some(item) = pi_subagent_background_item(custom_type, &text) {
+        let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
+            item,
+        )));
+        return;
+    }
+    let display = message
+        .get("display")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let _ = events.send(DriverEvent::ExtensionMessage {
+        custom_type: custom_type.to_owned(),
+        text,
+        display,
+    });
+}
+
+/// The custom message's text. Pi normalizes missing content to an empty array,
+/// but a plain string is still a legal `CustomMessage` body, so both shapes are
+/// decoded.
+fn pi_custom_message_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// pi-subagents' child and background notifications as detached work.
+///
+/// The two types are its own: a workflow child settling and a background task
+/// finishing. Their first line names the child and its outcome, so the item is
+/// named after the child, carries the outcome as its status, and keeps the
+/// whole message as its detail; anything else is an extension message with no
+/// detached work behind it.
+fn pi_subagent_background_item(custom_type: &str, text: &str) -> Option<BackgroundWorkItem> {
+    if !matches!(
+        custom_type,
+        "subagent-incremental-child-notify" | "subagent-notify"
+    ) {
+        return None;
+    }
+    let headline = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    // The child's key rides the first line's bold span ("…: **build**").
+    let child = headline
+        .split_once("**")
+        .and_then(|(_, rest)| rest.split_once("**"))
+        .map(|(child, _)| child.trim())
+        .filter(|child| !child.is_empty())
+        .unwrap_or(headline);
+    let status = if headline.contains("failed") {
+        BackgroundWorkStatus::Failed
+    } else if headline.contains("completed") {
+        BackgroundWorkStatus::Completed
+    } else if headline.contains("stopped") {
+        BackgroundWorkStatus::Stopped
+    } else {
+        BackgroundWorkStatus::Running
+    };
+    let mut item = BackgroundWorkItem::new(
+        BackgroundWorkKind::Subagent,
+        child.to_owned(),
+        child.to_owned(),
+        status,
+    );
+    item.background = true;
+    item.detail = Some(text.to_owned());
+    Some(item)
 }
 
 fn emit_completed_message_fallback(
@@ -2761,6 +2864,159 @@ mod tests {
         assert!(matches!(
             event_rx.recv().unwrap(),
             DriverEvent::TurnFinished { success: true, .. }
+        ));
+    }
+
+    #[test]
+    fn a_workflow_child_completion_lands_on_the_background_work_surface() {
+        // pi-subagents reports a background child's settle as a custom
+        // message. That message is the only signal the parent's session gets
+        // that the child finished, and detached work is already the surface
+        // for it, so it must not be dropped with the rest of the ignored
+        // stream.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({
+                "type": "message_start",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent-incremental-child-notify",
+                    "display": false,
+                    "content": "Workflow child completed: **build**\nWorkflow run: wf-1\nStatus: workflow finished"
+                }
+            }),
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent-incremental-child-notify",
+                    "display": false,
+                    "content": "Workflow child completed: **build**\nWorkflow run: wf-1\nStatus: workflow finished"
+                }
+            }),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) =
+            event_rx.recv().unwrap()
+        else {
+            panic!("a subagent child completion must land on the background-work surface")
+        };
+        assert_eq!(item.key.kind, BackgroundWorkKind::Subagent);
+        assert_eq!(item.title, "build", "the surface names the child");
+        assert_eq!(item.status, BackgroundWorkStatus::Completed);
+        assert!(
+            item.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("workflow finished"))
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "one completion must produce exactly one surface update"
+        );
+        assert!(!state.run_started);
+    }
+
+    #[test]
+    fn a_failed_background_task_lands_on_the_background_work_surface() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent-notify",
+                    "display": true,
+                    "content": "Background task failed: **code-auditor**\n\n(no output)"
+                }
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) =
+            event_rx.recv().unwrap()
+        else {
+            panic!("a background task notification must land on the background-work surface")
+        };
+        assert_eq!(item.key.kind, BackgroundWorkKind::Subagent);
+        assert_eq!(item.title, "code-auditor");
+        assert_eq!(item.status, BackgroundWorkStatus::Failed);
+    }
+
+    #[test]
+    fn another_extension_message_becomes_a_notice() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent_control_notice",
+                    "display": true,
+                    "content": "Workflow paused."
+                }
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::ExtensionMessage { custom_type, text, display }
+                if custom_type == "subagent_control_notice"
+                    && text == "Workflow paused."
+                    && display
+        ));
+    }
+
+    #[test]
+    fn an_extension_message_marked_not_for_display_is_still_delivered() {
+        // Pi hides these in its own TUI, but they are records in the
+        // provider's session tree. The client stores them without rendering,
+        // which it can only do if the flag survives the transport.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent-compaction-resume",
+                    "display": false,
+                    "content": "Context compaction resumed."
+                }
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::ExtensionMessage { custom_type, text, display }
+                if custom_type == "subagent-compaction-resume"
+                    && text == "Context compaction resumed."
+                    && !display
         ));
     }
 }
