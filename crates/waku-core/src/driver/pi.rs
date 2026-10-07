@@ -903,10 +903,12 @@ fn send_prompt(
     // already processing. Specify streamingBehavior ('steer' or 'followUp') to
     // queue the message." — and Waku can prompt into that state: stopping a
     // turn settles it here immediately, while Pi keeps streaming until its
-    // own abort finishes unwinding. `followUp` makes Pi queue the message on
-    // the settling run instead (it is ignored while Pi is idle), so a
-    // submission that races the tail of the previous turn is delivered rather
-    // than failed into the transcript.
+    // own abort finishes unwinding. Pi reads the option only while it is
+    // streaming, so one constant covers both cases: a prompt against an idle
+    // agent starts a run as before, and a submission that races the tail of
+    // the previous turn is queued and delivered — inside that run when it
+    // reaches a boundary, as its own run when an abort ended the first —
+    // rather than failed into the transcript.
     if let Err(error) = write_json_line(
         stdin,
         &json!({
@@ -1301,18 +1303,27 @@ fn handle_pi_message(
         let prompt_response = matches!(pending.lock().get(id), Some(PendingResponse::Prompt));
         if prompt_response {
             let success = value.get("success").and_then(Value::as_bool) == Some(true);
-            let local_only =
-                value.pointer("/data/agentInvoked").and_then(Value::as_bool) == Some(false);
-            if success && !local_only {
-                // OMP may acknowledge a prompt before reporting that an
-                // extension handled it locally. Retain the id for that second
-                // response; normal agent completion retires it below.
+            // Pi answers a prompt with what became of it: `started` and
+            // `queued` mean the work is on its way and the run settles the
+            // turn, while `handled` means an extension command or an input
+            // handler consumed the prompt and no run will start for it, so the
+            // turn settles here. Oh My Pi says the last part in two steps — an
+            // acknowledgement, then a second response carrying
+            // `agentInvoked: false` — which keeps that field as one more
+            // locally-handled signal.
+            let handled_locally = value
+                .pointer("/data/disposition")
+                .and_then(Value::as_str)
+                == Some("handled")
+                || value.pointer("/data/agentInvoked").and_then(Value::as_bool) == Some(false);
+            if success && !handled_locally {
                 return;
             }
             pending.lock().remove(id);
-            if !state.run_started {
-                let _ = events.send(DriverEvent::TurnStarted);
-            }
+            // A prompt answer never opens a turn. A run announces itself with
+            // `agent_start`/`turn_start`, and the two answers that settle here
+            // — a refusal and a locally handled command — have no run behind
+            // them at all.
             let error = (!success).then(|| {
                 value
                     .get("error")
@@ -1674,21 +1685,124 @@ mod tests {
     }
 
     #[test]
-    fn prompt_requests_carry_a_streaming_behavior() {
+    fn every_prompt_asks_the_provider_to_queue_it_while_streaming() {
         // Pi refuses a prompt that arrives while it is still streaming unless
         // the request says how to queue it, and Waku can prompt into exactly
         // that window: stopping a turn settles it here at once, while Pi keeps
-        // streaming until its own abort finishes unwinding. Always asking for
-        // `followUp` — ignored while Pi is idle — queues such a submission
-        // instead of failing it into the transcript as an assistant reply.
+        // streaming until its own abort finishes unwinding. Pi reads the
+        // option only while it is streaming, so one constant covers both cases
+        // and no branch of ours has to guess the provider's state.
         let (pending, _commands, _command_rx, _state) = harness();
+        let mut next = 0;
         let mut wire = Vec::new();
-        send_prompt(&mut wire, &pending, &mut 0, "hello").unwrap();
+        send_prompt(&mut wire, &pending, &mut next, "idle session").unwrap();
+        // The second prompt goes out before the first has settled, which is
+        // the window this option exists for.
+        send_prompt(&mut wire, &pending, &mut next, "still streaming").unwrap();
 
-        let request: Value = serde_json::from_slice(&wire).unwrap();
-        assert_eq!(request["type"], "prompt");
-        assert_eq!(request["message"], "hello");
-        assert_eq!(request["streamingBehavior"], "followUp");
+        let requests: Vec<Value> = String::from_utf8(wire)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["message"], "idle session");
+        assert_eq!(requests[1]["message"], "still streaming");
+        for request in requests {
+            assert_eq!(request["type"], "prompt");
+            assert_eq!(request["streamingBehavior"], "followUp");
+        }
+    }
+
+    #[test]
+    fn a_prompt_the_provider_queued_waits_for_the_run() {
+        // `queued` means the provider took the message for the turn that is
+        // still running, so the answer itself settles nothing: the run settles
+        // once its queue has drained.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "and also").unwrap();
+        for frame in [
+            json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "queued"}}),
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(event_rx.try_recv().is_err());
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn a_prompt_an_extension_handled_settles_without_a_run() {
+        // An extension command runs inside the provider and starts no run, so
+        // a client that waits for a settle would strand the turn forever.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "/mycommand").unwrap();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "handled"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished {
+                success: true,
+                summary: None,
+                ..
+            }
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a handled prompt opens no turn of its own"
+        );
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn a_run_settles_the_turn_the_provider_never_answered() {
+        // Pi writes no response at all for a prompt submitted while it is
+        // emitting its settle, so settlement cannot depend on one arriving.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "hello").unwrap();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]
@@ -1752,7 +1866,6 @@ mod tests {
             &events,
             &mut state,
         );
-        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
         assert!(
             matches!(event_rx.recv().unwrap(), DriverEvent::Error(error) if error == "command failed")
         );
@@ -1760,6 +1873,10 @@ mod tests {
             event_rx.recv().unwrap(),
             DriverEvent::TurnFinished { success: false, .. }
         ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a refused prompt opens no turn of its own"
+        );
         assert!(pending.lock().is_empty());
         assert_eq!(String::from_utf8(wire).unwrap().lines().count(), 2);
     }
