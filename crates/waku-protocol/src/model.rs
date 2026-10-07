@@ -1595,6 +1595,44 @@ impl AgentSession {
         taken
     }
 
+    /// Records the provider's refusal of the turn's own prompt, before the run
+    /// it asked for began.
+    ///
+    /// The user's message stays where they can see it — those are their own
+    /// words — marked not delivered with the reason the provider gave. The
+    /// turn goes with it: nothing ran, so no answer is coming and an answer
+    /// row under it would be a reply the provider never gave. The session is
+    /// idle again, so the next prompt starts normally. Returns whether a
+    /// refusal was recorded, which a turn the provider already started never
+    /// is — a run that fails after it began produced an answer, not a missed
+    /// delivery.
+    pub fn mark_active_prompt_undelivered(&mut self, reason: &str) -> bool {
+        let Some(turn) = self
+            .turns
+            .last()
+            .filter(|turn| turn.status == TurnStatus::Running && !turn.provider_turn_started)
+        else {
+            return false;
+        };
+        let turn_id = turn.id;
+        let mut refused = false;
+        for message in &mut self.messages {
+            if message.turn_id == Some(turn_id) && message.role == MessageRole::User {
+                message.turn_id = None;
+                message.pending = false;
+                message.undelivered_reason = Some(reason.to_owned());
+                refused = true;
+            }
+        }
+        if !refused {
+            return false;
+        }
+        self.turns.pop();
+        self.status = SessionStatus::Idle;
+        self.updated_at = unix_time();
+        true
+    }
+
     pub fn mark_active_turn_provider_started(&mut self) {
         if let Some(turn) = self
             .turns
@@ -1915,6 +1953,13 @@ pub struct Message {
     /// an unset flag stays off the wire so an older payload keeps working.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pending: bool,
+    /// The provider refused this message before accepting it, with the reason
+    /// it gave. The message never reached the conversation, so it is marked
+    /// undelivered instead of being answered. Live-transport state like
+    /// [`Self::pending`]: it is never stored, and an absent reason stays off
+    /// the wire so an older payload keeps working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undelivered_reason: Option<String>,
 }
 
 /// Serde predicate for a flag that is false unless something sets it, so an
@@ -1953,6 +1998,7 @@ impl Message {
             created_at: unix_time(),
             streaming: false,
             pending: false,
+            undelivered_reason: None,
         }
     }
 

@@ -986,6 +986,36 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                             .child(tr!("composer.queued_pending")),
                     );
                 }
+                if let Some(reason) = message.undelivered_reason.as_deref() {
+                    // The provider refused this message before it ran, so it
+                    // is not an answer and there is none below it: the words
+                    // stay, and the reason arrives with them. The icon and
+                    // text carry the state without leaning on colour.
+                    column = column.child(
+                        div()
+                            .mr(px(2.0))
+                            .max_w(px(540.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .text_size(sp(12.0))
+                            .line_height(sp(15.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .text_color(theme.danger)
+                                    .child(icon("icons/alert.svg", 11.0, theme.danger))
+                                    .child(tr!("composer.undelivered")),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme.text_tertiary)
+                                    .child(reason.to_owned()),
+                            ),
+                    );
+                }
                 column = column.child(render_message_footer(
                     theme,
                     message,

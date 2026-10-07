@@ -538,17 +538,18 @@ impl PiDriver {
                                 &prompt,
                             );
                             if let Err(error) = result {
-                                let _ = writer_events.send(DriverEvent::Error(tr!(
-                                    "errors.provider_rejected_prompt_detail",
-                                    provider = flavor.display_name(),
-                                    error = error
-                                )));
+                                // The prompt never reached the provider, so
+                                // this is the submitted message's delivery
+                                // failure: the reason settles the turn with
+                                // it, rather than arriving as an error the
+                                // app would render as its answer.
                                 let _ = writer_events.send(DriverEvent::TurnFinished {
                                     interrupted: false,
                                     success: false,
                                     summary: Some(tr!(
-                                        "errors.provider_rejected_prompt",
-                                        provider = flavor.display_name()
+                                        "errors.provider_rejected_prompt_detail",
+                                        provider = flavor.display_name(),
+                                        error = error
                                     )),
                                 });
                             }
@@ -1446,20 +1447,29 @@ fn handle_pi_message(
             // `agent_start`/`turn_start`, and the two answers that settle here
             // — a refusal and a locally handled command — have no run behind
             // them at all.
-            let error = (!success).then(|| {
+            //
+            // A refusal is the delivery failure of the message that asked for
+            // the run: it never reached the conversation, so the provider's
+            // own reason travels as the settlement's summary, which is what
+            // marks the message undelivered. Sending it as a transport error
+            // instead would have the client store it as an answer to a
+            // message the agent never saw.
+            let summary = (!success).then(|| {
                 value
                     .get("error")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .unwrap_or_else(|| format!("{} RPC command failed", flavor.display_name()))
+                    .unwrap_or_else(|| {
+                        tr!(
+                            "errors.provider_rejected_prompt",
+                            provider = flavor.display_name()
+                        )
+                    })
             });
-            if let Some(error) = error.as_ref() {
-                let _ = events.send(DriverEvent::Error(error.clone()));
-            }
             let _ = events.send(DriverEvent::TurnFinished {
                 interrupted: false,
                 success,
-                summary: error,
+                summary,
             });
             // No run stands behind this answer — a refusal, or an extension
             // command that consumed the prompt — so nothing is live until the
@@ -2296,6 +2306,55 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_prompt_settles_as_its_messages_delivery_failure() {
+        // The provider refused the prompt before accepting it, so the message
+        // never reached the conversation. The settlement says so, carrying the
+        // provider's own reason; a transport error would be shown as a reply
+        // to a message the agent never saw.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let mut wire = Vec::new();
+        let mut next_request_id = 0;
+        send_prompt(&mut wire, &pending, &mut next_request_id, "run the tests").unwrap();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "response",
+                "id": "waku-1",
+                "success": false,
+                "error": "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        let DriverEvent::TurnFinished {
+            success,
+            summary,
+            interrupted,
+        } = event_rx.recv().unwrap()
+        else {
+            panic!("a refused prompt settles the turn")
+        };
+        assert!(!success);
+        assert!(!interrupted);
+        assert_eq!(
+            summary.as_deref(),
+            Some(
+                "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
+            ),
+            "the provider's own refusal is what the message went undelivered by"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no error and no turn start: nothing ran, so nothing answers the message"
+        );
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
     fn asynchronous_prompt_errors_settle_only_the_current_prompt() {
         let (pending, commands, _command_rx, mut state) = harness();
         let (events, event_rx) = unbounded();
@@ -2321,12 +2380,8 @@ mod tests {
             &mut state,
         );
         assert!(
-            matches!(event_rx.recv().unwrap(), DriverEvent::Error(error) if error == "command failed")
+            matches!(event_rx.recv().unwrap(), DriverEvent::TurnFinished { success: false, summary: Some(reason), .. } if reason == "command failed")
         );
-        assert!(matches!(
-            event_rx.recv().unwrap(),
-            DriverEvent::TurnFinished { success: false, .. }
-        ));
         assert!(
             event_rx.try_recv().is_err(),
             "a refused prompt opens no turn of its own"
