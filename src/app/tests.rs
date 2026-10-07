@@ -86,6 +86,70 @@ fn a_retracted_message_returns_to_the_composer_in_front_of_its_draft() {
     );
 }
 
+/// A prompt the provider refuses before accepting it never runs, so the
+/// settlement is the delivery failure of the message that asked for it. The
+/// user's own words stay in the transcript, marked not delivered with the
+/// provider's reason; no answer row is made for a turn that never happened.
+#[test]
+fn a_refused_prompt_leaves_its_message_undelivered_and_unanswered() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    session.begin_turn("run the tests");
+    session.status = SessionStatus::Connecting;
+
+    assert!(
+        session
+            .mark_active_prompt_undelivered("Pi rejected the prompt: Agent is already processing")
+    );
+
+    assert_eq!(
+        folded_transcript_row_kinds(&session, &HashSet::new()),
+        vec![Message(0)],
+        "the prompt is the only row: nothing answers it"
+    );
+    assert!(session.active_turn_id().is_none());
+    assert_eq!(
+        session.status,
+        SessionStatus::Idle,
+        "the next prompt can run"
+    );
+    assert_eq!(
+        composer_submit_action(Some(session.status), false),
+        ComposerSubmitAction::Send,
+        "a refused prompt leaves nothing for the next one to queue behind"
+    );
+    let prompt = &session.messages[0];
+    assert_eq!(prompt.role, MessageRole::User);
+    assert_eq!(
+        prompt.undelivered_reason.as_deref(),
+        Some("Pi rejected the prompt: Agent is already processing")
+    );
+    assert!(!prompt.pending);
+    assert!(
+        !session
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Assistant),
+        "the provider's refusal is never stored as a reply"
+    );
+}
+
+#[test]
+fn a_run_that_failed_after_it_started_is_not_a_refused_prompt() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    let turn = session.begin_turn("run the tests");
+    session.mark_active_turn_provider_started();
+    session.status = SessionStatus::Working;
+
+    assert!(
+        !session.mark_active_prompt_undelivered("the provider gave up"),
+        "the prompt reached a run, so its failure is the turn's, not the delivery's"
+    );
+
+    assert_eq!(session.active_turn_id(), Some(turn));
+    assert_eq!(session.messages.len(), 1);
+    assert!(session.messages[0].undelivered_reason.is_none());
+}
+
 #[test]
 fn a_blank_comment_field_stores_no_comment() {
     assert_eq!(annotation_comment_value("   "), None);

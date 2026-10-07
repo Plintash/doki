@@ -19,4 +19,12 @@ annotations?: Array<MessageAnnotation>, created_at: number, streaming: boolean,
  * provider's own report sets it, it is never stored with the message, and
  * an unset flag stays off the wire so an older payload keeps working.
  */
-pending?: boolean, };
+pending?: boolean,
+/**
+ * The provider refused this message before accepting it, with the reason
+ * it gave. The message never reached the conversation, so it is marked
+ * undelivered instead of being answered. Live-transport state like
+ * [`Self::pending`]: it is never stored, and an absent reason stays off
+ * the wire so an older payload keeps working.
+ */
+undelivered_reason?: string | null, };

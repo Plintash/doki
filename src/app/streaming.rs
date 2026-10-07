@@ -30,6 +30,40 @@ impl Waku {
         }
     }
 
+    /// Records a settlement the provider reported as a refused prompt, and
+    /// whether this settlement was one.
+    ///
+    /// The prompt never reached the conversation, so the user's message is
+    /// marked not delivered with the provider's own reason instead of being
+    /// answered, and the turn that existed only for it is dropped. A turn the
+    /// provider had already started is not a refusal: the run failed, and the
+    /// settlement is that turn's outcome.
+    fn record_refused_prompt(
+        &mut self,
+        session_id: Uuid,
+        runtime: &mut SessionRuntime,
+        summary: Option<&str>,
+    ) -> bool {
+        let Some(session) = self.state.session_mut(session_id) else {
+            return false;
+        };
+        let reason = match summary {
+            Some(summary) => compact_driver_error(summary),
+            // A refusal with no reason of its own still did not deliver the
+            // message, and naming the provider says who refused it.
+            None => tr!(
+                "errors.provider_rejected_prompt",
+                provider = session.provider.display_name()
+            ),
+        };
+        if !session.mark_active_prompt_undelivered(&reason) {
+            return false;
+        }
+        runtime.last_driver_error = None;
+        self.state.mark_session_dirty(session_id);
+        true
+    }
+
     /// Hand back the queued messages a settlement took out of the provider's
     /// queue. They never reached the conversation, so they leave the transcript
     /// and their text returns to the user — the composer when this session is
@@ -719,6 +753,15 @@ impl Waku {
                 summary,
                 interrupted,
             } => {
+                // A prompt the provider refused before accepting it settles as
+                // the delivery failure of the message that asked for the run:
+                // that message stays, marked undelivered with the reason, and
+                // the turn goes with it. Nothing ran, so the usual settlement
+                // — an answer row, a checkpoint, background work — would be
+                // reporting a turn that never happened.
+                if !success && self.record_refused_prompt(session_id, runtime, summary.as_deref()) {
+                    return true;
+                }
                 let (session_status, turn_status, background_status) =
                     Self::turn_settlement(success, interrupted);
                 self.settle_foreground_work(session_id, background_status);

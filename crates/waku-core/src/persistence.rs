@@ -1586,6 +1586,9 @@ fn message_from_row(row: MessageColumns) -> Option<Message> {
         // not transcript history: a restored session starts delivered and the
         // provider's next report is what would say otherwise.
         pending: false,
+        // A refusal is live-transport state in the same way: a restored
+        // session has nothing undelivered to show.
+        undelivered_reason: None,
     })
 }
 
