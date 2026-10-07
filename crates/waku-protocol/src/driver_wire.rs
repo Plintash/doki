@@ -6,7 +6,10 @@ use uuid::Uuid;
 
 use crate::WireDriverEvent;
 use crate::computer_use::{ComputerTarget, ComputerUsePhase, ComputerUseState};
-use crate::model::{ActivityKind, DriverEvent, PermissionOption, UserInputQuestion};
+use crate::model::{
+    ActivityKind, DriverEvent, ExtensionWidgetPlacement, NotificationSeverity, PermissionOption,
+    UserInputQuestion,
+};
 
 pub fn decode_enum<T: DeserializeOwned>(value: &str) -> anyhow::Result<T> {
     serde_json::from_value(Value::String(value.to_owned()))
@@ -65,6 +68,32 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             "extensionMessage",
             json!({ "customType": custom_type, "text": text, "display": display }),
         ),
+        DriverEvent::ExtensionNotification { message, severity } => (
+            "extensionNotification",
+            json!({
+                "message": message,
+                "severity": encode_enum(severity)?,
+            }),
+        ),
+        DriverEvent::ExtensionStatus { key, text } => {
+            ("extensionStatus", json!({ "key": key, "text": text }))
+        }
+        DriverEvent::ExtensionWidget {
+            key,
+            lines,
+            placement,
+        } => (
+            "extensionWidget",
+            json!({
+                "key": key,
+                "lines": lines,
+                "placement": encode_enum(placement)?,
+            }),
+        ),
+        DriverEvent::ExtensionTitle { title } => ("extensionTitle", json!({ "title": title })),
+        DriverEvent::ExtensionEditorText { text } => {
+            ("extensionEditorText", json!({ "text": text }))
+        }
         DriverEvent::Permission {
             request_id,
             title,
@@ -184,6 +213,36 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
                 display: message.display,
             }
         }
+        "extensionNotification" => {
+            let notification: ExtensionNotificationWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionNotification {
+                message: notification.message,
+                severity: notification.severity,
+            }
+        }
+        "extensionStatus" => {
+            let status: ExtensionStatusWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionStatus {
+                key: status.key,
+                text: status.text,
+            }
+        }
+        "extensionWidget" => {
+            let widget: ExtensionWidgetWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionWidget {
+                key: widget.key,
+                lines: widget.lines,
+                placement: widget.placement,
+            }
+        }
+        "extensionTitle" => {
+            let title: ExtensionTitleWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionTitle { title: title.title }
+        }
+        "extensionEditorText" => {
+            let editor: ExtensionEditorTextWire = serde_json::from_value(payload)?;
+            DriverEvent::ExtensionEditorText { text: editor.text }
+        }
         "permission" => {
             let permission: PermissionWire = serde_json::from_value(payload)?;
             DriverEvent::Permission {
@@ -293,6 +352,56 @@ struct ExtensionMessageWire {
     /// behaves as one the provider marked for display.
     #[serde(default = "default_true")]
     display: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionNotificationWire {
+    message: String,
+    /// Absent on a payload written before the field existed; Pi's own default
+    /// for a notification that does not say how serious it is.
+    #[serde(default = "default_notification_severity")]
+    severity: NotificationSeverity,
+}
+
+fn default_notification_severity() -> NotificationSeverity {
+    NotificationSeverity::Info
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionStatusWire {
+    key: String,
+    /// Absent or null on a payload that clears the entry.
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionWidgetWire {
+    key: String,
+    /// Absent or null on a payload that clears the widget.
+    #[serde(default)]
+    lines: Option<Vec<String>>,
+    #[serde(default = "default_widget_placement")]
+    placement: ExtensionWidgetPlacement,
+}
+
+fn default_widget_placement() -> ExtensionWidgetPlacement {
+    ExtensionWidgetPlacement::AboveEditor
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionTitleWire {
+    title: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionEditorTextWire {
+    text: String,
 }
 
 fn default_true() -> bool {
@@ -458,6 +567,115 @@ mod tests {
             panic!("the event changed variants during its wire round trip");
         };
         assert!(display);
+    }
+
+    #[test]
+    fn extension_surface_events_round_trip_and_default_on_decode() {
+        // Every fire-and-forget surface an extension publishes has to survive
+        // the daemon wire whole, or the app never sees what the extension
+        // said: a notification's severity, a status entry's key and text, a
+        // widget's lines and placement, and the title and editor text are all
+        // the content, not decoration around it.
+        let wire = event_to_wire(DriverEvent::ExtensionNotification {
+            message: "Subagent failed: **code-auditor**".into(),
+            severity: NotificationSeverity::Warning,
+        })
+        .unwrap();
+        assert_eq!(wire.kind, "extensionNotification");
+        assert_eq!(wire.payload["severity"], "warning");
+        let DriverEvent::ExtensionNotification { message, severity } =
+            event_from_wire(wire).unwrap()
+        else {
+            panic!("the event changed variants during its wire round trip");
+        };
+        assert_eq!(message, "Subagent failed: **code-auditor**");
+        assert_eq!(severity, NotificationSeverity::Warning);
+
+        let wire = event_to_wire(DriverEvent::ExtensionStatus {
+            key: "subagent-slash".into(),
+            text: Some("running...".into()),
+        })
+        .unwrap();
+        assert_eq!(wire.kind, "extensionStatus");
+        let DriverEvent::ExtensionStatus { key, text } = event_from_wire(wire).unwrap() else {
+            panic!("the event changed variants during its wire round trip");
+        };
+        assert_eq!(key, "subagent-slash");
+        assert_eq!(text.as_deref(), Some("running..."));
+
+        // The clear an extension sends is the same method with no text, and it
+        // has to stay distinguishable from a set on the wire.
+        let wire = event_to_wire(DriverEvent::ExtensionStatus {
+            key: "subagent-slash".into(),
+            text: None,
+        })
+        .unwrap();
+        let DriverEvent::ExtensionStatus { text, .. } = event_from_wire(wire).unwrap() else {
+            panic!("the event changed variants during its wire round trip");
+        };
+        assert!(text.is_none());
+
+        let wire = event_to_wire(DriverEvent::ExtensionWidget {
+            key: "subagent-fleet".into(),
+            lines: Some(vec!["2 running".into()]),
+            placement: ExtensionWidgetPlacement::BelowEditor,
+        })
+        .unwrap();
+        assert_eq!(wire.kind, "extensionWidget");
+        assert_eq!(wire.payload["placement"], "belowEditor");
+        let DriverEvent::ExtensionWidget {
+            key,
+            lines,
+            placement,
+        } = event_from_wire(wire).unwrap()
+        else {
+            panic!("the event changed variants during its wire round trip");
+        };
+        assert_eq!(key, "subagent-fleet");
+        assert_eq!(lines.as_deref(), Some(["2 running".to_owned()].as_slice()));
+        assert_eq!(placement, ExtensionWidgetPlacement::BelowEditor);
+
+        let wire = event_to_wire(DriverEvent::ExtensionTitle {
+            title: "pi - waku".into(),
+        })
+        .unwrap();
+        assert_eq!(wire.kind, "extensionTitle");
+        let DriverEvent::ExtensionTitle { title } = event_from_wire(wire).unwrap() else {
+            panic!("the event changed variants during its wire round trip");
+        };
+        assert_eq!(title, "pi - waku");
+
+        let wire = event_to_wire(DriverEvent::ExtensionEditorText {
+            text: "review the diff".into(),
+        })
+        .unwrap();
+        assert_eq!(wire.kind, "extensionEditorText");
+        let DriverEvent::ExtensionEditorText { text } = event_from_wire(wire).unwrap() else {
+            panic!("the event changed variants during its wire round trip");
+        };
+        assert_eq!(text, "review the diff");
+
+        // A payload written by an older daemon carries no severity and no
+        // widget placement; both behave as Pi's own defaults say they should.
+        let legacy = crate::WireDriverEvent::new(
+            "extensionNotification",
+            json!({ "message": "Model registry refreshed" }),
+        );
+        let DriverEvent::ExtensionNotification { severity, .. } = event_from_wire(legacy).unwrap()
+        else {
+            panic!("the event changed variants during its wire round trip");
+        };
+        assert_eq!(severity, NotificationSeverity::Info);
+
+        let legacy = crate::WireDriverEvent::new(
+            "extensionWidget",
+            json!({ "key": "subagent-fleet", "lines": ["2 running"] }),
+        );
+        let DriverEvent::ExtensionWidget { placement, .. } = event_from_wire(legacy).unwrap()
+        else {
+            panic!("the event changed variants during its wire round trip");
+        };
+        assert_eq!(placement, ExtensionWidgetPlacement::AboveEditor);
     }
 
     #[test]

@@ -2,6 +2,8 @@
 import type { AgentTurn } from "./AgentTurn";
 import type { ContextUsage } from "./ContextUsage";
 import type { ExtensionMessage } from "./ExtensionMessage";
+import type { ExtensionStatusEntry } from "./ExtensionStatusEntry";
+import type { ExtensionWidget } from "./ExtensionWidget";
 import type { Message } from "./Message";
 import type { ProviderKind } from "./ProviderKind";
 import type { ProviderResumeCursor } from "./ProviderResumeCursor";
@@ -76,6 +78,21 @@ provider_session_id?: string | null,
  * even for the records the provider marks as not for display.
  */
 extension_messages?: Array<ExtensionMessage>,
+/**
+ * The status entries this session's extensions still keep, in the order
+ * they first published them.
+ */
+extension_status?: Array<ExtensionStatusEntry>,
+/**
+ * The widgets this session's extensions still keep, keyed the same way.
+ */
+extension_widgets?: Array<ExtensionWidget>,
+/**
+ * The window title an extension asked for on this session's behalf
+ * (`setTitle`). Session-scoped rather than window-scoped because the
+ * session that is showing is the one whose extension titled it.
+ */
+extension_window_title?: string | null,
 /**
  * Not stored in the session JSON — these are rows in the `messages`
  * table, reattached when the session is hydrated.

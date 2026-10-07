@@ -1236,6 +1236,9 @@ impl StateStore {
         session.turns = stored.turns;
         session.queued_messages = stored.queued_messages;
         session.extension_messages = stored.extension_messages;
+        session.extension_status = stored.extension_status;
+        session.extension_widgets = stored.extension_widgets;
+        session.extension_window_title = stored.extension_window_title;
         session.workspace = stored.workspace;
         session.provider_cursor = stored.provider_cursor;
         session.runtime_mode = stored.runtime_mode;
@@ -1538,6 +1541,9 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         runtime_event_cursor: None,
         provider_session_id: None,
         extension_messages: Vec::new(),
+        extension_status: Vec::new(),
+        extension_widgets: Vec::new(),
+        extension_window_title: None,
         messages: Vec::new(),
         transcript_blocks: Vec::new(),
         turns: Vec::new(),

@@ -1012,6 +1012,18 @@ pub struct AgentSession {
     /// even for the records the provider marks as not for display.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_messages: Vec<ExtensionMessage>,
+    /// The status entries this session's extensions still keep, in the order
+    /// they first published them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_status: Vec<ExtensionStatusEntry>,
+    /// The widgets this session's extensions still keep, keyed the same way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_widgets: Vec<ExtensionWidget>,
+    /// The window title an extension asked for on this session's behalf
+    /// (`setTitle`). Session-scoped rather than window-scoped because the
+    /// session that is showing is the one whose extension titled it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_window_title: Option<String>,
     /// Not stored in the session JSON — these are rows in the `messages`
     /// table, reattached when the session is hydrated.
     #[serde(default)]
@@ -1068,6 +1080,9 @@ impl AgentSession {
             runtime_event_cursor: None,
             provider_session_id: None,
             extension_messages: Vec::new(),
+            extension_status: Vec::new(),
+            extension_widgets: Vec::new(),
+            extension_window_title: None,
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
             turns: Vec::new(),
@@ -1105,6 +1120,9 @@ impl AgentSession {
             runtime_event_cursor: None,
             provider_session_id: None,
             extension_messages: Vec::new(),
+            extension_status: Vec::new(),
+            extension_widgets: Vec::new(),
+            extension_window_title: None,
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
             turns: Vec::new(),
@@ -2097,6 +2115,49 @@ impl ActivityKind {
     }
 }
 
+/// How serious an extension's notification is. The provider's own vocabulary
+/// (`notifyType`), kept so the client's notice surface can show the
+/// difference between something that failed and something merely worth
+/// saying.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum NotificationSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// Which side of the composer an extension's widget belongs on
+/// (`widgetPlacement`).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ExtensionWidgetPlacement {
+    AboveEditor,
+    BelowEditor,
+}
+
+/// One entry of an extension's status line (`setStatus`).
+///
+/// Pi keys these entries, so the same key replaces its entry instead of
+/// stacking another line, and clearing a key removes it: what the session
+/// holds is exactly what the extension still keeps.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionStatusEntry {
+    pub key: String,
+    pub text: String,
+}
+
+/// A block of text an extension displays against the composer (`setWidget`),
+/// keyed like a status entry.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionWidget {
+    pub key: String,
+    pub lines: Vec<String>,
+    pub placement: ExtensionWidgetPlacement,
+}
+
 #[derive(Clone, Debug)]
 pub enum DriverEvent {
     /// Client-only acknowledgement that every daemon event through this
@@ -2156,6 +2217,37 @@ pub enum DriverEvent {
         custom_type: String,
         text: String,
         display: bool,
+    },
+    /// An extension's own notification (`notify`). Out-of-band by design — the
+    /// provider records nothing in its session tree for it — so it reaches the
+    /// user's notice surface and never the transcript.
+    ExtensionNotification {
+        message: String,
+        severity: NotificationSeverity,
+    },
+    /// One entry of an extension's status line (`setStatus`), keyed the way the
+    /// provider keys it: `text` replaces that key's entry and `None` removes
+    /// it, so the surface shows exactly the entries the extension still keeps.
+    ExtensionStatus {
+        key: String,
+        text: Option<String>,
+    },
+    /// A block of text an extension displays against the composer
+    /// (`setWidget`), keyed like a status entry: `lines` replaces that key's
+    /// widget and `None` removes it.
+    ExtensionWidget {
+        key: String,
+        lines: Option<Vec<String>>,
+        placement: ExtensionWidgetPlacement,
+    },
+    /// The window title an extension asked for (`setTitle`). Also out-of-band:
+    /// nothing in the provider's session tree carries it.
+    ExtensionTitle {
+        title: String,
+    },
+    /// Text an extension put in the composer (`set_editor_text`).
+    ExtensionEditorText {
+        text: String,
     },
     Permission {
         request_id: String,

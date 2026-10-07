@@ -530,6 +530,37 @@ impl Waku {
                     record_extension_message(session, custom_type, text, display);
                 }
             }
+            DriverEvent::ExtensionNotification { message, severity } => {
+                // The provider records nothing for a notification — it is not a
+                // message in its session tree — so the notice surface is the
+                // only place it can land, and, like every other transient
+                // notice, only for the session the user is looking at.
+                if self.state.selected_session == Some(session_id) {
+                    self.show_toast_with_tone(message, extension_notification_tone(severity));
+                }
+            }
+            DriverEvent::ExtensionStatus { key, text } => {
+                if let Some(session) = self.state.session_mut(session_id) {
+                    set_extension_status(session, key, text);
+                }
+            }
+            DriverEvent::ExtensionWidget {
+                key,
+                lines,
+                placement,
+            } => {
+                if let Some(session) = self.state.session_mut(session_id) {
+                    set_extension_widget(session, key, lines, placement);
+                }
+            }
+            DriverEvent::ExtensionTitle { title } => {
+                if let Some(session) = self.state.session_mut(session_id) {
+                    set_extension_window_title(session, title);
+                }
+            }
+            DriverEvent::ExtensionEditorText { text } => {
+                self.apply_extension_editor_text(session_id, text, cx);
+            }
             DriverEvent::Permission {
                 request_id,
                 title,
@@ -976,6 +1007,36 @@ impl Waku {
         }
         runtime.computer_use_previews.push(preview);
     }
+
+    /// Put text an extension handed the composer (`set_editor_text`) where the
+    /// user will find it.
+    ///
+    /// It becomes the session's own draft, so a session in the background
+    /// keeps it until the user switches to it, and the visible composer only
+    /// takes it when that session is the one on screen. The draft is captured
+    /// first because the visible composer reaches its slot on a debounce, and
+    /// the extension's text belongs after the newest keystrokes, not behind
+    /// them.
+    fn apply_extension_editor_text(
+        &mut self,
+        session_id: Uuid,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = self.state.selected_session == Some(session_id);
+        if selected {
+            self.capture_current_composer_draft(cx);
+        }
+        let key = crate::persistence::ComposerDraftKey::Session(session_id);
+        let draft = extension_editor_text_draft(self.composer_drafts.get(key), text);
+        if self.composer_drafts.set(key, draft) {
+            self.schedule_composer_draft_save(cx);
+        }
+        if selected {
+            self.restore_selected_composer_draft(cx);
+        }
+        cx.notify();
+    }
 }
 
 /// The composer state a returned submission restores: the text the settlement
@@ -1037,6 +1098,78 @@ pub(super) fn record_extension_message(
         text,
         display,
     });
+}
+
+/// Records a status entry an extension published for its session.
+///
+/// Pi keys these entries by the extension's own key, so setting a key again
+/// replaces its entry and `None` clears it: the session holds exactly the
+/// entries the extension still keeps, which is what the composer strip shows.
+pub(super) fn set_extension_status(session: &mut AgentSession, key: String, text: Option<String>) {
+    match text {
+        Some(text) => match session
+            .extension_status
+            .iter_mut()
+            .find(|entry| entry.key == key)
+        {
+            Some(entry) => entry.text = text,
+            None => session
+                .extension_status
+                .push(ExtensionStatusEntry { key, text }),
+        },
+        None => session.extension_status.retain(|entry| entry.key != key),
+    }
+}
+
+/// Records a widget an extension displays against the composer, keyed like a
+/// status entry: `lines` replaces that key's widget and `None` clears it.
+pub(super) fn set_extension_widget(
+    session: &mut AgentSession,
+    key: String,
+    lines: Option<Vec<String>>,
+    placement: ExtensionWidgetPlacement,
+) {
+    match lines {
+        Some(lines) => match session
+            .extension_widgets
+            .iter_mut()
+            .find(|widget| widget.key == key)
+        {
+            Some(widget) => {
+                widget.lines = lines;
+                widget.placement = placement;
+            }
+            None => session.extension_widgets.push(ExtensionWidget {
+                key,
+                lines,
+                placement,
+            }),
+        },
+        None => session.extension_widgets.retain(|widget| widget.key != key),
+    }
+}
+
+/// Records the window title an extension asked for on this session's behalf.
+///
+/// A blank title is how an extension takes that title down again, and the
+/// window then carries the platform's own title as it did before.
+pub(super) fn set_extension_window_title(session: &mut AgentSession, title: String) {
+    session.extension_window_title = (!title.trim().is_empty()).then_some(title);
+}
+
+/// The draft an extension's editor text leaves behind.
+///
+/// The text replaces what the draft held — an empty text is the extension
+/// clearing the editor — while the user's own attachments and annotations stay
+/// beside it, because the provider's editor is text-only and never carried
+/// them.
+pub(super) fn extension_editor_text_draft(
+    existing: Option<&crate::persistence::ComposerDraft>,
+    text: String,
+) -> crate::persistence::ComposerDraft {
+    let mut draft = existing.cloned().unwrap_or_default();
+    draft.text = text;
+    draft
 }
 
 /// Whether a provider's own stream may open a turn that no Waku prompt did.
