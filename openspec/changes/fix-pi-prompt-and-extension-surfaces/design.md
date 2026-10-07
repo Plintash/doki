@@ -80,15 +80,24 @@ waits inside the current turn, `handled` means no run will start for this
 prompt. Oh My Pi's `data.agentInvoked: false` keeps its meaning as an additional
 `handled` signal; it is no longer the only test.
 
-One case keeps that from being the whole rule. `queued` means the provider holds
-the message, not that it has run it, and an **aborted** run settles without
-draining its queue — Pi then delivers the queued message as a run of its own
-("`abort` continues queued messages when they remain in the session", per its own
-`clear_queue` reference). A settlement arriving while the provider still holds a
-queued prompt is therefore not that message's turn ending, and the driver defers
-it until the queue report shows the message delivered (D6). Without that, the
-client shows a completed turn for the message and then opens a second one for its
-answer.
+One case keeps that from being the whole rule, and measuring it changed the
+design. At a normal turn boundary the provider drains its queue inside the same
+run, so the message is answered in that turn and there is one settlement. Across
+an **abort** it does not: the run settles with the message still held, no run
+starts for it, and the held text is only consumed by the *next* prompt, spliced
+in after that turn's first turn-end — the "message in the middle of a later
+turn" shape this change exists to prevent. (Pi's own `clear_queue` reference says
+an abort continues queued messages; in RPC mode on 1.0.0 that is not what
+happens. A live probe of the D1/D2 path is what showed it.)
+
+So a run's end must not leave text parked: on a settlement that still shows a
+held message the driver clears the queue and hands the cleared text back to the
+app — the same retraction a stop performs — and settles at once. Holding the turn
+open instead would hang a stopped turn until the user typed something, which is
+worse than the splice it was meant to prevent, and re-running the text would
+start a turn behind a stop the user asked for. The decision to clear is made from
+the provider's own queue report (D6), so a message the provider already delivered
+at its boundary is never touched.
 
 **D3 — Settlement never depends on the prompt answer.** A prompt submitted while
 Pi is emitting `agent_settled` is deferred and **no response is ever written**
