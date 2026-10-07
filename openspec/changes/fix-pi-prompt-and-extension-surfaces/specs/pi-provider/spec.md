@@ -46,10 +46,10 @@ extension consumed SHALL settle without waiting for a run that will never start.
 - **WHEN** a submitted prompt is consumed by an extension command and no run starts
 - **THEN** the turn settles at once, with no waiting spinner
 
-#### Scenario: A queued prompt is not settled before it runs
+#### Scenario: Nothing is left parked across a settlement
 
-- **WHEN** a message is queued on a running turn and that run ends — aborted, or finished — before the message has been delivered
-- **THEN** the turn is not settled as finished while the provider still owes that message, and the client shows one turn for it rather than a completed turn followed by a second one
+- **WHEN** a run ends while the provider still holds a message the user sent — the case a stop creates, because the provider drains its queue at a normal turn boundary but not across an abort
+- **THEN** the turn settles once and at once, and the held message is retracted with its text handed back to the user instead of waiting in the provider's queue to be spliced into a later turn
 
 #### Scenario: A missing answer does not stall the session
 
@@ -59,7 +59,10 @@ extension consumed SHALL settle without waiting for a run that will never start.
 ### Requirement: The client's queue is the provider's queue
 
 Waku SHALL treat the queue the provider reports as the truth about what is
-pending, and SHALL present a queued message as queued rather than delivered.
+pending, and SHALL present a queued message as queued rather than delivered. A
+settlement MUST NOT leave a message parked in that queue: a message the provider
+still holds when a run ends SHALL be retracted and its text handed back to the
+user, rather than left to arrive inside a later turn.
 
 #### Scenario: The pending list follows the provider
 
