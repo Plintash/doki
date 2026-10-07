@@ -568,17 +568,8 @@ impl PiDriver {
                             }
                         }
                         CommandMessage::Cancel => {
-                            if let Err(error) = send_request(
-                                &mut stdin,
-                                &writer_pending,
-                                &mut next_request_id,
-                                json!({"type": "abort"}),
-                            ) {
-                                let _ = writer_events.send(DriverEvent::Error(tr!(
-                                    "errors.stop_provider",
-                                    provider = flavor.display_name(),
-                                    error = error
-                                )));
+                            if stop_session(&mut stdin, &writer_events, flavor).is_err() {
+                                break;
                             }
                         }
                         CommandMessage::Options(options) => {
@@ -949,6 +940,39 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()
 /// owns stdout and would otherwise deadlock waiting for it.
 fn write_clear_queue(writer: &mut impl Write) -> std::io::Result<()> {
     write_json_line(writer, &json!({"type": "clear_queue"}))
+}
+
+/// Stops the run: the queue first, then the abort. The order is the point —
+/// an abort continues whatever the queue still holds, so a message the user
+/// stopped would run afterwards if the abort went first.
+///
+/// The abort carries no request id because it is never awaited: pi answers it
+/// only once the session is idle, which routinely outlasts the control timeout
+/// the other requests use. A waiter would report a slow stop as a transport
+/// error and hold the next prompt behind it, while the run's own settlement is
+/// what ends the turn either way.
+fn write_stop(writer: &mut impl Write) -> std::io::Result<()> {
+    write_clear_queue(writer)?;
+    write_json_line(writer, &json!({"type": "abort"}))
+}
+
+/// The stop as the transport performs it, including what it reports when the
+/// provider cannot be written to at all. The write failure is returned so the
+/// command loop can end, exactly as a dead pipe does for its other commands.
+fn stop_session(
+    writer: &mut impl Write,
+    events: &impl DriverEventSink,
+    flavor: PiFlavor,
+) -> std::io::Result<()> {
+    if let Err(error) = write_stop(writer) {
+        let _ = events.send(DriverEvent::Error(tr!(
+            "errors.stop_provider",
+            provider = flavor.display_name(),
+            error = error
+        )));
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn fail_pending(pending: &PendingResponses, message: &str) {
@@ -2020,6 +2044,52 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_the_provider_never_answers_reports_no_error_and_lets_the_next_prompt_go_out() {
+        // Pi answers `abort` only once its session is idle, which routinely
+        // outlasts the control timeout every other request uses. A stop that
+        // waited for that answer turned a slow abort into a transport error
+        // and held the next prompt behind it, so nothing is waited on: the
+        // run's own settlement is what ends the turn.
+        let (pending, _commands, _command_rx, _state) = harness();
+        let (events, event_rx) = unbounded();
+        let mut wire = Vec::new();
+        let mut next_request_id = 0;
+
+        stop_session(&mut wire, &events, PiFlavor::Pi).unwrap();
+        send_prompt(&mut wire, &pending, &mut next_request_id, "and also").unwrap();
+
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a slow abort is not a transport error"
+        );
+        let writes = wire_lines(&wire);
+        assert_eq!(writes[0]["type"], "clear_queue");
+        assert_eq!(writes[1]["type"], "abort");
+        assert_eq!(
+            writes[2]["type"], "prompt",
+            "the next prompt is not held behind the stop"
+        );
+    }
+
+    #[test]
+    fn stopping_a_turn_clears_the_queue_before_it_aborts() {
+        // Pi continues whatever its queue still holds when an abort lands, so
+        // clearing it is what keeps a message the user stopped from running
+        // afterwards. The clear has to be on the wire first.
+        let mut wire = Vec::new();
+        write_stop(&mut wire).unwrap();
+
+        let writes = wire_lines(&wire);
+        assert_eq!(writes.len(), 2, "a stop is the clear and the abort");
+        assert_eq!(writes[0]["type"], "clear_queue");
+        assert_eq!(writes[1]["type"], "abort");
+        assert!(
+            writes[1].get("id").is_none(),
+            "an answer is correlated by id, so an id-less abort has none to await"
+        );
+    }
+
+    #[test]
     fn a_settlement_that_still_holds_a_queued_message_hands_it_back() {
         // Measured against pi 1.0.0: an aborted run settles without draining
         // its queue, and pi never runs that message afterwards — it splices
@@ -2195,6 +2265,15 @@ mod tests {
             receiver,
             PiStreamState::default(),
         )
+    }
+
+    /// The commands a writer produced, in the order the provider reads them.
+    fn wire_lines(wire: &[u8]) -> Vec<Value> {
+        std::str::from_utf8(wire)
+            .expect("the wire is utf-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each write is one JSON command"))
+            .collect()
     }
 
     /// Drives the installed Pi RPC through one real provider turn. Ignored by

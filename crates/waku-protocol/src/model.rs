@@ -1530,6 +1530,19 @@ impl AgentSession {
         changed
     }
 
+    /// The text of the messages the provider's last queue report is still
+    /// holding — the queue a stop clears before it aborts the run.
+    ///
+    /// Only [`AgentSession::mark_provider_queue`] sets the pending mark, so
+    /// this is the provider's own queue rather than the client's guess at it.
+    pub fn provider_queued_texts(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter(|message| message.pending)
+            .map(|message| message.content.clone())
+            .collect()
+    }
+
     /// Takes back the messages a settlement removed from the provider's queue.
     ///
     /// They never reached the conversation, so they leave the transcript and a
@@ -4887,6 +4900,43 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(started.messages.len(), 1);
+    }
+
+    #[test]
+    fn a_stop_takes_back_the_message_the_provider_still_holds() {
+        // Stopping a turn clears the provider's queue before it aborts, so
+        // what the provider reports it is still holding is what a stop hands
+        // back to the user. Only the provider's own queue report marks a
+        // message as held, so a stop takes exactly those and never a message
+        // the provider already ran.
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Pi);
+
+        session.begin_turn("first");
+        session.push_message(MessageRole::Assistant, "first answer");
+        session.finish_active_turn(TurnStatus::Completed);
+        session.begin_turn("and also");
+        session.status = SessionStatus::Connecting;
+        session.mark_provider_queue(&[], &["and also".to_owned()]);
+
+        let held = session.provider_queued_texts();
+        assert_eq!(held, ["and also"]);
+
+        let returned = session.take_retracted_queue_messages(&held);
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].content, "and also");
+        // The stopped message left the transcript with the turn that existed
+        // only for it, and nothing is left held.
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.messages.len(), 2);
+        assert!(!session.is_busy());
+        assert!(session.provider_queued_texts().is_empty());
+
+        // The list is the provider's queue, not the transcript: a user message
+        // the provider never reported as held is not something a stop takes.
+        let mut delivered = AgentSession::new(project.id, ProviderKind::Pi);
+        delivered.begin_turn("finished");
+        assert!(delivered.provider_queued_texts().is_empty());
     }
 
     #[test]

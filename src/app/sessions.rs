@@ -1193,6 +1193,14 @@ impl Waku {
                 runtime.driver.cancel_computer_use();
             }
         }
+        // The stop takes the provider's queue with it, and the transport has
+        // just asked for that queue to be cleared, so the text of a message the
+        // user stopped is theirs again here. Pi's abort continues whatever its
+        // queue still holds, so leaving the text there would run the message
+        // after the stop; taking it back now, before the turn settles, also
+        // unwinds a turn that existed only for that message instead of
+        // settling it answerless.
+        self.return_stopped_queue_messages(session_id, cx);
         // Do not leave already-received text in the smoothing queue: once the
         // message is marked complete, a later delta would otherwise create a
         // second assistant bubble. Show the received portion immediately.
