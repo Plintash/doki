@@ -1746,6 +1746,220 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn daemon_terminal_retains_a_bounded_recent_window() {
+        // A small window keeps the fixture cheap; the daemon's production
+        // window is `RETAINED_OUTPUT_BYTES`, and the retention semantics are
+        // the same for either size.
+        const RETAINED_BYTES: usize = 8 * 1024;
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        hub.begin_runtime(session_id, runtime_id);
+        let (messages, events) = unbounded();
+        let (subscriber, _kicked) = Subscriber::new(messages);
+        hub.subscribe(&[], subscriber);
+        let terminal = crate::terminal::DaemonTerminal::open_with_shell_and_retention(
+            &root,
+            80,
+            24,
+            hub.event_sink(session_id, runtime_id),
+            terminal_test_shell(
+                "printf 'oldest-window\\n'; awk 'BEGIN { while (i++ < 60000) printf \"x\" }'; printf 'newest-window\\n'",
+            ),
+            RETAINED_BYTES,
+        )
+        .unwrap();
+
+        // Collect everything the terminal delivers until the shell exits, so
+        // the retained window is final and teardown starts from an idle shell.
+        let mut delivered = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon terminal never exited"
+            );
+            let Ok(message) = events.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            let ServerMessage::Event(event) = message else {
+                continue;
+            };
+            match event.event.kind.as_str() {
+                "terminalOutput" => delivered.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(event.event.payload["data"].as_str().unwrap())
+                        .unwrap(),
+                ),
+                "terminalExited" => break,
+                _ => {}
+            }
+        }
+
+        let retained = terminal.retained_output();
+        assert!(
+            delivered.len() > RETAINED_BYTES,
+            "fixture did not produce more output than the retained window: {} bytes",
+            delivered.len()
+        );
+        assert_eq!(
+            retained,
+            delivered[delivered.len() - RETAINED_BYTES..],
+            "retained output is not exactly the newest delivered bytes"
+        );
+        assert!(
+            !retained
+                .windows(b"oldest-window".len())
+                .any(|window| window == b"oldest-window"),
+            "output older than the retention window was not dropped"
+        );
+
+        drop(terminal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_flood_delivers_bounded_batches() {
+        websocket_terminal_output_shape(
+            "awk 'BEGIN { while (i++ < 30000) printf \"xxxxxxxxxx\" }'; printf '\\nflood-done\\n'",
+            b"flood-done",
+            b'x',
+            300_000,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_coalesces_many_small_writes() {
+        websocket_terminal_output_shape(
+            "i=0; while [ $i -lt 2000 ]; do printf 'x'; i=$((i+1)); done; printf '\\nsmall-done\\n'",
+            b"small-done",
+            b'x',
+            2000,
+        );
+    }
+
+    /// Runs a shell that writes `marker`-terminated output containing
+    /// `expected_filler` bytes of `filler`, then asserts output still arrives
+    /// in full while the delivered `terminalOutput` events stay within the
+    /// daemon's flush cadence: at most one event per flush interval, plus one
+    /// per `FLUSH_BYTES` of output, however many writes the shell made.
+    #[cfg(unix)]
+    fn websocket_terminal_output_shape(
+        script: &str,
+        marker: &[u8],
+        filler: u8,
+        expected_filler: usize,
+    ) {
+        const MAX_EVENT_BYTES: usize = 64 * 1024;
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(script));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        // Measured from before the terminal starts, so the batching bound
+        // below covers the whole window the daemon could have flushed in.
+        let started = std::time::Instant::now();
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let terminal_id = Uuid::new_v4();
+        let events = client.subscribe(terminal_id, terminal_id);
+        client
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+
+        let deadline = started + Duration::from_secs(30);
+        let mut delivered = Vec::new();
+        let mut output_events = 0_usize;
+        let mut largest_event = 0_usize;
+        while std::time::Instant::now() < deadline
+            && !delivered
+                .windows(marker.len())
+                .any(|window| window == marker)
+        {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let Ok(event) = events.recv_timeout(remaining) else {
+                break;
+            };
+            if event.event.kind != "terminalOutput" {
+                continue;
+            }
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(event.event.payload["data"].as_str().unwrap())
+                .unwrap();
+            output_events += 1;
+            largest_event = largest_event.max(data.len());
+            delivered.extend(data);
+        }
+
+        assert!(
+            delivered
+                .windows(marker.len())
+                .any(|window| window == marker),
+            "terminal output never reached {marker:?}"
+        );
+        let filler_bytes = delivered.iter().filter(|byte| **byte == filler).count();
+        assert_eq!(
+            filler_bytes, expected_filler,
+            "terminal delivery dropped or duplicated output bytes"
+        );
+        // The daemon flushes at most once per interval and once per threshold,
+        // so the event count is bounded by output size and elapsed time rather
+        // than by how many writes the shell made. The slack absorbs the first
+        // flush, which is immediate, plus scheduling jitter.
+        let elapsed = started.elapsed();
+        let max_events = 4
+            + delivered.len() / crate::terminal::FLUSH_BYTES
+            + elapsed.as_millis() as usize
+                / crate::terminal::FLUSH_INTERVAL.as_millis().max(1) as usize;
+        assert!(
+            output_events <= max_events,
+            "terminal delivery was not batched: {output_events} events (bound {max_events}) for {} output bytes in {elapsed:?}",
+            delivered.len()
+        );
+        assert!(
+            largest_event <= MAX_EVENT_BYTES,
+            "a single terminal event carried {largest_event} bytes"
+        );
+
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dropping_an_idle_terminal_does_not_wait_for_output() {
         let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
