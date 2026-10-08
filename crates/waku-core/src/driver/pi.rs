@@ -336,6 +336,20 @@ impl PiDriver {
         options: DriverStartOptions,
         events: DriverEventSender,
     ) -> anyhow::Result<Self> {
+        Self::launch(flavor, options, events, &[])
+    }
+
+    /// Starts a session that also loads `extensions` — the same `--extension`
+    /// flag the launch already hands Waku's own Pi extension. The live tests
+    /// pass their fixture this way, so the provider's own records are provoked
+    /// through the launch path the product uses rather than replayed from a
+    /// canned frame.
+    pub(crate) fn launch(
+        flavor: PiFlavor,
+        options: DriverStartOptions,
+        events: DriverEventSender,
+        extensions: &[PathBuf],
+    ) -> anyhow::Result<Self> {
         let DriverStartOptions {
             binary,
             cwd,
@@ -386,6 +400,9 @@ impl PiDriver {
             .transpose()?;
         let mut command = crate::command_env::command(&binary);
         command.args(["--mode", "rpc", flavor.full_access_arg()]);
+        for extension in extensions {
+            command.arg("--extension").arg(extension);
+        }
         if flavor.skips_version_check_by_env() {
             command.env("PI_SKIP_VERSION_CHECK", "1");
         }
@@ -3038,14 +3055,29 @@ mod tests {
             .collect()
     }
 
-    /// Drives the installed Pi RPC through one real provider turn. Ignored by
-    /// default because it needs the CLI, credentials, and network access.
-    #[test]
-    #[ignore = "requires an installed, authenticated pi"]
-    fn pi_context_usage_against_the_real_rpc() {
-        let binary = crate::command_env::find_executable("pi").expect("pi is not installed");
+    /// How long one live step may wait. A real turn answers in seconds, so the
+    /// budget covers a cold model and a cold extension load rather than a slow
+    /// transport, and it is per step rather than for a whole test.
+    const LIVE_STEP_TIMEOUT: Duration = Duration::from_secs(90);
+
+    /// A driver on a real `pi --mode rpc`, started the way the app starts one,
+    /// with `extension` loaded through the launch's own `--extension` flag, and
+    /// its native session already announced.
+    ///
+    /// `None` means this machine has no Pi, and the test that asked is skipped
+    /// rather than failed: the provider is a real process with a real model
+    /// behind it, and a suite that cannot run without one is a suite nobody
+    /// runs. Pi itself has no such excuse when it is installed.
+    fn real_pi_session(
+        extension: Option<PathBuf>,
+    ) -> Option<(PiDriver, crossbeam_channel::Receiver<DriverEvent>)> {
+        let Some(binary) = crate::command_env::find_executable("pi") else {
+            eprintln!("skipping a live Pi test: the `pi` CLI is not installed");
+            return None;
+        };
+        let extensions = extension.into_iter().collect::<Vec<_>>();
         let (events, event_rx) = crate::driver::test_event_channel();
-        let driver = PiDriver::start(
+        let driver = PiDriver::launch(
             PiFlavor::Pi,
             DriverStartOptions {
                 binary,
@@ -3060,28 +3092,52 @@ mod tests {
                 provider_cursor: None,
             },
             events,
+            &extensions,
         )
         .expect("the Pi RPC session should start");
-
-        let mut connected = false;
-        let mut context_tokens = None;
-        let mut context_window = None;
-        while let Ok(event) = event_rx.recv_timeout(Duration::from_secs(30)) {
-            match event {
-                DriverEvent::Connected { .. } => {
-                    connected = true;
-                    break;
-                }
-                DriverEvent::Error(error) => panic!("Pi failed to initialize: {error}"),
+        loop {
+            match next_live_step(&event_rx, "native session") {
+                DriverEvent::Connected { .. } => break,
+                DriverEvent::Error(error) => panic!("Pi failed to start: {error}"),
                 _ => {}
             }
         }
-        assert!(connected, "Pi never reported its native session");
+        Some((driver, event_rx))
+    }
+
+    /// The next event from the live provider. A provider that goes quiet is a
+    /// failure, and naming what was awaited is what makes a timeout readable.
+    fn next_live_event(
+        event_rx: &crossbeam_channel::Receiver<DriverEvent>,
+        awaited: &str,
+        budget: Duration,
+    ) -> DriverEvent {
+        event_rx.recv_timeout(budget).unwrap_or_else(|error| {
+            panic!("the live Pi session produced no {awaited} within {budget:?}: {error}")
+        })
+    }
+
+    /// The next event within the budget one step of a live turn gets.
+    fn next_live_step(
+        event_rx: &crossbeam_channel::Receiver<DriverEvent>,
+        awaited: &str,
+    ) -> DriverEvent {
+        next_live_event(event_rx, awaited, LIVE_STEP_TIMEOUT)
+    }
+
+    /// Drives the installed Pi RPC through one real provider turn and reads the
+    /// context usage the provider reports off it.
+    #[test]
+    fn pi_context_usage_against_the_real_rpc() {
+        let Some((driver, event_rx)) = real_pi_session(None) else {
+            return;
+        };
 
         driver.prompt("Reply with exactly: OK. Do not use any tools.".into());
-        let mut finished = false;
-        while let Ok(event) = event_rx.recv_timeout(Duration::from_secs(180)) {
-            match event {
+        let mut context_tokens = None;
+        let mut context_window = None;
+        loop {
+            match next_live_step(&event_rx, "the probe turn to settle") {
                 DriverEvent::UsageUpdated {
                     context_tokens: tokens,
                     context_window: window,
@@ -3091,7 +3147,6 @@ mod tests {
                 }
                 DriverEvent::TurnFinished { success, .. } => {
                     assert!(success, "Pi should finish the probe turn");
-                    finished = true;
                     break;
                 }
                 DriverEvent::Error(error) => panic!("Pi reported: {error}"),
@@ -3099,9 +3154,166 @@ mod tests {
             }
         }
 
-        assert!(finished, "Pi never settled the probe turn");
         assert!(context_tokens.is_some_and(|tokens| tokens > 0));
         assert!(context_window.is_some_and(|window| window > 0));
+    }
+
+    /// A prompt sent while the turn is still streaming is queued on that turn,
+    /// reported as pending, and delivered when the turn reaches its boundary —
+    /// the prompt Pi refused outright before this change, leaving the user's
+    /// words in a transcript the agent never saw.
+    #[test]
+    fn pi_queues_and_delivers_a_prompt_sent_mid_stream_against_the_real_rpc() {
+        const QUEUED: &str = "Reply with exactly QUEUED-OK and nothing else. Do not use any tools.";
+
+        let Some((driver, event_rx)) = real_pi_session(None) else {
+            return;
+        };
+        driver.prompt(
+            "Write a 200-word description of a lighthouse keeper's morning. Plain prose, one \
+             paragraph, no tools, do not shorten it."
+                .to_owned(),
+        );
+
+        let mut sent = false;
+        let mut text = String::new();
+        let mut pending = false;
+        let mut released = false;
+        loop {
+            match next_live_step(&event_rx, "the busy turn to settle") {
+                DriverEvent::TextDelta(delta) => {
+                    // The queued prompt has to race a turn that is streaming, so
+                    // it goes out with the first text the turn produces.
+                    if !sent {
+                        sent = true;
+                        driver.prompt(QUEUED.to_owned());
+                    }
+                    text.push_str(&delta);
+                }
+                DriverEvent::ProviderQueue { follow_up, .. } => {
+                    if follow_up.iter().any(|message| message == QUEUED) {
+                        pending = true;
+                    } else if pending {
+                        released = true;
+                    }
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished {
+                    success, summary, ..
+                } => {
+                    assert!(
+                        success,
+                        "a queued prompt must be delivered, not refused: {summary:?}"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            sent,
+            "the turn must stream text before the queued prompt goes out"
+        );
+        assert!(
+            pending,
+            "the provider's queue report must show the message while it is pending"
+        );
+        assert!(
+            released,
+            "the queue report must show the message leaving when it is delivered"
+        );
+        assert!(
+            text.contains("QUEUED-OK"),
+            "the queued message must be delivered into the turn: {text:?}"
+        );
+    }
+
+    /// A stop takes the message the user had queued out of the provider's queue
+    /// before it aborts, so a message they stopped never runs afterwards.
+    #[test]
+    fn pi_stopping_a_turn_takes_its_queued_message_back_against_the_real_rpc() {
+        const QUEUED: &str = "Reply with exactly QUEUED-OK and nothing else. Do not use any tools.";
+
+        let Some((driver, event_rx)) = real_pi_session(None) else {
+            return;
+        };
+        driver.prompt(
+            "Write a 300-word description of a lighthouse keeper's morning. Plain prose, one \
+             paragraph, no tools, do not shorten it."
+                .to_owned(),
+        );
+
+        let mut sent = false;
+        let mut pending = false;
+        let mut cleared = false;
+        loop {
+            match next_live_step(&event_rx, "the stopped turn to settle") {
+                DriverEvent::TextDelta(_) => {
+                    if !sent {
+                        sent = true;
+                        driver.prompt(QUEUED.to_owned());
+                    }
+                }
+                DriverEvent::ProviderQueue {
+                    steering,
+                    follow_up,
+                } => {
+                    if follow_up.iter().any(|message| message == QUEUED) {
+                        if !pending {
+                            pending = true;
+                            // Stopped while the provider still holds it.
+                            driver.cancel();
+                        }
+                    } else if pending && steering.is_empty() && follow_up.is_empty() {
+                        cleared = true;
+                    }
+                }
+                // The other shape the retraction takes: the run settled with
+                // the message still reported queued, so the settlement itself
+                // took it back.
+                DriverEvent::QueuedMessagesRetracted { messages } => {
+                    if messages.iter().any(|message| message == QUEUED) {
+                        cleared = true;
+                    }
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished { success, .. } => {
+                    assert!(success, "a stop must report no transport error");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            sent,
+            "the turn must stream text before the message is queued"
+        );
+        assert!(
+            pending,
+            "the message must be in the provider's queue before the stop"
+        );
+        assert!(cleared, "the stop must clear the provider's queue");
+
+        // An abort keeps unwinding after the settle, so the window that would
+        // show a stopped message running is the one after it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(event) =
+            event_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            match event {
+                DriverEvent::TextDelta(delta) => assert!(
+                    !delta.contains("QUEUED-OK"),
+                    "a stopped message must not run afterwards: {delta:?}"
+                ),
+                DriverEvent::TurnStarted => {
+                    panic!("a stopped message must not start a run of its own")
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                _ => {}
+            }
+        }
     }
 
     #[test]
