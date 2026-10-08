@@ -2627,12 +2627,7 @@ fn a_pi_run_the_agent_starts_opens_a_transcript_home() {
 fn an_extension_message_that_starts_no_run_opens_no_turn() {
     let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
 
-    record_extension_message(
-        &mut session,
-        "subagent_control_notice".into(),
-        "Workflow paused.".into(),
-        true,
-    );
+    record_extension_message(&mut session, "Workflow paused.".into(), true);
 
     assert!(session.active_turn_id().is_none());
     assert_eq!(session.status, SessionStatus::Idle);
@@ -2646,14 +2641,8 @@ fn an_extension_message_that_starts_no_run_opens_no_turn() {
 fn a_hidden_extension_message_adds_no_row() {
     let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
 
-    record_extension_message(
-        &mut session,
-        "subagent-compaction-resume".into(),
-        "Context compaction resumed.".into(),
-        false,
-    );
+    record_extension_message(&mut session, "Context compaction resumed.".into(), false);
 
-    assert!(session.extension_messages.is_empty());
     assert!(session.messages.is_empty(), "nothing is rendered for it");
     assert!(folded_transcript_row_kinds(&session, &HashSet::new()).is_empty());
 }
@@ -2664,12 +2653,7 @@ fn a_hidden_extension_message_adds_no_row() {
 fn a_visible_extension_message_becomes_a_transcript_notice() {
     let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
 
-    record_extension_message(
-        &mut session,
-        "subagent_control_notice".into(),
-        "Workflow paused.".into(),
-        true,
-    );
+    record_extension_message(&mut session, "Workflow paused.".into(), true);
 
     assert_eq!(session.messages.len(), 1);
     assert_eq!(session.messages[0].role, MessageRole::System);

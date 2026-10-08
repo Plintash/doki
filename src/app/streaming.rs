@@ -141,22 +141,31 @@ impl Waku {
     /// each entry is resolved back through the same seam its submission used
     /// before the pending list is matched against it.
     fn provider_queue_texts(&self, session_id: Uuid, report: &[String]) -> Vec<String> {
-        let Some(session) = self
+        let Some((provider, stored)) = self.stored_prompt_texts(session_id) else {
+            return report.to_vec();
+        };
+        stored_queue_texts(provider, &self.slash_command_index, &stored, report)
+    }
+
+    /// The prompts the transcript holds for a session, newest first: the list
+    /// every provider queue report is resolved against.
+    ///
+    /// A `queue_update` names both of its queues, and both name the same
+    /// stored prompts, so the transcript is read once for the pair.
+    fn stored_prompt_texts(&self, session_id: Uuid) -> Option<(ProviderKind, Vec<String>)> {
+        let session = self
             .state
             .sessions
             .iter()
-            .find(|session| session.id == session_id)
-        else {
-            return report.to_vec();
-        };
+            .find(|session| session.id == session_id)?;
         let stored = session
             .messages
             .iter()
             .rev()
             .filter(|message| message.role == MessageRole::User)
             .map(|message| message.content.clone())
-            .collect::<Vec<_>>();
-        stored_queue_texts(session.provider, &self.slash_command_index, &stored, report)
+            .collect();
+        Some((session.provider, stored))
     }
 
     pub(super) fn finish_streaming_assistant(&mut self, session_id: Uuid) {
@@ -581,23 +590,19 @@ impl Waku {
                 // `accepts_turn_output` deliberately.
                 self.handle_background_work_event(session_id, event);
             }
-            DriverEvent::ExtensionMessage {
-                custom_type,
-                text,
-                display,
-            } => {
+            DriverEvent::ExtensionMessage { text, display, .. } => {
                 if let Some(session) = self.state.session_mut(session_id) {
-                    record_extension_message(session, custom_type, text, display);
+                    record_extension_message(session, text, display);
                 }
             }
             DriverEvent::ExtensionNotification { message, severity } => {
                 // The provider records nothing for a notification — it is not a
                 // message in its session tree — so the notice surface is the
-                // only place it can land, and, like every other transient
-                // notice, only for the session the user is looking at.
-                if self.state.selected_session == Some(session_id) {
-                    self.show_toast_with_tone(message, extension_notification_tone(severity));
-                }
+                // only place it can land. It is shown whichever session is on
+                // screen: pi-subagents reports a failed child this way, and
+                // silence about work that was started here is the failure the
+                // notification exists to prevent.
+                self.show_toast_with_tone(message, extension_notification_tone(severity));
             }
             DriverEvent::ExtensionStatus { key, text } => {
                 if let Some(session) = self.state.session_mut(session_id) {
@@ -757,12 +762,15 @@ impl Waku {
                 // The provider's own queue is the truth about what is still on
                 // its way: a message in it is queued, and one it leaves out has
                 // been delivered.
-                let steering = self.provider_queue_texts(session_id, &steering);
-                let follow_up = self.provider_queue_texts(session_id, &follow_up);
-                if let Some(session) = self.state.session_mut(session_id)
-                    && session.mark_provider_queue(&steering, &follow_up)
-                {
-                    self.state.mark_session_dirty(session_id);
+                if let Some((provider, stored)) = self.stored_prompt_texts(session_id) {
+                    let commands = &self.slash_command_index;
+                    let steering = stored_queue_texts(provider, commands, &stored, &steering);
+                    let follow_up = stored_queue_texts(provider, commands, &stored, &follow_up);
+                    if let Some(session) = self.state.session_mut(session_id)
+                        && session.mark_provider_queue(&steering, &follow_up)
+                    {
+                        self.state.mark_session_dirty(session_id);
+                    }
                 }
             }
             DriverEvent::QueuedMessagesRetracted { messages } => {
@@ -1198,29 +1206,19 @@ pub(super) fn stored_queue_texts(
 /// Records an extension message from the provider's own session tree.
 ///
 /// A message the provider marked for display becomes a transcript notice, the
-/// same shape the app's own system lines take, and is kept beside it. Nothing
-/// is kept for a message the provider withheld from the conversation: no row
-/// shows it, so a copy the client never renders would only be a second record
-/// of a tree the provider already owns.
+/// same shape the app's own system lines take. A message the provider withheld
+/// from the conversation adds no row and is not kept beside one: nothing in the
+/// client renders it, and the provider's own session file is the record of a
+/// tree it owns.
 ///
 /// Recording a message never opens a turn: Pi announces a run of its own with
 /// `agent_start`/`turn_start`, and a notice an extension appends without one
 /// must not fabricate it.
-pub(super) fn record_extension_message(
-    session: &mut AgentSession,
-    custom_type: String,
-    text: String,
-    display: bool,
-) {
+pub(super) fn record_extension_message(session: &mut AgentSession, text: String, display: bool) {
     if !display || text.trim().is_empty() {
         return;
     }
-    session.push_message(MessageRole::System, text.clone());
-    session.extension_messages.push(ExtensionMessage {
-        custom_type,
-        text,
-        display,
-    });
+    session.push_message(MessageRole::System, text);
 }
 
 /// Records a status entry an extension published for its session.

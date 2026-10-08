@@ -13,26 +13,26 @@
 - [x] 2.2 Offer steering only to a live run: the driver sends `steer` while its run is live and the prompt path otherwise, and both flavours keep their existing acknowledgements; verified by a driver test where a steer arriving after the settle is written as a prompt and never parked in the provider's steering queue
 - [x] 2.3 Make stop clear the provider's queue before aborting, and write the abort without waiting for its answer so the control timeout no longer applies; verified by a driver test asserting `clear_queue` precedes `abort` and that a stop with no abort answer reports no error and lets the next prompt through
 - [x] 2.4 Return the text the queue clears to the user instead of discarding it; verified by an app test where stopping a turn puts the stopped message back in the composer
-- [x] 2.5 Keep Oh My Pi's behaviour unchanged through all of the above (its prompt answer, its settle event, its fork commands); verified by the existing `ohmypi_*` tests passing untouched
+- [x] 2.5 Keep Oh My Pi's behaviour unchanged through all of the above (its prompt answer, its settle event, its fork commands); verified by the existing `ohmypi_*` tests passing untouched, which cover its settle event, its titles and its fork commands — the prompt write is shared with Pi, so the queueing field goes out for both flavors, and Oh My Pi's own prompt path is covered only by the ignored live test because its CLI is not installed where the suite runs
 
 ## 3. Agent-initiated runs and extension messages
 
 - [x] 3.1 Allow Pi and Oh My Pi to open a turn with no prompt, as Codex, Claude and OpenCode already may, and keep the guard that only a run-start signal opens one; verified by an app test where a `TurnStarted` with no active turn opens one, its deltas land, and a custom message with no run does not
 - [x] 3.2 Decode `role: "custom"` messages — kind, text, display flag — in the transport's inbound stream; verified by driver tests for a custom message and for one marked not for display
 - [x] 3.3 Classify subagent notifications onto the detached-work surface (`BackgroundWork`, kind subagent) and everything else to a transcript system line; verified by driver tests for `subagent-incremental-child-notify`, `subagent-notify` and an unknown type, plus an app test showing the child where detached work is shown
-- [x] 3.4 Render a detached-work message on the work surface whatever its display flag says and add no conversation row for it, and add no row or stored copy for any other message the provider marked not for display; verified by driver tests asserting one `BackgroundWork` upsert and no `ExtensionMessage` for a hidden child record, and by an app test asserting a hidden notice adds neither a row nor a stored entry
+- [x] 3.4 Render a detached-work message on the work surface whatever its display flag says and add no conversation row for it, and add no row or stored copy for any other message the provider marked not for display; verified by driver tests asserting one `BackgroundWork` upsert and no `ExtensionMessage` for a hidden child record, and by an app test asserting a hidden notice adds no row
 
 ## 4. Extension UI surfaces
 
 - [x] 4.1 Route the provider's fire-and-forget requests to real surfaces: notifications with their severity, status updates, widgets, window title, and editor text into the composer; verified by per-method driver tests and an app test per surface
-- [x] 4.2 Answer the provider's dialogs instead of cancelling them: `select`, `confirm`, `input` and `editor` reach the user and return the answer in the provider's response shape, a dismissal returns a cancellation, and the provider's own timeout is honoured; verified by a driver round-trip test and app tests for answering and dismissing
+- [x] 4.2 Answer the provider's dialogs instead of cancelling them: `select`, `confirm`, `input` and `editor` reach the user and return the answer in the provider's response shape, a dismissal returns a cancellation, and nothing is cancelled on the user's behalf — the provider resolves the dialogs it sent a `timeout` for itself; verified by driver tests for the answer shape, the dismissal and the settlement that drops an unanswered dialog, plus app tests for answering and dismissing
 - [x] 4.3 Delete the blanket auto-cancel so no known request is answered on the user's behalf; verified by a test asserting a known dialog is not cancelled on arrival and only an unrecognised method is answered immediately
 
 ## 5. Verification
 
 - [x] 5.1 Extend the live RPC suite so it drives a real busy session: a prompt sent mid-stream is queued and delivered, the queue report matches, and a stop clears it; verified by the tests passing against the installed Pi 1.0 with no service the developer started
 - [x] 5.2 Add a fixture extension under the driver's fixtures that sends a custom message with a triggered run and asks one question, and a live test that covers the self-started turn, the message's classification and the dialog's answer; verified by the live test passing and by the fixture being loaded through the launch path the product uses
-- [x] 5.3 Run the acceptance path with `npm:pi-subagents`: a background workflow whose child completion wakes the parent, with the completion visible and the reply in the transcript; verified by the recorded run and the transcript it produced
+- [x] 5.3 Run the acceptance path with `npm:pi-subagents`: a background workflow whose child completion wakes the parent, with the completion visible and the reply in the transcript; verified by `pi_subagents_bring_a_background_child_wakes_the_parent_against_the_real_rpc` passing against the installed Pi 1.0 with the extension installed — the ignored live test that drives the product path, run with `env -u PI_SUBAGENT_CHILD cargo test -p waku-core --lib -- --ignored pi_subagents`
 - [x] 5.4 Update `docs/providers.md`: the Pi section's per-turn paragraph, the inbound-stream table (custom messages, queue reports), cancel (`clear_queue` then abort), steering's gate, and a new paragraph on extension surfaces; verified by each paragraph matching the implemented behaviour
 
 ## 6. Landing

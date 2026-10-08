@@ -33,12 +33,12 @@ use crate::model::{
     ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget,
     BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind,
     BackgroundWorkStatus, Checkpoint, CheckpointStatus, ContextUsage, DriverEvent,
-    ExtensionMessage, ExtensionStatusEntry, ExtensionWidget, ExtensionWidgetPlacement,
-    FavoriteModel, Message, MessageAnnotation, MessageAttachment, MessageRole,
-    NotificationSeverity, PendingPermission, Project, ProviderKind, ProviderModel, ProviderProbe,
-    ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary, QueuedMessage,
-    ReasoningBlock, RuntimeMode, SessionStatus, SessionWorkspace, TextSpan, TranscriptBlock,
-    TurnStatus, UserInputAnswer, UserInputQuestion, compact_path, unix_time, unix_time_millis,
+    ExtensionStatusEntry, ExtensionWidget, ExtensionWidgetPlacement, FavoriteModel, Message,
+    MessageAnnotation, MessageAttachment, MessageRole, NotificationSeverity, PendingPermission,
+    Project, ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor,
+    ProviderSessionHistory, ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode,
+    SessionStatus, SessionWorkspace, TextSpan, TranscriptBlock, TurnStatus, UserInputAnswer,
+    UserInputQuestion, compact_path, unix_time, unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
 

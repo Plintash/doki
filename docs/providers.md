@@ -305,7 +305,7 @@ strictness is why its catalog probe cannot borrow Pi's argument list.
 Waku stamps each request with a string id (`waku-<n>`) and Pi answers with
 `{"type": "response", "id", "success", "data"}`. Everything else on the stream
 is an unsolicited event. Requests are issued synchronously by the writer thread
-with a 10 s timeout ([pi.rs:1013](../crates/waku-core/src/driver/pi.rs#L1013));
+with a 10 s timeout ([pi.rs:1016](../crates/waku-core/src/driver/pi.rs#L1016));
 events keep flowing on the reader thread meanwhile. The handshake gets 30 s
 instead: the agent does not answer at all until it has finished loading its
 extensions, resources and — when model networking is on — its model catalog,
@@ -365,8 +365,10 @@ of ending at the transport. `notify` becomes a notification with its
 extension's own key (an absent `statusText` is the extension clearing it),
 `setWidget` a strip beside the composer kept on its key and placed where Pi puts
 it (`aboveEditor` or `belowEditor`), `setTitle` the window title, and
-`set_editor_text` the composer. The four dialog methods arrive as answerable
-requests and the answer goes back in the shape Pi asks for — `value` for
+`set_editor_text` the composer. A notification is shown whichever session is on
+screen, because a failed child is not silent just because the user is looking
+at another task. The four dialog methods arrive as answerable requests and the
+answer goes back in the shape Pi asks for — `value` for
 `select`, `input` and `editor`, `confirmed` for `confirm` — with a cancellation
 only when the user dismisses it. Nothing is cancelled on the user's behalf when
 it arrives; an unanswered dialog is bounded the way Pi bounds it (the provider
@@ -389,7 +391,7 @@ here, not the CLI's, and lifting it is a matter of wiring Oh My Pi's permission
 requests to a `Permission` event.
 
 **Cancel** — `clear_queue` first, then `abort`
-([pi.rs:1162](../crates/waku-core/src/driver/pi.rs#L1162)). That order is Pi's own
+([pi.rs:1168](../crates/waku-core/src/driver/pi.rs#L1168)). That order is Pi's own
 Esc recipe, and it is the reason to keep it: a message the user stopped is taken
 out of the session instead of waiting there to be carried into whatever runs
 next. The abort carries no request id and is not awaited — Pi answers it only
@@ -402,7 +404,7 @@ held retracts it — the driver clears the queue and reports the text — rather
 than leaving it parked.
 
 **Steer** — `{"type": "steer", "message": …}`, and only into a run that is
-still live ([pi.rs:1108](../crates/waku-core/src/driver/pi.rs#L1108)). Pi queues
+still live ([pi.rs:1111](../crates/waku-core/src/driver/pi.rs#L1111)). Pi queues
 a steer whether or not a run is open, and splices what it parks there into the
 next turn's boundary, so a steer arriving after its run settled is written as a
 prompt instead. Its `disposition: "queued"` means the message was accepted into

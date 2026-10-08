@@ -929,9 +929,12 @@ impl DriverControl for PiDriver {
         let Some(dialog) = self.dialogs.lock().remove(&request_id) else {
             return;
         };
+        // A Pi dialog asks one question, and its id is the request's own —
+        // the driver put it there — so the answer list holds exactly that
+        // question's labels, empty when the user dismissed it.
         let labels = answers
             .into_iter()
-            .find(|answer| answer.question_id == request_id)
+            .next()
             .map(|answer| answer.answers)
             .unwrap_or_default();
         let _ = self.commands.send(CommandMessage::ExtensionUiResponse(
@@ -1159,20 +1162,17 @@ fn write_clear_queue(writer: &mut impl Write) -> std::io::Result<()> {
 /// the other requests use. A waiter would report a slow stop as a transport
 /// error and hold the next prompt behind it, while the run's own settlement is
 /// what ends the turn either way.
-fn write_stop(writer: &mut impl Write) -> std::io::Result<()> {
-    write_clear_queue(writer)?;
-    write_json_line(writer, &json!({"type": "abort"}))
-}
-
-/// The stop as the transport performs it, including what it reports when the
-/// provider cannot be written to at all. The write failure is returned so the
-/// command loop can end, exactly as a dead pipe does for its other commands.
+///
+/// A write that fails at all is reported and returned so the command loop can
+/// end, exactly as a dead pipe does for its other commands.
 fn stop_session(
     writer: &mut impl Write,
     events: &impl DriverEventSink,
     flavor: PiFlavor,
 ) -> std::io::Result<()> {
-    if let Err(error) = write_stop(writer) {
+    let stopped =
+        write_clear_queue(writer).and_then(|()| write_json_line(writer, &json!({"type": "abort"})));
+    if let Err(error) = stopped {
         let _ = events.send(DriverEvent::Error(tr!(
             "errors.stop_provider",
             provider = flavor.display_name(),
@@ -2083,10 +2083,14 @@ fn pi_custom_message_text(content: Option<&Value>) -> String {
 /// pi-subagents' child and background notifications as detached work.
 ///
 /// The two types are its own: a workflow child settling and a background task
-/// finishing. Their first line names the child and its outcome, so the item is
-/// named after the child, carries the outcome as its status, and keeps the
-/// whole message as its detail; anything else is an extension message with no
-/// detached work behind it.
+/// finishing. Their first line names the child and its outcome — `Workflow
+/// child completed: **build**` — so the item is named after the child, carries
+/// the outcome as its status, and keeps the whole message as its detail;
+/// anything else is an extension message with no detached work behind it.
+///
+/// The child's key is that line's bold span, and a child may be called
+/// anything — `retry-failed` completes — so the outcome is read from the line
+/// with the span left out.
 fn pi_subagent_background_item(custom_type: &str, text: &str) -> Option<BackgroundWorkItem> {
     if !matches!(
         custom_type,
@@ -2099,22 +2103,24 @@ fn pi_subagent_background_item(custom_type: &str, text: &str) -> Option<Backgrou
         .find(|line| !line.trim().is_empty())
         .unwrap_or_default()
         .trim();
-    // The child's key rides the first line's bold span ("…: **build**").
-    let child = headline
-        .split_once("**")
-        .and_then(|(_, rest)| rest.split_once("**"))
-        .map(|(child, _)| child.trim())
-        .filter(|child| !child.is_empty())
-        .unwrap_or(headline);
-    let status = if headline.contains("failed") {
+    // The child's key is the bold span; the outcome is read around it.
+    let (before, rest) = headline.split_once("**").unwrap_or((headline, ""));
+    let (key, after) = rest.split_once("**").unwrap_or(("", ""));
+    let outcome = format!("{before}{after}");
+    let status = if outcome.contains("failed") {
         BackgroundWorkStatus::Failed
-    } else if headline.contains("completed") {
+    } else if outcome.contains("completed") {
         BackgroundWorkStatus::Completed
-    } else if headline.contains("stopped") {
+    } else if outcome.contains("stopped") {
         BackgroundWorkStatus::Stopped
     } else {
+        // `paused` and anything a later version words differently: the
+        // provider still holds the run, and the surface has no state of its
+        // own for a child that needs attention.
         BackgroundWorkStatus::Running
     };
+    let key = key.trim();
+    let child = if key.is_empty() { headline } else { key };
     let mut item = BackgroundWorkItem::new(
         BackgroundWorkKind::Subagent,
         child.to_owned(),
@@ -2457,12 +2463,14 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_the_provider_never_answers_reports_no_error_and_lets_the_next_prompt_go_out() {
-        // Pi answers `abort` only once its session is idle, which routinely
-        // outlasts the control timeout every other request uses. A stop that
-        // waited for that answer turned a slow abort into a transport error
-        // and held the next prompt behind it, so nothing is waited on: the
-        // run's own settlement is what ends the turn.
+    fn stopping_a_turn_clears_the_queue_before_it_aborts_and_waits_for_nothing() {
+        // Pi continues whatever its queue still holds when an abort lands, so
+        // clearing it is what keeps a message the user stopped from running
+        // afterwards: the clear has to be on the wire first. Pi answers
+        // `abort` only once its session is idle, which routinely outlasts the
+        // control timeout every other request uses, so nothing may wait on
+        // that answer — a waiter would report the slow stop as a transport
+        // error and hold the next prompt behind it.
         let (pending, _commands, _command_rx, _state) = harness();
         let (events, event_rx) = unbounded();
         let mut wire = Vec::new();
@@ -2473,32 +2481,19 @@ mod tests {
 
         assert!(
             event_rx.try_recv().is_err(),
-            "a slow abort is not a transport error"
+            "a stop the provider never answers is not a transport error"
         );
         let writes = wire_lines(&wire);
-        assert_eq!(writes[0]["type"], "clear_queue");
-        assert_eq!(writes[1]["type"], "abort");
-        assert_eq!(
-            writes[2]["type"], "prompt",
-            "the next prompt is not held behind the stop"
-        );
-    }
-
-    #[test]
-    fn stopping_a_turn_clears_the_queue_before_it_aborts() {
-        // Pi continues whatever its queue still holds when an abort lands, so
-        // clearing it is what keeps a message the user stopped from running
-        // afterwards. The clear has to be on the wire first.
-        let mut wire = Vec::new();
-        write_stop(&mut wire).unwrap();
-
-        let writes = wire_lines(&wire);
-        assert_eq!(writes.len(), 2, "a stop is the clear and the abort");
+        assert_eq!(writes.len(), 3, "a stop is the clear and the abort");
         assert_eq!(writes[0]["type"], "clear_queue");
         assert_eq!(writes[1]["type"], "abort");
         assert!(
             writes[1].get("id").is_none(),
             "an answer is correlated by id, so an id-less abort has none to await"
+        );
+        assert_eq!(
+            writes[2]["type"], "prompt",
+            "the next prompt is not held behind the stop"
         );
     }
 
@@ -4307,6 +4302,39 @@ mod tests {
         assert_eq!(item.key.kind, BackgroundWorkKind::Subagent);
         assert_eq!(item.title, "code-auditor");
         assert_eq!(item.status, BackgroundWorkStatus::Failed);
+    }
+
+    #[test]
+    fn a_child_named_after_an_outcome_settles_by_its_own_header() {
+        // pi-subagents words the header as "<what happened>: **<child key>**",
+        // and the key is the workflow's own: one called `retry-failed`
+        // completed, so the outcome cannot be read from the whole line.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent-incremental-child-notify",
+                    "display": false,
+                    "content": "Workflow child completed: **retry-failed**\nWorkflow run: wf-1\nStatus: workflow finished"
+                }
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) =
+            event_rx.recv().unwrap()
+        else {
+            panic!("a settled child belongs on the detached-work surface")
+        };
+        assert_eq!(item.title, "retry-failed");
+        assert_eq!(item.status, BackgroundWorkStatus::Completed);
     }
 
     #[test]

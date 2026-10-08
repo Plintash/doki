@@ -1015,11 +1015,6 @@ pub struct AgentSession {
     /// Read-only compatibility field for v1 state files. New saves omit it.
     #[serde(default, skip_serializing)]
     pub provider_session_id: Option<String>,
-    /// The provider's own extension messages, in the order it appended them.
-    /// Kept so the local session view stays identical to the provider's tree
-    /// even for the records the provider marks as not for display.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extension_messages: Vec<ExtensionMessage>,
     /// The status entries this session's extensions still keep, in the order
     /// they first published them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1087,7 +1082,6 @@ impl AgentSession {
             context_usage: None,
             runtime_event_cursor: None,
             provider_session_id: None,
-            extension_messages: Vec::new(),
             extension_status: Vec::new(),
             extension_widgets: Vec::new(),
             extension_window_title: None,
@@ -1127,7 +1121,6 @@ impl AgentSession {
             context_usage: None,
             runtime_event_cursor: None,
             provider_session_id: None,
-            extension_messages: Vec::new(),
             extension_status: Vec::new(),
             extension_widgets: Vec::new(),
             extension_window_title: None,
@@ -1992,23 +1985,6 @@ pub struct Message {
 /// unset flag stays off the wire and older payloads keep their behaviour.
 fn is_false(flag: &bool) -> bool {
     !*flag
-}
-
-/// An extension message from the provider's own session tree (`role:
-/// "custom"`).
-///
-/// The transcript renders the ones the provider marked for display as system
-/// lines, and the session keeps those beside the row. A message the provider
-/// withheld from the conversation has no row in the client either, so nothing
-/// is kept for it: the provider's own session file is the record of its tree.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct ExtensionMessage {
-    pub custom_type: String,
-    pub text: String,
-    /// Whether the provider intends this message to be shown. A message with
-    /// `display: false` adds no row.
-    pub display: bool,
 }
 
 impl Message {

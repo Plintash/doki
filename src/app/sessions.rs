@@ -1510,20 +1510,35 @@ impl Waku {
                 return;
             };
             let answers = pending.answers();
-            runtime
-                .driver
-                .respond_user_input(pending.request_id, answers);
-            if let Some(session) = self.state.session_mut(session_id)
-                && session.active_turn_id().is_some()
-            {
-                session.status = SessionStatus::Working;
-            }
-            self.user_input_answer
-                .update(cx, |input, cx| input.clear(cx));
+            self.answer_open_question(session_id, pending.request_id, answers, cx);
         } else {
             self.sync_user_input_answer(cx);
         }
         cx.notify();
+    }
+
+    /// Hands the answer the user gave — or the empty one a dismissal sends,
+    /// which a provider that takes dismissals reads as its cancellation — back
+    /// to the provider, and returns the session to work when the question
+    /// belonged to a live turn.
+    fn answer_open_question(
+        &mut self,
+        session_id: Uuid,
+        request_id: String,
+        answers: Vec<UserInputAnswer>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(runtime) = self.runtimes.get_mut(&session_id) else {
+            return;
+        };
+        runtime.driver.respond_user_input(request_id, answers);
+        if let Some(session) = self.state.session_mut(session_id)
+            && session.active_turn_id().is_some()
+        {
+            session.status = SessionStatus::Working;
+        }
+        self.user_input_answer
+            .update(cx, |input, cx| input.clear(cx));
     }
 
     /// Dismisses the open question without answering it. A provider that takes
@@ -1541,16 +1556,7 @@ impl Waku {
             return;
         };
         let dismissal = pending.dismissal();
-        runtime
-            .driver
-            .respond_user_input(pending.request_id, dismissal);
-        if let Some(session) = self.state.session_mut(session_id)
-            && session.active_turn_id().is_some()
-        {
-            session.status = SessionStatus::Working;
-        }
-        self.user_input_answer
-            .update(cx, |input, cx| input.clear(cx));
+        self.answer_open_question(session_id, pending.request_id, dismissal, cx);
         cx.notify();
     }
 

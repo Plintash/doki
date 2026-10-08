@@ -33,7 +33,6 @@ export type { CreatedWorktree } from "./CreatedWorktree";
 export type { DaemonReady } from "./DaemonReady";
 export type { DaemonSettings } from "./DaemonSettings";
 export type { DaySlice } from "./DaySlice";
-export type { ExtensionMessage } from "./ExtensionMessage";
 export type { ExtensionStatusEntry } from "./ExtensionStatusEntry";
 export type { ExtensionWidget } from "./ExtensionWidget";
 export type { ExtensionWidgetPlacement } from "./ExtensionWidgetPlacement";

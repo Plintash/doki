@@ -153,9 +153,11 @@ card already lives. It does not belong on the detached-work surface: those
 entries are provider work with a key, a status, a stop affordance and a part in
 a parked turn's decisions, and a block of text an extension keeps and clears
 would masquerade as running work. Dialogs become answerable requests with the
-ordinary `cancel` response as the dismissal, and an unanswered dialog is bounded
-by the timeout Pi itself sends when it has one. What stays cancelled is what Pi's
-RPC cannot carry at all (`custom`, `onTerminalInput`).
+ordinary `cancel` response as the dismissal, and the client never cancels one
+on its own: Pi's RPC mode resolves a dialog it was given a `timeout` for itself
+and forgets the request, so a cancellation from here would answer a question
+the provider is no longer asking. What stays cancelled is what Pi's RPC cannot
+carry at all (`custom`, `onTerminalInput`).
 
 **D10 — Verification is a live process, not a fixture.** The driver's live tests
 already spawn a real `pi --mode rpc` (`pi_context_usage_against_the_real_rpc`), so
@@ -178,8 +180,11 @@ completion must wake the parent and appear.
   Pi's own map of custom messages.
 - **Dialogs can hold the provider.** `select`/`confirm`/`input`/`editor` block
   Pi's extension until they are answered. Auto-cancelling was wrong, but
-  answering only in the UI risks an unnoticed open dialog; the driver bounds it
-  with the timeout Pi supplies and surfaces the request prominently.
+  answering only in the UI risks an unnoticed open dialog; Pi's RPC mode bounds
+  the ones it was given a `timeout` for by resolving them itself, and one it
+  sends without a timeout — its `editor` dialog carries none — waits for the
+  user exactly as it would in Pi's own terminal UI. The request is surfaced
+  prominently either way.
 - **Live tests need a credentialed Pi and the extension installed.** They must
   stay runnable without either — the existing live tests in `pi.rs` skip rather
   than fail when the binary is absent, and the pi-subagents acceptance run is
