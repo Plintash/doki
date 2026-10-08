@@ -1,6 +1,6 @@
 [package]
 name = "waku"
-version = "26.9.21"
+version = "26.10.8-rc.2"
 edition = "2024"
 description = "A fast, native control plane for local coding agents"
 license = "GPL-3.0-only"

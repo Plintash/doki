@@ -36,11 +36,16 @@ pub const DEFAULT_SIDEBAR_WIDTH: f32 = 252.0;
 pub const DEFAULT_RIGHT_PANEL_WIDTH: f32 = 460.0;
 
 /// How the desktop groups task history in the sidebar.
+///
+/// Project-first by default: a day's work is spread across every project it
+/// touched, so date headings pile unrelated tasks on top of each other, while
+/// the tasks sharing a project are the ones a user resumes together. Date
+/// headings stay one click away in the sidebar's options menu.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarGrouping {
-    Project,
     #[default]
+    Project,
     Updated,
 }
 
@@ -351,6 +356,11 @@ struct AppState {
     sidebar_width: f32,
     #[serde(default)]
     sidebar_grouping: SidebarGrouping,
+    /// Whether the stored grouping is the user's own pick. Documents written
+    /// before project-first grouping was the default carry a grouping nobody
+    /// chose, and that one has to yield to the current default.
+    #[serde(default)]
+    sidebar_grouping_chosen: bool,
     #[serde(default)]
     sidebar_ordering: SidebarOrdering,
     #[serde(default = "default_right_panel_width")]
@@ -409,6 +419,9 @@ pub struct PersistedState {
     pub sidebar_width: f32,
     #[serde(default)]
     pub sidebar_grouping: SidebarGrouping,
+    /// Set once the user picks a grouping, never by the default: it is what
+    /// keeps a later change of default from rewriting that choice.
+    pub sidebar_grouping_chosen: bool,
     #[serde(default)]
     pub sidebar_ordering: SidebarOrdering,
     #[serde(default = "default_right_panel_width")]
@@ -475,7 +488,8 @@ impl PersistedState {
             sidebar_visible: true,
             right_panel_visible: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
-            sidebar_grouping: SidebarGrouping::Updated,
+            sidebar_grouping: SidebarGrouping::default(),
+            sidebar_grouping_chosen: false,
             sidebar_ordering: SidebarOrdering::Newest,
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             markdown_preview: false,
@@ -619,6 +633,7 @@ impl PersistedState {
             right_panel_visible: self.right_panel_visible,
             sidebar_width: self.sidebar_width,
             sidebar_grouping: self.sidebar_grouping,
+            sidebar_grouping_chosen: self.sidebar_grouping_chosen,
             sidebar_ordering: self.sidebar_ordering,
             right_panel_width: self.right_panel_width,
             markdown_preview: self.markdown_preview,
@@ -651,7 +666,11 @@ impl PersistedState {
         self.sidebar_visible = app_state.sidebar_visible;
         self.right_panel_visible = app_state.right_panel_visible;
         self.sidebar_width = app_state.sidebar_width;
-        self.sidebar_grouping = app_state.sidebar_grouping;
+        self.sidebar_grouping = sidebar_grouping_for(
+            app_state.sidebar_grouping_chosen,
+            app_state.sidebar_grouping,
+        );
+        self.sidebar_grouping_chosen = app_state.sidebar_grouping_chosen;
         self.sidebar_ordering = app_state.sidebar_ordering;
         self.right_panel_width = app_state.right_panel_width;
         self.markdown_preview = app_state.markdown_preview;
@@ -735,6 +754,19 @@ impl PersistedState {
         if self.last_context_window.is_none() {
             self.last_context_window = session.context_window;
         }
+    }
+}
+
+/// The grouping a stored document opens with.
+///
+/// An unchosen grouping is whatever the default was in the build that wrote
+/// the document, so this build's default replaces it; a chosen one is the
+/// user's and survives every launch, including a switch back to date headings.
+fn sidebar_grouping_for(chosen: bool, stored: SidebarGrouping) -> SidebarGrouping {
+    if chosen {
+        stored
+    } else {
+        SidebarGrouping::default()
     }
 }
 
@@ -1223,9 +1255,22 @@ mod tests {
     fn legacy_app_state_defaults_sidebar_presentation() {
         let state: AppState = serde_json::from_str(r#"{"app_state_version":1}"#).unwrap();
 
-        assert_eq!(state.sidebar_grouping, SidebarGrouping::Updated);
+        assert_eq!(state.sidebar_grouping, SidebarGrouping::Project);
         assert_eq!(state.sidebar_ordering, SidebarOrdering::Newest);
         assert_eq!(state.last_runtime_mode, RuntimeMode::FullAccess);
+    }
+
+    #[test]
+    fn date_grouping_stored_before_the_default_changed_adopts_project_grouping() {
+        assert_eq!(
+            sidebar_grouping_for(false, SidebarGrouping::Updated),
+            SidebarGrouping::Project
+        );
+        assert_eq!(
+            sidebar_grouping_for(true, SidebarGrouping::Updated),
+            SidebarGrouping::Updated,
+            "a switch back to date headings survives the next launch"
+        );
     }
 
     #[test]
