@@ -18,6 +18,7 @@ the original feature bullet instead of adding separate entries for them.
 
 - Choose whether Enter steers the running turn or queues a follow-up while an agent works; ⌘Enter does the opposite for one message (Settings → General)
 - Pi: a steer the provider acknowledged and then refused now reads as undelivered instead of looking delivered
+- Tasks that were still running when the app was killed survive the next launch instead of being deleted, and renaming a task before opening it no longer wipes its stored history
 
 ## [26.10.8-rc.2]
 
