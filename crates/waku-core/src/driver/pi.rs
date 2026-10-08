@@ -1596,7 +1596,12 @@ fn handle_pi_message(
             let handled_locally = value.pointer("/data/disposition").and_then(Value::as_str)
                 == Some("handled")
                 || value.pointer("/data/agentInvoked").and_then(Value::as_bool) == Some(false);
-            if success && !handled_locally {
+            // A command that starts a run of its own — the shape an extension
+            // uses to wake the session — has already announced that run by the
+            // time this answer arrives, and the run settles its own turn.
+            // Settling here would end a turn the run is still writing into and
+            // then open a second one for the same work.
+            if success && (!handled_locally || state.run.is_live()) {
                 return;
             }
             pending.lock().remove(id);
@@ -2301,6 +2306,50 @@ mod tests {
             "a handled prompt opens no turn of its own"
         );
         assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn a_command_that_starts_a_run_keeps_its_own_turn() {
+        // The shape an extension command uses to wake the session: the handler
+        // starts a run inline, so the run's start arrives before the answer
+        // that says the prompt was handled. That run owns the turn; settling on
+        // the answer would end it early and open a second one for the same
+        // work, which the app renders as an empty completed turn.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "/council").unwrap();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "handled"}}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "an answer settles nothing while the run it started is live"
+        );
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "agent_settled"}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(event_rx.try_recv().is_err(), "one turn, one settlement");
     }
 
     #[test]
