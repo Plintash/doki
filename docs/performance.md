@@ -21,7 +21,7 @@ price:
 
 | Trigger | Cost | Allowed users |
 | --- | --- | --- |
-| `cx.notify(view)` | Re-renders that view and its ancestors; **cached sibling panes replay** | The stream pump (per commit), the pulse clock, user-event handlers |
+| `cx.notify(view)` | Re-renders that view and its ancestors; **cached sibling panes replay** | The stream pump (per commit), the pulse and dissolve clocks, user-event handlers |
 | `window.refresh()` | Re-renders everything and **bypasses every cached pane** | Genuine whole-window invalidation only: hover transitions, drags, theme |
 | `request_animation_frame` | Display-rate (120 Hz) re-render of the current view for as long as it re-arms | Nothing during streaming. One mounted repeating `with_animation` pinned the window at 120 Hz for a whole turn (~36% CPU by itself). The one sanctioned transient: the 200 ms panel show/hide slide ([src/app/render.rs](../src/app/render.rs)), which re-arms only while an edge is moving and gates the pane fan-out (below) |
 
@@ -83,9 +83,19 @@ every tick (a lease's stride resets after it fires); an earlier version kept
 the minimum stride forever, so one full-rate lease permanently dragged its
 pane back to 30 Hz.
 
-The veil dissolve is a pulse-clock client like everything else: the message
-veil at ≈ 30 Hz, the reasoning veil at ≈ 15 Hz, both leasing
-`window.current_view()` so a dissolve only rebuilds the island that hosts it.
+The veil dissolve rides a second clock. Loader ticks quantize a travelling
+gradient into visible steps, so `display_lease` (same file) ticks at display
+rate — 120 Hz on a ProMotion panel, with the extra wake-ups collapsing into one
+vsync on a 60 Hz display — while a streamed dissolve is in flight. The cadence
+is a Settings choice (`settings.stream_dissolve`: 120 fps by default, 60 and 30
+offered for battery); the two slower options stride the loader clock instead of
+starting the second one. It is still one `cx.notify` on
+`window.current_view()`, so a dissolve only rebuilds the island that hosts it,
+for the same per-frame work a display-rate redraw costs; the fee is that the
+whole visible transcript (not just the fading tail) rebuilds per frame while
+text streams. The reasoning peek keeps its ≈ 15 Hz pulse lease: minutes of
+thinking would pay that rebuild at display rate for a dim, compact, secondary
+surface.
 
 **Overlay scrollbars are the classic violator of both cadences.** A streaming
 surface moves its content every commit, so the bar sits in its reveal hold for
