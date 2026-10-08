@@ -18,9 +18,9 @@
 
 ## 3. Window factory and app-scope services
 
-- [ ] 3.1 Move the daemon supervisor, updater, and notification handling out of window-scoped state into an application global; verify the app still builds and existing startup tests pass
-- [ ] 3.2 Extract a reusable main-window opener from `run` that builds the window, creates the `Waku` entity, and restores the persisted placement; verify a normal launch is indistinguishable from today
-- [ ] 3.3 Route `on_reopen` and notification activation through the opener with a single-window guard; verify Dock activation with a window open focuses it and creates no second window
+- [x] 3.1 Move the daemon supervisor, updater, and notification handling out of window-scoped state into an application global; verify the app still builds and existing startup tests pass
+- [x] 3.2 Extract a reusable main-window opener from `run` that builds the window, creates the `Waku` entity, and restores the persisted placement; verify a normal launch is indistinguishable from today
+- [x] 3.3 Route `on_reopen` and notification activation through the opener with a single-window guard; verify Dock activation with a window open focuses it and creates no second window
 
 ## 4. Close, rebuild, and restore policy
 
