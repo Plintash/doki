@@ -759,8 +759,10 @@ impl Backend for WakuBackend {
                     );
                 }
                 let (cols, rows) = terminal.size();
+                let (data, sequence) = terminal.retained_snapshot();
                 Ok(ResponsePayload::TerminalSnapshot {
-                    data: terminal.retained_output(),
+                    data,
+                    sequence,
                     cols,
                     rows,
                 })

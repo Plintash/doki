@@ -19,7 +19,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -478,11 +478,16 @@ pub enum ResponsePayload {
         result: WorkspaceResult,
     },
     /// Retained terminal output and current size, returned by
-    /// [`Command::AttachTerminal`]. `data` is base64 on the wire.
+    /// [`Command::AttachTerminal`]. `data` is base64 on the wire. `sequence`
+    /// is the cumulative number of output bytes the terminal had produced when
+    /// the snapshot was taken, counting bytes the bounded ring already dropped;
+    /// a client drops live `terminalOutput` batches whose own end sequence is
+    /// at or below it, which makes the snapshot/live boundary exact.
     TerminalSnapshot {
         #[serde(with = "base64_bytes")]
         #[ts(type = "string")]
         data: Vec<u8>,
+        sequence: u64,
         cols: u16,
         rows: u16,
     },
@@ -559,21 +564,28 @@ mod tests {
 
         let payload = ResponsePayload::TerminalSnapshot {
             data: vec![0, 1, 2, 255],
+            sequence: 4096,
             cols: 120,
             rows: 40,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["type"], "terminalSnapshot");
         assert_eq!(json["data"], "AAEC/w==");
+        assert_eq!(json["sequence"], 4096);
         assert_eq!(json["cols"], 120);
         assert_eq!(json["rows"], 40);
 
-        let ResponsePayload::TerminalSnapshot { data, cols, rows } =
-            serde_json::from_value(json).unwrap()
+        let ResponsePayload::TerminalSnapshot {
+            data,
+            sequence,
+            cols,
+            rows,
+        } = serde_json::from_value(json).unwrap()
         else {
             panic!("unexpected payload variant");
         };
         assert_eq!(data, vec![0, 1, 2, 255]);
+        assert_eq!(sequence, 4096);
         assert_eq!((cols, rows), (120, 40));
     }
 
@@ -584,7 +596,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     #[test]
@@ -593,7 +605,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     #[test]

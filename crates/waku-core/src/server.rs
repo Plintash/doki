@@ -1876,7 +1876,10 @@ mod tests {
         let attached = attacher
             .request(terminal_id, terminal_id, Command::AttachTerminal)
             .unwrap();
-        let ResponsePayload::TerminalSnapshot { data, cols, rows } = attached else {
+        let ResponsePayload::TerminalSnapshot {
+            data, cols, rows, ..
+        } = attached
+        else {
             panic!("attach did not return a terminal snapshot: {attached:?}");
         };
         assert!(
@@ -1912,6 +1915,234 @@ mod tests {
 
         opener.shutdown();
         attacher.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A client that attaches while the shell is still writing must combine
+    /// the attach snapshot with the live events that follow it. The snapshot
+    /// and the first live emission share the terminal's retained lock, so the
+    /// boundary is exact: every advertised byte appears once, and a hole is
+    /// detectable as a jump in the per-terminal output sequence instead of
+    /// silently duplicating or dropping output.
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_attach_boundary_has_no_duplicates_or_gaps() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            // A finite numbered stream, then a marker and a natural exit so
+            // teardown reaps an exited shell instead of killing one stuck
+            // mid-write. The stream is long enough that attaching lands
+            // mid-burst, and the leading counter makes duplicates and gaps
+            // observable. Filler keeps the producer from one write per byte.
+            "awk 'BEGIN { pad = sprintf(\"%64s\", \"\"); i = 0; while (i < 3000) { printf \"%08d%s\\n\", i, pad; i++ }; printf \"burst-done\\n\" }'",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let terminal_id = Uuid::new_v4();
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let events = client.subscribe(terminal_id, terminal_id);
+        client
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        // Wait until the shell is mid-flood before attaching, so the snapshot
+        // and the live stream genuinely overlap.
+        terminal_output_until(&events, b"00000001");
+
+        let attached = client
+            .request(terminal_id, terminal_id, Command::AttachTerminal)
+            .unwrap();
+        let ResponsePayload::TerminalSnapshot {
+            data,
+            sequence,
+            ..
+        } = attached
+        else {
+            panic!("attach did not return a terminal snapshot: {attached:?}");
+        };
+
+        let mut reconstructed = data.clone();
+        let mut boundary = sequence;
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline && reconstructed.len() < data.len() + 50_000 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let Ok(event) = events.recv_timeout(remaining) else {
+                break;
+            };
+            if event.event.kind != "terminalOutput" {
+                continue;
+            }
+            let batch = base64::engine::general_purpose::STANDARD
+                .decode(event.event.payload["data"].as_str().unwrap())
+                .unwrap();
+            let end = event.event.payload["sequence"]
+                .as_u64()
+                .expect("terminalOutput did not carry its output sequence");
+            let start = end - batch.len() as u64;
+            if end <= boundary {
+                // Wholly covered by the snapshot the client already replayed.
+                continue;
+            }
+            assert_eq!(
+                start, boundary,
+                "the live stream jumped from sequence {boundary} to {start}"
+            );
+            reconstructed.extend_from_slice(&batch);
+            boundary = end;
+        }
+        assert!(
+            reconstructed.len() > data.len(),
+            "attach did not observe live output after the snapshot"
+        );
+
+        // Every line leads with a fixed-width counter, so a duplicated or
+        // skipped byte shows up as a non-consecutive pair of line numbers. The
+        // reconstruction may begin or end mid-line, so only a leading counter
+        // followed by non-digit filler counts.
+        let mut previous: Option<u64> = None;
+        let mut counted = 0_usize;
+        for line in reconstructed.split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.len() < 9 || !line[..8].iter().all(u8::is_ascii_digit) {
+                continue;
+            }
+            let value: u64 = std::str::from_utf8(&line[..8]).unwrap().parse().unwrap();
+            if let Some(previous) = previous {
+                assert_eq!(
+                    value,
+                    previous + 1,
+                    "the reconstructed terminal stream duplicated or skipped output at {value}"
+                );
+            }
+            previous = Some(value);
+            counted += 1;
+        }
+        assert!(counted > 4, "the reconstruction held too little output to judge");
+
+        // Let the burst finish before stopping the server so its shell exits
+        // on its own; killing a shell mid-write leaves the PTY child stuck
+        // exiting and blocks the daemon teardown.
+        terminal_output_until(&events, b"burst-done");
+
+        shutdown.store(true, Ordering::Release);
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Closing the surface (or the window) drops the desktop's client without
+    /// ending the shell. A client that arrives afterwards attaches to the same
+    /// terminal, reconstructs the grid from the replay, and finds the process
+    /// still able to answer input.
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_survives_client_disconnect_and_reattaches() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'daemon-shell-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    // The first client disconnects by shutting its own socket
+                    // down; a client-owned shutdown must not end the daemon.
+                    allow_shutdown: false,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let terminal_id = Uuid::new_v4();
+        let first = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let first_events = first.subscribe(terminal_id, terminal_id);
+        first
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        terminal_output_until(&first_events, b"daemon-shell-ready");
+        // Simulates the window tearing down: the client goes away, the daemon
+        // and its shell do not.
+        first.shutdown();
+
+        let second = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let second_events = second.subscribe(terminal_id, terminal_id);
+        let attached = second
+            .request(terminal_id, terminal_id, Command::AttachTerminal)
+            .unwrap();
+        let ResponsePayload::TerminalSnapshot { data, .. } = attached else {
+            panic!("attach did not return a terminal snapshot: {attached:?}");
+        };
+        assert!(
+            data.windows(b"daemon-shell-ready".len())
+                .any(|window| window == b"daemon-shell-ready"),
+            "reattach did not replay the grid the disconnected client saw"
+        );
+
+        second
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::WriteTerminal {
+                    data: b"still-alive\r".to_vec(),
+                },
+            )
+            .unwrap();
+        terminal_output_until(&second_events, b"echo:still-alive");
+
+        shutdown.store(true, Ordering::Release);
+        second.shutdown();
         server.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
