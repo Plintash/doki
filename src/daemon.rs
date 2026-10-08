@@ -1,31 +1,87 @@
 //! Desktop ownership of the Waku daemon process.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow, bail};
 use gpui::{App, Global};
 
-/// App-wide handle to the daemon supervisor.
+/// The application's daemon connection.
 ///
-/// The window opens before the daemon answers, so this starts empty and the
-/// window that connects fills it in. Windows borrow it and never own it, so
-/// closing a window leaves the daemon running and a rebuilt window reattaches
-/// to the same process: the supervisor only reaps its daemon once the last
-/// handle, this one, is dropped with the application.
-pub struct DaemonState(pub Option<waku_client::DaemonSupervisor>);
+/// The window opens before the daemon answers, so the connection is asked for
+/// once, at application scope, and its answer is kept here. Windows borrow the
+/// daemon and never own it, so closing the only window leaves the daemon
+/// running: a rebuilt window reattaches to the same process instead of
+/// starting and reaping a second one. The request itself is kept here too, so
+/// the window that made it closing mid-flight cannot drop the supervisor.
+#[derive(Clone)]
+pub enum DaemonState {
+    /// No window has asked for a daemon yet.
+    Idle,
+    /// A connection request is in flight; windows paint skeleton content.
+    Connecting,
+    /// The daemon answered.
+    Ready(waku_client::DaemonSupervisor),
+    /// The last request could not reach a daemon.
+    Failed(String),
+}
 
 impl Global for DaemonState {}
 
-/// The connected daemon, once a window has attached one.
-pub fn connected(cx: &App) -> Option<waku_client::DaemonSupervisor> {
+/// How a window reaches its daemon. Production starts the supervised daemon,
+/// or connects to one managed elsewhere; tests substitute a prepared answer so
+/// the startup path can run without a daemon. Runs off the UI thread.
+pub(crate) type DaemonConnector =
+    Arc<dyn Fn() -> anyhow::Result<waku_client::DaemonSupervisor> + Send + Sync>;
+
+/// The application's current daemon connection.
+///
+/// An application that has not asked yet reads as [`DaemonState::Idle`], so
+/// this is answerable before the first window builds.
+pub fn state(cx: &App) -> DaemonState {
     cx.try_global::<DaemonState>()
-        .and_then(|state| state.0.clone())
+        .cloned()
+        .unwrap_or(DaemonState::Idle)
 }
 
-/// Publish the connected daemon at application scope, so a window built later
-/// reattaches to it instead of starting a second one.
-pub fn publish(cx: &mut App, daemon: waku_client::DaemonSupervisor) {
-    cx.set_global(DaemonState(Some(daemon)));
+/// The connected daemon, once it has answered.
+pub fn connected(cx: &App) -> Option<waku_client::DaemonSupervisor> {
+    match cx.try_global::<DaemonState>() {
+        Some(DaemonState::Ready(daemon)) => Some(daemon.clone()),
+        _ => None,
+    }
+}
+
+/// Ask for the application's daemon, unless one is already connected or being
+/// connected.
+///
+/// The request belongs to the application rather than to the window that made
+/// it: its answer is published in [`DaemonState`] and handed to whichever main
+/// windows exist when it lands. A window that closes while the daemon is
+/// answering therefore cannot drop the supervisor — which would reap the
+/// daemon it just started — and a window opened while the request is still in
+/// flight joins it instead of starting a second daemon. A failed attempt may
+/// be retried, which is what reopening after a failure does.
+pub fn request(cx: &mut App, connector: DaemonConnector) {
+    match cx.try_global::<DaemonState>() {
+        Some(DaemonState::Ready(_) | DaemonState::Connecting) => return,
+        _ => {}
+    }
+    cx.set_global(DaemonState::Connecting);
+    cx.spawn(async move |cx| {
+        let answer = cx
+            .background_executor()
+            .spawn(async move { connector() })
+            .await;
+        cx.update(|cx| {
+            cx.set_global(match answer {
+                Ok(daemon) => DaemonState::Ready(daemon),
+                Err(error) => DaemonState::Failed(error.to_string()),
+            });
+            crate::main_window::attach_main_windows(cx);
+        });
+    })
+    .detach();
 }
 
 /// Connect to a daemon managed elsewhere, or start and supervise the local one.

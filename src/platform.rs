@@ -392,47 +392,15 @@ pub const fn primary_shortcut<'a>(macos: &'a str, other: &'a str) -> &'a str {
     }
 }
 
-/// Keep Waku's single main window alive when the user closes it. This preserves
-/// the current session and lets a Dock activation reveal the same GPUI window.
-#[cfg(target_os = "macos")]
-pub fn configure_main_window_close_behavior(window: &Window, cx: &gpui::App) {
-    window.on_window_should_close(cx, |window, _| {
-        hide_window(window);
-        false
-    });
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn configure_main_window_close_behavior(_: &Window, _: &gpui::App) {}
-
-#[cfg(target_os = "macos")]
-pub fn hide_window(window: &mut Window) {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSView;
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let Ok(handle) = HasWindowHandle::window_handle(window) else {
-        return;
-    };
-    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-        return;
-    };
-    let Some(_main_thread) = MainThreadMarker::new() else {
-        return;
-    };
-
-    // GPUI owns this view and its NSWindow. AppKit access stays on the main
-    // thread, and orderOut hides without triggering GPUI's close callback.
-    unsafe {
-        let view = handle.ns_view.cast::<NSView>().as_ref();
-        if let Some(native_window) = view.window() {
-            native_window.orderOut(None);
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn hide_window(window: &mut Window) {
+/// Close the main window, destroying it.
+///
+/// The window is disposable: closing it removes it and the application keeps
+/// running — macOS keeps the Dock icon, other platforms quit with their last
+/// window. GPUI's removal drops the platform window, and its macOS window
+/// closes its `NSWindow` from the main thread, so AppKit leaves a fullscreen
+/// space and closes the window in one step instead of the `orderOut` the hide
+/// path used, which stranded an empty black space behind.
+pub fn close_window(window: &mut Window) {
     window.remove_window();
 }
 

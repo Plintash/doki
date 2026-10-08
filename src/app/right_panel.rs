@@ -2115,8 +2115,26 @@ impl Waku {
                 window.focus(&focus_handle, cx);
             }
         } else {
-            crate::platform::hide_window(window);
+            self.close_window(window, cx);
         }
+    }
+
+    /// The settings page's close handler: same close, different key context.
+    pub(super) fn close_window_action(
+        &mut self,
+        _: &CloseWindow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_window(window, cx);
+    }
+
+    /// Save the desktop snapshot and close the window. The application keeps
+    /// running with no window, so the frame the user left behind is landed on
+    /// disk here — the quit-time save happens much later, if at all.
+    fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.persist_window_state(window, cx);
+        crate::platform::close_window(window);
     }
 
     pub(super) fn render_right_panel_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
