@@ -62,6 +62,10 @@ mod platform {
     pub(crate) struct RetainedOutput {
         capacity: usize,
         bytes: VecDeque<u8>,
+        /// Cumulative bytes ever pushed, including bytes the ring has dropped.
+        /// The ring plus this offset is the exact snapshot/live boundary a
+        /// client uses to avoid replaying output twice.
+        pushed: u64,
     }
 
     impl RetainedOutput {
@@ -69,10 +73,12 @@ mod platform {
             Self {
                 capacity: capacity.max(1),
                 bytes: VecDeque::new(),
+                pushed: 0,
             }
         }
 
         pub(crate) fn push(&mut self, bytes: &[u8]) {
+            self.pushed = self.pushed.saturating_add(bytes.len() as u64);
             if bytes.len() >= self.capacity {
                 // The push alone overflows the buffer, so nothing older can
                 // survive it.
@@ -94,6 +100,16 @@ mod platform {
 
         pub(crate) fn snapshot(&self) -> Vec<u8> {
             self.bytes.iter().copied().collect()
+        }
+
+        /// Cumulative output offset up to and including the last byte held.
+        pub(crate) fn sequence(&self) -> u64 {
+            self.pushed
+        }
+
+        /// The retained bytes and the cumulative offset of the last one.
+        pub(crate) fn snapshot_with_sequence(&self) -> (Vec<u8>, u64) {
+            (self.snapshot(), self.pushed)
         }
     }
 
@@ -248,6 +264,15 @@ mod platform {
             self.retained.lock().snapshot()
         }
 
+        /// The retained bytes and the cumulative output offset at the last
+        /// one, taken under the same lock the reader holds while appending and
+        /// delivering a batch. That lock is what makes the snapshot/live
+        /// boundary exact: a batch is either wholly inside the snapshot or
+        /// wholly after it, never both or neither.
+        pub fn retained_snapshot(&self) -> (Vec<u8>, u64) {
+            self.retained.lock().snapshot_with_sequence()
+        }
+
         /// The columns and rows most recently applied to this terminal.
         pub fn size(&self) -> (u16, u16) {
             *self.size.lock()
@@ -366,13 +391,18 @@ mod platform {
             if self.pending.is_empty() {
                 return;
             }
-            self.retained.lock().push(&self.pending);
             let data = base64::engine::general_purpose::STANDARD.encode(&self.pending);
-            self.pending.clear();
+            let batch = std::mem::take(&mut self.pending);
             self.last_flush = Some(Instant::now());
+            // Append and deliver under one lock. `retained_snapshot` reads the
+            // same lock, so an attach either observes this batch in the
+            // snapshot or receives it as a live event, never both.
+            let mut retained = self.retained.lock();
+            retained.push(&batch);
+            let sequence = retained.sequence();
             let _ = self.events.send_ephemeral(WireDriverEvent::new(
                 "terminalOutput",
-                json!({ "data": data }),
+                json!({ "data": data, "sequence": sequence }),
             ));
         }
 
@@ -467,5 +497,20 @@ mod tests {
         retained.push(b"klmnopqrs");
 
         assert_eq!(retained.snapshot(), b"lmnopqrs");
+    }
+
+    #[test]
+    fn retained_output_sequence_counts_dropped_bytes() {
+        let mut retained = RetainedOutput::new(4);
+        retained.push(b"abcd");
+        assert_eq!(retained.snapshot_with_sequence(), (b"abcd".to_vec(), 4));
+
+        // Two bytes age out, but the offset still counts them so a client can
+        // tell the snapshot is a suffix rather than the whole stream.
+        retained.push(b"ef");
+        assert_eq!(retained.snapshot_with_sequence(), (b"cdef".to_vec(), 6));
+
+        retained.push(b"ghijkl");
+        assert_eq!(retained.snapshot_with_sequence(), (b"ijkl".to_vec(), 12));
     }
 }

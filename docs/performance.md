@@ -105,6 +105,37 @@ one-shot wake for hold expiry and rides the pulse clock only through the
 350 ms fade. Driving frames through the hold pinned the pane at pulse rate the
 moment any scrollbar became visible.
 
+## Terminal output
+
+A terminal is a second streaming source, and it obeys the same rule as the
+transcript: the daemon coalesces output and the client renders from state,
+never per byte.
+
+- The daemon reader appends each read to the terminal's bounded ring and emits
+  one `terminalOutput` event per batch. A batch flushes when it reaches
+  `FLUSH_BYTES` (32 KiB) or `FLUSH_INTERVAL` (16 ms) after the previous flush,
+  whichever comes first, so an interactive echo waits at most one frame and a
+  flooding command cannot drive one message per write
+  ([crates/waku-core/src/terminal.rs](../crates/waku-core/src/terminal.rs)).
+  The ring keeps the most recent 1 MiB; the batch and ring caps are what stop a
+  flooding producer from growing daemon memory at the stream rate.
+- Attach replay and the live stream meet at an exact sequence boundary. The
+  terminal stamps every batch with its cumulative end offset, and
+  `AttachTerminal` returns the retained bytes with the offset at their last
+  byte, taken under the same lock the reader holds while appending and
+  delivering a batch. The client drops any batch at or below that offset, so a
+  byte cannot reach the emulator twice or slip through the gap.
+- The desktop driver is `TerminalSession` ([src/terminal.rs](../src/terminal.rs)):
+  a background reader feeds bytes into the Alacritty grid off the UI thread,
+  the grid renderer is unchanged from the pre-daemon terminal, and the view
+  polls it on the existing 24 ms pump. Input and resize are fire-and-forget
+  daemon notifications, so a keystroke never blocks the frame that produced it.
+
+Verify the cadence with
+`cargo test -p waku-core --locked websocket_terminal_flood_delivers_bounded_batches`
+and the boundary with
+`cargo test -p waku-core --locked websocket_terminal_attach_boundary_has_no_duplicates_or_gaps`.
+
 ## Bounding what is visible
 
 - The transcript is virtualized with `list()`; per-commit invalidation is the
