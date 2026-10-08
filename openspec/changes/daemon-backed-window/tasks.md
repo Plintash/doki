@@ -37,7 +37,7 @@
 - [x] 5.2 Move daemon spawn/connect and initial state loads off the window-open path so the first frame paints skeleton content; verify with a deliberately delayed daemon
 - [x] 5.3 Record cold-launch and reopen baselines in `docs/performance.md` and set the budgets the harness enforces
 - [x] 5.4 Add a repeatable latency harness that launches the debug app and checks the recorded budgets, and verify a deliberately slowed build fails it
-- [ ] 5.5 Profile window/renderer initialization; if it dominates the reopen budget, carry the minimal GPUI fork patch and record the profile and decision in the design or performance doc
+- [x] 5.5 Profile window/renderer initialization; if it dominates the reopen budget, carry the minimal GPUI fork patch and record the profile and decision in the design or performance doc
 
 ## 6. Integration validation
 
