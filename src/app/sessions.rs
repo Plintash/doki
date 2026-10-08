@@ -545,6 +545,16 @@ impl Waku {
         self.save();
     }
 
+    /// Mirror the live window frame into persisted state and land the snapshot
+    /// on disk. Closing the window destroys it while the application keeps
+    /// running, so the quit-time save never sees the frame the user left the
+    /// window at; this is the last moment it is known. `pub(crate)` because the
+    /// window that calls it on close lives outside this module.
+    pub(crate) fn persist_window_state(&mut self, window: &Window, cx: &App) {
+        self.capture_window_state(window, cx);
+        self.save();
+    }
+
     /// Mirror the live window frame into persisted state; disk waits for the
     /// app-quit save (any other `save` carries the frame along for free).
     /// macOS reports a zoomed window as `Windowed` with screen-filling bounds,

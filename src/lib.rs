@@ -142,8 +142,8 @@ pub fn run() {
             cx.set_global(crate::updater::UpdaterState(updater));
             // The daemon is app-scoped because it outlives any window, but it
             // is not connected yet: the window opens and paints first, then
-            // fills this in when its daemon answers.
-            cx.set_global(crate::daemon::DaemonState(None));
+            // asks for it.
+            cx.set_global(crate::daemon::DaemonState::Idle);
             cx.on_action(|_: &CheckForUpdates, cx| {
                 if let Some(updater) = &cx.global::<crate::updater::UpdaterState>().0 {
                     updater.check_for_updates();

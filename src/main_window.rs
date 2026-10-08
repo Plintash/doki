@@ -11,7 +11,9 @@
 //! skeleton content on the first frame and swaps in the daemon-backed
 //! workspace when the connection lands, so a daemon that is slow to start, or
 //! never starts at all, leaves a window that reports itself rather than a
-//! delayed or blank frame.
+//! delayed or blank frame. The connection itself is the application's (see
+//! `crate::daemon`), so closing the window while it is in flight neither drops
+//! the supervisor nor starts a second one.
 
 use std::sync::Arc;
 
@@ -21,10 +23,10 @@ use gpui::{
     WindowHandle, WindowOptions, div, point, px, size,
 };
 use uuid::Uuid;
-use waku_client::DaemonSupervisor;
 
 use crate::app::Waku;
 use crate::app::window_chrome::render_window_frame;
+use crate::daemon::{DaemonConnector, DaemonState};
 use crate::identity::{APP_ID, APP_NAME};
 use crate::theme::{Theme, sp};
 use crate::ui::icon;
@@ -60,35 +62,24 @@ pub fn show_main_window<V: 'static + Render>(
             window
         }
         None => cx
-            .open_window(options, |window, cx| {
-                crate::platform::configure_main_window_close_behavior(window, cx);
-                build(window, cx)
-            })
+            .open_window(options, build)
             .expect("failed to open Waku window"),
     };
     cx.activate(true);
     window
 }
 
-/// How a window reaches its daemon. Production starts the supervised daemon,
-/// or connects to one managed elsewhere; tests substitute a prepared answer so
-/// the startup path can run without a daemon. Runs off the UI thread.
-pub(crate) type DaemonConnector = Arc<dyn Fn() -> anyhow::Result<DaemonSupervisor> + Send + Sync>;
-
 /// The main window's root view.
 ///
 /// It opens with no workspace at all and paints skeleton content, then swaps in
-/// the daemon-backed workspace when the connection lands. A daemon that never
-/// answers is reported in the same window instead of leaving a blank frame.
+/// the daemon-backed workspace when the application's connection lands. A
+/// daemon that never answers is reported in the same window instead of leaving
+/// a blank frame.
 pub struct MainWindow {
     /// What the window shows. One state rather than a workspace beside a
     /// status flag, so "connecting", "failed", and "hydrated" cannot
     /// disagree with each other.
     content: WindowContent,
-    /// The newest connection request. An answer carrying an older generation
-    /// describes a request this window has moved past, so it is discarded
-    /// instead of replacing newer content.
-    connection: u64,
     /// The task a notification asked for before the workspace existed. A
     /// notification click can beat a slow daemon, and the tag has to survive
     /// until there is a workspace to select the task in.
@@ -111,60 +102,40 @@ impl MainWindow {
     fn connecting() -> Self {
         Self {
             content: WindowContent::Connecting,
-            connection: 0,
             requested_task: None,
         }
     }
 
-    /// Ask for the daemon, off the UI thread.
+    /// Ask the application for its daemon and show whatever it has.
     ///
     /// The window is already on screen when this runs, so the request only
     /// schedules work: a daemon that is slow to start never delays the first
-    /// frame, and one that cannot be reached is reported when its answer
-    /// arrives.
+    /// frame. The request itself is the application's, so it outlives this
+    /// window — closing while the daemon answers cannot drop the supervisor —
+    /// and a window opened while one is in flight joins it.
     fn connect(&mut self, window: &mut Window, connector: DaemonConnector, cx: &mut Context<Self>) {
-        self.connection = self.connection.wrapping_add(1).max(1);
-        let connection = self.connection;
-        // A window built after an earlier one connected reattaches to the
-        // daemon published at application scope instead of starting a second.
-        if let Some(daemon) = crate::daemon::connected(cx) {
-            self.apply_connection(connection, Ok(daemon), window, cx);
-            return;
-        }
-        cx.spawn_in(window, async move |this, cx| {
-            let connected = cx
-                .background_executor()
-                .spawn(async move { connector() })
-                .await;
-            // A window that closed while the daemon was answering has nowhere
-            // to put the result: the update fails, and the result is dropped
-            // with the window it was meant for.
-            this.update_in(cx, |this, window, cx| {
-                this.apply_connection(connection, connected, window, cx);
-            })
-            .ok();
-        })
-        .detach();
+        crate::daemon::request(cx, connector);
+        self.sync_daemon_state(window, cx);
     }
 
-    /// Apply one connection request's answer. A superseded request is dropped
-    /// here; a request whose window has since closed never reaches this at all.
-    fn apply_connection(
-        &mut self,
-        connection: u64,
-        result: anyhow::Result<DaemonSupervisor>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if connection != self.connection {
-            return;
-        }
-        match result {
-            Ok(daemon) => self.attach_workspace(daemon, window, cx),
-            Err(error) => {
-                self.content = WindowContent::Failed(error.to_string());
-                cx.notify();
+    /// Show the application's daemon connection in this window: build the
+    /// workspace once it is ready, and report a failed attempt. The connection
+    /// is the application's; this window only renders it, and reattaches when
+    /// it lands after the window opened.
+    pub(crate) fn sync_daemon_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match crate::daemon::state(cx) {
+            DaemonState::Ready(daemon) => {
+                if !matches!(self.content, WindowContent::Workspace(_)) {
+                    self.attach_workspace(daemon, window, cx);
+                }
             }
+            DaemonState::Failed(error) => {
+                if !matches!(&self.content, WindowContent::Failed(current) if *current == error) {
+                    self.content = WindowContent::Failed(error);
+                    cx.notify();
+                }
+            }
+            DaemonState::Idle | DaemonState::Connecting => {}
         }
     }
 
@@ -172,13 +143,13 @@ impl MainWindow {
     /// surface.
     fn attach_workspace(
         &mut self,
-        daemon: DaemonSupervisor,
+        daemon: waku_client::DaemonSupervisor,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Published before the workspace exists, so a window rebuilt from here
-        // on reattaches to this daemon instead of starting another one.
-        crate::daemon::publish(cx, daemon.clone());
+        // The connection is the application's, so the daemon was published at
+        // application scope before this window could see it; the workspace
+        // only borrows it.
         let workspace = Waku::new(window, cx, daemon);
         let composer_focus = workspace.read(cx).composer_focus(cx);
         window.focus(&composer_focus, cx);
@@ -203,6 +174,29 @@ impl MainWindow {
                 self.requested_task = Some(task_id);
             }
         }
+    }
+
+    /// Land the desktop snapshot this window holds on disk before it is
+    /// destroyed. The application keeps running after the close, so the
+    /// quit-time save never sees the frame the user left the window at.
+    fn persist_before_close(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let WindowContent::Workspace(workspace) = &self.content {
+            workspace.update(cx, |workspace, cx| workspace.persist_window_state(window, cx));
+        }
+    }
+}
+
+/// Attach the application's daemon to every main window that is waiting for
+/// one. A window opened after the connection landed attaches as it opens; this
+/// reaches the windows that were already on screen when it landed.
+pub(crate) fn attach_main_windows(cx: &mut App) {
+    for window in cx.windows() {
+        let Some(window) = window.downcast::<MainWindow>() else {
+            continue;
+        };
+        window
+            .update(cx, |root, window, cx| root.sync_daemon_state(window, cx))
+            .ok();
     }
 }
 
@@ -273,6 +267,14 @@ fn open_main_window_with(cx: &mut App, connector: DaemonConnector) -> WindowHand
         move |window, cx| {
             let root = cx.new(|_| MainWindow::connecting());
             root.update(cx, |root, cx| root.connect(window, connector, cx));
+            // AppKit asks before it closes the window from its own control; the
+            // window is the only thing that knows the frame it was left at, and
+            // the application outlives it, so save the snapshot here.
+            let closing = root.clone();
+            window.on_window_should_close(cx, move |window, cx| {
+                closing.update(cx, |root, cx| root.persist_before_close(window, cx));
+                true
+            });
             root
         },
     )
@@ -302,7 +304,7 @@ pub fn init_notification_activation(cx: &mut App) {
 }
 
 /// Route Dock activation through the same opener first launch uses, so a
-/// hidden or rebuilt window comes back identically and never as a second
+/// window the user closed comes back identically and never as a second
 /// window.
 pub trait WakuApplicationExt {
     fn with_main_window_reopen(self) -> Self;
@@ -423,7 +425,8 @@ mod tests {
     };
 
     use super::{
-        DaemonConnector, MainWindow, WindowContent, open_main_window_with, show_main_window,
+        DaemonConnector, DaemonState, MainWindow, WindowContent, open_main_window_with,
+        show_main_window,
     };
 
     /// Stands in for the window's root view. The guard only cares which window
@@ -541,71 +544,58 @@ mod tests {
         );
     }
 
-    /// An answer is only applied while it is still the newest request: one from
-    /// a request the window has moved past never replaces newer content.
+    /// A connection request belongs to the application, not to the window that
+    /// made it. A window that closes while the daemon is answering must not
+    /// drop the supervisor — which would reap the daemon it just started — and
+    /// a window opened while that request is still in flight joins it instead
+    /// of starting a second daemon.
     #[gpui::test]
-    fn a_superseded_connection_answer_is_discarded(cx: &mut TestAppContext) {
-        let window = cx.update(|cx| {
-            open_main_window_with(cx, Arc::new(|| Err(anyhow!("the first daemon is down"))))
-        });
-        let superseded = window
-            .read_with(cx, |root: &MainWindow, _| root.connection)
-            .unwrap();
+    fn a_window_opened_while_a_connection_is_in_flight_joins_it(cx: &mut TestAppContext) {
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connector = |connections: Arc<AtomicUsize>| -> DaemonConnector {
+            Arc::new(move || {
+                connections.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow!("the daemon is unreachable"))
+            })
+        };
 
-        // A second request makes the first one stale.
+        let first = cx.update(|cx| open_main_window_with(cx, connector(connections.clone())));
+        // The window closes before its daemon answers.
         cx.update(|cx| {
-            window
-                .update(cx, |root, window, cx| {
-                    root.connect(
-                        window,
-                        Arc::new(|| Err(anyhow!("the second daemon is down"))),
-                        cx,
-                    );
-                })
-                .unwrap();
+            first
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap()
         });
+        assert!(cx.windows().is_empty());
 
-        // The first request's answer arrives last and lands nowhere.
-        cx.update(|cx| {
-            window
-                .update(cx, |root, window, cx| {
-                    root.apply_connection(
-                        superseded,
-                        Err(anyhow!("the first daemon is down")),
-                        window,
-                        cx,
-                    );
-                })
-                .unwrap();
-        });
+        // Activating the app opens a window while that request is still in
+        // flight.
+        let reopened = cx.update(|cx| open_main_window_with(cx, connector(connections.clone())));
+        cx.run_until_parked();
+
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "reopening while a connection is in flight joins it instead of starting a second daemon"
+        );
         assert!(
-            window
+            reopened
                 .read_with(cx, |root: &MainWindow, _| matches!(
                     root.content,
-                    WindowContent::Connecting
+                    WindowContent::Failed(_)
                 ))
                 .unwrap(),
-            "a superseded answer leaves the window's content alone"
-        );
-
-        cx.run_until_parked();
-        let failure = window
-            .read_with(cx, |root: &MainWindow, _| match &root.content {
-                WindowContent::Failed(error) => Some(error.clone()),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(
-            failure.as_deref(),
-            Some("the second daemon is down"),
-            "the newest request's answer is the one that stands"
+            "the reopened window shows the answer the application was already waiting for"
         );
     }
 
-    /// An answer addressed to a window that has since closed is dropped: a late
-    /// hydration must not write state for a window that no longer exists.
+    /// The connection belongs to the application, so an answer that arrives
+    /// after the window that asked for it closed is still recorded at
+    /// application scope. For a `Ready` answer that is what keeps the
+    /// supervisor — and the daemon it just started — from being dropped with
+    /// the window that happened to ask for it.
     #[gpui::test]
-    fn an_answer_for_a_closed_window_is_dropped(cx: &mut TestAppContext) {
+    fn a_connection_answer_outlives_the_window_that_asked_for_it(cx: &mut TestAppContext) {
         let connections = Arc::new(AtomicUsize::new(0));
         let connector: DaemonConnector = {
             let connections = connections.clone();
@@ -639,20 +629,42 @@ mod tests {
             window.read_with(cx, |_: &MainWindow, _| ()).is_err(),
             "the window and its root view are gone"
         );
-
-        // A window opened afterwards starts from scratch: the answer that
-        // arrived for the closed one belongs to that window alone.
-        let reopened = cx.update(|cx| {
-            open_main_window_with(cx, Arc::new(|| Err(anyhow!("the daemon is unreachable"))))
-        });
         assert!(
-            reopened
-                .read_with(cx, |root: &MainWindow, _| matches!(
-                    root.content,
-                    WindowContent::Connecting
-                ))
-                .unwrap(),
-            "a reopened window starts from its own connection"
+            cx.read(|cx| matches!(
+                crate::daemon::state(cx),
+                DaemonState::Failed(message) if message == "the daemon is unreachable"
+            )),
+            "the answer is recorded at application scope, not with the window"
         );
+    }
+
+    /// Closing the only window destroys it and leaves the application running;
+    /// activation goes through the same opener and builds exactly one fresh
+    /// window.
+    #[gpui::test]
+    fn closing_the_window_leaves_the_app_running_and_activation_rebuilds_it(
+        cx: &mut TestAppContext,
+    ) {
+        let first = cx.update(|cx| {
+            show_main_window(cx, WindowOptions::default(), |_, cx| {
+                cx.new(|_| MainWindowProbe)
+            })
+        });
+
+        cx.update(|cx| {
+            first
+                .update(cx, |_, window, _| crate::platform::close_window(window))
+                .unwrap()
+        });
+        assert!(cx.windows().is_empty(), "closing removes the window");
+
+        // Dock activation: same opener, a new window, still only one.
+        let rebuilt = cx.update(|cx| {
+            show_main_window(cx, WindowOptions::default(), |_, cx| {
+                cx.new(|_| MainWindowProbe)
+            })
+        });
+        assert_eq!(cx.windows().len(), 1);
+        assert_ne!(rebuilt.window_id(), first.window_id());
     }
 }
