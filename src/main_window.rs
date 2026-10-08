@@ -312,11 +312,6 @@ fn open_main_window_with(cx: &mut App, connector: DaemonConnector) -> WindowHand
         move |window, cx| {
             let root = cx.new(|_| MainWindow::connecting());
             root.update(cx, |root, cx| root.connect(window, connector, cx));
-            // AppKit asks before it closes the window from its own control. The
-            // workspace answers: it holds the close back — with a confirmation —
-            // while a file editor is unsaved, and lands the desktop snapshot
-            // when the window may go. The application outlives the window, so
-            // this is the last moment the frame it was left at is known.
             let closing = root.clone();
             window.on_window_should_close(cx, move |window, cx| {
                 closing.update(cx, |root, cx| root.window_should_close(window, cx))

@@ -59,7 +59,6 @@ enum Sink {
 /// The application's startup trace.
 pub struct StartupTrace {
     process_start: Instant,
-    enabled: bool,
     close_after_launch: bool,
     state: RefCell<TraceState>,
     writer: Option<Sender<String>>,
@@ -91,12 +90,20 @@ impl StartupTrace {
     }
 
     /// A trace that collects runs without writing them anywhere. Only tests
-    /// need this: the application either traces to a sink or not at all.
+    /// need this: the application either traces to a sink or not at all. A
+    /// writer with no receiver keeps `is_some()` true while discarding every
+    /// line, which is tracing on for a test and nothing for production.
     #[cfg(test)]
     pub fn collecting(process_start: Instant) -> Self {
-        let mut trace = Self::new(process_start, None, false);
-        trace.enabled = true;
-        trace
+        let (writer, _discarded) = mpsc::channel::<String>();
+        let mut state = TraceState::default();
+        state.begin(RunKind::Cold, 0.0);
+        Self {
+            process_start,
+            close_after_launch: false,
+            state: RefCell::new(state),
+            writer: Some(writer),
+        }
     }
 
     fn new(process_start: Instant, sink: Option<Sink>, close_after_launch: bool) -> Self {
@@ -105,7 +112,6 @@ impl StartupTrace {
         state.begin(RunKind::Cold, 0.0);
         Self {
             process_start,
-            enabled: writer.is_some(),
             close_after_launch,
             state: RefCell::new(state),
             writer,
@@ -115,7 +121,7 @@ impl StartupTrace {
     /// Whether tracing is on. A disabled trace records nothing.
     #[cfg(test)]
     pub fn enabled(&self) -> bool {
-        self.enabled
+        self.writer.is_some()
     }
 
     /// Note that a window is opening. The first window continues the cold run
@@ -126,7 +132,7 @@ impl StartupTrace {
     }
 
     fn note_window_open_at(&self, at: Instant) {
-        if !self.enabled {
+        if self.writer.is_none() {
             return;
         }
         let start_ms = self.elapsed_ms(at);
@@ -149,7 +155,7 @@ impl StartupTrace {
     }
 
     fn record_at(&self, milestone: Milestone, at: Instant) -> Option<RunKind> {
-        if !self.enabled {
+        if self.writer.is_none() {
             return None;
         }
         let mut state = self.state.borrow_mut();
