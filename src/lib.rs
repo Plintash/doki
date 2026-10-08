@@ -35,6 +35,7 @@ mod computer_use;
 pub mod daemon;
 mod driver;
 mod input;
+mod main_window;
 mod md;
 mod platform;
 mod query;
@@ -49,13 +50,10 @@ pub use waku_client::{
     model_catalog, persistence, projectless, skills, usage, usage_history, worktree,
 };
 
-use gpui::{
-    App, Application, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, point, px, size,
-};
+use gpui::{App, KeyBinding, Menu, MenuItem, actions};
 
-use crate::app::Waku;
 use crate::identity::{APP_ID, APP_NAME};
+use crate::main_window::WakuApplicationExt as _;
 actions!(
     waku,
     [
@@ -113,87 +111,6 @@ actions!(
     ]
 );
 
-const DEFAULT_WINDOW_WIDTH: f32 = 1380.0;
-const DEFAULT_WINDOW_HEIGHT: f32 = 880.0;
-const MIN_WINDOW_WIDTH: f32 = 980.0;
-const MIN_WINDOW_HEIGHT: f32 = 680.0;
-/// How much titlebar must stay on the display for the window to be dragged
-/// back by hand.
-const TITLEBAR_GRAB_WIDTH: f32 = 160.0;
-const TITLEBAR_GRAB_HEIGHT: f32 = 22.0;
-
-/// Reopen the main window where the user last left it, on the display it was
-/// left on. GPUI window bounds are display-relative, so the persisted frame is
-/// anchored by resolving the saved display UUID against the connected
-/// displays — Zed's scheme — and `display_id` rides along in `WindowOptions`.
-/// When that display is gone the same offsets re-anchor on the primary
-/// display, and the origin is clamped so the titlebar stays grabbable after
-/// any display change.
-fn restored_window_placement(cx: &App) -> (WindowBounds, Option<gpui::DisplayId>) {
-    let centered = |cx: &App| {
-        (
-            WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
-                cx,
-            )),
-            None,
-        )
-    };
-    let Some(saved) = crate::persistence::load_window_state().filter(|saved| {
-        [saved.x, saved.y, saved.width, saved.height]
-            .iter()
-            .all(|value| value.is_finite())
-    }) else {
-        return centered(cx);
-    };
-    let display = saved.display.and_then(|uuid| {
-        cx.displays()
-            .into_iter()
-            .find(|display| display.uuid().ok() == Some(uuid))
-    });
-    let display_id = display.as_ref().map(|display| display.id());
-    let Some(anchor) = display.or_else(|| cx.primary_display()) else {
-        return centered(cx);
-    };
-    let anchor_size = anchor.bounds().size;
-    let width = saved.width.max(MIN_WINDOW_WIDTH);
-    let height = saved.height.max(MIN_WINDOW_HEIGHT);
-    let x = saved.x.clamp(
-        TITLEBAR_GRAB_WIDTH - width,
-        (f32::from(anchor_size.width) - TITLEBAR_GRAB_WIDTH).max(0.0),
-    );
-    let y = saved.y.clamp(
-        0.0,
-        (f32::from(anchor_size.height) - TITLEBAR_GRAB_HEIGHT).max(0.0),
-    );
-    let bounds = Bounds::new(point(px(x), px(y)), size(px(width), px(height)));
-    let window_bounds = if saved.maximized {
-        WindowBounds::Maximized(bounds)
-    } else {
-        WindowBounds::Windowed(bounds)
-    };
-    (window_bounds, display_id)
-}
-
-trait WakuApplicationExt {
-    fn with_main_window_reopen(self) -> Self;
-}
-
-impl WakuApplicationExt for Application {
-    fn with_main_window_reopen(self) -> Self {
-        self.on_reopen(|cx| {
-            if let Some(window) = cx.windows().into_iter().next() {
-                window
-                    .update(cx, |_, window, _| window.activate_window())
-                    .ok();
-            }
-            cx.activate(true);
-        });
-        self
-    }
-}
-
 pub fn run() {
     let daemon = crate::daemon::start_process()
         .unwrap_or_else(|error| panic!("failed to start Waku daemon: {error:#}"));
@@ -225,6 +142,10 @@ pub fn run() {
             let updater = crate::updater::Updater::init();
             let updater_available = updater.is_some();
             cx.set_global(crate::updater::UpdaterState(updater));
+            // The daemon belongs to the application, not to the window that
+            // happens to be showing its state, so it survives a closed or
+            // rebuilt window.
+            cx.set_global(crate::daemon::DaemonState(daemon));
             cx.on_action(|_: &CheckForUpdates, cx| {
                 if let Some(updater) = &cx.global::<crate::updater::UpdaterState>().0 {
                     updater.check_for_updates();
@@ -337,82 +258,10 @@ pub fn run() {
             })
             .detach();
 
-            let (window_bounds, display_id) = restored_window_placement(cx);
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        titlebar: Some(TitlebarOptions {
-                            title: Some(APP_NAME.into()),
-                            // Windows creates the window without `WS_CAPTION`
-                            // either way; asking for the transparent titlebar
-                            // is what extends the client area over the frame
-                            // so Waku's own header can host the caption
-                            // buttons and drag region.
-                            appears_transparent: cfg!(any(
-                                target_os = "macos",
-                                target_os = "windows"
-                            )),
-                            traffic_light_position: cfg!(target_os = "macos")
-                                .then(|| point(px(16.0), px(17.0))),
-                        }),
-                        // Waku moves its custom macOS titlebar explicitly. Keep
-                        // the NSWindow movable so native controls and Window-menu
-                        // tiling remain enabled.
-                        is_movable: true,
-                        app_owns_titlebar_drag: cfg!(target_os = "macos"),
-                        window_background: if cfg!(target_os = "macos") {
-                            WindowBackgroundAppearance::Blurred
-                        } else {
-                            WindowBackgroundAppearance::Opaque
-                        },
-                        app_id: Some(APP_ID.to_owned()),
-                        // GPUI defaults to compositor/server decorations. If a
-                        // Wayland compositor declines them, it reports the
-                        // client fallback and Waku renders that frame itself.
-                        #[cfg(target_os = "linux")]
-                        icon: crate::platform::linux_app_icon(),
-                        window_bounds: Some(window_bounds),
-                        display_id,
-                        window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
-                        ..Default::default()
-                    },
-                    move |window, cx| {
-                        crate::platform::configure_main_window_close_behavior(window, cx);
-                        let waku = Waku::new(window, cx, daemon);
-                        let composer_focus = waku.read(cx).composer_focus(cx);
-                        window.focus(&composer_focus, cx);
-                        waku
-                    },
-                )
-                .expect("failed to open Waku window");
-
-            cx.on_system_notification_response({
-                let window = window;
-                move |response, cx| {
-                    let Some(session_id) = crate::app::task_id_from_notification_tag(&response.tag)
-                    else {
-                        return;
-                    };
-                    window
-                        .update(cx, |waku, window, cx| {
-                            waku.open_task_from_notification(session_id, cx);
-                            window.activate_window();
-                            cx.activate(true);
-                        })
-                        .ok();
-                    cx.dismiss_system_notification(&response.tag);
-                }
-            });
-
-            window
-                .update(cx, |_, window, cx| {
-                    crate::platform::configure_sidebar_material(
-                        window,
-                        crate::theme::Theme::current(cx).is_dark,
-                    );
-                    cx.activate(true);
-                })
-                .ok();
+            crate::main_window::open_main_window(cx);
+            // Registered once, at application scope, so a notification click
+            // still lands after the window that first handled one is gone.
+            crate::main_window::init_notification_activation(cx);
 
             set_app_menus(cx, updater_available);
             // A Linux handoff retains the previous prefix until this freshly
