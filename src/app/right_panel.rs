@@ -2035,6 +2035,10 @@ mod tests {
         assert!(state.expanded_paths.is_empty());
         assert!(state.files_selected_path.is_none());
         assert_eq!(state.file_tree_width, DEFAULT_FILE_TREE_WIDTH);
+        assert!(state.pending_tab_reveal.is_none());
+        assert!(state.diff_snapshot.is_none());
+        assert!(state.diff_selected_file.is_none());
+        assert!(state.diff_expanded_paths.is_empty());
     }
 
     #[test]
@@ -2243,7 +2247,11 @@ impl Waku {
                         let surviving = restore_right_panel_descriptors(
                             descriptor,
                             |terminal_id| {
-                                crate::terminal::daemon_terminal_exists(&daemon, terminal_id)
+                                crate::terminal::daemon_terminal_exists(
+                                    &daemon,
+                                    session_id,
+                                    terminal_id,
+                                )
                             },
                             |path| workspace_file_exists(&workspace, &workspace_path, path),
                         );
@@ -2541,7 +2549,15 @@ impl Waku {
             return;
         }
         if let Some(terminal_id) = self.right_panel_surfaces[index].terminal_id() {
+            // Closing the tab is the explicit close: the daemon ends the shell
+            // and releases the terminal. Closing the window only drops the
+            // surface, which is what lets a reopened window reattach.
             self.right_panel_terminals.remove(&terminal_id);
+            let _ = self.daemon.client().notify(
+                terminal_id,
+                terminal_id,
+                waku_client::Command::CloseTerminal,
+            );
         }
         if let Some(browser_id) = self.right_panel_surfaces[index].browser_id() {
             self.right_panel_browsers.remove(&browser_id);
@@ -2801,6 +2817,10 @@ impl Waku {
     }
 
     fn ensure_right_panel_terminal(&mut self, terminal_id: Uuid, cx: &mut Context<Self>) {
+        let Some(task_id) = self.state.selected_session else {
+            self.right_panel_terminals.remove(&terminal_id);
+            return;
+        };
         let Some(working_directory) = self
             .selected_workspace_path()
             .map(std::path::Path::to_path_buf)
@@ -2814,12 +2834,14 @@ impl Waku {
             .is_some_and(|terminal| terminal.read(cx).working_directory() == working_directory);
         if !matches_project {
             // The daemon owns the shell, so a terminal works the same against a
-            // remote daemon as a local one; the surface only needs the id to
+            // remote daemon as a local one; the surface only needs the ids to
             // attach to and the cwd to open it with.
             let daemon = self.daemon.client();
             self.right_panel_terminals.insert(
                 terminal_id,
-                cx.new(|cx| TerminalView::new(daemon, terminal_id, working_directory.clone(), cx)),
+                cx.new(|cx| {
+                    TerminalView::new(daemon, task_id, terminal_id, working_directory.clone(), cx)
+                }),
             );
         }
     }

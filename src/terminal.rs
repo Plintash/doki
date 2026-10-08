@@ -30,7 +30,7 @@ use gpui::{
 use parking_lot::Mutex;
 use uuid::Uuid;
 
-use waku_client::{Command, DaemonClient, ResponsePayload};
+use waku_client::{Command, DaemonClient, ResponsePayload, TerminalSnapshot};
 
 use crate::persistence::DEFAULT_RIGHT_PANEL_WIDTH;
 use crate::theme::{Theme, sp};
@@ -179,57 +179,49 @@ impl Dimensions for TerminalDimensions {
     }
 }
 
-/// The replay a daemon terminal hands back on attach: the retained bytes and
-/// the cumulative output offset at the last one.
-struct AttachedTerminal {
-    data: Vec<u8>,
-    sequence: u64,
-    cols: u16,
-    rows: u16,
-}
-
 /// Attaches to the daemon terminal `terminal_id`, opening it if this is its
 /// first client. Attaching rather than opening first matters: `OpenTerminal`
 /// replaces and kills an existing shell, which is the opposite of restoring
 /// one across a surface or window teardown.
 fn attach_snapshot(
     daemon: &DaemonClient,
+    task_id: Uuid,
     terminal_id: Uuid,
     working_directory: &Path,
     columns: usize,
     rows: usize,
-) -> Result<AttachedTerminal> {
-    if let Some(snapshot) = request_snapshot(daemon, terminal_id)? {
+) -> Result<TerminalSnapshot> {
+    if let Some(snapshot) = request_snapshot(daemon, task_id, terminal_id)? {
         return Ok(snapshot);
     }
     daemon.request(
         terminal_id,
         terminal_id,
         Command::OpenTerminal {
+            task_id,
             cwd: working_directory.to_path_buf(),
             cols: columns.min(u16::MAX as usize) as u16,
             rows: rows.min(u16::MAX as usize) as u16,
         },
     )?;
-    request_snapshot(daemon, terminal_id)?
+    request_snapshot(daemon, task_id, terminal_id)?
         .ok_or_else(|| anyhow::anyhow!("Waku daemon did not retain the terminal it just opened"))
 }
 
-/// `Ok(None)` means the daemon has no terminal under this id yet, which is the
-/// only attach failure the caller recovers from by opening one.
-fn request_snapshot(daemon: &DaemonClient, terminal_id: Uuid) -> Result<Option<AttachedTerminal>> {
-    match daemon.request(terminal_id, terminal_id, Command::AttachTerminal) {
-        Ok(ResponsePayload::TerminalSnapshot {
-            data,
-            sequence,
-            cols,
-            rows,
-        }) => Ok(Some(AttachedTerminal {
-            data,
-            sequence,
-            cols,
-            rows,
-        })),
+/// The replay the daemon retains for `terminal_id`. `Ok(None)` means the daemon
+/// has no terminal under this id yet, which is the only attach failure the
+/// caller recovers from by opening one.
+fn request_snapshot(
+    daemon: &DaemonClient,
+    task_id: Uuid,
+    terminal_id: Uuid,
+) -> Result<Option<TerminalSnapshot>> {
+    match daemon.request(
+        terminal_id,
+        terminal_id,
+        Command::AttachTerminal { task_id },
+    ) {
+        Ok(ResponsePayload::TerminalSnapshot(snapshot)) => Ok(Some(snapshot)),
         Ok(other) => Err(anyhow::anyhow!(
             "Waku daemon returned an invalid terminal attachment: {other:?}"
         )),
@@ -280,11 +272,12 @@ struct TerminalSession {
 /// daemon never had, which is the opposite of restoring a dead one. The probe
 /// is a read-only `AttachTerminal`, and an unreachable daemon answers `false`
 /// so a missing terminal leaves the surface absent rather than an error.
-pub(crate) fn daemon_terminal_exists(daemon: &DaemonClient, terminal_id: Uuid) -> bool {
-    matches!(
-        daemon.request(terminal_id, terminal_id, Command::AttachTerminal),
-        Ok(ResponsePayload::TerminalSnapshot { .. })
-    )
+pub(crate) fn daemon_terminal_exists(
+    daemon: &DaemonClient,
+    task_id: Uuid,
+    terminal_id: Uuid,
+) -> bool {
+    matches!(request_snapshot(daemon, task_id, terminal_id), Ok(Some(_)))
 }
 
 impl TerminalSession {
@@ -293,6 +286,7 @@ impl TerminalSession {
     /// stay here; only bytes and control messages cross the daemon boundary.
     fn attach(
         daemon: DaemonClient,
+        task_id: Uuid,
         terminal_id: Uuid,
         working_directory: &Path,
         columns: usize,
@@ -302,7 +296,14 @@ impl TerminalSession {
         // from this point, and the snapshot's sequence marks which of them the
         // replay already covers.
         let events = daemon.subscribe(terminal_id, terminal_id);
-        let snapshot = attach_snapshot(&daemon, terminal_id, working_directory, columns, rows)?;
+        let snapshot = attach_snapshot(
+            &daemon,
+            task_id,
+            terminal_id,
+            working_directory,
+            columns,
+            rows,
+        )?;
 
         let columns = (snapshot.cols as usize).max(TERMINAL_MIN_COLUMNS);
         let rows = (snapshot.rows as usize).max(TERMINAL_MIN_ROWS);
@@ -442,9 +443,16 @@ impl TerminalSession {
             return;
         }
 
+        // The reader may be mid-batch, and a frame may not wait on it: leave
+        // the resize for the next frame, and stay dirty so there is one.
+        let Some(mut term) = self.term.try_lock_unfair() else {
+            self.dirty.store(true, Ordering::Release);
+            return;
+        };
         self.grid_size = (columns, rows);
         let dimensions = TerminalDimensions { columns, rows };
-        self.term.lock().resize(dimensions);
+        term.resize(dimensions);
+        drop(term);
         let size = WindowSize {
             num_lines: rows.min(u16::MAX as usize) as u16,
             num_cols: columns.min(u16::MAX as usize) as u16,
@@ -489,15 +497,22 @@ impl TerminalSession {
         Some(TerminalLink { value, bounds })
     }
 
-    fn snapshot(
+    /// One frame's read of the grid, taken only while the daemon reader is
+    /// between batches.
+    ///
+    /// The reader holds this lock while it advances a batch of output, so a
+    /// frame that waited on it would stall the UI behind emulation no frame
+    /// budget can see. `None` means the reader is mid-batch: the view keeps the
+    /// frame it last painted, and the reader's dirty flag brings the next read.
+    fn frame(
         &self,
         theme: Theme,
         selection_color: Hsla,
         cursor_style: TerminalCursorStyle,
         hovered_link: Option<&Match>,
-    ) -> TerminalSnapshot {
+    ) -> Option<TerminalFrame> {
         self.dark_theme.store(theme.is_dark, Ordering::Release);
-        let term = self.term.lock();
+        let term = self.term.try_lock_unfair()?;
         let content = term.renderable_content();
         let columns = self.grid_size.0;
         let rows = self.grid_size.1;
@@ -600,10 +615,15 @@ impl TerminalSession {
             rendered_rows.push(TerminalRow { text, runs });
         }
 
-        TerminalSnapshot {
+        let history_size = term.grid().history_size();
+        Some(TerminalFrame {
             rows: rendered_rows,
             outline_cursor,
-        }
+            max_offset: px(history_size as f32 * TERMINAL_CELL_HEIGHT),
+            scrolled: px(
+                history_size.saturating_sub(content.display_offset) as f32 * TERMINAL_CELL_HEIGHT
+            ),
+        })
     }
 }
 
@@ -619,14 +639,19 @@ impl Drop for TerminalSession {
     }
 }
 
-/// Adapts the alacritty grid to the overlay scrollbar: the scrollback history
-/// is the content above the viewport, and `display_offset` is how far back up
-/// into it the view currently sits (0 = pinned to the live bottom).
+/// Adapts the frame's grid read to the overlay scrollbar: the scrollback
+/// history is the content above the viewport, and `display_offset` is how far
+/// back up into it the view currently sits (0 = pinned to the live bottom).
+///
+/// The offsets come from the frame's non-blocking read, so the bar's paint pass
+/// never waits on the daemon reader either.
 #[derive(Clone)]
 struct TerminalScrollbarTarget {
     term: Arc<FairMutex<Term<TerminalEventProxy>>>,
     dirty: Arc<AtomicBool>,
     viewport_rows: usize,
+    max_offset: Pixels,
+    scrolled: Pixels,
 }
 
 impl scrollbar::Scrollable for TerminalScrollbarTarget {
@@ -635,16 +660,15 @@ impl scrollbar::Scrollable for TerminalScrollbarTarget {
     }
 
     fn max_offset(&self) -> Pixels {
-        px(self.term.lock().grid().history_size() as f32 * TERMINAL_CELL_HEIGHT)
+        self.max_offset
     }
 
     fn scrolled(&self) -> Pixels {
-        let term = self.term.lock();
-        let grid = term.grid();
-        let lines_above = grid.history_size().saturating_sub(grid.display_offset());
-        px(lines_above as f32 * TERMINAL_CELL_HEIGHT)
+        self.scrolled
     }
 
+    /// A grab or track click is a user action, not a frame, so it may take the
+    /// grid lock outright.
     fn scroll_to(&self, offset: Pixels) {
         let mut term = self.term.lock();
         let target_offset = (term.grid().history_size() as f32
@@ -704,9 +728,15 @@ struct TerminalRow {
     runs: Vec<TerminalRun>,
 }
 
-struct TerminalSnapshot {
+/// What one frame paints from the grid: the rendered rows, the outline cursor,
+/// and the overlay scrollbar's offsets, all taken in the same read.
+struct TerminalFrame {
     rows: Vec<TerminalRow>,
     outline_cursor: Option<(usize, usize)>,
+    /// History above the viewport, and how far back into it the view sits, in
+    /// pixels.
+    max_offset: Pixels,
+    scrolled: Pixels,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -825,6 +855,9 @@ pub struct TerminalView {
     grid_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     selecting: bool,
     hovered_link: Option<TerminalLink>,
+    /// The grid read the last frame painted, repainted when the reader holds
+    /// the grid mid-batch; see [`TerminalSession::frame`].
+    last_frame: Option<TerminalFrame>,
     cursor_blink: gpui::Entity<TerminalCursorBlink>,
     cursor_focus_tracking_started: bool,
     context_menu: ContextMenuHandle,
@@ -834,6 +867,7 @@ pub struct TerminalView {
 impl TerminalView {
     pub fn new(
         daemon: DaemonClient,
+        task_id: Uuid,
         terminal_id: Uuid,
         working_directory: PathBuf,
         cx: &mut Context<Self>,
@@ -843,7 +877,7 @@ impl TerminalView {
             let started = cx
                 .background_executor()
                 .spawn(async move {
-                    TerminalSession::attach(daemon, terminal_id, &terminal_cwd, 52, 36)
+                    TerminalSession::attach(daemon, task_id, terminal_id, &terminal_cwd, 52, 36)
                 })
                 .await;
             if this
@@ -894,6 +928,7 @@ impl TerminalView {
             grid_bounds: Rc::new(Cell::new(None)),
             selecting: false,
             hovered_link: None,
+            last_frame: None,
             cursor_blink,
             cursor_focus_tracking_started: false,
             context_menu,
@@ -1294,10 +1329,19 @@ impl Render for TerminalView {
             );
         }
         let hovered_link = self.hovered_link.as_ref().map(|link| &link.bounds);
-        let snapshot = self
+        // A frame repaints the grid it last read when the reader holds the grid
+        // mid-batch, and stays dirty so the next poll reads again; see
+        // [`TerminalSession::frame`].
+        if let Some(frame) = self
             .session
             .as_ref()
-            .map(|session| session.snapshot(theme, selection_color, cursor_style, hovered_link));
+            .and_then(|session| session.frame(theme, selection_color, cursor_style, hovered_link))
+        {
+            self.last_frame = Some(frame);
+        } else if let Some(session) = self.session.as_ref() {
+            session.dirty.store(true, Ordering::Release);
+        }
+        let frame = self.last_frame.as_ref();
         let title = if self.title.trim().is_empty() {
             tr!("right_panel.terminal")
         } else {
@@ -1330,15 +1374,16 @@ impl Render for TerminalView {
             screen = screen.cursor_pointer();
         }
 
-        if let Some(snapshot) = snapshot {
-            let TerminalSnapshot {
-                rows: snapshot_rows,
+        if let Some(frame) = frame {
+            let TerminalFrame {
+                rows,
                 outline_cursor,
-            } = snapshot;
-            for row in snapshot_rows {
+                ..
+            } = frame;
+            for row in rows {
                 let runs = row
                     .runs
-                    .into_iter()
+                    .iter()
                     .map(|run| {
                         let mut run_font = terminal_font();
                         if run.style.bold {
@@ -1372,10 +1417,10 @@ impl Render for TerminalView {
                         .whitespace_nowrap()
                         .text_size(px(TERMINAL_FONT_SIZE))
                         .line_height(px(TERMINAL_CELL_HEIGHT))
-                        .child(StyledText::new(row.text).with_runs(runs)),
+                        .child(StyledText::new(row.text.clone()).with_runs(runs)),
                 );
             }
-            if let Some((row, column)) = outline_cursor {
+            if let Some((row, column)) = *outline_cursor {
                 screen = screen.child(
                     div()
                         .absolute()
@@ -1457,12 +1502,14 @@ impl Render for TerminalView {
             },
         );
 
-        let scrollbar = self.session.as_ref().map(|session| {
+        let scrollbar = self.session.as_ref().zip(frame).map(|(session, frame)| {
             scrollbar::vertical(
                 &TerminalScrollbarTarget {
                     term: session.term.clone(),
                     dirty: session.dirty.clone(),
                     viewport_rows: session.grid_size.1,
+                    max_offset: frame.max_offset,
+                    scrolled: frame.scrolled,
                 },
                 &self.scrollbar_state,
             )
@@ -1486,6 +1533,10 @@ impl Render for TerminalView {
             .id("alacritty-terminal")
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
+            // One tab stop for the whole pane: the grid is the only control in
+            // it, and focus is visible as the solid cursor.
+            .tab_index(0)
+            .tab_group()
             .size_full()
             .min_h_0()
             .min_w_0()
