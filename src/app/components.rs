@@ -862,8 +862,10 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                             .overflow_hidden()
                             .rounded(px(12.0))
                             .border_1()
-                            .border_color(theme.raised)
-                            .bg(theme.raised)
+                            // The composer's surface and edge, so the transcript
+                            // reuses one card recipe instead of another gray.
+                            .border_color(theme.border)
+                            .bg(theme.composer)
                             .px(px(11.0))
                             .py(px(7.0))
                             .text_size(sp(14.0))
@@ -897,13 +899,13 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                                         body.child(scrollbar::edge_fade(
                                             viewport.scroll_handle.clone(),
                                             scrollbar::FadeEdge::Top,
-                                            theme.raised,
+                                            theme.composer,
                                         ))
                                         .child(
                                             scrollbar::edge_fade(
                                                 viewport.scroll_handle.clone(),
                                                 scrollbar::FadeEdge::Bottom,
-                                                theme.raised,
+                                                theme.composer,
                                             ),
                                         )
                                     }),
