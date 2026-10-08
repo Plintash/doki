@@ -225,3 +225,103 @@ alternatively fold activities into the virtualized list as block-granularity
 rows. Smaller levers, in memory and unproven: stable
 `StyledText` element ids for gpui's per-element layout memo, and the per-row
 `Message` clones in the row builder.
+
+## Startup and reopen latency
+
+The window paints before the daemon answers, and closing it destroys it, so
+both the first launch and the rebuild that follows a Dock activation are
+measured properties with recorded budgets. Instrumentation is opt-in:
+
+- `WAKU_STARTUP_TRACE=1` (or `stderr`) writes one milestone line per completed
+  launch or rebuild to stderr.
+- `WAKU_STARTUP_TRACE=<path>` appends the same lines to a file, which is what
+  the harness uses because `open` sends an app's stderr to the unified log.
+
+A line is written when a run reaches `interactive`, from a writer thread rather
+than the frame that got there. `src/latency.rs` owns the format, the parser,
+and the budgets; `src/startup_trace.rs` owns the collection. Both are unit
+tested; only the launch timing itself needs the harness.
+
+```
+startup-trace pid=97892 run=0 kind=cold start_ms=0.000 process_start_ms=0.000 \
+  window_open_ms=55.000 first_frame_ms=108.000 daemon_ready_ms=190.000 \
+  tasks_hydrated_ms=303.000 interactive_ms=306.000
+```
+
+Every timestamp is milliseconds since the process started, and `start_ms` is
+the activation that produced the run: zero for the cold launch, the moment the
+window opener ran for a rebuild. A run's latency is `interactive - start_ms`,
+which is what the budgets bound. `run` and `kind` separate the two runs in one
+process's trace file.
+
+| Milestone | Recorded at |
+| --- | --- |
+| `process_start` | The first line of `run`, before GPUI is built; always 0 |
+| `window_open` | Just before `open_window`, and only when opening rather than focusing |
+| `first_frame` | The window's first render — skeleton content on a cold launch |
+| `daemon_ready` | The window observing `DaemonState::Ready`; for a rebuild the daemon was already connected |
+| `tasks_hydrated` | `Waku::new` returned, task state loaded from the daemon |
+| `interactive` | The first frame showing the hydrated workspace |
+
+`first_frame` and `interactive` are render passes, not confirmed presents:
+GPUI exposes no presented-frame callback, and the two are the same frame on a
+rebuild because the workspace is built while the window is constructed.
+
+### Baselines and budgets
+
+Measured on the reference machine (Apple silicon, debug build, 2026-10-08)
+over five warm runs plus the first launch after a bundle:
+
+| Run | `window_open` | `first_frame` | `daemon_ready` | `tasks_hydrated` | `interactive` | Latency |
+| --- | --- | --- | --- | --- | --- | --- |
+| Cold launch | 50–59 | 99–112 | 160–185 | 269–293 | 271–295 | **271–295 ms** |
+| Cold launch, first after a build | 51 | 95 | 809 | 929 | 933 | **933 ms** |
+| Reopen | 592–616 | 677–719 | 608–632 | 677–719 | 677–719 | **74–111 ms** |
+
+The first launch after a build is the slow one: the daemon binary is cold in
+the page cache, so `daemon_ready` alone is ~800 ms against ~170 ms warm. The
+rebuild reuses the running daemon and its process is warm, which is why it is
+an order of magnitude faster than the launch.
+
+Budgets are set from those baselines in `BUDGETS` (`src/latency.rs`) and
+repeated here; re-derive them on a materially slower machine rather than
+raising them on a hunch:
+
+| Budget | Baseline | Budget |
+| --- | --- | --- |
+| Cold launch | 271–933 ms | **3000 ms** |
+| Reopen | 74–111 ms | **500 ms** |
+
+The headroom is roughly three to five times the worst observed run. That is
+loose enough for a cold page cache and tight enough that putting a blocking
+daemon spawn or state load back on the reopen path fails: a rebuild that waits
+on the daemon pays the ~800 ms `daemon_ready` cost the launch pays.
+
+### Running the harness
+
+The harness launches the debug app with `open -g`, so it never takes focus,
+and terminates the app and its daemon when it is done. A traced cold launch
+closes its own window and rebuilds it through the same opener Dock activation
+uses, which is what produces the reopen run; driving AppKit's own reopen from
+outside needs accessibility control a repeatable harness cannot rely on.
+
+```sh
+cargo build --package waku-daemon --bin waku-daemon
+scripts/bundle.sh debug
+cargo run --bin waku-latency-harness
+```
+
+It prints each run's milestones and both budget verdicts, and exits non-zero
+when either budget is missed. Two ways to check the gate itself:
+
+- `cargo run --bin waku-latency-harness -- --reopen-budget-ms 1` fails without
+  rebuilding, which shows the comparison is live.
+- A deliberately slowed build fails for real. Adding a 1200 ms sleep to the
+  reopen path (`MainWindow::attach_workspace`, before `Waku::new`) pushes the
+  rebuild to ~1300 ms against the 500 ms budget while the cold launch stays
+  inside its own budget, and the harness reports the overrun.
+
+The harness assumes a debug bundle in `target/debug`; `--app` points it at
+another one. Debug builds overweight layout and scene generics, so treat the
+absolute numbers as structure, not as what users feel, and confirm user-facing
+claims on a release build.
