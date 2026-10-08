@@ -1799,7 +1799,7 @@ mod tests {
             }
         }
 
-        let retained = terminal.retained_output();
+        let retained = terminal.retained_snapshot().0;
         assert!(
             delivered.len() > RETAINED_BYTES,
             "fixture did not produce more output than the retained window: {} bytes",
@@ -2239,7 +2239,7 @@ mod tests {
             Command::AttachTerminal { task_id },
         );
         assert!(
-            attached.is_err(),
+            matches!(attached, Ok(ResponsePayload::TerminalAbsent)),
             "the closed terminal was still attachable: {attached:?}"
         );
 
@@ -2339,7 +2339,7 @@ mod tests {
             },
         );
         assert!(
-            attached.is_err(),
+            matches!(attached, Ok(ResponsePayload::TerminalAbsent)),
             "a removed task's terminal was still attachable: {attached:?}"
         );
         let kept = client.request(
@@ -2351,6 +2351,60 @@ mod tests {
             matches!(kept, Ok(ResponsePayload::TerminalSnapshot(_))),
             "removing one task took another task's terminal: {kept:?}"
         );
+
+        shutdown.store(true, Ordering::Release);
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An attach to an id the daemon never opened reports explicit absence and
+    /// creates nothing, so a client can open a terminal there without an error
+    /// being indistinguishable from a live terminal's loss.
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_attach_reports_absence_for_an_unknown_terminal() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        for attach in [1, 2] {
+            let response = client
+                .request(
+                    terminal_id,
+                    terminal_id,
+                    Command::AttachTerminal { task_id },
+                )
+                .unwrap();
+            assert!(
+                matches!(response, ResponsePayload::TerminalAbsent),
+                "attach {attach} did not report absence: {response:?}"
+            );
+        }
 
         shutdown.store(true, Ordering::Release);
         client.shutdown();
