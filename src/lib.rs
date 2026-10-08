@@ -112,12 +112,10 @@ actions!(
 );
 
 pub fn run() {
-    let daemon = crate::daemon::start_process()
-        .unwrap_or_else(|error| panic!("failed to start Waku daemon: {error:#}"));
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
         .with_main_window_reopen()
-        .run(move |cx: &mut App| {
+        .run(|cx: &mut App| {
             // Linux uses this for Wayland app_id/X11 WM_CLASS and notification
             // attribution. Other platforms also benefit from one stable
             // process identity.
@@ -142,10 +140,10 @@ pub fn run() {
             let updater = crate::updater::Updater::init();
             let updater_available = updater.is_some();
             cx.set_global(crate::updater::UpdaterState(updater));
-            // The daemon belongs to the application, not to the window that
-            // happens to be showing its state, so it survives a closed or
-            // rebuilt window.
-            cx.set_global(crate::daemon::DaemonState(daemon));
+            // The daemon is app-scoped because it outlives any window, but it
+            // is not connected yet: the window opens and paints first, then
+            // fills this in when its daemon answers.
+            cx.set_global(crate::daemon::DaemonState(None));
             cx.on_action(|_: &CheckForUpdates, cx| {
                 if let Some(updater) = &cx.global::<crate::updater::UpdaterState>().0 {
                     updater.check_for_updates();
