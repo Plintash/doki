@@ -53,6 +53,30 @@ pub enum SidebarOrdering {
     Oldest,
 }
 
+/// What the composer's primary send action does while the agent is working:
+/// steer the running turn, or queue the message as a follow-up. The
+/// primary-modifier chord applies the other action to one message.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FollowUpBehavior {
+    Queue,
+    #[default]
+    Steer,
+}
+
+impl FollowUpBehavior {
+    pub const ALL: [Self; 2] = [Self::Queue, Self::Steer];
+
+    /// The other behavior, which the primary-modifier chord applies to one
+    /// message.
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Queue => Self::Steer,
+            Self::Steer => Self::Queue,
+        }
+    }
+}
+
 fn default_sidebar_visibility() -> bool {
     true
 }
@@ -252,6 +276,9 @@ pub struct AppSettings {
     /// applied.
     pub code_font_size: f32,
     pub render_math: bool,
+    /// What the composer's primary send action does while the agent is
+    /// working; the primary-modifier chord does the opposite.
+    pub follow_up_behavior: FollowUpBehavior,
     pub daemon_exposure: DaemonExposureSettings,
     /// Preferred target of the header's "open project in app" control, by
     /// catalog id. `None` — and an id no longer installed — fall back to the
@@ -268,6 +295,7 @@ impl Default for AppSettings {
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             code_font_size: DEFAULT_CODE_FONT_SIZE,
             render_math: true,
+            follow_up_behavior: FollowUpBehavior::Steer,
             daemon_exposure: DaemonExposureSettings::default(),
             open_in_app: None,
         }
@@ -368,6 +396,8 @@ pub struct PersistedState {
     #[serde(default = "default_render_math")]
     pub render_math: bool,
     #[serde(default)]
+    pub follow_up_behavior: FollowUpBehavior,
+    #[serde(default)]
     pub daemon_exposure: DaemonExposureSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_in_app: Option<String>,
@@ -439,6 +469,7 @@ impl PersistedState {
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             code_font_size: DEFAULT_CODE_FONT_SIZE,
             render_math: true,
+            follow_up_behavior: FollowUpBehavior::Steer,
             daemon_exposure: DaemonExposureSettings::default(),
             open_in_app: None,
             sidebar_visible: true,
@@ -566,6 +597,7 @@ impl PersistedState {
             ui_font_size: self.ui_font_size,
             code_font_size: self.code_font_size,
             render_math: self.render_math,
+            follow_up_behavior: self.follow_up_behavior,
             daemon_exposure: self.daemon_exposure.clone(),
             open_in_app: self.open_in_app.clone(),
         }
@@ -601,6 +633,7 @@ impl PersistedState {
         self.ui_font_size = sanitized_ui_font_size(settings.ui_font_size);
         self.code_font_size = sanitized_code_font_size(settings.code_font_size);
         self.render_math = settings.render_math;
+        self.follow_up_behavior = settings.follow_up_behavior;
         self.daemon_exposure = settings.daemon_exposure;
         self.open_in_app = settings.open_in_app;
     }
@@ -1136,6 +1169,26 @@ mod tests {
         let mut restored = PersistedState::empty();
         restored.apply_app_settings(serde_json::from_value(settings).unwrap());
         assert!(!restored.render_math);
+    }
+
+    #[test]
+    fn follow_up_behavior_defaults_to_steer_and_persists_as_an_app_preference() {
+        let defaults: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.follow_up_behavior, FollowUpBehavior::Steer);
+        let mut state = PersistedState::empty();
+        assert_eq!(state.follow_up_behavior, FollowUpBehavior::Steer);
+        state.follow_up_behavior = FollowUpBehavior::Queue;
+        let settings = serde_json::to_value(state.app_settings()).unwrap();
+        assert_eq!(settings["follow_up_behavior"], "queue");
+        assert!(
+            serde_json::to_value(state.app_state())
+                .unwrap()
+                .get("follow_up_behavior")
+                .is_none()
+        );
+        let mut restored = PersistedState::empty();
+        restored.apply_app_settings(serde_json::from_value(settings).unwrap());
+        assert_eq!(restored.follow_up_behavior, FollowUpBehavior::Queue);
     }
 
     #[test]

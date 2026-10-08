@@ -56,7 +56,8 @@ use crate::ui::tooltip::Tooltip;
 use crate::browser::BrowserView;
 use crate::persistence::{
     ComposerDraftStore, ComposerDrafts, DEFAULT_RIGHT_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH,
-    PersistedState, PersistedWindowState, SidebarGrouping, SidebarOrdering, StateStore,
+    FollowUpBehavior, PersistedState, PersistedWindowState, SidebarGrouping, SidebarOrdering,
+    StateStore,
 };
 use crate::query::{Query, QueryCache};
 use crate::review_diff::{Snapshot as ReviewDiffSnapshot, Source as ReviewDiffSource};
@@ -2554,7 +2555,7 @@ impl Waku {
                             this.submit_composer_submission(submission, cx);
                         }
                     }
-                    ComposerEvent::SubmitSteer(prompt) => {
+                    ComposerEvent::SubmitOpposite(prompt) => {
                         if let Some(session_id) = this.selected_session().and_then(|session| {
                             this.response_fork_preparations
                                 .contains_key(&session.id)
@@ -2564,7 +2565,7 @@ impl Waku {
                         } else if let Some(submission) =
                             this.submission_with_attachments(prompt, cx)
                         {
-                            this.steer_composer_submission(submission, cx);
+                            this.submit_opposite_composer_submission(submission, cx);
                         }
                     }
                     ComposerEvent::SteerQueued => {

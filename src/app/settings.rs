@@ -428,6 +428,34 @@ impl Waku {
         let updater_available = cx
             .try_global::<crate::updater::UpdaterState>()
             .is_some_and(|updater| updater.0.is_some());
+        let selected_follow_up = self.state.follow_up_behavior;
+        let weak = cx.entity().downgrade();
+        let follow_up_handle = self.menu_handle("follow-up-behavior-selector", cx);
+        let follow_up_selector = dropdown_menu(
+            MenuChip::new("follow-up-behavior-selector")
+                .label(follow_up_behavior_label(selected_follow_up))
+                .outlined()
+                .selected(follow_up_handle.is_open())
+                .w(px(116.0))
+                .justify_between(),
+            "follow-up-behavior-selector-menu",
+            &follow_up_handle,
+            MenuAlign::BelowRight,
+            move |_| {
+                FollowUpBehavior::ALL
+                    .into_iter()
+                    .map(|behavior| {
+                        let weak = weak.clone();
+                        MenuItem::new(follow_up_behavior_label(behavior), move |_, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.set_follow_up_behavior(behavior, cx);
+                            });
+                        })
+                        .selected(behavior == selected_follow_up)
+                    })
+                    .collect()
+            },
+        );
         div()
             .child(
                 div()
@@ -496,6 +524,44 @@ impl Waku {
                             move |this, _, cx| this.set_render_math(!enabled, cx)
                         },
                     )),
+            )
+            .child(
+                div()
+                    .mt(px(15.0))
+                    .w_full()
+                    .min_h(px(60.0))
+                    .px(px(20.0))
+                    .py(px(12.0))
+                    .rounded(px(13.0))
+                    .bg(theme.raised)
+                    .flex()
+                    .items_center()
+                    .gap(px(24.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(sp(13.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(tr!("settings.follow_up_behavior")),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(5.0))
+                                    .text_size(sp(12.5))
+                                    .line_height(sp(18.0))
+                                    .text_color(theme.text_secondary)
+                                    .child(tr!(
+                                        "settings.follow_up_behavior_description",
+                                        shortcut =
+                                            crate::platform::primary_shortcut("⌘↩", "Ctrl+Enter")
+                                    )),
+                            ),
+                    )
+                    .child(follow_up_selector),
             )
             .when(updater_available, |column| {
                 let enabled = self.automatic_updates_enabled;
@@ -1501,6 +1567,15 @@ impl Waku {
         cx.notify();
     }
 
+    fn set_follow_up_behavior(&mut self, behavior: FollowUpBehavior, cx: &mut Context<Self>) {
+        if self.state.follow_up_behavior == behavior {
+            return;
+        }
+        self.state.follow_up_behavior = behavior;
+        self.save();
+        cx.notify();
+    }
+
     fn set_ui_font_size(&mut self, size: f32, window: &mut Window, cx: &mut Context<Self>) {
         let size = waku_client::persistence::sanitized_ui_font_size(size);
         if self.state.ui_font_size == size {
@@ -2471,6 +2546,13 @@ fn font_size_label(size: f32) -> String {
         format!("{size:.0} px")
     } else {
         format!("{size} px")
+    }
+}
+
+fn follow_up_behavior_label(behavior: FollowUpBehavior) -> String {
+    match behavior {
+        FollowUpBehavior::Queue => tr!("settings.follow_up_behavior_queue"),
+        FollowUpBehavior::Steer => tr!("settings.follow_up_behavior_steer"),
     }
 }
 

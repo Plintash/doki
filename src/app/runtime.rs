@@ -2035,8 +2035,8 @@ impl Waku {
                     this.submit_message_edit_prompt(prompt.clone(), cx)
                 }
                 // An edited past message resubmits from that point; there is
-                // no running turn for it to steer.
-                ComposerEvent::SubmitSteer(prompt) => {
+                // no running turn for it to steer or queue behind.
+                ComposerEvent::SubmitOpposite(prompt) => {
                     this.submit_message_edit_prompt(prompt.clone(), cx)
                 }
                 ComposerEvent::SteerQueued => {}
@@ -2966,12 +2966,47 @@ impl Waku {
             return;
         }
         if session.is_busy() {
-            // While the agent is working, Enter queues a follow-up instead of
-            // refusing the message. The queue drains once the turn settles.
-            self.enqueue_follow_up_submission(session.id, submission, cx);
+            // While the agent is working, Enter follows the configured
+            // follow-up behavior instead of refusing the message. A steer the
+            // provider cannot take falls back to the queue, which drains once
+            // the turn settles.
+            let session_id = session.id;
+            match self.state.follow_up_behavior {
+                FollowUpBehavior::Steer => self.steer_composer_submission(submission, cx),
+                FollowUpBehavior::Queue => {
+                    self.enqueue_follow_up_submission(session_id, submission, cx)
+                }
+            }
             return;
         }
         self.submit_submission_for_session(session.id, submission, cx);
+    }
+
+    /// The opposite of the configured follow-up behavior, for the
+    /// primary-modifier chord. An idle session has nothing to steer or queue
+    /// behind, so the message is sent normally.
+    pub(super) fn submit_opposite_composer_submission(
+        &mut self,
+        submission: ComposerSubmission,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        if self.response_fork_preparations.contains_key(&session.id) {
+            return;
+        }
+        if !session.is_busy() || session.status == SessionStatus::Background {
+            self.submit_composer_submission(submission, cx);
+            return;
+        }
+        let session_id = session.id;
+        match self.state.follow_up_behavior.opposite() {
+            FollowUpBehavior::Steer => self.steer_composer_submission(submission, cx),
+            FollowUpBehavior::Queue => {
+                self.enqueue_follow_up_submission(session_id, submission, cx)
+            }
+        }
     }
 
     /// Deliver a steering message into the running turn. Providers without a
