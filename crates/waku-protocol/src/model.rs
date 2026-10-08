@@ -159,6 +159,14 @@ impl ProviderKind {
                 | Self::Pi
         )
     }
+
+    /// Whether a question this provider asks can be dismissed by cancelling
+    /// it. Pi's extension UI subprotocol is the only one with a cancellation
+    /// response, so only its dialogs offer a dismissal; the structured-input
+    /// transports have no way to take a question back once it is shown.
+    pub fn supports_user_input_cancellation(self) -> bool {
+        matches!(self, Self::OhMyPi | Self::Pi)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -1007,6 +1015,18 @@ pub struct AgentSession {
     /// Read-only compatibility field for v1 state files. New saves omit it.
     #[serde(default, skip_serializing)]
     pub provider_session_id: Option<String>,
+    /// The status entries this session's extensions still keep, in the order
+    /// they first published them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_status: Vec<ExtensionStatusEntry>,
+    /// The widgets this session's extensions still keep, keyed the same way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_widgets: Vec<ExtensionWidget>,
+    /// The window title an extension asked for on this session's behalf
+    /// (`setTitle`). Session-scoped rather than window-scoped because the
+    /// session that is showing is the one whose extension titled it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_window_title: Option<String>,
     /// Not stored in the session JSON — these are rows in the `messages`
     /// table, reattached when the session is hydrated.
     #[serde(default)]
@@ -1062,6 +1082,9 @@ impl AgentSession {
             context_usage: None,
             runtime_event_cursor: None,
             provider_session_id: None,
+            extension_status: Vec::new(),
+            extension_widgets: Vec::new(),
+            extension_window_title: None,
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
             turns: Vec::new(),
@@ -1098,6 +1121,9 @@ impl AgentSession {
             context_usage: None,
             runtime_event_cursor: None,
             provider_session_id: None,
+            extension_status: Vec::new(),
+            extension_widgets: Vec::new(),
+            extension_window_title: None,
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
             turns: Vec::new(),
@@ -1487,6 +1513,145 @@ impl AgentSession {
         }
     }
 
+    /// Marks the user messages the provider reports it is still holding. Each
+    /// report is the provider's complete queue, so a message the report leaves
+    /// out is delivered — this is the only thing that says so.
+    ///
+    /// Returns whether the client's view changed.
+    pub fn mark_provider_queue(&mut self, steering: &[String], follow_up: &[String]) -> bool {
+        // A queued message is the newest message with its text: an earlier one
+        // with the same words has already run, so each held text is spent on
+        // the newest message it matches and no older one can be marked.
+        let mut held = steering.iter().chain(follow_up).collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        for message in self.messages.iter().rev() {
+            if message.role != MessageRole::User {
+                continue;
+            }
+            if let Some(index) = held.iter().position(|text| **text == message.content) {
+                held.remove(index);
+                pending.push(message.id);
+            }
+        }
+        let mut changed = false;
+        for message in &mut self.messages {
+            if message.role != MessageRole::User {
+                continue;
+            }
+            if message.pending != pending.contains(&message.id) {
+                message.pending = !message.pending;
+                changed = true;
+            }
+        }
+        if changed {
+            self.updated_at = unix_time();
+        }
+        changed
+    }
+
+    /// The text of the messages the provider's last queue report is still
+    /// holding — the queue a stop clears before it aborts the run.
+    ///
+    /// Only [`AgentSession::mark_provider_queue`] sets the pending mark, so
+    /// this is the provider's own queue rather than the client's guess at it.
+    pub fn provider_queued_texts(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter(|message| message.pending)
+            .map(|message| message.content.clone())
+            .collect()
+    }
+
+    /// Takes back the messages a settlement removed from the provider's queue.
+    ///
+    /// They never reached the conversation, so they leave the transcript and a
+    /// turn that owes nothing else goes with them; the caller hands the text
+    /// back to the user. Only messages still shown as pending are taken, so a
+    /// message the provider already delivered is never also retracted.
+    pub fn take_retracted_queue_messages(&mut self, texts: &[String]) -> Vec<Message> {
+        let mut taken = Vec::new();
+        let mut taken_at = Vec::new();
+        for text in texts {
+            let Some(index) = self
+                .messages
+                .iter()
+                .position(|message| message.pending && &message.content == text)
+            else {
+                continue;
+            };
+            let mut message = self.messages.remove(index);
+            message.pending = false;
+            taken.push(message);
+            taken_at.push(index);
+        }
+        if taken.is_empty() {
+            return taken;
+        }
+        // Blocks anchor on how many messages precede them, so every removal
+        // moves the blocks behind it up by one.
+        let message_count = self.messages.len();
+        for block in &mut self.transcript_blocks {
+            block.after_message -= taken_at
+                .iter()
+                .filter(|index| **index < block.after_message)
+                .count();
+            block.after_message = block.after_message.min(message_count);
+        }
+        if let Some(turn) = self.active_turn_id()
+            && !self
+                .messages
+                .iter()
+                .any(|message| message.turn_id == Some(turn))
+            && self
+                .turns
+                .last()
+                .is_some_and(|last| !last.provider_turn_started)
+        {
+            self.unwind_unstarted_turn(turn);
+            self.status = SessionStatus::Idle;
+        }
+        self.updated_at = unix_time();
+        taken
+    }
+
+    /// Records the provider's refusal of the turn's own prompt, before the run
+    /// it asked for began.
+    ///
+    /// The user's message stays where they can see it — those are their own
+    /// words — marked not delivered with the reason the provider gave. The
+    /// turn goes with it: nothing ran, so no answer is coming and an answer
+    /// row under it would be a reply the provider never gave. The session is
+    /// idle again, so the next prompt starts normally. Returns whether a
+    /// refusal was recorded, which a turn the provider already started never
+    /// is — a run that fails after it began produced an answer, not a missed
+    /// delivery.
+    pub fn mark_active_prompt_undelivered(&mut self, reason: &str) -> bool {
+        let Some(turn) = self
+            .turns
+            .last()
+            .filter(|turn| turn.status == TurnStatus::Running && !turn.provider_turn_started)
+        else {
+            return false;
+        };
+        let turn_id = turn.id;
+        let mut refused = false;
+        for message in &mut self.messages {
+            if message.turn_id == Some(turn_id) && message.role == MessageRole::User {
+                message.turn_id = None;
+                message.pending = false;
+                message.undelivered_reason = Some(reason.to_owned());
+                refused = true;
+            }
+        }
+        if !refused {
+            return false;
+        }
+        self.turns.pop();
+        self.status = SessionStatus::Idle;
+        self.updated_at = unix_time();
+        true
+    }
+
     pub fn mark_active_turn_provider_started(&mut self) {
         if let Some(turn) = self
             .turns
@@ -1801,6 +1966,25 @@ pub struct Message {
     pub annotations: Vec<MessageAnnotation>,
     pub created_at: u64,
     pub streaming: bool,
+    /// The provider reported this message in its queue and has not delivered
+    /// it yet. Live-transport state rather than transcript history: only the
+    /// provider's own report sets it, it is never stored with the message, and
+    /// an unset flag stays off the wire so an older payload keeps working.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pending: bool,
+    /// The provider refused this message before accepting it, with the reason
+    /// it gave. The message never reached the conversation, so it is marked
+    /// undelivered instead of being answered. Live-transport state like
+    /// [`Self::pending`]: it is never stored, and an absent reason stays off
+    /// the wire so an older payload keeps working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undelivered_reason: Option<String>,
+}
+
+/// Serde predicate for a flag that is false unless something sets it, so an
+/// unset flag stays off the wire and older payloads keep their behaviour.
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 impl Message {
@@ -1815,6 +1999,8 @@ impl Message {
             annotations: Vec::new(),
             created_at: unix_time(),
             streaming: false,
+            pending: false,
+            undelivered_reason: None,
         }
     }
 
@@ -1959,6 +2145,49 @@ impl ActivityKind {
     }
 }
 
+/// How serious an extension's notification is. The provider's own vocabulary
+/// (`notifyType`), kept so the client's notice surface can show the
+/// difference between something that failed and something merely worth
+/// saying.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum NotificationSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// Which side of the composer an extension's widget belongs on
+/// (`widgetPlacement`).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ExtensionWidgetPlacement {
+    AboveEditor,
+    BelowEditor,
+}
+
+/// One entry of an extension's status line (`setStatus`).
+///
+/// Pi keys these entries, so the same key replaces its entry instead of
+/// stacking another line, and clearing a key removes it: what the session
+/// holds is exactly what the extension still keeps.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionStatusEntry {
+    pub key: String,
+    pub text: String,
+}
+
+/// A block of text an extension displays against the composer (`setWidget`),
+/// keyed like a status entry.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionWidget {
+    pub key: String,
+    pub lines: Vec<String>,
+    pub placement: ExtensionWidgetPlacement,
+}
+
 #[derive(Clone, Debug)]
 pub enum DriverEvent {
     /// Client-only acknowledgement that every daemon event through this
@@ -2009,6 +2238,47 @@ pub enum DriverEvent {
     /// deliberately separate from transcript activities: completing a turn
     /// must not make a detached process or subagent look complete.
     BackgroundWork(BackgroundWorkEvent),
+    /// An extension message the provider appended to its own session tree
+    /// (`role: "custom"`). `custom_type` is the provider's kind — for
+    /// pi-subagents, a child or background notification — and `display` is
+    /// whether the provider intends it to be shown. Detached-work
+    /// notifications arrive as [`Self::BackgroundWork`] instead.
+    ExtensionMessage {
+        custom_type: String,
+        text: String,
+        display: bool,
+    },
+    /// An extension's own notification (`notify`). Out-of-band by design — the
+    /// provider records nothing in its session tree for it — so it reaches the
+    /// user's notice surface and never the transcript.
+    ExtensionNotification {
+        message: String,
+        severity: NotificationSeverity,
+    },
+    /// One entry of an extension's status line (`setStatus`), keyed the way the
+    /// provider keys it: `text` replaces that key's entry and `None` removes
+    /// it, so the surface shows exactly the entries the extension still keeps.
+    ExtensionStatus {
+        key: String,
+        text: Option<String>,
+    },
+    /// A block of text an extension displays against the composer
+    /// (`setWidget`), keyed like a status entry: `lines` replaces that key's
+    /// widget and `None` removes it.
+    ExtensionWidget {
+        key: String,
+        lines: Option<Vec<String>>,
+        placement: ExtensionWidgetPlacement,
+    },
+    /// The window title an extension asked for (`setTitle`). Also out-of-band:
+    /// nothing in the provider's session tree carries it.
+    ExtensionTitle {
+        title: String,
+    },
+    /// Text an extension put in the composer (`set_editor_text`).
+    ExtensionEditorText {
+        text: String,
+    },
     Permission {
         request_id: String,
         title: String,
@@ -2023,7 +2293,10 @@ pub enum DriverEvent {
         questions: Vec<UserInputQuestion>,
     },
     ComputerUseUpdated(crate::computer_use::ComputerUseState),
-    /// The provider accepted a steering message into the running turn.
+    /// The provider accepted a steering message: into the run that was still
+    /// open, or — when that run had already settled — as the prompt that opens
+    /// the next turn. Either way the message is with the provider and belongs
+    /// in the transcript.
     SteerAccepted {
         message: String,
     },
@@ -2032,6 +2305,21 @@ pub enum DriverEvent {
     SteerRejected {
         message: String,
         reason: String,
+    },
+    /// The provider's own report of the messages it is still holding. Each
+    /// report is the complete queue, so it decides which messages the client
+    /// shows as pending. Providers without such a report (Oh My Pi) never
+    /// send one.
+    ProviderQueue {
+        steering: Vec<String>,
+        follow_up: Vec<String>,
+    },
+    /// A settlement took these messages back out of the provider's queue
+    /// because no run would ever carry them. They never reached the
+    /// conversation, so their text is the user's again. Sent immediately
+    /// before the `TurnFinished` that caused it.
+    QueuedMessagesRetracted {
+        messages: Vec<String>,
     },
     /// Context-window occupancy reported by the live stream. Fields arrive at
     /// different moments — token counts with each assistant message, the
@@ -4632,6 +4920,148 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("queued_messages");
         let legacy_session: AgentSession = serde_json::from_value(legacy).unwrap();
         assert!(legacy_session.queued_messages.is_empty());
+    }
+
+    #[test]
+    fn a_queued_message_reads_pending_until_the_provider_lets_it_go() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Pi);
+
+        session.begin_turn("first");
+        session.push_message(MessageRole::Assistant, "answering");
+        session.begin_turn("and also");
+
+        // The provider's queue report is the whole truth about what is
+        // pending: the message in it is queued, everything else is not.
+        assert!(session.mark_provider_queue(&["stop".to_owned()], &["and also".to_owned()]));
+        assert!(session.messages[2].pending);
+        assert!(!session.messages[0].pending);
+        assert!(session.messages[1].role == MessageRole::Assistant);
+        assert!(!session.messages[1].pending);
+
+        // The next report is complete too, so leaving the queue delivers it.
+        assert!(session.mark_provider_queue(&[], &[]));
+        assert!(!session.messages[2].pending);
+
+        // A report that repeats what is already known changes nothing.
+        assert!(!session.mark_provider_queue(&[], &[]));
+
+        // A queued message is the newest message with its text: an earlier
+        // turn that used the same words has already run.
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut repeated = AgentSession::new(project.id, ProviderKind::Pi);
+        repeated.begin_turn("continue");
+        repeated.push_message(MessageRole::Assistant, "first answer");
+        repeated.finish_active_turn(TurnStatus::Completed);
+        repeated.begin_turn("continue");
+        repeated.mark_provider_queue(&[], &["continue".to_owned()]);
+        assert!(
+            !repeated.messages[0].pending,
+            "the delivered turn is not queued"
+        );
+        assert!(repeated.messages[2].pending);
+    }
+
+    #[test]
+    fn a_retracted_message_leaves_the_transcript_and_its_unstarted_turn() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Pi);
+
+        session.begin_turn("first");
+        session.push_message(MessageRole::Assistant, "first answer");
+        session.finish_active_turn(TurnStatus::Completed);
+        session.begin_turn("and also");
+        session.status = SessionStatus::Connecting;
+        session.mark_provider_queue(&[], &["and also".to_owned()]);
+
+        // The settlement took the message back out of the provider's queue:
+        // it never reached the conversation, so it leaves the transcript and
+        // the turn that existed only for it goes with it.
+        let returned = session.take_retracted_queue_messages(&["and also".to_owned()]);
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].content, "and also");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.status, SessionStatus::Idle);
+        assert!(!session.is_busy());
+
+        // A delivered message is never retracted: only what the client still
+        // shows as pending leaves, so nothing is both retracted and delivered.
+        let mut started = AgentSession::new(project.id, ProviderKind::Pi);
+        let turn = started.begin_turn("first");
+        started.mark_active_turn_provider_started();
+        started.transcript_blocks.push(TranscriptBlock {
+            after_message: 1,
+            turn_id: Some(turn),
+            activities: Vec::new(),
+        });
+        started.push_user_message_with_presentation("steer", None, Vec::new(), Vec::new());
+        started.transcript_blocks.push(TranscriptBlock {
+            after_message: 2,
+            turn_id: Some(turn),
+            activities: Vec::new(),
+        });
+        started.mark_provider_queue(&["steer".to_owned()], &[]);
+        let returned =
+            started.take_retracted_queue_messages(&["steer".to_owned(), "other".to_owned()]);
+        assert_eq!(
+            returned
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["steer"]
+        );
+        assert!(started.active_turn_id() == Some(turn));
+        assert_eq!(started.messages.len(), 1);
+        // The blocks behind the removed message move up with it.
+        assert_eq!(started.transcript_blocks[0].after_message, 1);
+        assert_eq!(started.transcript_blocks[1].after_message, 1);
+
+        // Nothing pending means nothing to retract.
+        started.mark_provider_queue(&[], &[]);
+        assert!(
+            started
+                .take_retracted_queue_messages(&["steer".to_owned()])
+                .is_empty()
+        );
+        assert_eq!(started.messages.len(), 1);
+    }
+
+    #[test]
+    fn a_stop_takes_back_the_message_the_provider_still_holds() {
+        // Stopping a turn clears the provider's queue before it aborts, so
+        // what the provider reports it is still holding is what a stop hands
+        // back to the user. Only the provider's own queue report marks a
+        // message as held, so a stop takes exactly those and never a message
+        // the provider already ran.
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Pi);
+
+        session.begin_turn("first");
+        session.push_message(MessageRole::Assistant, "first answer");
+        session.finish_active_turn(TurnStatus::Completed);
+        session.begin_turn("and also");
+        session.status = SessionStatus::Connecting;
+        session.mark_provider_queue(&[], &["and also".to_owned()]);
+
+        let held = session.provider_queued_texts();
+        assert_eq!(held, ["and also"]);
+
+        let returned = session.take_retracted_queue_messages(&held);
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].content, "and also");
+        // The stopped message left the transcript with the turn that existed
+        // only for it, and nothing is left held.
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.messages.len(), 2);
+        assert!(!session.is_busy());
+        assert!(session.provider_queued_texts().is_empty());
+
+        // The list is the provider's queue, not the transcript: a user message
+        // the provider never reported as held is not something a stop takes.
+        let mut delivered = AgentSession::new(project.id, ProviderKind::Pi);
+        delivered.begin_turn("finished");
+        assert!(delivered.provider_queued_texts().is_empty());
     }
 
     #[test]

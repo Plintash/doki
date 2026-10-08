@@ -1176,6 +1176,10 @@ composer.remove_followup:
   en: Remove from queue
 composer.queued_message_actions:
   en: Follow-up actions
+composer.queued_pending:
+  en: Waiting to be delivered
+composer.undelivered:
+  en: Not delivered
 user_input.other_placeholder:
   en: Type another answer
 user_input.back:
@@ -1186,6 +1190,8 @@ user_input.submit:
   en: Submit
 user_input.progress:
   en: "%{current} of %{total}"
+user_input.dismiss:
+  en: Dismiss
 composer.preparing_task:
   en: Preparing task…
 composer.queue_followup:

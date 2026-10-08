@@ -1193,6 +1193,14 @@ impl Waku {
                 runtime.driver.cancel_computer_use();
             }
         }
+        // The stop takes the provider's queue with it, and the transport has
+        // just asked for that queue to be cleared, so the text of a message the
+        // user stopped is theirs again here. Pi's abort continues whatever its
+        // queue still holds, so leaving the text there would run the message
+        // after the stop; taking it back now, before the turn settles, also
+        // unwinds a turn that existed only for that message instead of
+        // settling it answerless.
+        self.return_stopped_queue_messages(session_id, cx);
         // Do not leave already-received text in the smoothing queue: once the
         // message is marked complete, a later delta would otherwise create a
         // second assistant bubble. Show the received portion immediately.
@@ -1502,17 +1510,53 @@ impl Waku {
                 return;
             };
             let answers = pending.answers();
-            runtime
-                .driver
-                .respond_user_input(pending.request_id, answers);
-            if let Some(session) = self.state.session_mut(session_id) {
-                session.status = SessionStatus::Working;
-            }
-            self.user_input_answer
-                .update(cx, |input, cx| input.clear(cx));
+            self.answer_open_question(session_id, pending.request_id, answers, cx);
         } else {
             self.sync_user_input_answer(cx);
         }
+        cx.notify();
+    }
+
+    /// Hands the answer the user gave — or the empty one a dismissal sends,
+    /// which a provider that takes dismissals reads as its cancellation — back
+    /// to the provider, and returns the session to work when the question
+    /// belonged to a live turn.
+    fn answer_open_question(
+        &mut self,
+        session_id: Uuid,
+        request_id: String,
+        answers: Vec<UserInputAnswer>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(runtime) = self.runtimes.get_mut(&session_id) else {
+            return;
+        };
+        runtime.driver.respond_user_input(request_id, answers);
+        if let Some(session) = self.state.session_mut(session_id)
+            && session.active_turn_id().is_some()
+        {
+            session.status = SessionStatus::Working;
+        }
+        self.user_input_answer
+            .update(cx, |input, cx| input.clear(cx));
+    }
+
+    /// Dismisses the open question without answering it. A provider that takes
+    /// a dismissal back reads the empty answer as its cancellation, so an
+    /// extension blocked on the question continues instead of waiting out its
+    /// own timeout.
+    pub(super) fn dismiss_user_input(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.state.selected_session else {
+            return;
+        };
+        let Some(runtime) = self.runtimes.get_mut(&session_id) else {
+            return;
+        };
+        let Some(pending) = runtime.pending_user_input.take() else {
+            return;
+        };
+        let dismissal = pending.dismissal();
+        self.answer_open_question(session_id, pending.request_id, dismissal, cx);
         cx.notify();
     }
 

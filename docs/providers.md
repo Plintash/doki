@@ -268,7 +268,7 @@ visible.
 
 Oh My Pi is a fork of Pi that kept the RPC transport and renamed part of its
 surface, so one driver serves both. `PiFlavor`
-([pi.rs:39](../crates/waku-core/src/driver/pi.rs#L39)) carries every divergence,
+([pi.rs:52](../crates/waku-core/src/driver/pi.rs#L52)) carries every divergence,
 which is what keeps the two from drifting into near-copies:
 
 | | Pi | Oh My Pi |
@@ -288,7 +288,7 @@ Everything below is shared unless noted.
 
 **Launch** — `pi --mode rpc --approve` with `PI_SKIP_VERSION_CHECK=1`;
 `omp --mode rpc --yolo`
-([pi.rs:246](../crates/waku-core/src/driver/pi.rs#L246)). Oh My Pi negotiates
+([pi.rs:402](../crates/waku-core/src/driver/pi.rs#L402)). Oh My Pi negotiates
 protocol v2 first, before `get_state`, so a large first response arrives chunked
 rather than shrunk to an error frame. Its opening `ready` frame is what makes
 that worth doing — it reports `supportedProtocolVersions: [1, 2]` alongside a
@@ -305,7 +305,7 @@ strictness is why its catalog probe cannot borrow Pi's argument list.
 Waku stamps each request with a string id (`waku-<n>`) and Pi answers with
 `{"type": "response", "id", "success", "data"}`. Everything else on the stream
 is an unsolicited event. Requests are issued synchronously by the writer thread
-with a 10 s timeout ([pi.rs:800](../crates/waku-core/src/driver/pi.rs#L800));
+with a 10 s timeout ([pi.rs:1016](../crates/waku-core/src/driver/pi.rs#L1016));
 events keep flowing on the reader thread meanwhile. The handshake gets 30 s
 instead: the agent does not answer at all until it has finished loading its
 extensions, resources and — when model networking is on — its model catalog,
@@ -321,37 +321,100 @@ resuming → `set_model {provider, modelId}` → `set_thinking_level {level}` �
 `get_state`. The final state supplies `/data/sessionId` and `/data/sessionFile`;
 both go into the cursor, and resume needs the **file path**, not just the id.
 
-**Per turn** — `{"type": "prompt", "message": …}`.
+**Per turn** — `{"type": "prompt", "message": …, "streamingBehavior": "followUp"}`.
+Pi reads that option only while it is streaming, so one constant covers both
+cases: against an idle agent it is ignored and the prompt starts a run, and a
+prompt that races the tail of a turn is queued on the turn already open instead
+of refused. The refusal it replaces — `Agent is already processing. Specify
+streamingBehavior ('steer' or 'followUp') to queue the message.` — was stored as
+an assistant reply while the provider's session never received the words at all.
 
-**Inbound stream** ([pi.rs:1182](../crates/waku-core/src/driver/pi.rs#L1182)):
+The answer reports what became of the prompt: `data.disposition` is `started`,
+`queued`, or `handled`. `queued` belongs to the turn that is already open — Pi
+drains its steering and follow-up queues before it settles — so it neither opens
+a turn nor settles one. `handled` means an extension command or input handler
+consumed the prompt, so it settles at once, unless a run is already live: an
+extension command that wakes the session by appending a message with
+`{triggerTurn: true}` starts that run inside the handler, and since Pi emits
+`agent_start` before it writes the answer, the turn belongs to the run and the
+run's own settle ends it. Settlement never depends on the answer at all: a
+prompt answer is written only from the prompt's preflight, so a prompt submitted
+while Pi is emitting `agent_settled` is deferred and never answered, and a
+prompt refused before acceptance settles as that message's delivery failure
+rather than as an assistant reply.
+
+**Inbound stream** ([pi.rs:1586](../crates/waku-core/src/driver/pi.rs#L1586)):
 
 | Event | Becomes |
 | --- | --- |
 | `agent_start`, `turn_start` | `TurnStarted` (once per run) |
 | `message_update` → `text_delta` / `thinking_delta` | `TextDelta` / `ReasoningDelta` |
 | `message_end` | fallback text/thinking when no delta was streamed |
+| `message_end` with `role: "custom"` | `BackgroundWork` (kind subagent) for pi-subagents' child and background notifications, which the work surface shows whatever their `display` flag says; `ExtensionMessage` for any other extension message, which the transcript renders only when `display` is true |
 | `tool_execution_start` / `_update` / `_end` | `RichActivity` |
 | `auto_retry_end` | clears or sets the failure flag |
 | `agent_settled` (Pi) / `agent_end` (Oh My Pi) | `TurnFinished`, then resets stream state |
-| `extension_ui_request` | auto-cancelled — Waku has no UI for extension prompts |
+| `queue_update` | `ProviderQueue` — the provider's complete steering and follow-up queues, which are the client's pending list |
+| `extension_ui_request` → `select`, `confirm`, `input`, `editor` | `UserInputRequested`, answered through `respond_user_input` |
+| `extension_ui_request` → `notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text` | the app's notification, session-status, widget, window-title and composer surfaces |
+| `extension_ui_request`, any other method | answered with a cancellation at once, so an unknown dialog does not block the extension until its timeout |
+
+**Extension surfaces** — Pi's extension UI subprotocol reaches the app instead
+of ending at the transport. `notify` becomes a notification with its
+`notifyType` severity, `setStatus` a per-session status line keyed by the
+extension's own key (an absent `statusText` is the extension clearing it),
+`setWidget` a strip beside the composer kept on its key and placed where Pi puts
+it (`aboveEditor` or `belowEditor`), `setTitle` the window title, and
+`set_editor_text` the composer. A notification is shown whichever session is on
+screen, because a failed child is not silent just because the user is looking
+at another task. The four dialog methods arrive as answerable requests and the
+answer goes back in the shape Pi asks for — `value` for
+`select`, `input` and `editor`, `confirmed` for `confirm` — with a cancellation
+only when the user dismisses it. Nothing is cancelled on the user's behalf when
+it arrives; an unanswered dialog is bounded the way Pi bounds it (the provider
+auto-resolves the ones it sent a `timeout` with), and one still unanswered when
+its run settles is dropped with the run rather than answered later. A method the
+client does not know is cancelled at once, because the extension is blocking on
+it and no surface can present it. What Pi's RPC mode cannot carry at all
+(`ctx.ui.custom()`, `onTerminalInput`, `setToolsExpanded`) is a no-op on the
+provider's side, so there is nothing to receive. pi-subagents is the reference
+user: its async status widget, its fleet strip, its `subagent-notify` and
+`subagent-incremental-child-notify` messages, and the questions its inspector
+asks all arrive through these records.
 
 **Access modes** — Full access only, enforced at driver start rather than
 degraded silently: any other selection fails with "currently supports Full
-access only" ([pi.rs:209](../crates/waku-core/src/driver/pi.rs#L209)).
+access only" ([pi.rs:365](../crates/waku-core/src/driver/pi.rs#L365)).
 Pi has no permission system at all, so `--approve` is the whole story. Oh My Pi
 *does* have one, which Waku's `--yolo` then bypasses — the restriction is Waku's
 here, not the CLI's, and lifting it is a matter of wiring Oh My Pi's permission
 requests to a `Permission` event.
 
-**Cancel** — `{"type": "abort"}`.
+**Cancel** — `clear_queue` first, then `abort`
+([pi.rs:1168](../crates/waku-core/src/driver/pi.rs#L1168)). That order is Pi's own
+Esc recipe, and it is the reason to keep it: a message the user stopped is taken
+out of the session instead of waiting there to be carried into whatever runs
+next. The abort carries no request id and is not awaited — Pi answers it only
+once the session is idle, which routinely outlasts the 10 s control timeout —
+so a slow stop is not a transport error and does not hold the next prompt behind
+it; the run's own settle ends the turn. The text is not lost either way: the
+client already knows the provider's queue (above), hands those messages back to
+the composer when the user stops, and a settlement that still finds a message
+held retracts it — the driver clears the queue and reports the text — rather
+than leaving it parked.
 
-**Steer** — `{"type": "steer", "message": …}`; the request acknowledgment
-resolves to `SteerAccepted` or `SteerRejected`.
+**Steer** — `{"type": "steer", "message": …}`, and only into a run that is
+still live ([pi.rs:1111](../crates/waku-core/src/driver/pi.rs#L1111)). Pi queues
+a steer whether or not a run is open, and splices what it parks there into the
+next turn's boundary, so a steer arriving after its run settled is written as a
+prompt instead. Its `disposition: "queued"` means the message was accepted into
+the live turn, which is what `SteerAccepted` reports — not that it was
+delivered.
 
 **Rewind and branch** — both go through `get_fork_messages` → `fork {entryId}`
 (`get_branch_messages` → `branch` on Oh My Pi), or `clone` when nothing is
 removed, then `get_state`
-([pi.rs:996](../crates/waku-core/src/driver/pi.rs#L996)). Rewind adopts the fork
+([pi.rs:1351](../crates/waku-core/src/driver/pi.rs#L1351)). Rewind adopts the fork
 as the session's new cursor. Branch additionally `switch_session`es back to the
 source file and verifies it landed on the right session; if that restore fails
 the runtime is dropped, because the RPC process may still be sitting on the fork
@@ -360,7 +423,7 @@ the runtime is dropped, because the RPC process may still be sitting on the fork
 **Copying a whole session differs.** Removing no turns is a plain copy, which Pi
 performs in place. Oh My Pi only copies at launch, so Waku shells out to a
 throwaway `omp --mode rpc --yolo --fork <session file>` and reads the new cursor
-off it ([pi.rs:1108](../crates/waku-core/src/driver/pi.rs#L1108)). That is the
+off it ([pi.rs:1463](../crates/waku-core/src/driver/pi.rs#L1463)). That is the
 better shape anyway: the out-of-process copy never moves the live session, so
 unlike the in-place path it needs no restore afterwards and cannot strand the
 RPC process on the fork.

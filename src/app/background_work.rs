@@ -1986,6 +1986,35 @@ mod tests {
         item
     }
 
+    /// A settled subagent notification is what pi-subagents posts when a
+    /// background child finishes. It must reach the detached-work surface and
+    /// stay there; a short foreground command would be dropped at completion.
+    #[test]
+    fn a_settled_subagent_notification_stays_on_the_surface() {
+        let mut registry = BackgroundWorkRegistry::default();
+        let mut notification = BackgroundWorkItem::new(
+            BackgroundWorkKind::Subagent,
+            "build",
+            "build",
+            BackgroundWorkStatus::Completed,
+        );
+        notification.background = true;
+        notification.detail = Some("Workflow child completed: **build**".into());
+        registry.apply(BackgroundWorkEvent::Upsert(notification));
+
+        let items = registry.ordered_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key.kind, BackgroundWorkKind::Subagent);
+        assert_eq!(items[0].title, "build");
+        assert_eq!(items[0].status, BackgroundWorkStatus::Completed);
+        assert!(
+            items[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Workflow child completed"))
+        );
+    }
+
     #[test]
     fn info_popover_uses_distinct_process_status_icons() {
         assert_eq!(

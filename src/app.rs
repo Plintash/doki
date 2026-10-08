@@ -32,12 +32,13 @@ use crate::md;
 use crate::model::{
     ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget,
     BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind,
-    BackgroundWorkStatus, Checkpoint, CheckpointStatus, ContextUsage, DriverEvent, FavoriteModel,
-    Message, MessageAnnotation, MessageAttachment, MessageRole, PendingPermission, Project,
-    ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor, ProviderSessionHistory,
-    ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode, SessionStatus,
-    SessionWorkspace, TextSpan, TranscriptBlock, TurnStatus, UserInputAnswer, UserInputQuestion,
-    compact_path, unix_time, unix_time_millis,
+    BackgroundWorkStatus, Checkpoint, CheckpointStatus, ContextUsage, DriverEvent,
+    ExtensionStatusEntry, ExtensionWidget, ExtensionWidgetPlacement, FavoriteModel, Message,
+    MessageAnnotation, MessageAttachment, MessageRole, NotificationSeverity, PendingPermission,
+    Project, ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor,
+    ProviderSessionHistory, ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode,
+    SessionStatus, SessionWorkspace, TextSpan, TranscriptBlock, TurnStatus, UserInputAnswer,
+    UserInputQuestion, compact_path, unix_time, unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -282,8 +283,23 @@ struct ToastState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ToastTone {
+    /// The app's own alert tone, which is also what a notification the provider
+    /// calls an error uses: `notifyType` speaks the same three severities, and
+    /// each keeps its own icon and colour rather than collapsing into one
+    /// "something happened" mark.
     Alert,
+    Warning,
+    Info,
     Success,
+}
+
+/// The tone an extension's notification takes on the notice surface.
+fn extension_notification_tone(severity: NotificationSeverity) -> ToastTone {
+    match severity {
+        NotificationSeverity::Error => ToastTone::Alert,
+        NotificationSeverity::Warning => ToastTone::Warning,
+        NotificationSeverity::Info => ToastTone::Info,
+    }
 }
 
 fn paused_toast_duration(remaining: Duration, elapsed: Duration) -> Duration {
@@ -953,16 +969,21 @@ struct PendingUserInput {
     question_index: usize,
     selections: HashMap<String, Vec<String>>,
     custom_answers: HashMap<String, String>,
+    /// Whether the provider takes a dismissal back as a cancellation. Only a
+    /// provider with a cancellation response (Pi's extension dialogs) offers
+    /// the card a way to dismiss the question without answering it.
+    dismissible: bool,
 }
 
 impl PendingUserInput {
-    fn new(request_id: String, questions: Vec<UserInputQuestion>) -> Self {
+    fn new(request_id: String, questions: Vec<UserInputQuestion>, dismissible: bool) -> Self {
         Self {
             request_id,
             questions,
             question_index: 0,
             selections: HashMap::new(),
             custom_answers: HashMap::new(),
+            dismissible,
         }
     }
 
@@ -970,29 +991,45 @@ impl PendingUserInput {
         self.questions.get(self.question_index)
     }
 
+    /// The answer the provider receives when the user submits: the custom text
+    /// when the user typed one, otherwise the options they selected.
     fn answers(&self) -> Vec<UserInputAnswer> {
         self.questions
             .iter()
-            .map(|question| {
-                let custom = self
-                    .custom_answers
-                    .get(&question.id)
-                    .map(|answer| answer.trim())
-                    .filter(|answer| !answer.is_empty());
-                UserInputAnswer {
-                    question_id: question.id.clone(),
-                    answers: custom.map_or_else(
-                        || {
-                            self.selections
-                                .get(&question.id)
-                                .cloned()
-                                .unwrap_or_default()
-                        },
-                        |answer| vec![answer.to_owned()],
-                    ),
-                }
+            .map(|question| UserInputAnswer {
+                question_id: question.id.clone(),
+                answers: self.answer_for(&question.id),
             })
             .collect()
+    }
+
+    /// The answer a dismissal sends: nothing for every question. A provider
+    /// that takes a dismissal reads the empty answer as its cancellation.
+    fn dismissal(&self) -> Vec<UserInputAnswer> {
+        self.questions
+            .iter()
+            .map(|question| UserInputAnswer {
+                question_id: question.id.clone(),
+                answers: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn answer_for(&self, question_id: &str) -> Vec<String> {
+        let custom = self
+            .custom_answers
+            .get(question_id)
+            .map(|answer| answer.trim())
+            .filter(|answer| !answer.is_empty());
+        custom.map_or_else(
+            || {
+                self.selections
+                    .get(question_id)
+                    .cloned()
+                    .unwrap_or_default()
+            },
+            |answer| vec![answer.to_owned()],
+        )
     }
 }
 
@@ -1584,6 +1621,11 @@ pub struct Waku {
     header_drag_armed: bool,
     toast: Option<ToastState>,
     toast_generation: u64,
+    /// The extension window title the platform is currently showing, and the
+    /// platform's own title to put back when the session on screen has none.
+    /// Both are cached so a frame only touches the platform on a real change.
+    applied_extension_window_title: Option<String>,
+    platform_window_title: Option<String>,
     copied_control_feedback: HashMap<String, u64>,
     copied_control_generation: u64,
     copied_message_feedback: HashMap<Uuid, u64>,
@@ -3097,6 +3139,8 @@ impl Waku {
                     hovered: false,
                 }),
                 toast_generation: 0,
+                applied_extension_window_title: None,
+                platform_window_title: None,
                 copied_control_feedback: HashMap::new(),
                 copied_control_generation: 0,
                 copied_message_feedback: HashMap::new(),

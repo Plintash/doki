@@ -473,6 +473,39 @@ impl Waku {
                     }
                 }))
         });
+        let dismiss = pending.dismissible.then(|| {
+            let focus = self.transcript_control_focus(
+                format!("user-input-{request_id}-{question_index}-dismiss"),
+                cx,
+            );
+            div()
+                .id(SharedString::from(format!(
+                    "user-input-{request_id}-{question_index}-dismiss"
+                )))
+                .track_focus(&focus)
+                .tab_index(0)
+                .tab_stop(true)
+                .h(px(26.0))
+                .px(px(8.0))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .cursor_default()
+                .text_size(sp(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text_tertiary)
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                .hover(|style| style.bg(theme.overlay).text_color(theme.text_secondary))
+                .active(|style| style.opacity(0.8))
+                .child(tr!("user_input.dismiss"))
+                .on_click(cx.listener(|this, _, _, cx| this.dismiss_user_input(cx)))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        this.dismiss_user_input(cx);
+                        cx.stop_propagation();
+                    }
+                }))
+        });
         let continue_button = div()
             .id(SharedString::from(format!(
                 "user-input-{request_id}-{question_index}-continue"
@@ -619,6 +652,7 @@ impl Waku {
                         .flex()
                         .items_center()
                         .children(back)
+                        .children(dismiss)
                         .child(div().flex_1())
                         .child(continue_button),
                 ),
@@ -3166,6 +3200,80 @@ impl Waku {
             ));
         }
         row
+    }
+
+    /// The extension surfaces that belong against the composer.
+    ///
+    /// Pi's `setStatus` is a live progress line the extension keeps until it
+    /// clears the key, and `setWidget` is a block of text it asks for above or
+    /// below the editor. Both are session state, so they follow the session
+    /// they were published for. Nothing here is drawn when the session keeps
+    /// none of them, which is the common case.
+    pub(super) fn render_extension_surfaces(
+        &self,
+        placement: ExtensionWidgetPlacement,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let session = self.selected_session()?;
+        let theme = Theme::current(cx);
+        let mut strip = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .py(px(4.0))
+            .px(px(12.0));
+        let mut rows = 0;
+
+        // The status line sits closest to the transcript, ahead of the
+        // widgets an extension pins against the editor's own edge.
+        if placement == ExtensionWidgetPlacement::AboveEditor {
+            for entry in &session.extension_status {
+                rows += 1;
+                strip = strip.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "extension-status-{}",
+                            entry.key
+                        )))
+                        .min_w_0()
+                        .text_size(sp(12.5))
+                        .text_color(theme.text_tertiary)
+                        .child(SharedString::from(entry.text.clone())),
+                );
+            }
+        }
+
+        for widget in session
+            .extension_widgets
+            .iter()
+            .filter(|widget| widget.placement == placement)
+        {
+            rows += 1;
+            let mut lines = div().flex().flex_col();
+            for line in &widget.lines {
+                lines = lines.child(
+                    div()
+                        .min_w_0()
+                        .text_size(sp(11.5))
+                        .line_height(sp(15.0))
+                        .font_family(md::render::MONO_FAMILY)
+                        .text_color(theme.text_secondary)
+                        .child(SharedString::from(line.clone())),
+                );
+            }
+            strip = strip.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "extension-widget-{}",
+                        widget.key
+                    )))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(lines),
+            );
+        }
+
+        (rows > 0).then_some(strip)
     }
 
     /// The pending follow-up queue between the transcript and the composer: a

@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -23,7 +24,12 @@ use super::{activity, computer_use as computer_use_runtime};
 use crate::driver::{
     DriverControl, DriverEventSender, DriverEventSink, DriverStartOptions, SessionOptions,
 };
-use crate::model::{ActivityKind, DriverEvent, ProviderResumeCursor, ReportedCommand, RuntimeMode};
+use crate::model::{
+    ActivityKind, BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKind,
+    BackgroundWorkStatus, DriverEvent, ExtensionWidgetPlacement, NotificationSeverity,
+    ProviderResumeCursor, ReportedCommand, RuntimeMode, UserInputAnswer, UserInputOption,
+    UserInputQuestion,
+};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -154,7 +160,14 @@ enum CommandMessage {
     Prompt(String),
     Steer(String),
     Cancel,
+    /// Take back whatever the provider's queue still holds without waiting for
+    /// its answer; the reader owns stdout and cannot block on a response.
+    RetractQueuedMessages,
     CancelExtensionRequest(String),
+    /// A dialog answer already in the `extension_ui_response` shape the
+    /// provider reads. The reader owns stdout, so the answer travels the same
+    /// way every other write does.
+    ExtensionUiResponse(Value),
     Options(SessionOptions),
     Rollback {
         turns: usize,
@@ -178,7 +191,125 @@ pub struct PiDriver {
     flavor: PiFlavor,
     commands: Sender<CommandMessage>,
     computer_use: Option<computer_use_runtime::ComputerUseRuntime>,
+    /// The dialogs still waiting for the user, keyed by the provider's request
+    /// id, shared with the reader thread that opened them. The stored method is
+    /// what tells the answer which `extension_ui_response` shape it must take.
+    dialogs: PiDialogs,
 }
+
+/// The dialogs the transport has handed to the client and not yet answered.
+type PiDialogs = Arc<Mutex<HashMap<String, PiExtensionDialog>>>;
+
+/// The dialog methods whose answers travel back as an `extension_ui_response`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PiExtensionDialog {
+    Select,
+    Confirm,
+    Input,
+    Editor,
+}
+
+impl PiExtensionDialog {
+    /// `None` for a method Pi does not document: its answer shape is unknown,
+    /// so it is cancelled rather than presented.
+    fn from_method(method: &str) -> Option<Self> {
+        match method {
+            "select" => Some(Self::Select),
+            "confirm" => Some(Self::Confirm),
+            "input" => Some(Self::Input),
+            "editor" => Some(Self::Editor),
+            _ => None,
+        }
+    }
+
+    /// The one question the client asks for this dialog. The question id is
+    /// the provider's request id, so the answer needs no other correlation.
+    fn question(self, id: &str, request: &Value) -> UserInputQuestion {
+        let title = request
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let text = |field: &str| {
+            request
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(title)
+        };
+        let (header, question, options) = match self {
+            // Pi's select, input and editor carry only a title; it is the
+            // question, so the card leads with it rather than an empty label.
+            Self::Select => {
+                let options = request
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|options| {
+                        options
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|label| UserInputOption {
+                                label: label.to_owned(),
+                                description: None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ("", title, options)
+            }
+            Self::Confirm => (
+                title,
+                text("message"),
+                [(PI_CONFIRM_ACCEPT, None), (PI_CONFIRM_DECLINE, None)]
+                    .into_iter()
+                    .map(|(label, description)| UserInputOption {
+                        label: label.to_owned(),
+                        description: description.map(str::to_owned),
+                    })
+                    .collect(),
+            ),
+            // The placeholder and prefill Pi sends for these have no home on
+            // the question card; the typed answer is what the provider gets.
+            Self::Input | Self::Editor => ("", title, Vec::new()),
+        };
+        UserInputQuestion {
+            id: id.to_owned(),
+            header: header.to_owned(),
+            question: question.to_owned(),
+            options,
+            multi_select: false,
+        }
+    }
+
+    /// The `extension_ui_response` for the labels the client chose. No label is
+    /// the dismissal, which is Pi's cancellation: the extension receives
+    /// `undefined` for a value dialog and `false` for a confirmation.
+    fn response(self, id: &str, answers: &[String]) -> Value {
+        let answer = answers.iter().find(|answer| !answer.trim().is_empty());
+        match (self, answer) {
+            (_, None) => json!({
+                "type": "extension_ui_response",
+                "id": id,
+                "cancelled": true,
+            }),
+            (Self::Confirm, Some(answer)) => json!({
+                "type": "extension_ui_response",
+                "id": id,
+                "confirmed": answer == PI_CONFIRM_ACCEPT,
+            }),
+            (_, Some(answer)) => json!({
+                "type": "extension_ui_response",
+                "id": id,
+                "value": answer,
+            }),
+        }
+    }
+}
+
+/// The labels of the confirm dialog's two answers. They are the card's text and
+/// the transport's signal at once, so `response` compares the answer to the
+/// accept label rather than trusting the order Pi never guaranteed.
+const PI_CONFIRM_ACCEPT: &str = "Yes";
+const PI_CONFIRM_DECLINE: &str = "No";
 
 fn configure_pi_computer_use_command(
     command: &mut std::process::Command,
@@ -204,6 +335,20 @@ impl PiDriver {
         flavor: PiFlavor,
         options: DriverStartOptions,
         events: DriverEventSender,
+    ) -> anyhow::Result<Self> {
+        Self::launch(flavor, options, events, &[])
+    }
+
+    /// Starts a session that also loads `extensions` — the same `--extension`
+    /// flag the launch already hands Waku's own Pi extension. The live tests
+    /// pass their fixture this way, so the provider's own records are provoked
+    /// through the launch path the product uses rather than replayed from a
+    /// canned frame.
+    pub(crate) fn launch(
+        flavor: PiFlavor,
+        options: DriverStartOptions,
+        events: DriverEventSender,
+        extensions: &[PathBuf],
     ) -> anyhow::Result<Self> {
         let DriverStartOptions {
             binary,
@@ -255,6 +400,9 @@ impl PiDriver {
             .transpose()?;
         let mut command = crate::command_env::command(&binary);
         command.args(["--mode", "rpc", flavor.full_access_arg()]);
+        for extension in extensions {
+            command.arg("--extension").arg(extension);
+        }
         if flavor.skips_version_check_by_env() {
             command.env("PI_SKIP_VERSION_CHECK", "1");
         }
@@ -287,14 +435,22 @@ impl PiDriver {
 
         let (commands, command_rx) = unbounded();
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let run = RunLiveness::default();
+        let reader_run = run.clone();
         let reader_pending = pending.clone();
         let reader_commands = commands.clone();
         let reader_events = events.clone();
+        let dialogs: PiDialogs = Arc::new(Mutex::new(HashMap::new()));
+        let reader_dialogs = dialogs.clone();
         let reader_thread =
             thread::Builder::new()
                 .name("waku-pi-reader".into())
                 .spawn(move || {
-                    let mut stream_state = PiStreamState::default();
+                    let mut stream_state = PiStreamState {
+                        run: reader_run,
+                        dialogs: reader_dialogs,
+                        ..PiStreamState::default()
+                    };
                     let mut chunks = ChunkAssembly::default();
                     for line in BufReader::new(stdout).lines() {
                         match line {
@@ -526,53 +682,35 @@ impl PiDriver {
                                 &prompt,
                             );
                             if let Err(error) = result {
-                                let _ = writer_events.send(DriverEvent::Error(tr!(
-                                    "errors.provider_rejected_prompt_detail",
-                                    provider = flavor.display_name(),
-                                    error = error
-                                )));
+                                // The prompt never reached the provider, so
+                                // this is the submitted message's delivery
+                                // failure: the reason settles the turn with
+                                // it, rather than arriving as an error the
+                                // app would render as its answer.
                                 let _ = writer_events.send(DriverEvent::TurnFinished {
                                     interrupted: false,
                                     success: false,
                                     summary: Some(tr!(
-                                        "errors.provider_rejected_prompt",
-                                        provider = flavor.display_name()
+                                        "errors.provider_rejected_prompt_detail",
+                                        provider = flavor.display_name(),
+                                        error = error
                                     )),
                                 });
                             }
                         }
                         CommandMessage::Steer(prompt) => {
-                            let result = send_request(
+                            send_steer(
                                 &mut stdin,
                                 &writer_pending,
                                 &mut next_request_id,
-                                json!({"type": "steer", "message": prompt}),
+                                &writer_events,
+                                &run,
+                                prompt,
                             );
-                            match result {
-                                Ok(_) => {
-                                    let _ = writer_events
-                                        .send(DriverEvent::SteerAccepted { message: prompt });
-                                }
-                                Err(error) => {
-                                    let _ = writer_events.send(DriverEvent::SteerRejected {
-                                        message: prompt,
-                                        reason: error,
-                                    });
-                                }
-                            }
                         }
                         CommandMessage::Cancel => {
-                            if let Err(error) = send_request(
-                                &mut stdin,
-                                &writer_pending,
-                                &mut next_request_id,
-                                json!({"type": "abort"}),
-                            ) {
-                                let _ = writer_events.send(DriverEvent::Error(tr!(
-                                    "errors.stop_provider",
-                                    provider = flavor.display_name(),
-                                    error = error
-                                )));
+                            if stop_session(&mut stdin, &writer_events, flavor).is_err() {
+                                break;
                             }
                         }
                         CommandMessage::Options(options) => {
@@ -639,6 +777,14 @@ impl PiDriver {
                                 current_effort = options.reasoning_effort;
                             }
                         }
+                        CommandMessage::RetractQueuedMessages => {
+                            // The queue report already handed the text back, so
+                            // the answer is not read; it only has to leave the
+                            // provider's queue before the next prompt is written.
+                            if write_clear_queue(&mut stdin).is_err() {
+                                break;
+                            }
+                        }
                         CommandMessage::CancelExtensionRequest(id) => {
                             if write_json_line(
                                 &mut stdin,
@@ -650,6 +796,11 @@ impl PiDriver {
                             )
                             .is_err()
                             {
+                                break;
+                            }
+                        }
+                        CommandMessage::ExtensionUiResponse(response) => {
+                            if write_json_line(&mut stdin, &response).is_err() {
                                 break;
                             }
                         }
@@ -741,6 +892,7 @@ impl PiDriver {
             flavor,
             commands,
             computer_use,
+            dialogs,
         })
     }
 }
@@ -769,6 +921,26 @@ impl DriverControl for PiDriver {
     }
 
     fn respond(&self, _request_id: String, _option_id: String) {}
+
+    fn respond_user_input(&self, request_id: String, answers: Vec<UserInputAnswer>) {
+        // Only a dialog the user is looking at can be answered. An answer to
+        // anything else, or a second answer to the same request, is dropped
+        // rather than written as a response the provider never asked for.
+        let Some(dialog) = self.dialogs.lock().remove(&request_id) else {
+            return;
+        };
+        // A Pi dialog asks one question, and its id is the request's own —
+        // the driver put it there — so the answer list holds exactly that
+        // question's labels, empty when the user dismissed it.
+        let labels = answers
+            .into_iter()
+            .next()
+            .map(|answer| answer.answers)
+            .unwrap_or_default();
+        let _ = self.commands.send(CommandMessage::ExtensionUiResponse(
+            dialog.response(&request_id, &labels),
+        ));
+    }
 
     fn apply_options(&self, options: SessionOptions) -> bool {
         // Both flavors have setters for the model and thinking level, so those
@@ -898,9 +1070,25 @@ fn send_prompt(
     // OMP built-ins can hold the prompt response until compaction or another
     // command finishes. Do not apply the short control-RPC timeout or block
     // the writer from sending abort while waiting for that response.
+    //
+    // Pi rejects a prompt outright while it is still streaming — "Agent is
+    // already processing. Specify streamingBehavior ('steer' or 'followUp') to
+    // queue the message." — and Waku can prompt into that state: stopping a
+    // turn settles it here immediately, while Pi keeps streaming until its
+    // own abort finishes unwinding. Pi reads the option only while it is
+    // streaming, so one constant covers both cases: a prompt against an idle
+    // agent starts a run as before, and a submission that races the tail of
+    // the previous turn is queued and delivered — inside that run when it
+    // reaches a boundary, as its own run when an abort ended the first —
+    // rather than failed into the transcript.
     if let Err(error) = write_json_line(
         stdin,
-        &json!({"id": id, "type": "prompt", "message": prompt}),
+        &json!({
+            "id": id,
+            "type": "prompt",
+            "message": prompt,
+            "streamingBehavior": "followUp",
+        }),
     ) {
         pending.lock().remove(&id);
         return Err(format!("transport write failed: {error}"));
@@ -908,10 +1096,91 @@ fn send_prompt(
     Ok(())
 }
 
+/// Hands a steering message to the provider.
+///
+/// The provider queues a steer whether or not a run is open, and a message it
+/// parks there is spliced into the boundary of whatever turn runs next — a
+/// message landing in the middle of a conversation it did not belong to. So the
+/// steer record is written only for the run that is still live; with no run to
+/// join, the message takes the prompt path and is delivered as the next turn
+/// instead. Both flavors acknowledge the same way: accepted once the message is
+/// with the provider, rejected when the write failed. A converted steer is
+/// acknowledged as accepted too, because that is what the app needs to keep the
+/// message in the transcript — reporting it as a rejected steer would have the
+/// app submit the same text a second time.
+fn send_steer(
+    stdin: &mut impl Write,
+    pending: &PendingResponses,
+    next_request_id: &mut u64,
+    events: &impl DriverEventSink,
+    run: &RunLiveness,
+    prompt: String,
+) {
+    let delivered = if run.is_live() {
+        send_request(
+            stdin,
+            pending,
+            next_request_id,
+            json!({"type": "steer", "message": prompt}),
+        )
+        .map(|_| ())
+    } else {
+        send_prompt(stdin, pending, next_request_id, &prompt)
+    };
+    match delivered {
+        Ok(_) => {
+            let _ = events.send(DriverEvent::SteerAccepted { message: prompt });
+        }
+        Err(error) => {
+            let _ = events.send(DriverEvent::SteerRejected {
+                message: prompt,
+                reason: error,
+            });
+        }
+    }
+}
+
 fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()> {
     serde_json::to_writer(&mut *writer, value)?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+/// Takes back the messages the provider's queue still holds and returns their
+/// text. No request id: the answer is not awaited, because the reader thread
+/// owns stdout and would otherwise deadlock waiting for it.
+fn write_clear_queue(writer: &mut impl Write) -> std::io::Result<()> {
+    write_json_line(writer, &json!({"type": "clear_queue"}))
+}
+
+/// Stops the run: the queue first, then the abort. The order is the point —
+/// an abort continues whatever the queue still holds, so a message the user
+/// stopped would run afterwards if the abort went first.
+///
+/// The abort carries no request id because it is never awaited: pi answers it
+/// only once the session is idle, which routinely outlasts the control timeout
+/// the other requests use. A waiter would report a slow stop as a transport
+/// error and hold the next prompt behind it, while the run's own settlement is
+/// what ends the turn either way.
+///
+/// A write that fails at all is reported and returned so the command loop can
+/// end, exactly as a dead pipe does for its other commands.
+fn stop_session(
+    writer: &mut impl Write,
+    events: &impl DriverEventSink,
+    flavor: PiFlavor,
+) -> std::io::Result<()> {
+    let stopped =
+        write_clear_queue(writer).and_then(|()| write_json_line(writer, &json!({"type": "abort"})));
+    if let Err(error) = stopped {
+        let _ = events.send(DriverEvent::Error(tr!(
+            "errors.stop_provider",
+            provider = flavor.display_name(),
+            error = error
+        )));
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn fail_pending(pending: &PendingResponses, message: &str) {
@@ -1259,13 +1528,59 @@ fn clone_ohmypi_session(
     result
 }
 
+/// Whether the provider has a run open right now.
+///
+/// The reader thread owns the value — the provider's own run-start and
+/// settlement events are what change it — and the writer thread holds a clone,
+/// because only a live run may be offered a steering message.
+#[derive(Clone, Default)]
+struct RunLiveness(Arc<AtomicBool>);
+
+impl RunLiveness {
+    fn is_live(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn open(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn close(&self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 #[derive(Default)]
 struct PiStreamState {
-    run_started: bool,
+    /// The provider's run. Shared with the writer thread, so a reset of the
+    /// per-run stream state keeps the same handle rather than a fresh one.
+    run: RunLiveness,
+    /// The extension dialogs still unanswered, shared with the driver handle
+    /// that answers them; like the run handle it outlives a run's reset.
+    dialogs: PiDialogs,
     message_saw_text: bool,
     message_saw_reasoning: bool,
     failed: bool,
     tools: HashMap<String, (ActivityKind, String)>,
+    /// The messages the provider's last queue report still held, in the order
+    /// it reported them. Empty on a provider that reports no queue.
+    queued: Vec<String>,
+}
+
+impl PiStreamState {
+    /// Clears the per-run stream state between runs. The run handle and the
+    /// dialogs survive, because the writer thread reads liveness through its
+    /// own clone of the run and a dialog the client has not answered yet must
+    /// not be forgotten.
+    fn reset(&mut self) {
+        let run = self.run.clone();
+        let dialogs = self.dialogs.clone();
+        *self = Self {
+            run,
+            dialogs,
+            ..Self::default()
+        };
+    }
 }
 
 fn handle_pi_message(
@@ -1287,34 +1602,59 @@ fn handle_pi_message(
         let prompt_response = matches!(pending.lock().get(id), Some(PendingResponse::Prompt));
         if prompt_response {
             let success = value.get("success").and_then(Value::as_bool) == Some(true);
-            let local_only =
-                value.pointer("/data/agentInvoked").and_then(Value::as_bool) == Some(false);
-            if success && !local_only {
-                // OMP may acknowledge a prompt before reporting that an
-                // extension handled it locally. Retain the id for that second
-                // response; normal agent completion retires it below.
+            // Pi answers a prompt with what became of it: `started` and
+            // `queued` mean the work is on its way and the run settles the
+            // turn, while `handled` means an extension command or an input
+            // handler consumed the prompt and no run will start for it, so the
+            // turn settles here. Oh My Pi says the last part in two steps — an
+            // acknowledgement, then a second response carrying
+            // `agentInvoked: false` — which keeps that field as one more
+            // locally-handled signal.
+            let handled_locally = value.pointer("/data/disposition").and_then(Value::as_str)
+                == Some("handled")
+                || value.pointer("/data/agentInvoked").and_then(Value::as_bool) == Some(false);
+            // A command that starts a run of its own — the shape an extension
+            // uses to wake the session — has already announced that run by the
+            // time this answer arrives, and the run settles its own turn.
+            // Settling here would end a turn the run is still writing into and
+            // then open a second one for the same work.
+            if success && (!handled_locally || state.run.is_live()) {
                 return;
             }
             pending.lock().remove(id);
-            if !state.run_started {
-                let _ = events.send(DriverEvent::TurnStarted);
-            }
-            let error = (!success).then(|| {
+            // A prompt answer never opens a turn. A run announces itself with
+            // `agent_start`/`turn_start`, and the two answers that settle here
+            // — a refusal and a locally handled command — have no run behind
+            // them at all.
+            //
+            // A refusal is the delivery failure of the message that asked for
+            // the run: it never reached the conversation, so the provider's
+            // own reason travels as the settlement's summary, which is what
+            // marks the message undelivered. Sending it as a transport error
+            // instead would have the client store it as an answer to a
+            // message the agent never saw.
+            let summary = (!success).then(|| {
                 value
                     .get("error")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .unwrap_or_else(|| format!("{} RPC command failed", flavor.display_name()))
+                    .unwrap_or_else(|| {
+                        tr!(
+                            "errors.provider_rejected_prompt",
+                            provider = flavor.display_name()
+                        )
+                    })
             });
-            if let Some(error) = error.as_ref() {
-                let _ = events.send(DriverEvent::Error(error.clone()));
-            }
             let _ = events.send(DriverEvent::TurnFinished {
                 interrupted: false,
                 success,
-                summary: error,
+                summary,
             });
-            *state = PiStreamState::default();
+            // No run stands behind this answer — a refusal, or an extension
+            // command that consumed the prompt — so nothing is live until the
+            // provider announces a run of its own.
+            state.run.close();
+            state.reset();
             return;
         }
         let Some(PendingResponse::Request(response)) = pending.lock().remove(id) else {
@@ -1359,10 +1699,23 @@ fn handle_pi_message(
         if value.get("isTerminal").and_then(Value::as_bool) == Some(false) {
             return;
         }
-        if state.run_started {
+        if state.run.is_live() {
             pending
                 .lock()
                 .retain(|_, response| matches!(response, PendingResponse::Request(_)));
+            // A settlement must not leave text parked in the provider's queue.
+            // Measured against pi 1.0.0: an aborted run settles without
+            // draining its queue, and pi does not run that message afterwards
+            // — it splices it into whatever the user sends next. So the queue
+            // is taken back and its text handed to the user, and the turn
+            // still settles here, once and at once.
+            let retracted = std::mem::take(&mut state.queued);
+            if !retracted.is_empty() {
+                let _ = commands.send(CommandMessage::RetractQueuedMessages);
+                let _ = events.send(DriverEvent::QueuedMessagesRetracted {
+                    messages: retracted,
+                });
+            }
             let success = !state.failed;
             let _ = events.send(DriverEvent::TurnFinished {
                 interrupted: false,
@@ -1375,19 +1728,36 @@ fn handle_pi_message(
                 }),
             });
         }
-        *state = PiStreamState::default();
+        // The run is over, so a steering message has nothing left to join,
+        // and a dialog that was still unanswered belonged to it: the provider
+        // resolves an abandoned dialog on its own timeout, and that request is
+        // no longer answerable.
+        state.run.close();
+        state.dialogs.lock().clear();
+        state.reset();
         return;
     }
 
     match event_type {
+        "queue_update" => {
+            // Each report is the provider's complete queue, so the client's
+            // pending list is the provider's own rather than a guess.
+            let steering = message_texts(value.get("steering"));
+            let follow_up = message_texts(value.get("followUp"));
+            state.queued = steering.iter().chain(&follow_up).cloned().collect();
+            let _ = events.send(DriverEvent::ProviderQueue {
+                steering,
+                follow_up,
+            });
+        }
         "command_output" => {
             if let Some(text) = value
                 .get("text")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
             {
-                if !state.run_started {
-                    state.run_started = true;
+                if !state.run.is_live() {
+                    state.run.open();
                     let _ = events.send(DriverEvent::TurnStarted);
                 }
                 // Each command_output is a complete output block, unlike
@@ -1396,8 +1766,8 @@ fn handle_pi_message(
             }
         }
         "agent_start" | "turn_start" => {
-            if !state.run_started {
-                state.run_started = true;
+            if !state.run.is_live() {
+                state.run.open();
                 state.failed = false;
                 let _ = events.send(DriverEvent::TurnStarted);
             }
@@ -1439,16 +1809,28 @@ fn handle_pi_message(
             }
         }
         "message_end" => {
-            if value.pointer("/message/role").and_then(Value::as_str) == Some("assistant") {
-                // This is the context the next call starts from, not the
-                // cumulative billed total for the whole session.
-                if let Some(tokens) = value.get("message").and_then(pi_message_context_tokens) {
-                    let _ = events.send(DriverEvent::UsageUpdated {
-                        context_tokens: Some(tokens),
-                        context_window: None,
-                    });
+            let message = value.get("message");
+            match message
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+            {
+                Some("assistant") => {
+                    // This is the context the next call starts from, not the
+                    // cumulative billed total for the whole session.
+                    if let Some(tokens) = message.and_then(pi_message_context_tokens) {
+                        let _ = events.send(DriverEvent::UsageUpdated {
+                            context_tokens: Some(tokens),
+                            context_window: None,
+                        });
+                    }
+                    emit_completed_message_fallback(message, events, state);
                 }
-                emit_completed_message_fallback(value.get("message"), events, state);
+                Some("custom") => {
+                    if let Some(message) = message {
+                        emit_extension_message(message, events);
+                    }
+                }
+                _ => {}
             }
         }
         "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
@@ -1520,10 +1902,89 @@ fn handle_pi_message(
         "extension_ui_request" => {
             let method = value.get("method").and_then(Value::as_str);
             let id = value.get("id").and_then(Value::as_str);
-            if matches!(method, Some("select" | "confirm" | "input" | "editor"))
-                && let Some(id) = id
+            // A dialog blocks the extension until the user answers it. It
+            // becomes an ordinary user-input request; the answer comes back
+            // through the transport's own response method, and the provider's
+            // own timeout dismisses an abandoned one.
+            if let (Some(dialog), Some(id)) = (method.and_then(PiExtensionDialog::from_method), id)
             {
-                let _ = commands.send(CommandMessage::CancelExtensionRequest(id.to_owned()));
+                let question = dialog.question(id, &value);
+                state.dialogs.lock().insert(id.to_owned(), dialog);
+                let _ = events.send(DriverEvent::UserInputRequested {
+                    request_id: id.to_owned(),
+                    questions: vec![question],
+                });
+                return;
+            }
+            match method {
+                // The rest are the extension's own status surfaces: none
+                // expects an answer, so each is forwarded to the app instead
+                // of being dropped.
+                Some("notify") => {
+                    if let Some(message) = value.get("message").and_then(Value::as_str) {
+                        let _ = events.send(DriverEvent::ExtensionNotification {
+                            message: message.to_owned(),
+                            severity: pi_notification_severity(value.get("notifyType")),
+                        });
+                    }
+                }
+                Some("setStatus") => {
+                    if let Some(key) = value.get("statusKey").and_then(Value::as_str) {
+                        let _ = events.send(DriverEvent::ExtensionStatus {
+                            key: key.to_owned(),
+                            text: value
+                                .get("statusText")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                        });
+                    }
+                }
+                Some("setWidget") => {
+                    if let Some(key) = value.get("widgetKey").and_then(Value::as_str) {
+                        let _ = events.send(DriverEvent::ExtensionWidget {
+                            key: key.to_owned(),
+                            // Pi sends the lines themselves in RPC mode, and
+                            // their absence is the extension's own clear.
+                            lines: value.get("widgetLines").and_then(Value::as_array).map(
+                                |lines| {
+                                    lines
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_owned)
+                                        .collect()
+                                },
+                            ),
+                            placement: match value.get("widgetPlacement").and_then(Value::as_str) {
+                                Some("belowEditor") => ExtensionWidgetPlacement::BelowEditor,
+                                _ => ExtensionWidgetPlacement::AboveEditor,
+                            },
+                        });
+                    }
+                }
+                Some("setTitle") => {
+                    if let Some(title) = value.get("title").and_then(Value::as_str) {
+                        let _ = events.send(DriverEvent::ExtensionTitle {
+                            title: title.to_owned(),
+                        });
+                    }
+                }
+                Some("set_editor_text") => {
+                    if let Some(text) = value.get("text").and_then(Value::as_str) {
+                        let _ = events.send(DriverEvent::ExtensionEditorText {
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+                // A method the client does not know is not one it can present,
+                // and if it is a dialog the provider is blocking on it. Cancel
+                // it so the extension continues instead of waiting out its
+                // timeout; nothing else Pi sends needs an answer.
+                _ => {
+                    if let Some(id) = id {
+                        let _ =
+                            commands.send(CommandMessage::CancelExtensionRequest(id.to_owned()));
+                    }
+                }
             }
         }
         "extension_error" => {
@@ -1531,6 +1992,31 @@ fn handle_pi_message(
         }
         _ => {}
     }
+}
+
+/// The severity of an extension's notification. `notifyType` is optional, and
+/// an omission means the same thing to Pi as it does here: informational.
+fn pi_notification_severity(notify_type: Option<&Value>) -> NotificationSeverity {
+    match notify_type.and_then(Value::as_str) {
+        Some("warning") => NotificationSeverity::Warning,
+        Some("error") => NotificationSeverity::Error,
+        _ => NotificationSeverity::Info,
+    }
+}
+
+/// The text entries of one queue in a `queue_update` report. Anything that is
+/// not a string is not a message the client can show.
+fn message_texts(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn publish_commands(
@@ -1545,6 +2031,105 @@ fn publish_commands(
         })
         .collect();
     let _ = events.send(DriverEvent::AvailableCommands(commands));
+}
+
+fn emit_extension_message(message: &Value, events: &impl DriverEventSink) {
+    let custom_type = message
+        .get("customType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let text = pi_custom_message_text(message.get("content"));
+    let display = message
+        .get("display")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    // pi-subagents reports its detached children through its own custom
+    // messages. Those records are the only sign a background child settled,
+    // and the client already has a surface for work that outlives the turn.
+    // The flag decides the conversation rather than that surface: pi-subagents
+    // marks a completed child not for display and a failed or stopped one for
+    // display, and both are the same kind of event, so the child's outcome
+    // goes to the detached-work surface either way and never becomes a chat
+    // row.
+    if let Some(item) = pi_subagent_background_item(custom_type, &text) {
+        let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
+            item,
+        )));
+        return;
+    }
+    let _ = events.send(DriverEvent::ExtensionMessage {
+        custom_type: custom_type.to_owned(),
+        text,
+        display,
+    });
+}
+
+/// The custom message's text. Pi normalizes missing content to an empty array,
+/// but a plain string is still a legal `CustomMessage` body, so both shapes are
+/// decoded.
+fn pi_custom_message_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// pi-subagents' child and background notifications as detached work.
+///
+/// The two types are its own: a workflow child settling and a background task
+/// finishing. Their first line names the child and its outcome — `Workflow
+/// child completed: **build**` — so the item is named after the child, carries
+/// the outcome as its status, and keeps the whole message as its detail;
+/// anything else is an extension message with no detached work behind it.
+///
+/// The child's key is that line's bold span, and a child may be called
+/// anything — `retry-failed` completes — so the outcome is read from the line
+/// with the span left out.
+fn pi_subagent_background_item(custom_type: &str, text: &str) -> Option<BackgroundWorkItem> {
+    if !matches!(
+        custom_type,
+        "subagent-incremental-child-notify" | "subagent-notify"
+    ) {
+        return None;
+    }
+    let headline = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    // The child's key is the bold span; the outcome is read around it.
+    let (before, rest) = headline.split_once("**").unwrap_or((headline, ""));
+    let (key, after) = rest.split_once("**").unwrap_or(("", ""));
+    let outcome = format!("{before}{after}");
+    let status = if outcome.contains("failed") {
+        BackgroundWorkStatus::Failed
+    } else if outcome.contains("completed") {
+        BackgroundWorkStatus::Completed
+    } else if outcome.contains("stopped") {
+        BackgroundWorkStatus::Stopped
+    } else {
+        // `paused` and anything a later version words differently: the
+        // provider still holds the run, and the surface has no state of its
+        // own for a child that needs attention.
+        BackgroundWorkStatus::Running
+    };
+    let key = key.trim();
+    let child = if key.is_empty() { headline } else { key };
+    let mut item = BackgroundWorkItem::new(
+        BackgroundWorkKind::Subagent,
+        child.to_owned(),
+        child.to_owned(),
+        status,
+    );
+    item.background = true;
+    item.detail = Some(text.to_owned());
+    Some(item)
 }
 
 fn emit_completed_message_fallback(
@@ -1656,7 +2241,348 @@ mod tests {
         assert!(
             matches!(event_rx.recv().unwrap(), DriverEvent::AvailableCommands(commands) if commands.is_empty())
         );
-        assert!(!state.run_started);
+        assert!(!state.run.is_live());
+    }
+
+    #[test]
+    fn every_prompt_asks_the_provider_to_queue_it_while_streaming() {
+        // Pi refuses a prompt that arrives while it is still streaming unless
+        // the request says how to queue it, and Waku can prompt into exactly
+        // that window: stopping a turn settles it here at once, while Pi keeps
+        // streaming until its own abort finishes unwinding. Pi reads the
+        // option only while it is streaming, so one constant covers both cases
+        // and no branch of ours has to guess the provider's state.
+        let (pending, _commands, _command_rx, _state) = harness();
+        let mut next = 0;
+        let mut wire = Vec::new();
+        send_prompt(&mut wire, &pending, &mut next, "idle session").unwrap();
+        // The second prompt goes out before the first has settled, which is
+        // the window this option exists for.
+        send_prompt(&mut wire, &pending, &mut next, "still streaming").unwrap();
+
+        let requests: Vec<Value> = String::from_utf8(wire)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["message"], "idle session");
+        assert_eq!(requests[1]["message"], "still streaming");
+        for request in requests {
+            assert_eq!(request["type"], "prompt");
+            assert_eq!(request["streamingBehavior"], "followUp");
+        }
+    }
+
+    #[test]
+    fn a_prompt_the_provider_queued_waits_for_the_run() {
+        // `queued` means the provider took the message for the turn that is
+        // still running, so the answer itself settles nothing: the run settles
+        // once its queue has drained.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "and also").unwrap();
+        for frame in [
+            json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "queued"}}),
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(event_rx.try_recv().is_err());
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn a_prompt_an_extension_handled_settles_without_a_run() {
+        // An extension command runs inside the provider and starts no run, so
+        // a client that waits for a settle would strand the turn forever.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "/mycommand").unwrap();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "handled"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished {
+                success: true,
+                summary: None,
+                ..
+            }
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a handled prompt opens no turn of its own"
+        );
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn a_command_that_starts_a_run_keeps_its_own_turn() {
+        // The shape an extension command uses to wake the session: the handler
+        // starts a run inline, so the run's start arrives before the answer
+        // that says the prompt was handled. That run owns the turn; settling on
+        // the answer would end it early and open a second one for the same
+        // work, which the app renders as an empty completed turn.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "/council").unwrap();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "handled"}}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "an answer settles nothing while the run it started is live"
+        );
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "agent_settled"}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(event_rx.try_recv().is_err(), "one turn, one settlement");
+    }
+
+    #[test]
+    fn a_run_settles_the_turn_the_provider_never_answered() {
+        // Pi writes no response at all for a prompt submitted while it is
+        // emitting its settle, so settlement cannot depend on one arriving.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "hello").unwrap();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_provider_queue_report_reaches_the_stream() {
+        // The client's pending list is the provider's own queue, so every
+        // report is forwarded — each one is the complete queue, so the last
+        // report wins.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "queue_update", "steering": ["stop"], "followUp": ["and also"]}),
+            json!({"type": "queue_update", "steering": [], "followUp": []}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        let DriverEvent::ProviderQueue {
+            steering,
+            follow_up,
+        } = event_rx.recv().unwrap()
+        else {
+            panic!("the provider's queue report should reach the stream");
+        };
+        assert_eq!(steering, ["stop"]);
+        assert_eq!(follow_up, ["and also"]);
+        let DriverEvent::ProviderQueue {
+            steering,
+            follow_up,
+        } = event_rx.recv().unwrap()
+        else {
+            panic!("the drained report should reach the stream too");
+        };
+        assert!(steering.is_empty() && follow_up.is_empty());
+        assert!(event_rx.try_recv().is_err(), "a report is one event");
+    }
+
+    #[test]
+    fn retracting_a_queue_asks_the_provider_to_clear_it() {
+        // `clear_queue` is what takes a parked message out of the provider's
+        // queue. It carries no request id: the driver's reader thread owns
+        // stdout, so the answer can never be awaited from there.
+        let mut wire = Vec::new();
+        write_clear_queue(&mut wire).unwrap();
+        let request: Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(request["type"], "clear_queue");
+        assert!(request.get("id").is_none());
+    }
+
+    #[test]
+    fn stopping_a_turn_clears_the_queue_before_it_aborts_and_waits_for_nothing() {
+        // Pi continues whatever its queue still holds when an abort lands, so
+        // clearing it is what keeps a message the user stopped from running
+        // afterwards: the clear has to be on the wire first. Pi answers
+        // `abort` only once its session is idle, which routinely outlasts the
+        // control timeout every other request uses, so nothing may wait on
+        // that answer — a waiter would report the slow stop as a transport
+        // error and hold the next prompt behind it.
+        let (pending, _commands, _command_rx, _state) = harness();
+        let (events, event_rx) = unbounded();
+        let mut wire = Vec::new();
+        let mut next_request_id = 0;
+
+        stop_session(&mut wire, &events, PiFlavor::Pi).unwrap();
+        send_prompt(&mut wire, &pending, &mut next_request_id, "and also").unwrap();
+
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a stop the provider never answers is not a transport error"
+        );
+        let writes = wire_lines(&wire);
+        assert_eq!(writes.len(), 3, "a stop is the clear and the abort");
+        assert_eq!(writes[0]["type"], "clear_queue");
+        assert_eq!(writes[1]["type"], "abort");
+        assert!(
+            writes[1].get("id").is_none(),
+            "an answer is correlated by id, so an id-less abort has none to await"
+        );
+        assert_eq!(
+            writes[2]["type"], "prompt",
+            "the next prompt is not held behind the stop"
+        );
+    }
+
+    #[test]
+    fn a_settlement_that_still_holds_a_queued_message_hands_it_back() {
+        // Measured against pi 1.0.0: an aborted run settles without draining
+        // its queue, and pi never runs that message afterwards — it splices
+        // it into whatever the user sends next. A settlement therefore may
+        // not leave text parked in the queue: it is cleared and handed back
+        // to the user, and the turn still settles once, immediately.
+        let (pending, commands, command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "queue_update", "steering": [], "followUp": ["and also"]}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::ProviderQueue { .. }
+        ));
+        let DriverEvent::QueuedMessagesRetracted { messages } = event_rx.recv().unwrap() else {
+            panic!("the settlement takes the queued message back")
+        };
+        assert_eq!(messages, ["and also"]);
+        let DriverEvent::TurnFinished { success, .. } = event_rx.recv().unwrap() else {
+            panic!("the turn still settles")
+        };
+        assert!(success, "the interruption is not a failure of this turn");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the turn settles once, immediately"
+        );
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            CommandMessage::RetractQueuedMessages
+        ));
+    }
+
+    #[test]
+    fn a_message_delivered_at_the_boundary_is_never_retracted() {
+        // The normal case: pi drains the queue into the running turn before it
+        // settles, so the settlement sees no queue and touches nothing.
+        let (pending, commands, command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "queue_update", "steering": [], "followUp": ["and also"]}),
+            json!({"type": "turn_start"}),
+            json!({"type": "queue_update", "steering": [], "followUp": []}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::ProviderQueue { follow_up, .. } if follow_up == ["and also"]
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::ProviderQueue { ref steering, ref follow_up } if steering.is_empty() && follow_up.is_empty()
+        ));
+        let DriverEvent::TurnFinished { success, .. } = event_rx.recv().unwrap() else {
+            panic!("the delivered message's turn still settles");
+        };
+        assert!(success);
+        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
@@ -1696,6 +2622,55 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_prompt_settles_as_its_messages_delivery_failure() {
+        // The provider refused the prompt before accepting it, so the message
+        // never reached the conversation. The settlement says so, carrying the
+        // provider's own reason; a transport error would be shown as a reply
+        // to a message the agent never saw.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let mut wire = Vec::new();
+        let mut next_request_id = 0;
+        send_prompt(&mut wire, &pending, &mut next_request_id, "run the tests").unwrap();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "response",
+                "id": "waku-1",
+                "success": false,
+                "error": "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        let DriverEvent::TurnFinished {
+            success,
+            summary,
+            interrupted,
+        } = event_rx.recv().unwrap()
+        else {
+            panic!("a refused prompt settles the turn")
+        };
+        assert!(!success);
+        assert!(!interrupted);
+        assert_eq!(
+            summary.as_deref(),
+            Some(
+                "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
+            ),
+            "the provider's own refusal is what the message went undelivered by"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no error and no turn start: nothing ran, so nothing answers the message"
+        );
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
     fn asynchronous_prompt_errors_settle_only_the_current_prompt() {
         let (pending, commands, _command_rx, mut state) = harness();
         let (events, event_rx) = unbounded();
@@ -1720,17 +2695,254 @@ mod tests {
             &events,
             &mut state,
         );
-        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
         assert!(
-            matches!(event_rx.recv().unwrap(), DriverEvent::Error(error) if error == "command failed")
+            matches!(event_rx.recv().unwrap(), DriverEvent::TurnFinished { success: false, summary: Some(reason), .. } if reason == "command failed")
         );
-        assert!(matches!(
-            event_rx.recv().unwrap(),
-            DriverEvent::TurnFinished { success: false, .. }
-        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a refused prompt opens no turn of its own"
+        );
         assert!(pending.lock().is_empty());
         assert_eq!(String::from_utf8(wire).unwrap().lines().count(), 2);
     }
+
+    #[test]
+    fn a_steer_that_misses_the_run_is_delivered_as_a_prompt() {
+        // The provider queues a steer whether or not a run is open — measured
+        // against pi 1.0.0, a message steered into an idle session waits in
+        // the steering queue and is spliced into the boundary of whatever turn
+        // runs next. A steer for a run that has already settled therefore goes
+        // out as a prompt for the next turn instead, and still reaches the app
+        // as an accepted message.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { .. }
+        ));
+
+        let mut wire = Vec::new();
+        let mut next_request_id = 0;
+        send_steer(
+            &mut wire,
+            &pending,
+            &mut next_request_id,
+            &events,
+            &state.run,
+            "stop doing that".to_owned(),
+        );
+
+        let frames = wire_frames(&wire);
+        assert_eq!(
+            frames.len(),
+            1,
+            "a steer the provider would park is never written"
+        );
+        assert_eq!(frames[0]["type"], "prompt");
+        assert_eq!(frames[0]["message"], "stop doing that");
+        assert_eq!(
+            frames[0]["streamingBehavior"], "followUp",
+            "the next turn's prompt waits for the settled run the provider still owes"
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerAccepted { message } if message == "stop doing that"
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_steer_into_the_live_run_is_written_as_a_steer() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+
+        let frames = steered_frames(&pending, &events, &state.run, "stop doing that");
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["type"], "steer");
+        assert_eq!(frames[0]["message"], "stop doing that");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerAccepted { message } if message == "stop doing that"
+        ));
+    }
+
+    #[test]
+    fn oh_my_pi_keeps_its_steering_and_gates_on_its_own_run() {
+        // The second flavor's steering is untouched: a steer into its live run
+        // is the same record and the same acknowledgement it gets today. Its
+        // run lifecycle is spelled differently (`agent_end`), and the gate
+        // reads that lifecycle too, so a steer arriving after its run settled
+        // takes the prompt path instead of waiting in the provider's queue.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::OhMyPi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+
+        let live = steered_frames(&pending, &events, &state.run, "stop doing that");
+        assert_eq!(live[0]["type"], "steer");
+        assert_eq!(live[0]["message"], "stop doing that");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerAccepted { message } if message == "stop doing that"
+        ));
+
+        handle_pi_message(
+            PiFlavor::OhMyPi,
+            json!({"type": "agent_end", "messages": []}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { .. }
+        ));
+        let mut wire = Vec::new();
+        let mut next_request_id = 0;
+        send_steer(
+            &mut wire,
+            &pending,
+            &mut next_request_id,
+            &events,
+            &state.run,
+            "never mind".to_owned(),
+        );
+        let frames = wire_frames(&wire);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["type"], "prompt");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerAccepted { message } if message == "never mind"
+        ));
+    }
+
+    fn wire_frames(wire: &[u8]) -> Vec<Value> {
+        String::from_utf8(wire.to_vec())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// What one steering message writes to the transport. The provider answers
+    /// a request the way its RPC does, so the writer's own wait is satisfied.
+    fn steered_frames(
+        pending: &PendingResponses,
+        events: &Sender<DriverEvent>,
+        run: &RunLiveness,
+        prompt: &str,
+    ) -> Vec<Value> {
+        let (wire_tx, wire_rx) = unbounded();
+        let writer_pending = pending.clone();
+        let writer_events = events.clone();
+        let writer_run = run.clone();
+        let writer_prompt = prompt.to_owned();
+        let writer = thread::spawn(move || {
+            let mut wire = WireRecorder::new(wire_tx);
+            let mut next_request_id = 0;
+            send_steer(
+                &mut wire,
+                &writer_pending,
+                &mut next_request_id,
+                &writer_events,
+                &writer_run,
+                writer_prompt,
+            );
+        });
+        let mut frames = Vec::new();
+        while let Ok(bytes) = wire_rx.recv() {
+            let frame: Value = serde_json::from_slice(&bytes).unwrap();
+            if let Some(id) = frame.get("id").and_then(Value::as_str)
+                && let Some(PendingResponse::Request(response)) = pending.lock().remove(id)
+            {
+                let _ = response.send(Ok(json!({
+                    "type": "response",
+                    "id": id,
+                    "success": true,
+                    "data": {"disposition": "queued"},
+                })));
+            }
+            frames.push(frame);
+        }
+        writer.join().unwrap();
+        frames
+    }
+
+    /// Collects the lines a writer sends, so a test can answer them.
+    struct WireRecorder {
+        lines: Sender<Vec<u8>>,
+        partial: Vec<u8>,
+    }
+
+    impl WireRecorder {
+        fn new(lines: Sender<Vec<u8>>) -> Self {
+            Self {
+                lines,
+                partial: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for WireRecorder {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            // One frame is one line, but the transport writes it in as many
+            // calls as it likes.
+            self.partial.extend_from_slice(buffer);
+            while let Some(end) = self.partial.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.partial.drain(..=end).collect();
+                let _ = self.lines.send(line[..line.len() - 1].to_vec());
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn harness() -> (
         PendingResponses,
         Sender<CommandMessage>,
@@ -1746,14 +2958,148 @@ mod tests {
         )
     }
 
-    /// Drives the installed Pi RPC through one real provider turn. Ignored by
-    /// default because it needs the CLI, credentials, and network access.
-    #[test]
-    #[ignore = "requires an installed, authenticated pi"]
-    fn pi_context_usage_against_the_real_rpc() {
-        let binary = crate::command_env::find_executable("pi").expect("pi is not installed");
+    /// A driver handle and the reader state that share one dialog store, so a
+    /// dialog the reader opens is the one the handle answers, and the reply
+    /// travels the transport's own command channel.
+    struct DialogHarness {
+        driver: PiDriver,
+        pending: PendingResponses,
+        commands: Sender<CommandMessage>,
+        command_rx: crossbeam_channel::Receiver<CommandMessage>,
+        events: Sender<DriverEvent>,
+        event_rx: crossbeam_channel::Receiver<DriverEvent>,
+        state: PiStreamState,
+    }
+
+    impl DialogHarness {
+        fn new() -> Self {
+            let (commands, command_rx) = unbounded();
+            let dialogs: PiDialogs = Arc::new(Mutex::new(HashMap::new()));
+            let (events, event_rx) = unbounded();
+            let driver = PiDriver {
+                flavor: PiFlavor::Pi,
+                commands: commands.clone(),
+                computer_use: None,
+                dialogs: dialogs.clone(),
+            };
+            Self {
+                driver,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                commands,
+                command_rx,
+                events,
+                event_rx,
+                state: PiStreamState {
+                    dialogs,
+                    ..PiStreamState::default()
+                },
+            }
+        }
+
+        /// Feeds one inbound frame the way the reader thread does.
+        fn open(&mut self, request: Value) {
+            handle_pi_message(
+                PiFlavor::Pi,
+                request,
+                &self.pending,
+                &self.commands,
+                &self.events,
+                &mut self.state,
+            );
+        }
+
+        /// The single question the last `open` put in front of the client.
+        fn question(&mut self) -> UserInputQuestion {
+            let event = self
+                .event_rx
+                .try_recv()
+                .expect("the dialog must reach the client");
+            let DriverEvent::UserInputRequested {
+                request_id,
+                mut questions,
+            } = event
+            else {
+                panic!("a dialog must arrive as a user-input request")
+            };
+            assert_eq!(questions.len(), 1, "a dialog is one question");
+            assert_eq!(
+                questions[0].id, request_id,
+                "the question id is the provider's request id, so the answer correlates"
+            );
+            questions.remove(0)
+        }
+    }
+
+    /// Drives one `extension_ui_request` frame through the inbound stream and
+    /// returns the events it produced, in order.
+    fn extension_ui_events(request: Value) -> Vec<DriverEvent> {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            request,
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        event_rx.try_iter().collect()
+    }
+
+    /// The commands a writer produced, in the order the provider reads them.
+    fn wire_lines(wire: &[u8]) -> Vec<Value> {
+        std::str::from_utf8(wire)
+            .expect("the wire is utf-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each write is one JSON command"))
+            .collect()
+    }
+
+    /// How long one live step may wait. A real turn answers in seconds, so the
+    /// budget covers a cold model and a cold extension load rather than a slow
+    /// transport, and it is per step rather than for a whole test.
+    const LIVE_STEP_TIMEOUT: Duration = Duration::from_secs(90);
+
+    /// A detached workflow has to spawn its own runner, start a child session
+    /// and post the completion, so it gets a budget of its own.
+    const LIVE_WORKFLOW_TIMEOUT: Duration = Duration::from_secs(240);
+
+    /// The probe fixture as an extension Pi loads from a path of its own.
+    ///
+    /// A path per test, because Pi resolves a loaded extension by path: two
+    /// sessions naming the same file would have the second read what the first
+    /// compiled.
+    fn live_probe_extension(name: &str) -> PathBuf {
+        live_fixture(name, include_str!("fixtures/pi_live_probe.js"))
+    }
+
+    /// A fixture extension, written where Pi can load it.
+    fn live_fixture(name: &str, source: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("waku-pi-live-{name}"));
+        std::fs::create_dir_all(&directory).expect("the fixture extension needs a directory");
+        let path = directory.join(format!("{name}.js"));
+        std::fs::write(&path, source).expect("the fixture extension needs its body");
+        path
+    }
+
+    /// A driver on a real `pi --mode rpc`, started the way the app starts one,
+    /// with `extension` loaded through the launch's own `--extension` flag, and
+    /// its native session already announced.
+    ///
+    /// `None` means this machine has no Pi, and the test that asked is skipped
+    /// rather than failed: the provider is a real process with a real model
+    /// behind it, and a suite that cannot run without one is a suite nobody
+    /// runs. Pi itself has no such excuse when it is installed.
+    fn real_pi_session(
+        extension: Option<PathBuf>,
+    ) -> Option<(PiDriver, crossbeam_channel::Receiver<DriverEvent>)> {
+        let Some(binary) = crate::command_env::find_executable("pi") else {
+            eprintln!("skipping a live Pi test: the `pi` CLI is not installed");
+            return None;
+        };
+        let extensions = extension.into_iter().collect::<Vec<_>>();
         let (events, event_rx) = crate::driver::test_event_channel();
-        let driver = PiDriver::start(
+        let driver = PiDriver::launch(
             PiFlavor::Pi,
             DriverStartOptions {
                 binary,
@@ -1768,28 +3114,323 @@ mod tests {
                 provider_cursor: None,
             },
             events,
+            &extensions,
         )
         .expect("the Pi RPC session should start");
-
-        let mut connected = false;
-        let mut context_tokens = None;
-        let mut context_window = None;
-        while let Ok(event) = event_rx.recv_timeout(Duration::from_secs(30)) {
-            match event {
-                DriverEvent::Connected { .. } => {
-                    connected = true;
-                    break;
-                }
-                DriverEvent::Error(error) => panic!("Pi failed to initialize: {error}"),
+        loop {
+            match next_live_step(&event_rx, "native session") {
+                DriverEvent::Connected { .. } => break,
+                DriverEvent::Error(error) => panic!("Pi failed to start: {error}"),
                 _ => {}
             }
         }
-        assert!(connected, "Pi never reported its native session");
+        Some((driver, event_rx))
+    }
+
+    /// A run the extension starts on its own reaches the transcript: the
+    /// message that caused it has a home, one turn opens with no Waku prompt,
+    /// and the reply streams into that same turn — the shape a background
+    /// subagent's completion wake takes.
+    #[test]
+    fn pi_streams_a_run_an_extension_starts_against_the_real_rpc() {
+        let Some((driver, event_rx)) = real_pi_session(Some(live_probe_extension("wake"))) else {
+            return;
+        };
+        driver.prompt("/waku-live-wake".to_owned());
+
+        let mut started = 0;
+        let mut woken = None;
+        let mut text = String::new();
+        loop {
+            match next_live_step(&event_rx, "the run the extension started to settle") {
+                DriverEvent::TurnStarted => started += 1,
+                DriverEvent::ExtensionMessage {
+                    custom_type,
+                    text: body,
+                    display,
+                } => {
+                    woken = Some((custom_type, body, display));
+                }
+                DriverEvent::TextDelta(delta) => text.push_str(&delta),
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished {
+                    success, summary, ..
+                } => {
+                    assert!(success, "the wake's run should finish: {summary:?}");
+                    assert_eq!(
+                        started, 1,
+                        "a run with no Waku prompt of its own still opens one turn"
+                    );
+                    assert!(
+                        woken.is_some() && text.contains("WAKU-LIVE-WAKE"),
+                        "the run's message and reply must land in the turn that settles"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // A second turn for the same run would arrive right behind the first
+        // settle — the empty completed turn the answer used to open — so the
+        // window after it is where that has to be ruled out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(event) =
+            event_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            match event {
+                DriverEvent::TurnStarted => {
+                    panic!("one run must open one turn, not settle an empty one and start another")
+                }
+                DriverEvent::TurnFinished { .. } => panic!("one run must settle once"),
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(started, 1, "a run settles its turn once");
+        assert_eq!(
+            woken,
+            Some((
+                "waku-live-wake".to_owned(),
+                "Reply with exactly: WAKU-LIVE-WAKE. Do not use any tools.".to_owned(),
+                true
+            )),
+            "the extension message that started the run must reach the client"
+        );
+        assert!(
+            text.contains("WAKU-LIVE-WAKE"),
+            "the run's reply must stream into the transcript: {text:?}"
+        );
+    }
+
+    /// The extension's own messages reach their surfaces — a subagent's child
+    /// notification as detached work, anything else as an extension message,
+    /// and one marked not for display as such — and the question it asks is
+    /// answered instead of cancelled on the user's behalf.
+    #[test]
+    fn pi_surfaces_extension_messages_and_answers_its_question_against_the_real_rpc() {
+        let Some((driver, event_rx)) = real_pi_session(Some(live_probe_extension("probe"))) else {
+            return;
+        };
+        driver.prompt("/waku-live-probe".to_owned());
+
+        let mut notice = None;
+        let mut child = None;
+        let mut hidden = None;
+        let mut question = None;
+        let mut answer = None;
+        let mut started = false;
+        loop {
+            match next_live_step(&event_rx, "the extension's messages and question") {
+                DriverEvent::ExtensionMessage {
+                    custom_type,
+                    text,
+                    display,
+                } => match custom_type.as_str() {
+                    "waku-live-notice" => notice = Some((text, display)),
+                    "waku-live-hidden" => hidden = Some((text, display)),
+                    "waku-live-answer" => answer = Some(text),
+                    other => panic!("an extension message was not classified: {other}"),
+                },
+                DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) => {
+                    child = Some(item)
+                }
+                DriverEvent::UserInputRequested {
+                    request_id,
+                    questions,
+                } => {
+                    assert!(question.is_none(), "the probe asks exactly one question");
+                    assert_eq!(questions.len(), 1, "a dialog is one question");
+                    assert_eq!(
+                        questions[0].id, request_id,
+                        "the question id is the provider's request id"
+                    );
+                    assert!(
+                        questions[0]
+                            .options
+                            .iter()
+                            .any(|option| option.label == PI_CONFIRM_ACCEPT),
+                        "a confirmation offers its own answers"
+                    );
+                    question = Some(questions[0].question.clone());
+                    driver.respond_user_input(
+                        request_id.clone(),
+                        vec![UserInputAnswer {
+                            question_id: request_id,
+                            answers: vec![PI_CONFIRM_ACCEPT.to_owned()],
+                        }],
+                    );
+                }
+                DriverEvent::TurnStarted => started = true,
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished { success, .. } => {
+                    assert!(success, "an extension command settles the turn it consumed");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            notice,
+            Some(("probe notice".to_owned(), true)),
+            "a plain extension message reaches the client"
+        );
+        let child =
+            child.expect("the subagent notification must land on the detached-work surface");
+        assert_eq!(child.key.kind, BackgroundWorkKind::Subagent);
+        assert_eq!(child.key.provider_id, "probe-child");
+        assert_eq!(child.title, "probe-child");
+        assert_eq!(child.status, BackgroundWorkStatus::Completed);
+        assert!(child.background, "a workflow child outlives the turn");
+        assert_eq!(
+            hidden,
+            Some(("hidden probe".to_owned(), false)),
+            "a message marked not for display is still delivered as one"
+        );
+        assert!(
+            question.is_some_and(|question| question == "Answer the probe?"),
+            "the extension's question reaches the client"
+        );
+        assert_eq!(
+            answer,
+            Some("answer=true".to_owned()),
+            "the extension receives the user's answer, not a cancellation"
+        );
+        assert!(
+            !started,
+            "a message an extension appends without a run opens no turn"
+        );
+    }
+
+    /// The next event from the live provider. A provider that goes quiet is a
+    /// failure, and naming what was awaited is what makes a timeout readable.
+    fn next_live_event(
+        event_rx: &crossbeam_channel::Receiver<DriverEvent>,
+        awaited: &str,
+        budget: Duration,
+    ) -> DriverEvent {
+        event_rx.recv_timeout(budget).unwrap_or_else(|error| {
+            panic!("the live Pi session produced no {awaited} within {budget:?}: {error}")
+        })
+    }
+
+    /// The next event within the budget one step of a live turn gets.
+    fn next_live_step(
+        event_rx: &crossbeam_channel::Receiver<DriverEvent>,
+        awaited: &str,
+    ) -> DriverEvent {
+        next_live_event(event_rx, awaited, LIVE_STEP_TIMEOUT)
+    }
+
+    /// The acceptance path this change exists for: `npm:pi-subagents` runs one
+    /// background workflow, and the child's completion wakes the session — the
+    /// completion lands where detached work is shown, the wake opens a turn with
+    /// no Waku prompt, and the reply it produced streams into the transcript.
+    ///
+    /// Ignored because it needs Pi 1.0 authenticated with `npm:pi-subagents`
+    /// installed, and because the extension registers nothing in a process that
+    /// is itself a Pi subagent: it stands down when `PI_SUBAGENT_CHILD` is set,
+    /// which is the case in a session that is one. Run it with
+    /// `env -u PI_SUBAGENT_CHILD cargo test -p waku-core --lib -- --ignored
+    /// pi_subagents`.
+    #[test]
+    #[ignore = "runs one real pi-subagents background workflow"]
+    fn pi_subagents_bring_a_background_child_wakes_the_parent_against_the_real_rpc() {
+        let extension = live_fixture(
+            "subagents_wake",
+            include_str!("fixtures/pi_subagents_wake.js"),
+        );
+        let Some((driver, event_rx)) = real_pi_session(Some(extension)) else {
+            return;
+        };
+
+        // The command's own turn settles with no run: the workflow it launched
+        // is detached, so the wake arrives later, as a run of its own.
+        driver.prompt("/waku-subagents-wake".to_owned());
+
+        let mut command_settled = false;
+        let mut completion = false;
+        let mut child = None;
+        let mut woke = false;
+        let mut reply = String::new();
+        loop {
+            match next_live_event(
+                &event_rx,
+                "the background child's completion",
+                LIVE_WORKFLOW_TIMEOUT,
+            ) {
+                DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) => {
+                    completion = true;
+                    if item.key.kind == BackgroundWorkKind::Subagent {
+                        child = Some(item);
+                    }
+                }
+                DriverEvent::TurnStarted => {
+                    assert!(
+                        completion,
+                        "the wake must follow the completion, not open a turn of its own"
+                    );
+                    woke = true;
+                }
+                DriverEvent::TextDelta(delta) if woke => reply.push_str(&delta),
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished {
+                    success, summary, ..
+                } => {
+                    if !woke {
+                        assert!(
+                            success,
+                            "the command's own turn settles cleanly: {summary:?}"
+                        );
+                        command_settled = true;
+                        continue;
+                    }
+                    assert!(success, "the wake's run should finish: {summary:?}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            command_settled,
+            "the command that launched the workflow settles"
+        );
+        let child = child.expect("the child's completion must land on the detached-work surface");
+        assert_eq!(child.status, BackgroundWorkStatus::Completed);
+        assert!(
+            child.background,
+            "a workflow child outlives the turn it was launched in"
+        );
+        assert!(
+            child
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Background task completed")),
+            "the completion says what became of the child: {:?}",
+            child.detail
+        );
+        assert!(
+            !reply.trim().is_empty(),
+            "the reply the wake produced must stream into the transcript"
+        );
+    }
+
+    /// Drives the installed Pi RPC through one real provider turn and reads the
+    /// context usage the provider reports off it.
+    #[test]
+    fn pi_context_usage_against_the_real_rpc() {
+        let Some((driver, event_rx)) = real_pi_session(None) else {
+            return;
+        };
 
         driver.prompt("Reply with exactly: OK. Do not use any tools.".into());
-        let mut finished = false;
-        while let Ok(event) = event_rx.recv_timeout(Duration::from_secs(180)) {
-            match event {
+        let mut context_tokens = None;
+        let mut context_window = None;
+        loop {
+            match next_live_step(&event_rx, "the probe turn to settle") {
                 DriverEvent::UsageUpdated {
                     context_tokens: tokens,
                     context_window: window,
@@ -1799,7 +3440,6 @@ mod tests {
                 }
                 DriverEvent::TurnFinished { success, .. } => {
                     assert!(success, "Pi should finish the probe turn");
-                    finished = true;
                     break;
                 }
                 DriverEvent::Error(error) => panic!("Pi reported: {error}"),
@@ -1807,9 +3447,166 @@ mod tests {
             }
         }
 
-        assert!(finished, "Pi never settled the probe turn");
         assert!(context_tokens.is_some_and(|tokens| tokens > 0));
         assert!(context_window.is_some_and(|window| window > 0));
+    }
+
+    /// A prompt sent while the turn is still streaming is queued on that turn,
+    /// reported as pending, and delivered when the turn reaches its boundary —
+    /// the prompt Pi refused outright before this change, leaving the user's
+    /// words in a transcript the agent never saw.
+    #[test]
+    fn pi_queues_and_delivers_a_prompt_sent_mid_stream_against_the_real_rpc() {
+        const QUEUED: &str = "Reply with exactly QUEUED-OK and nothing else. Do not use any tools.";
+
+        let Some((driver, event_rx)) = real_pi_session(None) else {
+            return;
+        };
+        driver.prompt(
+            "Write a 200-word description of a lighthouse keeper's morning. Plain prose, one \
+             paragraph, no tools, do not shorten it."
+                .to_owned(),
+        );
+
+        let mut sent = false;
+        let mut text = String::new();
+        let mut pending = false;
+        let mut released = false;
+        loop {
+            match next_live_step(&event_rx, "the busy turn to settle") {
+                DriverEvent::TextDelta(delta) => {
+                    // The queued prompt has to race a turn that is streaming, so
+                    // it goes out with the first text the turn produces.
+                    if !sent {
+                        sent = true;
+                        driver.prompt(QUEUED.to_owned());
+                    }
+                    text.push_str(&delta);
+                }
+                DriverEvent::ProviderQueue { follow_up, .. } => {
+                    if follow_up.iter().any(|message| message == QUEUED) {
+                        pending = true;
+                    } else if pending {
+                        released = true;
+                    }
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished {
+                    success, summary, ..
+                } => {
+                    assert!(
+                        success,
+                        "a queued prompt must be delivered, not refused: {summary:?}"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            sent,
+            "the turn must stream text before the queued prompt goes out"
+        );
+        assert!(
+            pending,
+            "the provider's queue report must show the message while it is pending"
+        );
+        assert!(
+            released,
+            "the queue report must show the message leaving when it is delivered"
+        );
+        assert!(
+            text.contains("QUEUED-OK"),
+            "the queued message must be delivered into the turn: {text:?}"
+        );
+    }
+
+    /// A stop takes the message the user had queued out of the provider's queue
+    /// before it aborts, so a message they stopped never runs afterwards.
+    #[test]
+    fn pi_stopping_a_turn_takes_its_queued_message_back_against_the_real_rpc() {
+        const QUEUED: &str = "Reply with exactly QUEUED-OK and nothing else. Do not use any tools.";
+
+        let Some((driver, event_rx)) = real_pi_session(None) else {
+            return;
+        };
+        driver.prompt(
+            "Write a 300-word description of a lighthouse keeper's morning. Plain prose, one \
+             paragraph, no tools, do not shorten it."
+                .to_owned(),
+        );
+
+        let mut sent = false;
+        let mut pending = false;
+        let mut cleared = false;
+        loop {
+            match next_live_step(&event_rx, "the stopped turn to settle") {
+                DriverEvent::TextDelta(_) => {
+                    if !sent {
+                        sent = true;
+                        driver.prompt(QUEUED.to_owned());
+                    }
+                }
+                DriverEvent::ProviderQueue {
+                    steering,
+                    follow_up,
+                } => {
+                    if follow_up.iter().any(|message| message == QUEUED) {
+                        if !pending {
+                            pending = true;
+                            // Stopped while the provider still holds it.
+                            driver.cancel();
+                        }
+                    } else if pending && steering.is_empty() && follow_up.is_empty() {
+                        cleared = true;
+                    }
+                }
+                // The other shape the retraction takes: the run settled with
+                // the message still reported queued, so the settlement itself
+                // took it back.
+                DriverEvent::QueuedMessagesRetracted { messages } => {
+                    if messages.iter().any(|message| message == QUEUED) {
+                        cleared = true;
+                    }
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished { success, .. } => {
+                    assert!(success, "a stop must report no transport error");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            sent,
+            "the turn must stream text before the message is queued"
+        );
+        assert!(
+            pending,
+            "the message must be in the provider's queue before the stop"
+        );
+        assert!(cleared, "the stop must clear the provider's queue");
+
+        // An abort keeps unwinding after the settle, so the window that would
+        // show a stopped message running is the one after it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(event) =
+            event_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            match event {
+                DriverEvent::TextDelta(delta) => assert!(
+                    !delta.contains("QUEUED-OK"),
+                    "a stopped message must not run afterwards: {delta:?}"
+                ),
+                DriverEvent::TurnStarted => {
+                    panic!("a stopped message must not start a run of its own")
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                _ => {}
+            }
+        }
     }
 
     #[test]
@@ -1819,6 +3616,7 @@ mod tests {
             flavor: PiFlavor::Pi,
             commands,
             computer_use: None,
+            dialogs: PiDialogs::default(),
         };
         let options = |mode| SessionOptions {
             mode,
@@ -2414,5 +4212,612 @@ mod tests {
             event_rx.recv().unwrap(),
             DriverEvent::TurnFinished { success: true, .. }
         ));
+    }
+
+    #[test]
+    fn a_workflow_child_completion_lands_on_the_background_work_surface() {
+        // pi-subagents reports a background child's settle as a custom
+        // message. That message is the only signal the parent's session gets
+        // that the child finished, and detached work is already the surface
+        // for it, so it must not be dropped with the rest of the ignored
+        // stream.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({
+                "type": "message_start",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent-incremental-child-notify",
+                    "display": false,
+                    "content": "Workflow child completed: **build**\nWorkflow run: wf-1\nStatus: workflow finished"
+                }
+            }),
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent-incremental-child-notify",
+                    "display": false,
+                    "content": "Workflow child completed: **build**\nWorkflow run: wf-1\nStatus: workflow finished"
+                }
+            }),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) =
+            event_rx.recv().unwrap()
+        else {
+            panic!("a subagent child completion must land on the background-work surface")
+        };
+        assert_eq!(item.key.kind, BackgroundWorkKind::Subagent);
+        assert_eq!(item.title, "build", "the surface names the child");
+        assert_eq!(item.status, BackgroundWorkStatus::Completed);
+        assert!(
+            item.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("workflow finished"))
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "one completion must produce exactly one surface update"
+        );
+        assert!(!state.run.is_live());
+    }
+
+    #[test]
+    fn a_failed_background_task_lands_on_the_background_work_surface() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent-notify",
+                    "display": true,
+                    "content": "Background task failed: **code-auditor**\n\n(no output)"
+                }
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) =
+            event_rx.recv().unwrap()
+        else {
+            panic!("a background task notification must land on the background-work surface")
+        };
+        assert_eq!(item.key.kind, BackgroundWorkKind::Subagent);
+        assert_eq!(item.title, "code-auditor");
+        assert_eq!(item.status, BackgroundWorkStatus::Failed);
+    }
+
+    #[test]
+    fn a_child_named_after_an_outcome_settles_by_its_own_header() {
+        // pi-subagents words the header as "<what happened>: **<child key>**",
+        // and the key is the workflow's own: one called `retry-failed`
+        // completed, so the outcome cannot be read from the whole line.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent-incremental-child-notify",
+                    "display": false,
+                    "content": "Workflow child completed: **retry-failed**\nWorkflow run: wf-1\nStatus: workflow finished"
+                }
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) =
+            event_rx.recv().unwrap()
+        else {
+            panic!("a settled child belongs on the detached-work surface")
+        };
+        assert_eq!(item.title, "retry-failed");
+        assert_eq!(item.status, BackgroundWorkStatus::Completed);
+    }
+
+    #[test]
+    fn another_extension_message_becomes_a_notice() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent_control_notice",
+                    "display": true,
+                    "content": "Workflow paused."
+                }
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::ExtensionMessage { custom_type, text, display }
+                if custom_type == "subagent_control_notice"
+                    && text == "Workflow paused."
+                    && display
+        ));
+    }
+
+    #[test]
+    fn an_extension_message_marked_not_for_display_is_still_delivered() {
+        // Pi hides these from its own conversation, so the client adds no
+        // conversation row for one. Which is only possible if the flag survives
+        // the transport. The one exception is pi-subagents' detached-child
+        // records, which the client shows on the work surface instead.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "custom",
+                    "customType": "subagent-compaction-resume",
+                    "display": false,
+                    "content": "Context compaction resumed."
+                }
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::ExtensionMessage { custom_type, text, display }
+                if custom_type == "subagent-compaction-resume"
+                    && text == "Context compaction resumed."
+                    && !display
+        ));
+    }
+
+    #[test]
+    fn an_extension_notification_carries_its_severity() {
+        // pi-subagents reports a failed child through `notify`, and the
+        // severity is what tells the user whether anything went wrong: the
+        // app's own notice surface shows the difference.
+        let events = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-5",
+            "method": "notify",
+            "message": "Subagent failed: **code-auditor**",
+            "notifyType": "error"
+        }));
+
+        assert!(matches!(
+            events.as_slice(),
+            [DriverEvent::ExtensionNotification { message, severity }]
+                if message == "Subagent failed: **code-auditor**"
+                    && *severity == NotificationSeverity::Error
+        ));
+    }
+
+    #[test]
+    fn an_extension_status_lives_on_its_key_and_clears_when_the_extension_clears_it() {
+        // Pi keys its status entries by the extension's own key, and reports a
+        // clear as the same method with no text. Both halves have to reach the
+        // client: the first is the progress line the user watches, the second
+        // is what takes it down again.
+        let set = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-7",
+            "method": "setStatus",
+            "statusKey": "subagent-slash",
+            "statusText": "running..."
+        }));
+        assert!(matches!(
+            set.as_slice(),
+            [DriverEvent::ExtensionStatus { key, text }]
+                if key == "subagent-slash" && text.as_deref() == Some("running...")
+        ));
+
+        let cleared = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-8",
+            "method": "setStatus",
+            "statusKey": "subagent-slash"
+        }));
+        assert!(matches!(
+            cleared.as_slice(),
+            [DriverEvent::ExtensionStatus { key, text }]
+                if key == "subagent-slash" && text.is_none()
+        ));
+    }
+
+    #[test]
+    fn a_notification_without_a_severity_is_informational() {
+        // `notifyType` is optional, and an omission means to Pi exactly what it
+        // means here.
+        let events = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-6",
+            "method": "notify",
+            "message": "Model registry refreshed."
+        }));
+
+        assert!(matches!(
+            events.as_slice(),
+            [DriverEvent::ExtensionNotification { severity, .. }]
+                if *severity == NotificationSeverity::Info
+        ));
+    }
+
+    #[test]
+    fn an_extension_widget_keeps_its_lines_and_its_placement() {
+        let set = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-9",
+            "method": "setWidget",
+            "widgetKey": "subagent-fleet",
+            "widgetLines": ["--- fleet ---", "2 running"],
+            "widgetPlacement": "belowEditor"
+        }));
+        let [event] = set.as_slice() else {
+            panic!("a widget update must be the only event its request produces")
+        };
+        let DriverEvent::ExtensionWidget {
+            key,
+            lines,
+            placement,
+        } = event
+        else {
+            panic!("a setWidget request must reach the client as a widget update")
+        };
+        assert_eq!(key, "subagent-fleet");
+        assert_eq!(
+            lines.as_deref(),
+            Some(["--- fleet ---".to_owned(), "2 running".to_owned()].as_slice())
+        );
+        assert_eq!(*placement, ExtensionWidgetPlacement::BelowEditor);
+
+        // Pi defaults the placement to the editor's own edge.
+        let defaulted = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-10",
+            "method": "setWidget",
+            "widgetKey": "subagent-fleet",
+            "widgetLines": ["1 running"]
+        }));
+        let [DriverEvent::ExtensionWidget { placement, .. }] = defaulted.as_slice() else {
+            panic!("a widget update must be the only event its request produces")
+        };
+        assert_eq!(*placement, ExtensionWidgetPlacement::AboveEditor);
+    }
+
+    #[test]
+    fn an_extension_widget_lives_on_its_key_and_clears_when_the_extension_clears_it() {
+        let events = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-11",
+            "method": "setWidget",
+            "widgetKey": "subagent-fleet"
+        }));
+
+        assert!(matches!(
+            events.as_slice(),
+            [DriverEvent::ExtensionWidget { key, lines, .. }]
+                if key == "subagent-fleet" && lines.is_none()
+        ));
+    }
+
+    #[test]
+    fn an_extension_title_and_editor_text_reach_the_client() {
+        // Neither surface has a fallback in the transport: the app is the only
+        // place they can be shown.
+        let titled = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-12",
+            "method": "setTitle",
+            "title": "pi - waku-pi1-wt/t16"
+        }));
+        assert!(matches!(
+            titled.as_slice(),
+            [DriverEvent::ExtensionTitle { title }] if title == "pi - waku-pi1-wt/t16"
+        ));
+
+        let edited = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-13",
+            "method": "set_editor_text",
+            "text": "review the diff"
+        }));
+        assert!(matches!(
+            edited.as_slice(),
+            [DriverEvent::ExtensionEditorText { text }] if text == "review the diff"
+        ));
+    }
+
+    #[test]
+    fn a_dialog_reaches_the_client_instead_of_being_cancelled_on_arrival() {
+        // The provider blocks the extension until the question is answered, so
+        // cancelling it on arrival is what made every dialog unusable. It has
+        // to become a request the user can see; nothing is written back until
+        // they answer or dismiss it.
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-1",
+            "method": "select",
+            "title": "Allow dangerous command?",
+            "options": ["Allow", "Block"]
+        }));
+
+        let question = harness.question();
+        assert_eq!(question.question, "Allow dangerous command?");
+        assert_eq!(
+            question
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Allow", "Block"]
+        );
+        assert!(
+            harness.command_rx.try_recv().is_err(),
+            "no response is written before the user answers"
+        );
+    }
+
+    #[test]
+    fn an_unknown_method_is_cancelled_so_the_provider_is_not_left_waiting() {
+        // A method the client cannot present is answered immediately: if it is
+        // a dialog the extension is blocked on it, and the client has no way
+        // to show it.
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-9",
+            "method": "custom",
+            "title": "Pick a canvas"
+        }));
+
+        assert!(
+            harness.event_rx.try_recv().is_err(),
+            "an unknown method has no surface"
+        );
+        assert!(matches!(
+            harness.command_rx.try_recv(),
+            Ok(CommandMessage::CancelExtensionRequest(id)) if id == "uuid-9"
+        ));
+    }
+
+    #[test]
+    fn answering_a_dialog_returns_the_value_the_provider_expects() {
+        // select, input and editor all answer with `value`; the chosen option
+        // label is what Pi compares against its own option list.
+        for (request, answer, expected) in [
+            (
+                json!({
+                    "type": "extension_ui_request",
+                    "id": "uuid-1",
+                    "method": "select",
+                    "title": "Allow dangerous command?",
+                    "options": ["Allow", "Block"]
+                }),
+                "Block",
+                "Block",
+            ),
+            (
+                json!({
+                    "type": "extension_ui_request",
+                    "id": "uuid-3",
+                    "method": "input",
+                    "title": "Enter a value",
+                    "placeholder": "type something..."
+                }),
+                "deploy to preview",
+                "deploy to preview",
+            ),
+            (
+                json!({
+                    "type": "extension_ui_request",
+                    "id": "uuid-4",
+                    "method": "editor",
+                    "title": "Edit some text",
+                    "prefill": "Line 1"
+                }),
+                "Line 1\nedited",
+                "Line 1\nedited",
+            ),
+        ] {
+            let id = request["id"].as_str().unwrap().to_owned();
+            let mut harness = DialogHarness::new();
+            harness.open(request);
+            let _ = harness.question();
+            harness.driver.respond_user_input(
+                id.clone(),
+                vec![UserInputAnswer {
+                    question_id: id.clone(),
+                    answers: vec![answer.to_owned()],
+                }],
+            );
+            assert!(
+                matches!(
+                    harness.command_rx.try_recv(),
+                    Ok(CommandMessage::ExtensionUiResponse(value))
+                        if value == json!({
+                            "type": "extension_ui_response",
+                            "id": id,
+                            "value": expected,
+                        })
+                ),
+                "{answer:?} must answer as {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_confirmation_answers_with_a_boolean() {
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-2",
+            "method": "confirm",
+            "title": "Clear session?",
+            "message": "All messages will be lost."
+        }));
+        let question = harness.question();
+        assert_eq!(question.question, "All messages will be lost.");
+        let labels: Vec<&str> = question
+            .options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect();
+        assert_eq!(labels, ["Yes", "No"]);
+
+        harness.driver.respond_user_input(
+            "uuid-2".into(),
+            vec![UserInputAnswer {
+                question_id: "uuid-2".into(),
+                answers: vec!["No".into()],
+            }],
+        );
+        assert!(matches!(
+            harness.command_rx.try_recv(),
+            Ok(CommandMessage::ExtensionUiResponse(value))
+                if value == json!({
+                    "type": "extension_ui_response",
+                    "id": "uuid-2",
+                    "confirmed": false,
+                })
+        ));
+    }
+
+    #[test]
+    fn dismissing_a_dialog_cancels_it_with_the_provider() {
+        // Dismissing is the cancellation the extension reads as `undefined`,
+        // not a value from an option the user never chose.
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-1",
+            "method": "select",
+            "title": "Allow dangerous command?",
+            "options": ["Allow", "Block"]
+        }));
+        let _ = harness.question();
+
+        harness.driver.respond_user_input(
+            "uuid-1".into(),
+            vec![UserInputAnswer {
+                question_id: "uuid-1".into(),
+                answers: Vec::new(),
+            }],
+        );
+        assert!(matches!(
+            harness.command_rx.try_recv(),
+            Ok(CommandMessage::ExtensionUiResponse(value))
+                if value == json!({
+                    "type": "extension_ui_response",
+                    "id": "uuid-1",
+                    "cancelled": true,
+                })
+        ));
+    }
+
+    #[test]
+    fn an_answer_to_a_dialog_that_is_not_open_is_dropped() {
+        // The provider correlates responses by id; one for a request it never
+        // sent, or a second answer to the same one, would be a reply to a
+        // question that is no longer being asked.
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-1",
+            "method": "select",
+            "title": "Allow dangerous command?",
+            "options": ["Allow", "Block"]
+        }));
+        let _ = harness.question();
+        let answer = |answers: Vec<String>| {
+            vec![UserInputAnswer {
+                question_id: "uuid-1".into(),
+                answers,
+            }]
+        };
+
+        harness
+            .driver
+            .respond_user_input("uuid-other".into(), answer(vec!["Allow".into()]));
+        harness
+            .driver
+            .respond_user_input("uuid-1".into(), answer(vec!["Allow".into()]));
+        assert!(matches!(
+            harness.command_rx.try_recv(),
+            Ok(CommandMessage::ExtensionUiResponse(value))
+                if value == json!({
+                    "type": "extension_ui_response",
+                    "id": "uuid-1",
+                    "value": "Allow",
+                })
+        ));
+
+        harness
+            .driver
+            .respond_user_input("uuid-1".into(), answer(vec!["Block".into()]));
+        assert!(
+            harness.command_rx.try_recv().is_err(),
+            "a dialog is answered once"
+        );
+    }
+
+    #[test]
+    fn a_dialog_the_run_settled_without_answering_is_no_longer_answerable() {
+        // A settlement ends the run the dialog belonged to. Whatever the
+        // client still shows for it, the provider has moved on (its own
+        // timeout resolves an abandoned dialog), so an answer must not be
+        // written back as if the question were still open.
+        let mut harness = DialogHarness::new();
+        harness.open(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-1",
+            "method": "confirm",
+            "title": "Clear session?",
+            "message": "All messages will be lost."
+        }));
+        let _ = harness.question();
+
+        harness.open(json!({"type": "agent_settled"}));
+        harness.driver.respond_user_input(
+            "uuid-1".into(),
+            vec![UserInputAnswer {
+                question_id: "uuid-1".into(),
+                answers: vec!["Yes".into()],
+            }],
+        );
+        assert!(
+            harness.command_rx.try_recv().is_err(),
+            "the settled run's dialog is not answered afterwards"
+        );
     }
 }

@@ -30,6 +30,144 @@ impl Waku {
         }
     }
 
+    /// Records a settlement the provider reported as a refused prompt, and
+    /// whether this settlement was one.
+    ///
+    /// The prompt never reached the conversation, so the user's message is
+    /// marked not delivered with the provider's own reason instead of being
+    /// answered, and the turn that existed only for it is dropped. A turn the
+    /// provider had already started is not a refusal: the run failed, and the
+    /// settlement is that turn's outcome.
+    fn record_refused_prompt(
+        &mut self,
+        session_id: Uuid,
+        runtime: &mut SessionRuntime,
+        summary: Option<&str>,
+    ) -> bool {
+        let Some(session) = self.state.session_mut(session_id) else {
+            return false;
+        };
+        let reason = match summary {
+            Some(summary) => compact_driver_error(summary),
+            // A refusal with no reason of its own still did not deliver the
+            // message, and naming the provider says who refused it.
+            None => tr!(
+                "errors.provider_rejected_prompt",
+                provider = session.provider.display_name()
+            ),
+        };
+        if !session.mark_active_prompt_undelivered(&reason) {
+            return false;
+        }
+        runtime.last_driver_error = None;
+        self.state.mark_session_dirty(session_id);
+        true
+    }
+
+    /// Hand back the queued messages a settlement took out of the provider's
+    /// queue. They never reached the conversation, so they leave the transcript
+    /// and their text returns to the user — the composer when this session is
+    /// the one on screen, and its stored draft when it is not, so a background
+    /// session's message cannot land in someone else's input. A turn that
+    /// existed only for them goes with them, rather than settling as an
+    /// answerless turn.
+    fn return_retracted_messages(
+        &mut self,
+        session_id: Uuid,
+        texts: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let selected = self.state.selected_session == Some(session_id);
+        let previous_kinds = self.snapshot_selected_transcript_rows(session_id);
+        if selected {
+            // The visible composer reaches its draft slot on a debounce, and the
+            // returned text has to land beside the newest keystrokes rather than
+            // behind them.
+            self.capture_current_composer_draft(cx);
+        }
+        let Some(returned) = self
+            .state
+            .session_mut(session_id)
+            .map(|session| session.take_retracted_queue_messages(texts))
+        else {
+            return;
+        };
+        if returned.is_empty() {
+            return;
+        }
+        let key = crate::persistence::ComposerDraftKey::Session(session_id);
+        let draft = returned_messages_draft(self.composer_drafts.get(key), &returned);
+        if self.composer_drafts.set(key, draft) {
+            self.schedule_composer_draft_save(cx);
+        }
+        if selected {
+            self.restore_selected_composer_draft(cx);
+        }
+        self.state.mark_session_dirty(session_id);
+        if let Some(previous_kinds) = previous_kinds.as_deref() {
+            self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
+        }
+        cx.notify();
+    }
+
+    /// Hand back the messages the provider still holds, which a stop is about
+    /// to take out of its queue: the transport clears the queue before it
+    /// aborts, so without this the text a stopped turn removed would be gone.
+    /// The stopped messages reach the user through the same retraction a
+    /// settlement performs.
+    pub(super) fn return_stopped_queue_messages(
+        &mut self,
+        session_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        let texts = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.provider_queued_texts())
+            .unwrap_or_default();
+        if texts.is_empty() {
+            return;
+        }
+        self.return_retracted_messages(session_id, &texts, cx);
+    }
+
+    /// The stored prompt each provider queue report entry names, in the
+    /// report's order.
+    ///
+    /// A report speaks the transport's language — templates expanded, skills
+    /// in provider syntax — while the transcript keeps what the user typed, so
+    /// each entry is resolved back through the same seam its submission used
+    /// before the pending list is matched against it.
+    fn provider_queue_texts(&self, session_id: Uuid, report: &[String]) -> Vec<String> {
+        let Some((provider, stored)) = self.stored_prompt_texts(session_id) else {
+            return report.to_vec();
+        };
+        stored_queue_texts(provider, &self.slash_command_index, &stored, report)
+    }
+
+    /// The prompts the transcript holds for a session, newest first: the list
+    /// every provider queue report is resolved against.
+    ///
+    /// A `queue_update` names both of its queues, and both name the same
+    /// stored prompts, so the transcript is read once for the pair.
+    fn stored_prompt_texts(&self, session_id: Uuid) -> Option<(ProviderKind, Vec<String>)> {
+        let session = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)?;
+        let stored = session
+            .messages
+            .iter()
+            .rev()
+            .filter(|message| message.role == MessageRole::User)
+            .map(|message| message.content.clone())
+            .collect();
+        Some((session.provider, stored))
+    }
+
     pub(super) fn finish_streaming_assistant(&mut self, session_id: Uuid) {
         if let Some(session) = self.state.session_mut(session_id) {
             for message in &mut session.messages {
@@ -345,20 +483,7 @@ impl Waku {
                         // a `/goal` began: the provider's start confirms it.
                         session.mark_active_turn_provider_started();
                         session.status = SessionStatus::Working;
-                    } else if matches!(
-                        session.provider,
-                        ProviderKind::Codex | ProviderKind::Claude | ProviderKind::OpenCode
-                    ) {
-                        // Some providers start turns on their own: Codex goal
-                        // continuation pursues an active goal whenever the
-                        // thread is idle, and Claude Code re-enters the model
-                        // once a backgrounded command, subagent or monitor
-                        // settles. Give the turn a transcript home — there is
-                        // no user message for it — so its work streams in
-                        // instead of being dropped.
-                        session.begin_provider_turn();
-                        session.mark_active_turn_provider_started();
-                        session.status = SessionStatus::Working;
+                    } else if begin_provider_initiated_turn(session) {
                         self.state.mark_session_dirty(session_id);
                     }
                 }
@@ -465,6 +590,42 @@ impl Waku {
                 // `accepts_turn_output` deliberately.
                 self.handle_background_work_event(session_id, event);
             }
+            DriverEvent::ExtensionMessage { text, display, .. } => {
+                if let Some(session) = self.state.session_mut(session_id) {
+                    record_extension_message(session, text, display);
+                }
+            }
+            DriverEvent::ExtensionNotification { message, severity } => {
+                // The provider records nothing for a notification — it is not a
+                // message in its session tree — so the notice surface is the
+                // only place it can land. It is shown whichever session is on
+                // screen: pi-subagents reports a failed child this way, and
+                // silence about work that was started here is the failure the
+                // notification exists to prevent.
+                self.show_toast_with_tone(message, extension_notification_tone(severity));
+            }
+            DriverEvent::ExtensionStatus { key, text } => {
+                if let Some(session) = self.state.session_mut(session_id) {
+                    set_extension_status(session, key, text);
+                }
+            }
+            DriverEvent::ExtensionWidget {
+                key,
+                lines,
+                placement,
+            } => {
+                if let Some(session) = self.state.session_mut(session_id) {
+                    set_extension_widget(session, key, lines, placement);
+                }
+            }
+            DriverEvent::ExtensionTitle { title } => {
+                if let Some(session) = self.state.session_mut(session_id) {
+                    set_extension_window_title(session, title);
+                }
+            }
+            DriverEvent::ExtensionEditorText { text } => {
+                self.apply_extension_editor_text(session_id, text, cx);
+            }
             DriverEvent::Permission {
                 request_id,
                 title,
@@ -488,13 +649,27 @@ impl Waku {
                 request_id,
                 questions,
             } => {
-                if self.accepts_turn_output(session_id) && !questions.is_empty() {
-                    runtime.pending_user_input = Some(PendingUserInput::new(request_id, questions));
+                // A provider whose dismissal is a cancellation (Pi's extension
+                // dialogs) can ask outside a turn: an extension command opens
+                // the dialog before any run starts, and dropping it there
+                // would leave the extension blocked. A structured question
+                // still belongs to the turn that asked it.
+                let dismissible = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .is_some_and(|session| session.provider.supports_user_input_cancellation());
+                if !questions.is_empty() && (dismissible || self.accepts_turn_output(session_id)) {
+                    runtime.pending_user_input =
+                        Some(PendingUserInput::new(request_id, questions, dismissible));
                     if self.state.selected_session == Some(session_id) {
                         self.user_input_answer
                             .update(cx, |input, cx| input.clear(cx));
                     }
-                    if let Some(session) = self.state.session_mut(session_id) {
+                    if let Some(session) = self.state.session_mut(session_id)
+                        && session.active_turn_id().is_some()
+                    {
                         session.status = SessionStatus::Waiting;
                     }
                 }
@@ -580,6 +755,31 @@ impl Waku {
                     self.enqueue_follow_up_submission(session_id, submission, cx);
                 }
             }
+            DriverEvent::ProviderQueue {
+                steering,
+                follow_up,
+            } => {
+                // The provider's own queue is the truth about what is still on
+                // its way: a message in it is queued, and one it leaves out has
+                // been delivered.
+                if let Some((provider, stored)) = self.stored_prompt_texts(session_id) {
+                    let commands = &self.slash_command_index;
+                    let steering = stored_queue_texts(provider, commands, &stored, &steering);
+                    let follow_up = stored_queue_texts(provider, commands, &stored, &follow_up);
+                    if let Some(session) = self.state.session_mut(session_id)
+                        && session.mark_provider_queue(&steering, &follow_up)
+                    {
+                        self.state.mark_session_dirty(session_id);
+                    }
+                }
+            }
+            DriverEvent::QueuedMessagesRetracted { messages } => {
+                // No run will carry these, so they leave the transcript and
+                // their text goes back to the user. The settle that caused it
+                // arrives next.
+                let messages = self.provider_queue_texts(session_id, &messages);
+                self.return_retracted_messages(session_id, &messages, cx);
+            }
             DriverEvent::PlanUsageUpdated(usage) => {
                 if let Some(provider) = self
                     .state
@@ -635,6 +835,15 @@ impl Waku {
                 summary,
                 interrupted,
             } => {
+                // A prompt the provider refused before accepting it settles as
+                // the delivery failure of the message that asked for the run:
+                // that message stays, marked undelivered with the reason, and
+                // the turn goes with it. Nothing ran, so the usual settlement
+                // — an answer row, a checkpoint, background work — would be
+                // reporting a turn that never happened.
+                if !success && self.record_refused_prompt(session_id, runtime, summary.as_deref()) {
+                    return true;
+                }
                 let (session_status, turn_status, background_status) =
                     Self::turn_settlement(success, interrupted);
                 self.settle_foreground_work(session_id, background_status);
@@ -892,6 +1101,229 @@ impl Waku {
         }
         runtime.computer_use_previews.push(preview);
     }
+
+    /// Put text an extension handed the composer (`set_editor_text`) where the
+    /// user will find it.
+    ///
+    /// It becomes the session's own draft, so a session in the background
+    /// keeps it until the user switches to it, and the visible composer only
+    /// takes it when that session is the one on screen. The draft is captured
+    /// first because the visible composer reaches its slot on a debounce, and
+    /// the extension's text belongs after the newest keystrokes, not behind
+    /// them.
+    fn apply_extension_editor_text(
+        &mut self,
+        session_id: Uuid,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = self.state.selected_session == Some(session_id);
+        if selected {
+            self.capture_current_composer_draft(cx);
+        }
+        let key = crate::persistence::ComposerDraftKey::Session(session_id);
+        let draft = extension_editor_text_draft(self.composer_drafts.get(key), text);
+        if self.composer_drafts.set(key, draft) {
+            self.schedule_composer_draft_save(cx);
+        }
+        if selected {
+            self.restore_selected_composer_draft(cx);
+        }
+        cx.notify();
+    }
+}
+
+/// The composer state a returned submission restores: the text the settlement
+/// handed back, in front of whatever the draft already held, with the
+/// returned message's own attachments and annotations kept alongside.
+pub(super) fn returned_messages_draft(
+    existing: Option<&crate::persistence::ComposerDraft>,
+    returned: &[Message],
+) -> crate::persistence::ComposerDraft {
+    let mut draft = existing.cloned().unwrap_or_default();
+    let returned_text = returned
+        .iter()
+        .map(|message| message.visible_content().trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let existing_text = std::mem::take(&mut draft.text);
+    draft.text = match (returned_text.is_empty(), existing_text.is_empty()) {
+        (true, _) => existing_text,
+        (false, true) => returned_text,
+        (false, false) => format!("{returned_text}\n\n{existing_text}"),
+    };
+    let mut attachments = returned
+        .iter()
+        .flat_map(|message| message.attachments.iter())
+        .map(super::drafts::draft_attachment)
+        .collect::<Vec<_>>();
+    attachments.extend(draft.attachments);
+    draft.attachments = attachments;
+    let mut annotations = returned
+        .iter()
+        .flat_map(|message| message.annotations.iter().cloned())
+        .collect::<Vec<_>>();
+    annotations.extend(draft.annotations);
+    draft.annotations = annotations;
+    draft
+}
+
+/// The stored prompt each provider queue report entry names.
+///
+/// The transport text and the transcript text differ wherever submission
+/// resolves one: a template expands, a skill takes the provider's syntax. A
+/// queue report names the message by the transport's text, so each entry is
+/// matched back to the newest stored prompt that resolves to it; an entry
+/// already in transport form (a steer's message) matches its own text as it
+/// is.
+///
+/// `stored` is newest first, so the match agrees with the newest-first rule
+/// the pending mark itself applies.
+pub(super) fn stored_queue_texts(
+    provider: ProviderKind,
+    commands: &[SlashCommand],
+    stored: &[String],
+    report: &[String],
+) -> Vec<String> {
+    report
+        .iter()
+        .map(|entry| {
+            stored
+                .iter()
+                .find(|prompt| {
+                    prompt.as_str() == entry
+                        || crate::composer_complete::resolved_submission(provider, prompt, commands)
+                            .as_deref()
+                            == Some(entry.as_str())
+                })
+                .cloned()
+                .unwrap_or_else(|| entry.clone())
+        })
+        .collect()
+}
+
+/// Records an extension message from the provider's own session tree.
+///
+/// A message the provider marked for display becomes a transcript notice, the
+/// same shape the app's own system lines take. A message the provider withheld
+/// from the conversation adds no row and is not kept beside one: nothing in the
+/// client renders it, and the provider's own session file is the record of a
+/// tree it owns.
+///
+/// Recording a message never opens a turn: Pi announces a run of its own with
+/// `agent_start`/`turn_start`, and a notice an extension appends without one
+/// must not fabricate it.
+pub(super) fn record_extension_message(session: &mut AgentSession, text: String, display: bool) {
+    if !display || text.trim().is_empty() {
+        return;
+    }
+    session.push_message(MessageRole::System, text);
+}
+
+/// Records a status entry an extension published for its session.
+///
+/// Pi keys these entries by the extension's own key, so setting a key again
+/// replaces its entry and `None` clears it: the session holds exactly the
+/// entries the extension still keeps, which is what the composer strip shows.
+pub(super) fn set_extension_status(session: &mut AgentSession, key: String, text: Option<String>) {
+    match text {
+        Some(text) => match session
+            .extension_status
+            .iter_mut()
+            .find(|entry| entry.key == key)
+        {
+            Some(entry) => entry.text = text,
+            None => session
+                .extension_status
+                .push(ExtensionStatusEntry { key, text }),
+        },
+        None => session.extension_status.retain(|entry| entry.key != key),
+    }
+}
+
+/// Records a widget an extension displays against the composer, keyed like a
+/// status entry: `lines` replaces that key's widget and `None` clears it.
+pub(super) fn set_extension_widget(
+    session: &mut AgentSession,
+    key: String,
+    lines: Option<Vec<String>>,
+    placement: ExtensionWidgetPlacement,
+) {
+    match lines {
+        Some(lines) => match session
+            .extension_widgets
+            .iter_mut()
+            .find(|widget| widget.key == key)
+        {
+            Some(widget) => {
+                widget.lines = lines;
+                widget.placement = placement;
+            }
+            None => session.extension_widgets.push(ExtensionWidget {
+                key,
+                lines,
+                placement,
+            }),
+        },
+        None => session.extension_widgets.retain(|widget| widget.key != key),
+    }
+}
+
+/// Records the window title an extension asked for on this session's behalf.
+///
+/// A blank title is how an extension takes that title down again, and the
+/// window then carries the platform's own title as it did before.
+pub(super) fn set_extension_window_title(session: &mut AgentSession, title: String) {
+    session.extension_window_title = (!title.trim().is_empty()).then_some(title);
+}
+
+/// The draft an extension's editor text leaves behind.
+///
+/// The text replaces what the draft held — an empty text is the extension
+/// clearing the editor — while the user's own attachments and annotations stay
+/// beside it, because the provider's editor is text-only and never carried
+/// them.
+pub(super) fn extension_editor_text_draft(
+    existing: Option<&crate::persistence::ComposerDraft>,
+    text: String,
+) -> crate::persistence::ComposerDraft {
+    let mut draft = existing.cloned().unwrap_or_default();
+    draft.text = text;
+    draft
+}
+
+/// Whether a provider's own stream may open a turn that no Waku prompt did.
+///
+/// Codex goal continuation pursues an active goal whenever its thread is idle,
+/// Claude Code re-enters the model once a backgrounded command, subagent or
+/// monitor settles, and Pi wakes its session when an extension posts a
+/// turn-triggering message. A provider absent here never gets a turn without a
+/// prompt.
+pub(super) fn provider_starts_turns_on_its_own(provider: ProviderKind) -> bool {
+    matches!(
+        provider,
+        ProviderKind::Codex
+            | ProviderKind::Claude
+            | ProviderKind::OpenCode
+            | ProviderKind::Pi
+            | ProviderKind::OhMyPi
+    )
+}
+
+/// Gives a run the provider started on its own a transcript home.
+///
+/// There is no user message for such a turn, so its work would otherwise be
+/// dropped. Only the provider's own run-start signal calls this, and an
+/// already-open turn is left to its own start report.
+pub(super) fn begin_provider_initiated_turn(session: &mut AgentSession) -> bool {
+    if session.active_turn_id().is_some() || !provider_starts_turns_on_its_own(session.provider) {
+        return false;
+    }
+    session.begin_provider_turn();
+    session.mark_active_turn_provider_started();
+    session.status = SessionStatus::Working;
+    true
 }
 
 /// Foreground output is stronger evidence of a started provider turn than a

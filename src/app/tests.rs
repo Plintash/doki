@@ -1,4 +1,6 @@
-use super::ComposerSubmission;
+use std::path::PathBuf;
+
+use super::ToastTone;
 use super::composer::{
     ComposerSubmitAction, annotation_comment_value, composer_submit_action, dropped_file_mention,
     merged_submission, next_picker_highlight, visible_branch_entries,
@@ -6,19 +8,23 @@ use super::composer::{
 use super::runtime::{merge_remote_session_catalog, session_has_active_provider_turn};
 use super::sessions::denial_answer;
 use super::settings::visible_settings_pages;
+use super::{ComposerAttachment, ComposerSubmission};
 use super::{
     ESCAPE_STOP_CONFIRMATION_TIMEOUT, EscapeStopConfirmation, EscapeStopPress, EscapeStopTarget,
     NAVIGATION_RAIL_TICK_HEIGHT, NAVIGATION_RAIL_TURN_HEIGHT, PendingUserInput, SessionNavigation,
     StreamDeltaKind, TranscriptRowKind::*, active_navigation_turn_index,
     append_text_delta_to_session, assistant_response_footer, assistant_response_footer_index,
-    assistant_response_footer_time, compact_driver_error, disclosure_leading_space, fenced_code,
-    fitted_file_tree_width, fitted_panel_widths, folded_transcript_row_kinds,
+    assistant_response_footer_time, begin_provider_initiated_turn, compact_driver_error,
+    disclosure_leading_space, extension_editor_text_draft, extension_notification_tone,
+    fenced_code, fitted_file_tree_width, fitted_panel_widths, folded_transcript_row_kinds,
     format_worked_duration, format_working_elapsed, maintain_transcript_anchor, message_opens_turn,
     message_starts_followup_turn, navigation_preview_snippet, navigation_rail_fade_visibility,
     navigation_rail_height, navigation_rail_scale, paused_toast_duration, pop_stream_batch,
-    push_transcript_activity, response_footer_message_index, response_row_turn_id,
-    session_accepts_turn_output, session_is_reapable, should_refresh_branch_after_activity,
-    should_show_navigation_rail, should_show_scroll_to_bottom, task_id_from_notification_tag,
+    push_transcript_activity, record_extension_message, response_footer_message_index,
+    response_row_turn_id, returned_messages_draft, session_accepts_turn_output,
+    session_is_reapable, set_extension_status, set_extension_widget, set_extension_window_title,
+    should_refresh_branch_after_activity, should_show_navigation_rail,
+    should_show_scroll_to_bottom, stored_queue_texts, task_id_from_notification_tag,
     task_notification_tag, transcript_anchor_end_space, transcript_navigation_turns,
     transcript_rests_at_tail, transcript_row_kinds, transcript_row_splice,
     transcript_rows_fingerprint, widened_panel_width_for_file_editor,
@@ -27,10 +33,182 @@ use super::{
 use crate::git_branch::BranchEntry;
 use crate::model::{
     ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget, Checkpoint,
-    CheckpointFile, CheckpointStatus, DriverEvent, Message, MessageAnnotation, MessageRole,
+    CheckpointFile, CheckpointStatus, DriverEvent, ExtensionStatusEntry, ExtensionWidgetPlacement,
+    Message, MessageAnnotation, MessageAttachment, MessageRole, NotificationSeverity,
     PendingPermission, PermissionOption, ProviderKind, ReasoningBlock, RuntimeEventCursor,
     SessionStatus, TextSpan, TranscriptBlock, TurnStatus, UserInputOption, UserInputQuestion,
 };
+
+#[test]
+fn a_retracted_message_returns_to_the_composer_in_front_of_its_draft() {
+    // A settlement that takes a queued message back hands the text to the
+    // user: it lands in the composer, in front of whatever was already typed,
+    // with the message's own presentation kept alongside.
+    let attachment = MessageAttachment {
+        path: PathBuf::from("/tmp/report.pdf"),
+        mention: "@report.pdf".into(),
+        name: "report.pdf".into(),
+        is_dir: false,
+        is_image: false,
+        blob_reference: Some("blob-1".into()),
+    };
+    let annotation = MessageAnnotation {
+        id: Uuid::new_v4(),
+        target: AnnotationTarget::MessageSpan {
+            message_id: Uuid::new_v4(),
+            spans: Vec::new(),
+            quote: "quoted".into(),
+            block: "block".into(),
+        },
+        comment: Some("keep this".into()),
+    };
+    let returned = vec![
+        Message::new(MessageRole::User, "@report.pdf and also")
+            .with_presentation(Some("and also".into()), vec![attachment])
+            .with_annotations(vec![annotation.clone()]),
+    ];
+    let existing = crate::persistence::ComposerDraft {
+        text: "half-written".into(),
+        attachments: Vec::new(),
+        annotations: Vec::new(),
+    };
+
+    let draft = returned_messages_draft(Some(&existing), &returned);
+    assert_eq!(draft.text, "and also\n\nhalf-written");
+    assert_eq!(draft.attachments.len(), 1);
+    assert_eq!(draft.attachments[0].name, "report.pdf");
+    assert_eq!(draft.annotations, vec![annotation]);
+
+    // An empty composer simply takes the text.
+    let draft = returned_messages_draft(None, &returned);
+    assert_eq!(draft.text, "and also");
+    assert_eq!(
+        returned_messages_draft(None, &[]).text,
+        "",
+        "nothing returned leaves the draft alone"
+    );
+}
+
+/// A queued prompt reaches the provider in its resolved form while the
+/// transcript keeps the typed one, so the provider's queue report names the
+/// message by text the transcript never stored. Reading the report back has to
+/// find the message anyway, or a queued template or skill prompt never shows
+/// pending and a stop cannot hand its text back.
+#[test]
+fn a_queue_report_entry_finds_the_typed_prompt_it_resolved_from() {
+    use crate::composer_complete::{CommandScope, SlashCommand};
+
+    let commands = vec![
+        SlashCommand {
+            name: "plan".into(),
+            description: String::new(),
+            scope: CommandScope::Skill,
+            argument_hint: None,
+            template: None,
+        },
+        SlashCommand {
+            name: "ship".into(),
+            description: String::new(),
+            scope: CommandScope::Project,
+            argument_hint: None,
+            template: Some("Release $ARGUMENTS now".into()),
+        },
+    ];
+
+    // Newest first, as the pending mark reads the transcript.
+    let stored = vec!["/plan tomorrow".to_owned(), "/ship it".to_owned()];
+    assert_eq!(
+        stored_queue_texts(
+            ProviderKind::Pi,
+            &commands,
+            &stored,
+            &[
+                "/skill:plan tomorrow".to_owned(),
+                "Release it now".to_owned()
+            ],
+        ),
+        vec!["/plan tomorrow".to_owned(), "/ship it".to_owned()],
+        "a skill and a template both resolve away from the typed text"
+    );
+
+    // An entry that matches a stored prompt directly (a steer keeps the
+    // transport text the provider will echo) and one the client cannot place
+    // are kept as they are, so the pending mark stays the provider's queue and
+    // a message it does not name stays delivered.
+    assert_eq!(
+        stored_queue_texts(
+            ProviderKind::Pi,
+            &commands,
+            &["/plan tomorrow".to_owned()],
+            &["/plan tomorrow".to_owned(), "unrecognised".to_owned()],
+        ),
+        vec!["/plan tomorrow".to_owned(), "unrecognised".to_owned()]
+    );
+}
+
+/// A prompt the provider refuses before accepting it never runs, so the
+/// settlement is the delivery failure of the message that asked for it. The
+/// user's own words stay in the transcript, marked not delivered with the
+/// provider's reason; no answer row is made for a turn that never happened.
+#[test]
+fn a_refused_prompt_leaves_its_message_undelivered_and_unanswered() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    session.begin_turn("run the tests");
+    session.status = SessionStatus::Connecting;
+
+    assert!(
+        session
+            .mark_active_prompt_undelivered("Pi rejected the prompt: Agent is already processing")
+    );
+
+    assert_eq!(
+        folded_transcript_row_kinds(&session, &HashSet::new()),
+        vec![Message(0)],
+        "the prompt is the only row: nothing answers it"
+    );
+    assert!(session.active_turn_id().is_none());
+    assert_eq!(
+        session.status,
+        SessionStatus::Idle,
+        "the next prompt can run"
+    );
+    assert_eq!(
+        composer_submit_action(Some(session.status), false),
+        ComposerSubmitAction::Send,
+        "a refused prompt leaves nothing for the next one to queue behind"
+    );
+    let prompt = &session.messages[0];
+    assert_eq!(prompt.role, MessageRole::User);
+    assert_eq!(
+        prompt.undelivered_reason.as_deref(),
+        Some("Pi rejected the prompt: Agent is already processing")
+    );
+    assert!(!prompt.pending);
+    assert!(
+        !session
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Assistant),
+        "the provider's refusal is never stored as a reply"
+    );
+}
+
+#[test]
+fn a_run_that_failed_after_it_started_is_not_a_refused_prompt() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    let turn = session.begin_turn("run the tests");
+    session.mark_active_turn_provider_started();
+    session.status = SessionStatus::Working;
+
+    assert!(
+        !session.mark_active_prompt_undelivered("the provider gave up"),
+        "the prompt reached a run, so its failure is the turn's, not the delivery's"
+    );
+
+    assert_eq!(session.active_turn_id(), Some(turn));
+    assert_eq!(session.messages.len(), 1);
+    assert!(session.messages[0].undelivered_reason.is_none());
+}
 
 #[test]
 fn a_blank_comment_field_stores_no_comment() {
@@ -207,7 +385,7 @@ fn structured_user_input_preserves_question_order_and_custom_answer_precedence()
             multi_select: false,
         },
     ];
-    let mut pending = PendingUserInput::new("request-1".into(), questions);
+    let mut pending = PendingUserInput::new("request-1".into(), questions, false);
     pending
         .selections
         .insert("environment".into(), vec!["Preview".into()]);
@@ -223,6 +401,68 @@ fn structured_user_input_preserves_question_order_and_custom_answer_precedence()
     assert_eq!(answers[0].answers, ["Preview"]);
     assert_eq!(answers[1].question_id, "notes");
     assert_eq!(answers[1].answers, ["Use the EU region"]);
+}
+
+/// An extension's dialog is the same question surface with one extra move:
+/// dismissing it sends no answer at all, which the transport turns into the
+/// cancellation the provider reads as \"the user did not choose\".
+#[test]
+fn a_dismissible_dialog_answers_with_its_choice_or_dismisses_with_nothing() {
+    let question = UserInputQuestion {
+        id: "uuid-1".into(),
+        header: String::new(),
+        question: "Allow dangerous command?".into(),
+        options: vec![
+            UserInputOption {
+                label: "Allow".into(),
+                description: None,
+            },
+            UserInputOption {
+                label: "Block".into(),
+                description: None,
+            },
+        ],
+        multi_select: false,
+    };
+    let mut pending = PendingUserInput::new("uuid-1".into(), vec![question], true);
+    assert!(pending.dismissible);
+
+    pending
+        .selections
+        .insert("uuid-1".into(), vec!["Block".into()]);
+    let answers = pending.answers();
+    assert_eq!(answers[0].question_id, "uuid-1");
+    assert_eq!(answers[0].answers, ["Block"]);
+
+    // Dismissing discards any selection: a cancellation must not carry a value
+    // the user never confirmed by submitting.
+    let dismissal = pending.dismissal();
+    assert_eq!(dismissal[0].question_id, "uuid-1");
+    assert!(
+        dismissal[0].answers.is_empty(),
+        "a dismissal sends no answer for the provider to read as a choice"
+    );
+}
+
+/// Only a provider whose transport carries a cancellation gets the dismiss
+/// move; a structured question has no way to be taken back.
+#[test]
+fn only_a_transport_with_a_cancellation_gets_a_dismissible_question() {
+    assert!(ProviderKind::Pi.supports_user_input_cancellation());
+    assert!(ProviderKind::OhMyPi.supports_user_input_cancellation());
+    for provider in [
+        ProviderKind::Claude,
+        ProviderKind::Codex,
+        ProviderKind::OpenCode,
+        ProviderKind::Cursor,
+        ProviderKind::DeepSeek,
+        ProviderKind::Amp,
+    ] {
+        assert!(
+            !provider.supports_user_input_cancellation(),
+            "{provider:?} has no cancellation response"
+        );
+    }
 }
 use gpui::{ListAlignment, ListState, Pixels, px};
 use std::{
@@ -2348,4 +2588,249 @@ fn the_rail_draws_only_installed_providers_the_settings_left_on() {
         Some(ProviderKind::Claude),
         ProviderKind::Claude
     ));
+}
+
+/// A Pi run the agent starts on its own — an extension waking the session —
+/// has no user message and no submission. The provider's own start signal is
+/// the only thing that may open its turn, and once open the turn must accept
+/// output exactly as a prompted one does.
+#[test]
+fn a_pi_run_the_agent_starts_opens_a_transcript_home() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    let session_id = session.id;
+
+    assert!(begin_provider_initiated_turn(&mut session));
+    assert!(session.active_turn_id().is_some());
+    assert_eq!(session.status, SessionStatus::Working);
+    let turn_id = session.active_turn_id();
+
+    // Its deltas land in the turn that was opened, exactly as a prompted
+    // turn's would, so the wake's reply reaches the transcript.
+    assert!(session_accepts_turn_output(&mut session));
+    let mut sessions = vec![session];
+    append_text_delta_to_session(&mut sessions, session_id, false, "Waking".into());
+    assert_eq!(sessions[0].messages.len(), 1);
+    assert_eq!(sessions[0].messages[0].role, MessageRole::Assistant);
+    assert_eq!(sessions[0].messages[0].turn_id, turn_id);
+    assert_eq!(sessions[0].messages[0].content, "Waking");
+
+    // A provider whose stream cannot start a turn never fabricates one.
+    let mut other = AgentSession::new(Uuid::new_v4(), ProviderKind::DeepSeek);
+    assert!(!begin_provider_initiated_turn(&mut other));
+    assert!(other.active_turn_id().is_none());
+    assert_eq!(other.status, SessionStatus::Idle);
+}
+
+/// An extension message with no run behind it is appended to the session, not
+/// a turn: nothing about a notice may make the client look busy.
+#[test]
+fn an_extension_message_that_starts_no_run_opens_no_turn() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+
+    record_extension_message(&mut session, "Workflow paused.".into(), true);
+
+    assert!(session.active_turn_id().is_none());
+    assert_eq!(session.status, SessionStatus::Idle);
+}
+
+/// The provider hides `display: false` records from the conversation, so the
+/// client adds no row for one and keeps nothing beside it: the provider's own
+/// session file is the record of its tree, and a copy nothing renders would be
+/// a second one.
+#[test]
+fn a_hidden_extension_message_adds_no_row() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+
+    record_extension_message(&mut session, "Context compaction resumed.".into(), false);
+
+    assert!(session.messages.is_empty(), "nothing is rendered for it");
+    assert!(folded_transcript_row_kinds(&session, &HashSet::new()).is_empty());
+}
+
+/// Everything else the provider marks for display becomes a transcript
+/// notice, the same shape the app's own system lines take.
+#[test]
+fn a_visible_extension_message_becomes_a_transcript_notice() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+
+    record_extension_message(&mut session, "Workflow paused.".into(), true);
+
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].role, MessageRole::System);
+    assert_eq!(session.messages[0].content, "Workflow paused.");
+    assert_eq!(
+        folded_transcript_row_kinds(&session, &HashSet::new()),
+        [Message(0)]
+    );
+}
+
+/// An extension's status is keyed, and it lives on the session: it shows while
+/// the extension keeps it and goes away when the extension clears that key.
+#[test]
+fn an_extension_status_shows_while_it_is_kept_and_goes_when_it_is_cleared() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+
+    set_extension_status(
+        &mut session,
+        "subagent-slash".into(),
+        Some("running...".into()),
+    );
+    assert_eq!(session.extension_status.len(), 1);
+    assert_eq!(session.extension_status[0].key, "subagent-slash");
+    assert_eq!(session.extension_status[0].text, "running...");
+
+    // Pi keys the entries, so a second set on the same key replaces that
+    // entry instead of stacking another line.
+    set_extension_status(
+        &mut session,
+        "subagent-slash".into(),
+        Some("2 live | 12 tools".into()),
+    );
+    assert_eq!(session.extension_status.len(), 1);
+    assert_eq!(session.extension_status[0].text, "2 live | 12 tools");
+
+    // Another key is another entry, and clearing one leaves the other alone.
+    set_extension_status(
+        &mut session,
+        "subagent-slash-text".into(),
+        Some("inspecting".into()),
+    );
+    set_extension_status(&mut session, "subagent-slash".into(), None);
+    assert_eq!(session.extension_status.len(), 1);
+    assert_eq!(session.extension_status[0].key, "subagent-slash-text");
+}
+
+/// A widget is keyed like a status entry and keeps both its lines and the side
+/// of the composer it asked for; clearing the key takes it down.
+#[test]
+fn an_extension_widget_keeps_its_lines_and_placement_until_it_is_cleared() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+
+    set_extension_widget(
+        &mut session,
+        "subagent-fleet".into(),
+        Some(vec!["--- fleet ---".into(), "2 running".into()]),
+        ExtensionWidgetPlacement::BelowEditor,
+    );
+    assert_eq!(session.extension_widgets.len(), 1);
+    assert_eq!(session.extension_widgets[0].key, "subagent-fleet");
+    assert_eq!(
+        session.extension_widgets[0].lines,
+        ["--- fleet ---", "2 running"]
+    );
+    assert_eq!(
+        session.extension_widgets[0].placement,
+        ExtensionWidgetPlacement::BelowEditor
+    );
+
+    // Setting the key again replaces the widget, placement included: one
+    // widget can move, it does not become two.
+    set_extension_widget(
+        &mut session,
+        "subagent-fleet".into(),
+        Some(vec!["1 running".into()]),
+        ExtensionWidgetPlacement::AboveEditor,
+    );
+    assert_eq!(session.extension_widgets.len(), 1);
+    assert_eq!(session.extension_widgets[0].lines, ["1 running"]);
+    assert_eq!(
+        session.extension_widgets[0].placement,
+        ExtensionWidgetPlacement::AboveEditor
+    );
+
+    set_extension_widget(
+        &mut session,
+        "subagent-fleet".into(),
+        None,
+        ExtensionWidgetPlacement::AboveEditor,
+    );
+    assert!(session.extension_widgets.is_empty());
+}
+
+/// Text an extension puts in the composer replaces the text that was there and
+/// leaves the user's own chips and annotations alone.
+#[test]
+fn extension_editor_text_replaces_the_draft_text_and_keeps_what_it_did_not_touch() {
+    let annotation = MessageAnnotation {
+        id: Uuid::new_v4(),
+        target: AnnotationTarget::MessageSpan {
+            message_id: Uuid::new_v4(),
+            spans: Vec::new(),
+            quote: "quoted".into(),
+            block: "block".into(),
+        },
+        comment: Some("keep this".into()),
+    };
+    let attachment = ComposerAttachment {
+        path: PathBuf::from("/tmp/report.pdf"),
+        client_preview_image: None,
+        mention: "@report.pdf".into(),
+        name: "report.pdf".into(),
+        is_dir: false,
+        is_image: false,
+        blob_reference: None,
+    };
+    let existing = crate::persistence::ComposerDraft {
+        text: "half-written".into(),
+        attachments: vec![crate::persistence::ComposerDraftAttachment::from(
+            &attachment,
+        )],
+        annotations: vec![annotation.clone()],
+    };
+
+    let draft = extension_editor_text_draft(Some(&existing), "review the diff".into());
+    assert_eq!(draft.text, "review the diff");
+    assert_eq!(draft.attachments.len(), 1);
+    assert_eq!(draft.attachments[0].name, "report.pdf");
+    assert_eq!(draft.annotations, vec![annotation.clone()]);
+
+    // Clearing the editor clears the text, not the chips beside it.
+    let draft = extension_editor_text_draft(Some(&existing), String::new());
+    assert!(draft.text.is_empty());
+    assert_eq!(draft.attachments.len(), 1);
+
+    // A session that has never been typed into simply takes the text.
+    let draft = extension_editor_text_draft(None, "review the diff".into());
+    assert_eq!(draft.text, "review the diff");
+    assert!(draft.attachments.is_empty());
+    assert!(draft.annotations.is_empty());
+}
+
+/// The window carries the selected session's extension title, and nothing of
+/// its own once that session has none.
+#[test]
+fn the_window_title_comes_from_the_selected_sessions_extension_title() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    assert!(session.extension_window_title.is_none());
+
+    set_extension_window_title(&mut session, "pi - waku-pi1-wt/t16".into());
+    assert_eq!(
+        session.extension_window_title.as_deref(),
+        Some("pi - waku-pi1-wt/t16")
+    );
+
+    // An empty title is how an extension takes its own title back down, and
+    // the window then carries the platform's own title as it did before.
+    set_extension_window_title(&mut session, String::new());
+    assert!(session.extension_window_title.is_none());
+    set_extension_window_title(&mut session, "   ".into());
+    assert!(session.extension_window_title.is_none());
+}
+
+/// A notification's severity is what the notice surface shows: a failure that
+/// arrives looking like an informational line is the defect this answers.
+#[test]
+fn an_extension_notifications_severity_reaches_the_notice_surface() {
+    assert_eq!(
+        extension_notification_tone(NotificationSeverity::Error),
+        ToastTone::Alert
+    );
+    assert_eq!(
+        extension_notification_tone(NotificationSeverity::Warning),
+        ToastTone::Warning
+    );
+    assert_eq!(
+        extension_notification_tone(NotificationSeverity::Info),
+        ToastTone::Info
+    );
 }

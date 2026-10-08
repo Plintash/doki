@@ -1235,6 +1235,9 @@ impl StateStore {
         session.transcript_blocks = stored.transcript_blocks;
         session.turns = stored.turns;
         session.queued_messages = stored.queued_messages;
+        session.extension_status = stored.extension_status;
+        session.extension_widgets = stored.extension_widgets;
+        session.extension_window_title = stored.extension_window_title;
         session.workspace = stored.workspace;
         session.provider_cursor = stored.provider_cursor;
         session.runtime_mode = stored.runtime_mode;
@@ -1536,6 +1539,9 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         context_usage: None,
         runtime_event_cursor: None,
         provider_session_id: None,
+        extension_status: Vec::new(),
+        extension_widgets: Vec::new(),
+        extension_window_title: None,
         messages: Vec::new(),
         transcript_blocks: Vec::new(),
         turns: Vec::new(),
@@ -1580,6 +1586,13 @@ fn message_from_row(row: MessageColumns) -> Option<Message> {
             .unwrap_or_default(),
         created_at: created_at as u64,
         streaming: streaming != 0,
+        // Whether the provider still holds a message is live-transport state,
+        // not transcript history: a restored session starts delivered and the
+        // provider's next report is what would say otherwise.
+        pending: false,
+        // A refusal is live-transport state in the same way: a restored
+        // session has nothing undelivered to show.
+        undelivered_reason: None,
     })
 }
 

@@ -599,6 +599,7 @@ user_input.back: 戻る
 user_input.next: 次へ
 user_input.submit: 送信
 user_input.progress: "%{current} / %{total}"
+user_input.dismiss: 閉じる
 composer.preparing_task: タスクを準備中…
 composer.queue_followup: フォローアップとしてキューに追加（⏎）
 composer.message: メッセージ
@@ -614,6 +615,8 @@ composer.suggestions: 入力候補
 composer.loading_suggestions: 入力候補を読み込み中…
 composer.remove_attachment: "%{name} を削除"
 composer.queued_message_actions: フォローアップの操作
+composer.queued_pending: 送信待ち
+composer.undelivered: 未配信
 
 branches.detached_head: Detached HEAD
 branches.search_project: "%{project} のブランチを検索"
