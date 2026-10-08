@@ -36,11 +36,16 @@ pub const DEFAULT_SIDEBAR_WIDTH: f32 = 252.0;
 pub const DEFAULT_RIGHT_PANEL_WIDTH: f32 = 460.0;
 
 /// How the desktop groups task history in the sidebar.
+///
+/// Project-first by default: a day's work is spread across every project it
+/// touched, so date headings pile unrelated tasks on top of each other, while
+/// the tasks sharing a project are the ones a user resumes together. Date
+/// headings stay one click away in the sidebar's options menu.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarGrouping {
-    Project,
     #[default]
+    Project,
     Updated,
 }
 
@@ -51,6 +56,30 @@ pub enum SidebarOrdering {
     #[default]
     Newest,
     Oldest,
+}
+
+/// What the composer's primary send action does while the agent is working:
+/// steer the running turn, or queue the message as a follow-up. The
+/// primary-modifier chord applies the other action to one message.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FollowUpBehavior {
+    Queue,
+    #[default]
+    Steer,
+}
+
+impl FollowUpBehavior {
+    pub const ALL: [Self; 2] = [Self::Queue, Self::Steer];
+
+    /// The other behavior, which the primary-modifier chord applies to one
+    /// message.
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Queue => Self::Steer,
+            Self::Steer => Self::Queue,
+        }
+    }
 }
 
 fn default_sidebar_visibility() -> bool {
@@ -273,6 +302,9 @@ pub struct AppSettings {
     /// Frame budget for the streaming text dissolve: 30, 60, or 120. See
     /// [`DISSOLVE_FPS_CHOICES`].
     pub dissolve_fps: u32,
+    /// What the composer's primary send action does while the agent is
+    /// working; the primary-modifier chord does the opposite.
+    pub follow_up_behavior: FollowUpBehavior,
     pub daemon_exposure: DaemonExposureSettings,
     /// Preferred target of the header's "open project in app" control, by
     /// catalog id. `None` — and an id no longer installed — fall back to the
@@ -290,6 +322,7 @@ impl Default for AppSettings {
             code_font_size: DEFAULT_CODE_FONT_SIZE,
             render_math: true,
             dissolve_fps: DEFAULT_DISSOLVE_FPS,
+            follow_up_behavior: FollowUpBehavior::Steer,
             daemon_exposure: DaemonExposureSettings::default(),
             open_in_app: None,
         }
@@ -345,6 +378,11 @@ struct AppState {
     sidebar_width: f32,
     #[serde(default)]
     sidebar_grouping: SidebarGrouping,
+    /// Whether the stored grouping is the user's own pick. Documents written
+    /// before project-first grouping was the default carry a grouping nobody
+    /// chose, and that one has to yield to the current default.
+    #[serde(default)]
+    sidebar_grouping_chosen: bool,
     #[serde(default)]
     sidebar_ordering: SidebarOrdering,
     #[serde(default = "default_right_panel_width")]
@@ -392,6 +430,8 @@ pub struct PersistedState {
     #[serde(default = "default_dissolve_fps")]
     pub dissolve_fps: u32,
     #[serde(default)]
+    pub follow_up_behavior: FollowUpBehavior,
+    #[serde(default)]
     pub daemon_exposure: DaemonExposureSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_in_app: Option<String>,
@@ -403,6 +443,9 @@ pub struct PersistedState {
     pub sidebar_width: f32,
     #[serde(default)]
     pub sidebar_grouping: SidebarGrouping,
+    /// Set once the user picks a grouping, never by the default: it is what
+    /// keeps a later change of default from rewriting that choice.
+    pub sidebar_grouping_chosen: bool,
     #[serde(default)]
     pub sidebar_ordering: SidebarOrdering,
     #[serde(default = "default_right_panel_width")]
@@ -464,12 +507,14 @@ impl PersistedState {
             code_font_size: DEFAULT_CODE_FONT_SIZE,
             render_math: true,
             dissolve_fps: DEFAULT_DISSOLVE_FPS,
+            follow_up_behavior: FollowUpBehavior::Steer,
             daemon_exposure: DaemonExposureSettings::default(),
             open_in_app: None,
             sidebar_visible: true,
             right_panel_visible: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
-            sidebar_grouping: SidebarGrouping::Updated,
+            sidebar_grouping: SidebarGrouping::default(),
+            sidebar_grouping_chosen: false,
             sidebar_ordering: SidebarOrdering::Newest,
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             markdown_preview: false,
@@ -592,6 +637,7 @@ impl PersistedState {
             code_font_size: self.code_font_size,
             render_math: self.render_math,
             dissolve_fps: self.dissolve_fps,
+            follow_up_behavior: self.follow_up_behavior,
             daemon_exposure: self.daemon_exposure.clone(),
             open_in_app: self.open_in_app.clone(),
         }
@@ -613,6 +659,7 @@ impl PersistedState {
             right_panel_visible: self.right_panel_visible,
             sidebar_width: self.sidebar_width,
             sidebar_grouping: self.sidebar_grouping,
+            sidebar_grouping_chosen: self.sidebar_grouping_chosen,
             sidebar_ordering: self.sidebar_ordering,
             right_panel_width: self.right_panel_width,
             markdown_preview: self.markdown_preview,
@@ -628,6 +675,7 @@ impl PersistedState {
         self.code_font_size = sanitized_code_font_size(settings.code_font_size);
         self.render_math = settings.render_math;
         self.dissolve_fps = sanitized_dissolve_fps(settings.dissolve_fps);
+        self.follow_up_behavior = settings.follow_up_behavior;
         self.daemon_exposure = settings.daemon_exposure;
         self.open_in_app = settings.open_in_app;
     }
@@ -645,7 +693,11 @@ impl PersistedState {
         self.sidebar_visible = app_state.sidebar_visible;
         self.right_panel_visible = app_state.right_panel_visible;
         self.sidebar_width = app_state.sidebar_width;
-        self.sidebar_grouping = app_state.sidebar_grouping;
+        self.sidebar_grouping = sidebar_grouping_for(
+            app_state.sidebar_grouping_chosen,
+            app_state.sidebar_grouping,
+        );
+        self.sidebar_grouping_chosen = app_state.sidebar_grouping_chosen;
         self.sidebar_ordering = app_state.sidebar_ordering;
         self.right_panel_width = app_state.right_panel_width;
         self.markdown_preview = app_state.markdown_preview;
@@ -729,6 +781,19 @@ impl PersistedState {
         if self.last_context_window.is_none() {
             self.last_context_window = session.context_window;
         }
+    }
+}
+
+/// The grouping a stored document opens with.
+///
+/// An unchosen grouping is whatever the default was in the build that wrote
+/// the document, so this build's default replaces it; a chosen one is the
+/// user's and survives every launch, including a switch back to date headings.
+fn sidebar_grouping_for(chosen: bool, stored: SidebarGrouping) -> SidebarGrouping {
+    if chosen {
+        stored
+    } else {
+        SidebarGrouping::default()
     }
 }
 
@@ -1038,6 +1103,15 @@ impl StateStore {
             .iter()
             .filter(|session| dirty_ids.contains(&session.id))
             .cloned()
+            .collect::<Vec<AgentSession>>();
+        // `detail_loaded` is process-local and does not cross the wire, so a
+        // skeleton arrives at the daemon looking like a fully loaded but empty
+        // session. Name the projections here; the daemon restores the marker
+        // before it merges and saves them.
+        let skeleton_session_ids = sessions
+            .iter()
+            .filter(|session| !session.detail_loaded)
+            .map(|session| session.id)
             .collect();
         let live_session_ids = state.sessions.iter().map(|session| session.id).collect();
         self.daemon
@@ -1048,6 +1122,7 @@ impl StateStore {
                 Command::SaveTaskState {
                     projects: state.projects.clone(),
                     live_session_ids,
+                    skeleton_session_ids,
                     sessions,
                 },
             )
@@ -1183,6 +1258,26 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_behavior_defaults_to_steer_and_persists_as_an_app_preference() {
+        let defaults: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.follow_up_behavior, FollowUpBehavior::Steer);
+        let mut state = PersistedState::empty();
+        assert_eq!(state.follow_up_behavior, FollowUpBehavior::Steer);
+        state.follow_up_behavior = FollowUpBehavior::Queue;
+        let settings = serde_json::to_value(state.app_settings()).unwrap();
+        assert_eq!(settings["follow_up_behavior"], "queue");
+        assert!(
+            serde_json::to_value(state.app_state())
+                .unwrap()
+                .get("follow_up_behavior")
+                .is_none()
+        );
+        let mut restored = PersistedState::empty();
+        restored.apply_app_settings(serde_json::from_value(settings).unwrap());
+        assert_eq!(restored.follow_up_behavior, FollowUpBehavior::Queue);
+    }
+
+    #[test]
     fn desktop_settings_paths_are_build_specific() {
         let app_settings_path = default_app_settings_path();
         let legacy_settings_paths = default_legacy_settings_paths();
@@ -1214,9 +1309,22 @@ mod tests {
     fn legacy_app_state_defaults_sidebar_presentation() {
         let state: AppState = serde_json::from_str(r#"{"app_state_version":1}"#).unwrap();
 
-        assert_eq!(state.sidebar_grouping, SidebarGrouping::Updated);
+        assert_eq!(state.sidebar_grouping, SidebarGrouping::Project);
         assert_eq!(state.sidebar_ordering, SidebarOrdering::Newest);
         assert_eq!(state.last_runtime_mode, RuntimeMode::FullAccess);
+    }
+
+    #[test]
+    fn date_grouping_stored_before_the_default_changed_adopts_project_grouping() {
+        assert_eq!(
+            sidebar_grouping_for(false, SidebarGrouping::Updated),
+            SidebarGrouping::Project
+        );
+        assert_eq!(
+            sidebar_grouping_for(true, SidebarGrouping::Updated),
+            SidebarGrouping::Updated,
+            "a switch back to date headings survives the next launch"
+        );
     }
 
     #[test]

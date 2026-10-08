@@ -64,6 +64,65 @@ impl Waku {
         true
     }
 
+    /// Puts a steer the provider rejected back under the user's control.
+    ///
+    /// The message never reached the transcript — an acknowledged steer takes
+    /// another path — so the user must keep it: queued behind a busy turn
+    /// with the provider's reason as a toast, started as the next turn when
+    /// the turn it missed settled cleanly, and left visible in the composer's
+    /// queue when the user stopped that turn instead.
+    fn settle_rejected_steer(
+        &mut self,
+        session_id: Uuid,
+        submission: ComposerSubmission,
+        reason: &str,
+        allow_queue_drain: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (busy, settled_cleanly) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| {
+                let settled_cleanly = session
+                    .turns
+                    .last()
+                    .is_some_and(|turn| turn.status == TurnStatus::Completed);
+                (session.is_busy(), settled_cleanly)
+            })
+            .unwrap_or((false, false));
+        if busy {
+            self.enqueue_follow_up_submission(session_id, submission, cx);
+            if self.state.selected_session == Some(session_id) {
+                self.show_toast(tr!(
+                    "session.steer_rejected",
+                    error = compact_driver_error(reason)
+                ));
+            }
+        } else if settled_cleanly {
+            // The turn settled before the steer arrived; run the message as a
+            // fresh turn instead of losing it. Submission is deferred through
+            // the queue-drain pass because this session's runtime is detached
+            // from the map while its events are handled — an inline submit
+            // would spawn a second driver process only to have it clobbered
+            // when the drain re-inserts the detached runtime.
+            if let Some(session) = self.state.session_mut(session_id) {
+                session
+                    .queued_messages
+                    .insert(0, submission.into_queued_message());
+            }
+            if allow_queue_drain {
+                self.pending_queue_drains.push(session_id);
+            }
+        } else {
+            // The user stopped the turn (or the provider died) before the
+            // steer landed. Keep the message visible and user-controlled
+            // instead of auto-running it.
+            self.enqueue_follow_up_submission(session_id, submission, cx);
+        }
+    }
+
     /// Hand back the queued messages a settlement took out of the provider's
     /// queue. They never reached the conversation, so they leave the transcript
     /// and their text returns to the user — the composer when this session is
@@ -692,67 +751,76 @@ impl Waku {
                     .unwrap_or_else(|| ComposerSubmission::plain(message.clone()));
                 // The provider folded the message into the live turn. Append
                 // it to the same turn so the transcript mirrors the provider
-                // conversation (no new turn boundary).
+                // conversation (no new turn boundary). Keep the row's id: a
+                // steer the run could not take is converted to a prompt, and
+                // if the provider then refuses that prompt the acknowledgement
+                // already happened, so only the id lets the late rejection
+                // mark this row undelivered.
                 if let Some(session) = self.state.session_mut(session_id) {
-                    session.push_user_message_with_presentation(
-                        message,
+                    let message_id = session.push_user_message_with_presentation(
+                        message.clone(),
                         submission.display_content,
                         submission.attachments,
                         submission.annotations,
                     );
                     session.updated_at = unix_time();
+                    runtime.delivered_steers.push_back((message, message_id));
                 }
             }
             DriverEvent::SteerRejected { message, reason } => {
-                let submission = runtime
+                let pending = runtime
                     .pending_steers
                     .iter()
                     .position(|submission| submission.prompt == message)
-                    .and_then(|index| runtime.pending_steers.remove(index))
-                    .or_else(|| runtime.pending_steers.pop_front())
-                    .unwrap_or_else(|| ComposerSubmission::plain(message));
-                let (busy, settled_cleanly) = self
-                    .state
-                    .sessions
+                    .and_then(|index| runtime.pending_steers.remove(index));
+                if let Some(submission) = pending {
+                    self.settle_rejected_steer(
+                        session_id,
+                        submission,
+                        &reason,
+                        allow_queue_drain,
+                        cx,
+                    );
+                } else if let Some((_, message_id)) = runtime
+                    .delivered_steers
                     .iter()
-                    .find(|session| session.id == session_id)
-                    .map(|session| {
-                        let settled_cleanly = session
-                            .turns
-                            .last()
-                            .is_some_and(|turn| turn.status == TurnStatus::Completed);
-                        (session.is_busy(), settled_cleanly)
-                    })
-                    .unwrap_or((false, false));
-                if busy {
-                    self.enqueue_follow_up_submission(session_id, submission, cx);
-                    if self.state.selected_session == Some(session_id) {
-                        self.show_toast(tr!(
-                            "session.steer_rejected",
-                            error = compact_driver_error(&reason)
-                        ));
-                    }
-                } else if settled_cleanly {
-                    // The turn settled before the steer arrived; run the
-                    // message as a fresh turn instead of losing it. Submission
-                    // is deferred through the queue-drain pass because this
-                    // session's runtime is detached from the map while its
-                    // events are handled — an inline submit would spawn a
-                    // second driver process only to have it clobbered when the
-                    // drain re-inserts the detached runtime.
-                    if let Some(session) = self.state.session_mut(session_id) {
-                        session
-                            .queued_messages
-                            .insert(0, submission.into_queued_message());
-                    }
-                    if allow_queue_drain {
-                        self.pending_queue_drains.push(session_id);
+                    .position(|(accepted, _)| accepted == &message)
+                    .and_then(|index| runtime.delivered_steers.remove(index))
+                {
+                    // The provider acknowledged this steer's write earlier,
+                    // so the transcript already carries the row. The refusal
+                    // means it never joined the conversation: keep the user's
+                    // words visible but stop calling them delivered, rather
+                    // than submitting the same text a second time.
+                    let marked = self.state.session_mut(session_id).is_some_and(|session| {
+                        session.mark_message_undelivered(message_id, &compact_driver_error(&reason))
+                    });
+                    if marked {
+                        self.state.mark_session_dirty(session_id);
+                    } else {
+                        // The row is gone — rewound, or dropped with a
+                        // replaced runtime — so keep the text user-controlled
+                        // as a steer that never landed would be.
+                        self.settle_rejected_steer(
+                            session_id,
+                            ComposerSubmission::plain(message),
+                            &reason,
+                            allow_queue_drain,
+                            cx,
+                        );
                     }
                 } else {
-                    // The user stopped the turn (or the provider died) before
-                    // the steer landed. Keep the message visible and
-                    // user-controlled instead of auto-running it.
-                    self.enqueue_follow_up_submission(session_id, submission, cx);
+                    let submission = runtime
+                        .pending_steers
+                        .pop_front()
+                        .unwrap_or_else(|| ComposerSubmission::plain(message));
+                    self.settle_rejected_steer(
+                        session_id,
+                        submission,
+                        &reason,
+                        allow_queue_drain,
+                        cx,
+                    );
                 }
             }
             DriverEvent::ProviderQueue {
@@ -835,6 +903,9 @@ impl Waku {
                 summary,
                 interrupted,
             } => {
+                // A settlement ends the run those steers joined, so their
+                // accepted rows need no later-refusal correlation.
+                runtime.delivered_steers.clear();
                 // A prompt the provider refused before accepting it settles as
                 // the delivery failure of the message that asked for the run:
                 // that message stays, marked undelivered with the reason, and

@@ -64,7 +64,7 @@ actions!(
         Redo,
         Enter,
         Newline,
-        SubmitSteer,
+        SubmitOpposite,
         Clear,
         ShowCharacterPalette,
     ]
@@ -114,9 +114,10 @@ pub fn init(cx: &mut App) {
         // break where Enter itself would submit.
         KeyBinding::new("ctrl-enter", Newline, Some("TextInput")),
         KeyBinding::new("alt-enter", Newline, Some("TextInput")),
-        // While a turn is running, Enter queues a follow-up; the platform's
-        // primary modifier + Enter injects it when the provider supports it.
-        KeyBinding::new("secondary-enter", SubmitSteer, Some("TextInput")),
+        // While a turn is running, Enter applies the configured follow-up
+        // behavior; the primary modifier + Enter applies the opposite action
+        // to one message.
+        KeyBinding::new("secondary-enter", SubmitOpposite, Some("TextInput")),
         // Two-stage escape for fields that opt in via `clear_on_escape`:
         // the handler propagates when the field is empty (or not opted in),
         // and the keystroke falls through to the surface's own escape —
@@ -1720,14 +1721,15 @@ impl TextInput {
         self.clear(cx);
     }
 
-    fn submit_steer(&mut self, _: &SubmitSteer, _: &mut Window, cx: &mut Context<Self>) {
+    fn submit_opposite(&mut self, _: &SubmitOpposite, _: &mut Window, cx: &mut Context<Self>) {
         match self.mode {
             // For a one-line field the forceful chord is just Enter.
             FieldMode::SingleLine => {
                 cx.emit(InputEvent::Submit(self.content.to_string()));
             }
-            // Steering is prompt vocabulary. The field only propagates the
-            // action; the composer wrapper claims it from an outer handler.
+            // Steering and queueing are prompt vocabulary. The field only
+            // propagates the action; the composer wrapper claims it from an
+            // outer handler.
             FieldMode::MultiLine => cx.propagate(),
         }
     }
@@ -2834,7 +2836,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::newline))
-            .on_action(cx.listener(Self::submit_steer))
+            .on_action(cx.listener(Self::submit_opposite))
             .on_action(cx.listener(Self::clear_field))
             .on_action(cx.listener(Self::show_character_palette))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -2942,16 +2944,17 @@ impl Focusable for TextInput {
     }
 }
 
-/// What the composer tells its owner. `Submit` and `SubmitSteer` carry the
+/// What the composer tells its owner. `Submit` and `SubmitOpposite` carry the
 /// trimmed prompt; the remaining events report composer-level interactions
 /// or mirror [`InputEvent`] from the embedded field.
 #[derive(Clone)]
 pub enum ComposerEvent {
-    /// Enter: send the prompt, or queue it behind the running turn.
+    /// Enter: send the prompt, or apply the configured follow-up behavior
+    /// while the agent is working.
     Submit(String),
-    /// Primary modifier + Enter: deliver the prompt into the running turn
-    /// instead of queueing it behind the turn.
-    SubmitSteer(String),
+    /// Primary modifier + Enter: apply the opposite of the configured
+    /// follow-up behavior for one message.
+    SubmitOpposite(String),
     /// Primary modifier + Enter in an empty composer: activate the oldest
     /// queued follow-up's Steer control.
     SteerQueued,
@@ -3093,16 +3096,17 @@ impl Render for ComposerInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w_full()
-            // The embedded field propagates SubmitSteer; this ancestor
-            // handler is where steering becomes a composer event.
-            .on_action(cx.listener(|composer, _: &SubmitSteer, _, cx| {
+            // The embedded field propagates SubmitOpposite; this ancestor
+            // handler is where the opposite follow-up action becomes a
+            // composer event.
+            .on_action(cx.listener(|composer, _: &SubmitOpposite, _, cx| {
                 let value = composer.content(cx).trim().to_owned();
                 if value.is_empty() {
                     cx.emit(ComposerEvent::SteerQueued);
                     return;
                 }
                 composer.input.update(cx, |input, cx| input.clear(cx));
-                cx.emit(ComposerEvent::SubmitSteer(value));
+                cx.emit(ComposerEvent::SubmitOpposite(value));
             }))
             .child(self.input.clone())
     }
@@ -3196,7 +3200,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn secondary_enter_steers_text_or_activates_the_queue(cx: &mut TestAppContext) {
+    fn secondary_enter_submits_the_opposite_follow_up(cx: &mut TestAppContext) {
         let (composer, cx) = setup_composer(cx);
         let events: Rc<RefCell<Vec<ComposerEvent>>> = Rc::default();
         let sink = events.clone();
@@ -3216,11 +3220,9 @@ mod tests {
         composer.update(cx, |composer, cx| composer.set_content("hold on", cx));
         events.borrow_mut().clear();
         cx.simulate_keystrokes("secondary-enter");
-        assert!(
-            events.borrow().iter().any(
-                |event| matches!(event, ComposerEvent::SubmitSteer(text) if text == "hold on")
-            )
-        );
+        assert!(events.borrow().iter().any(
+            |event| matches!(event, ComposerEvent::SubmitOpposite(text) if text == "hold on")
+        ));
         cx.read_entity(&composer, |composer, cx| {
             assert_eq!(composer.content(cx), "")
         });

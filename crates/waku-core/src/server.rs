@@ -1220,6 +1220,7 @@ mod tests {
                     Command::SaveTaskState {
                         projects: Vec::new(),
                         live_session_ids: vec![session_id],
+                        skeleton_session_ids: Vec::new(),
                         sessions: vec![session],
                     },
                 )
@@ -1252,6 +1253,7 @@ mod tests {
                 Command::SaveTaskState {
                     projects: Vec::new(),
                     live_session_ids: vec![session_id],
+                    skeleton_session_ids: Vec::new(),
                     sessions: vec![checkpoint],
                 },
             )
@@ -1274,6 +1276,7 @@ mod tests {
                 Command::SaveTaskState {
                     projects: Vec::new(),
                     live_session_ids: vec![session_id, second_id],
+                    skeleton_session_ids: Vec::new(),
                     sessions: vec![second],
                 },
             )
@@ -1333,6 +1336,7 @@ mod tests {
                 Command::SaveTaskState {
                     projects: vec![project.clone()],
                     live_session_ids: vec![session.id],
+                    skeleton_session_ids: Vec::new(),
                     sessions: vec![session.clone()],
                 },
             )
@@ -1347,6 +1351,7 @@ mod tests {
                 Command::SaveTaskState {
                     projects: vec![project],
                     live_session_ids: vec![session.id],
+                    skeleton_session_ids: Vec::new(),
                     sessions: vec![session],
                 },
             )
@@ -1365,6 +1370,109 @@ mod tests {
 
         stale_client.shutdown();
         server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A task that was running when the app died must survive the next launch.
+    ///
+    /// The restarted client interrupts the orphaned task without hydrating it,
+    /// so the save carries a list projection. `detail_loaded` never crosses the
+    /// wire, and without the skeleton ids that empty shell replaced the stored
+    /// transcript and the task's rows were deleted as if the client had
+    /// removed it.
+    #[cfg(unix)]
+    #[test]
+    fn a_projection_save_after_restart_keeps_the_interrupted_task() {
+        let root = std::env::temp_dir().join(format!("waku-skeleton-save-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("app.db");
+        let hub = Arc::new(Hub::default());
+
+        let project = Project::from_path(root.join("repo"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.status = SessionStatus::Working;
+        session.begin_turn("keep this task");
+        session.push_message(crate::model::MessageRole::Assistant, "partial answer");
+        session.provider_cursor = Some(crate::model::ProviderResumeCursor::Codex {
+            thread_id: "thread".into(),
+        });
+        let session_id = session.id;
+
+        let save = |backend: &WakuBackend,
+                    sessions: Vec<AgentSession>,
+                    skeleton_session_ids: Vec<Uuid>| {
+            backend
+                .handle(
+                    Request {
+                        request_id: Uuid::nil(),
+                        session_id: Uuid::nil(),
+                        runtime_id: Uuid::nil(),
+                        command: Command::SaveTaskState {
+                            projects: vec![project.clone()],
+                            live_session_ids: vec![session_id],
+                            skeleton_session_ids,
+                            sessions,
+                        },
+                    },
+                    hub.event_sink(Uuid::nil(), Uuid::nil()),
+                )
+                .unwrap()
+        };
+
+        // The first daemon persists the task while it is still running.
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(database.clone()),
+        )
+        .unwrap();
+        save(&backend, vec![session.clone()], Vec::new());
+        drop(backend);
+
+        // The app and daemon restart. The client loads the list and interrupts
+        // the task it can no longer attach to, all while holding a skeleton.
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(database.clone()),
+        )
+        .unwrap();
+        let ResponsePayload::TaskState { mut sessions, .. } = backend
+            .handle(
+                Request {
+                    request_id: Uuid::nil(),
+                    session_id: Uuid::nil(),
+                    runtime_id: Uuid::nil(),
+                    command: Command::LoadTaskState,
+                },
+                hub.event_sink(Uuid::nil(), Uuid::nil()),
+            )
+            .unwrap()
+        else {
+            panic!("expected daemon task state");
+        };
+        assert_eq!(sessions.len(), 1, "the stored task is listed");
+        let mut skeleton = sessions.remove(0);
+        assert!(!skeleton.detail_loaded);
+        skeleton.status = SessionStatus::Idle;
+        let skeleton_id = skeleton.id;
+        // The projection crosses the wire without its process-local marker; the
+        // client names it in the save so the daemon can restore the marker.
+        let wire: AgentSession =
+            serde_json::from_slice(&serde_json::to_vec(&skeleton).unwrap()).unwrap();
+        assert!(wire.detail_loaded, "the marker is process-local");
+        save(&backend, vec![wire], vec![skeleton_id]);
+        drop(backend);
+
+        // Nothing about the task's stored detail was overwritten or removed.
+        let store = StateStore::daemon(database.clone());
+        let mut state = store.load().unwrap();
+        assert_eq!(state.sessions.len(), 1, "the interrupted task kept its row");
+        let mut restored = state.sessions.remove(0);
+        assert_eq!(restored.status, SessionStatus::Idle);
+        store.hydrate(&mut restored).unwrap();
+        assert_eq!(restored.turns.len(), 1);
+        assert_eq!(restored.messages.len(), 2);
+        assert!(restored.provider_cursor.is_some());
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

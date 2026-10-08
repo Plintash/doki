@@ -3505,6 +3505,12 @@ impl Waku {
         // `enter` cannot slip past a disabled control.
         let no_providers = self.model_picker_has_no_providers();
         let can_send = has_draft && !no_providers;
+        // While the agent is working, the arrow reports what Enter will do:
+        // the configured follow-up behavior. A steer the provider cannot take
+        // degrades to the queue, so the button only promises a steer when the
+        // running turn can accept one.
+        let follow_up_steers = self.state.follow_up_behavior == FollowUpBehavior::Steer
+            && session.is_some_and(|session| self.session_can_steer(session));
         let (autocomplete, autocomplete_actionable) =
             match self.render_composer_autocomplete(window, cx) {
                 Some((element, actionable)) => (Some(element), actionable),
@@ -3645,7 +3651,7 @@ impl Waku {
                                 .when(can_send, |element| {
                                     element.child(
                                         div()
-                                            .id("queue-follow-up")
+                                            .id("follow-up-action")
                                             .w(px(26.0))
                                             .h(px(26.0))
                                             .rounded_full()
@@ -3661,7 +3667,11 @@ impl Waku {
                                                 16.0,
                                                 theme.on_inverse,
                                             ))
-                                            .tooltip(Tooltip::text(tr!("composer.queue_followup")))
+                                            .tooltip(Tooltip::text(if follow_up_steers {
+                                                tr!("composer.steer_followup")
+                                            } else {
+                                                tr!("composer.queue_followup")
+                                            }))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 let prompt =
                                                     this.composer.read(cx).content(cx).to_owned();

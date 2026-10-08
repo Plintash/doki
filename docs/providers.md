@@ -409,7 +409,10 @@ a steer whether or not a run is open, and splices what it parks there into the
 next turn's boundary, so a steer arriving after its run settled is written as a
 prompt instead. Its `disposition: "queued"` means the message was accepted into
 the live turn, which is what `SteerAccepted` reports — not that it was
-delivered.
+delivered. A refusal of that converted prompt — the provider refuses while it
+is compacting — travels back as the same steer's `SteerRejected`, carrying the
+text the write already acknowledged, so the app can mark the transcript row
+undelivered instead of submitting the text a second time.
 
 **Rewind and branch** — both go through `get_fork_messages` → `fork {entryId}`
 (`get_branch_messages` → `branch` on Oh My Pi), or `clone` when nothing is
@@ -971,7 +974,7 @@ What the long-lived session buys, and what Waku pays for not having it:
 | Interactive approvals | Every provider: Claude via the SDK's `canUseTool` (including `AskUserQuestion` and `ExitPlanMode`), Cursor/Grok via ACP `session/request_permission`, Codex via `*requestApproval*` | Every provider except Amp and Pi, neither of which exposes a request to answer |
 | Interrupt | `session/cancel`, `query.interrupt()` (plus `stopTask()` for runaway subagents) | Protocol interrupt everywhere except Amp, which has none and is stopped outright |
 | Change model mid-session | `capabilities.sessionModelSwitch: "in-session"` → `session/set_model`, `query.setModel()` | Every transport keeps the session except Amp, whose mode is a launch argument |
-| Mid-turn prompt | Queued into the live agent loop as a **steer**, same turn | Steered into the live turn on every provider (`⌘↩`); plain `Enter` queues a visible, editable follow-up instead |
+| Mid-turn prompt | Queued into the live agent loop as a **steer**, same turn | Steered into the live turn on every provider; `Enter` follows the client's follow-up behavior (steer by default) and `⌘↩` does the opposite, with a visible, editable queue as the fallback |
 | Native rollback | `rollbackThread` on the adapter contract | Codex/Pi natively; the rest emulated out-of-band by the `*_session.rs` helpers |
 | Idle cleanup | `ProviderSessionReaper` stops sessions idle 30 min, swept every 5 min, skipping threads with an active turn | same, on the same thresholds |
 

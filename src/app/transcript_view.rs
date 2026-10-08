@@ -3321,9 +3321,13 @@ impl Waku {
             return cluster.into_any_element();
         }
         // `Theme::overlay` is 5% alpha and GPUI's `opacity` multiplies it.
+        // Expanded detail uses this faint wash instead of a border or a
+        // divider line, the way Codex and Paseo mark an open tool call.
         let activity_surface = theme.surface.blend(theme.overlay.opacity(0.7));
-        let activity_hover_surface = theme.surface.blend(theme.overlay);
-        let activity_active_surface = theme.surface.blend(theme.overlay_strong.opacity(0.72));
+        // Hover and active stay a step below the expanded detail wash so a
+        // highlighted row never reads darker than the content it opens.
+        let activity_hover_surface = theme.surface.blend(theme.overlay.opacity(0.5));
+        let activity_active_surface = theme.surface.blend(theme.overlay.opacity(0.8));
         let mut items = div()
             .w_full()
             .min_w_0()
@@ -3428,26 +3432,17 @@ impl Waku {
                 .min_w_0()
                 .overflow_hidden()
                 .rounded(px(9.0))
-                .border_1()
-                .border_color(theme.border_strong)
-                .bg(activity_surface)
                 .flex()
                 .flex_col()
                 .child(
                     div()
                         .id(SharedString::from(format!("activity-item-{id}")))
-                        // The parent owns a 1px border on each edge, so a
-                        // 28px row makes the visible activity header 30px.
                         .h(px(28.0))
                         .px(px(8.0))
                         .flex()
                         .items_center()
                         .gap(px(8.0))
-                        .rounded_tl(px(8.0))
-                        .rounded_tr(px(8.0))
-                        .when(!item_expanded, |element| {
-                            element.rounded_bl(px(8.0)).rounded_br(px(8.0))
-                        })
+                        .rounded(px(9.0))
                         .text_size(sp(12.5))
                         .line_height(sp(16.0))
                         .when(has_detail, |element| {
@@ -3586,10 +3581,11 @@ impl Waku {
                         .w_full()
                         .min_w_0()
                         .relative()
+                        .mt(px(4.0))
                         .max_h(px(400.0))
                         .overflow_hidden()
-                        .border_t_1()
-                        .border_color(theme.border_strong)
+                        .rounded(px(9.0))
+                        .bg(activity_surface)
                         .child(
                             div()
                                 .id(SharedString::from(format!("reasoning-scroll-{id}")))
@@ -3654,8 +3650,9 @@ impl Waku {
                 let mut detail_card = div()
                     .w_full()
                     .min_w_0()
-                    .border_t_1()
-                    .border_color(theme.border_strong)
+                    .mt(px(4.0))
+                    .rounded(px(9.0))
+                    .bg(activity_surface)
                     .px(px(12.0))
                     .py(px(8.0))
                     .flex()
@@ -3922,10 +3919,11 @@ impl Waku {
             .w_full()
             .min_w_0()
             .relative()
+            .mt(px(4.0))
             .max_h(px(ACTIVITY_DIFF_MAX_HEIGHT))
             .overflow_hidden()
-            .border_t_1()
-            .border_color(theme.border_strong)
+            .rounded(px(9.0))
+            .bg(surface)
             .child(rows)
             .child(scrollbar::edge_fade(
                 viewport.scroll_handle.clone(),

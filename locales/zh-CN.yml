@@ -76,7 +76,7 @@ settings.providers: 服务商
 settings.usage: 用量
 settings.daemon: 守护进程
 settings.computer_use: 电脑操作
-settings.general_keywords: 通用 本地 项目 对话 隐私 更新 自动 版本 数学 公式 表达式 math latex
+settings.general_keywords: 通用 本地 项目 对话 隐私 更新 自动 版本 数学 公式 表达式 math latex 后续 排队 引导 enter
 settings.appearance_keywords: 外观 主题 系统 浅色 深色 语言 英语 中文 简体 字号 字体 大小 编辑器
 settings.providers_keywords: 服务商 智能体 模型 命令行 版本 安装 检测 claude codex cursor opencode amp grok pi
 settings.skills: 技能
@@ -161,6 +161,10 @@ settings.render_math: 渲染数学公式
 settings.render_math_description: 在 Markdown 中显示排版后的公式。关闭后显示 LaTeX 源码。
 settings.stream_dissolve: 流式渐显
 settings.stream_dissolve_description: 流式文字到达时的渐显帧率。高刷新率屏幕下越高越顺滑，越低越省电。
+settings.follow_up_behavior: 后续消息行为
+settings.follow_up_behavior_description: 智能体工作时回车的行为；%{shortcut} 对单条消息执行另一项。
+settings.follow_up_behavior_queue: 排队
+settings.follow_up_behavior_steer: 引导
 settings.theme_system: 跟随系统
 settings.theme_light: 浅色
 settings.theme_dark: 深色
@@ -576,6 +580,7 @@ user_input.progress: "%{current} / %{total}"
 user_input.dismiss: 忽略
 composer.preparing_task: 正在准备任务…
 composer.queue_followup: 排队为后续消息（⏎）
+composer.steer_followup: 引导当前回合（⏎）
 composer.message: 消息
 composer.queue_placeholder: 添加后续消息…
 composer.prompt_placeholder: 让 Doki 构建些什么…

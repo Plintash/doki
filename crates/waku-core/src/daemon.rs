@@ -353,6 +353,7 @@ impl Backend for WakuBackend {
             Command::SaveTaskState {
                 projects,
                 live_session_ids: _,
+                skeleton_session_ids,
                 sessions,
             } => {
                 let active_runtimes = self
@@ -379,6 +380,22 @@ impl Backend for WakuBackend {
                     .filter(|session| !removed_session_ids.contains(&session.id))
                     .collect::<Vec<_>>();
                 drop(removed_session_ids);
+                // `detail_loaded` is process-local and does not survive the
+                // wire, so the client names the skeletons it is sending.
+                // Restore the marker before merging: without it the empty
+                // projection looks like a fully loaded session, and the save
+                // below overwrites the stored transcript and deletes the
+                // task's rows as if the client had removed it.
+                let skeleton_session_ids = skeleton_session_ids.into_iter().collect::<HashSet<_>>();
+                let sessions = sessions
+                    .into_iter()
+                    .map(|mut session| {
+                        if skeleton_session_ids.contains(&session.id) {
+                            session.detail_loaded = false;
+                        }
+                        session
+                    })
+                    .collect::<Vec<_>>();
                 let saved_ids = sessions
                     .iter()
                     .map(|session| session.id)

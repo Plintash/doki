@@ -157,7 +157,7 @@ settings.daemon:
 settings.computer_use:
   en: Computer Use
 settings.general_keywords:
-  en: general local projects conversations privacy updates automatic sparkle version math latex formula expression
+  en: general local projects conversations privacy updates automatic sparkle version math latex formula expression follow-up steer queue enter
 settings.appearance_keywords:
   en: appearance theme system light dark language english chinese simplified font size text editor
 settings.providers_keywords:
@@ -326,6 +326,14 @@ settings.stream_dissolve:
   en: Streaming dissolve
 settings.stream_dissolve_description:
   en: Frame rate for text fading in as it streams. Higher is smoother on high-refresh displays; lower saves battery.
+settings.follow_up_behavior:
+  en: Follow-up behavior
+settings.follow_up_behavior_description:
+  en: What Enter does while the agent is working; %{shortcut} does the opposite for one message.
+settings.follow_up_behavior_queue:
+  en: Queue
+settings.follow_up_behavior_steer:
+  en: Steer
 settings.theme_system:
   en: System
 settings.theme_light:
@@ -1200,6 +1208,8 @@ composer.preparing_task:
   en: Preparing task…
 composer.queue_followup:
   en: Queue as follow-up (⏎)
+composer.steer_followup:
+  en: Steer the running turn (⏎)
 composer.message:
   en: Message
 composer.queue_placeholder:
