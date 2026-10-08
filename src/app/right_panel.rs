@@ -955,6 +955,145 @@ fn reusable_surface_index(
     }
 }
 
+/// The right-panel descriptor a rebuilt window persists for one task.
+///
+/// Only durable identities are captured: a terminal's daemon id, a
+/// workspace-relative file path, a diff source. Browsers, the file browser,
+/// and background-work tabs have no identity to restore, and view state —
+/// editor contents, file-tree expansion, scroll — is deliberately left out.
+/// The active tab is recorded (remapped to the persisted list) so a reopened
+/// panel shows the surface that was on screen; a tab whose descriptor does
+/// not survive the rebuild is dropped from the active index too.
+fn persist_right_panel_descriptors(
+    surfaces: &[RightPanelSurface],
+    active_surface: Option<usize>,
+    diff_source: ReviewDiffSource,
+) -> RightPanelTaskDescriptor {
+    let mut descriptors = Vec::new();
+    let mut active = None;
+    for (index, surface) in surfaces.iter().enumerate() {
+        let descriptor = match surface {
+            RightPanelSurface::Terminal(terminal_id) => RightPanelSurfaceDescriptor::Terminal {
+                terminal_id: *terminal_id,
+            },
+            RightPanelSurface::File(path) => {
+                RightPanelSurfaceDescriptor::File { path: path.clone() }
+            }
+            RightPanelSurface::Diff => RightPanelSurfaceDescriptor::Diff {
+                source: crate::review_diff::wire_source(diff_source),
+            },
+            RightPanelSurface::Browser(_)
+            | RightPanelSurface::Files
+            | RightPanelSurface::BackgroundWork { .. } => continue,
+        };
+        if active_surface == Some(index) {
+            active = Some(descriptors.len());
+        }
+        descriptors.push(descriptor);
+    }
+    RightPanelTaskDescriptor {
+        surfaces: descriptors,
+        active,
+    }
+}
+
+/// The subset of one task's descriptors a rebuilt window can restore.
+///
+/// `terminal_exists` and `file_exists` answer whether the referenced daemon
+/// terminal or file is still there; an entry with no surviving object drops
+/// out, including the tab that was active. A panel with survivors opens on
+/// the first of them when its active tab did not survive.
+fn restore_right_panel_descriptors(
+    descriptor: RightPanelTaskDescriptor,
+    terminal_exists: impl Fn(Uuid) -> bool,
+    file_exists: impl Fn(&str) -> bool,
+) -> RightPanelTaskDescriptor {
+    let mut surfaces = Vec::new();
+    let mut active = None;
+    for (index, surface) in descriptor.surfaces.into_iter().enumerate() {
+        let survives = match &surface {
+            RightPanelSurfaceDescriptor::Terminal { terminal_id } => terminal_exists(*terminal_id),
+            RightPanelSurfaceDescriptor::File { path } => file_exists(path),
+            RightPanelSurfaceDescriptor::Diff { .. } => true,
+        };
+        if !survives {
+            continue;
+        }
+        if descriptor.active == Some(index) {
+            active = Some(surfaces.len());
+        }
+        surfaces.push(surface);
+    }
+    RightPanelTaskDescriptor {
+        active: active.or_else(|| (!surfaces.is_empty()).then_some(0)),
+        surfaces,
+    }
+}
+
+/// The in-memory panel a rebuilt window builds from restored descriptors.
+/// Everything descriptors do not carry — editors, expansion, scroll — starts
+/// empty; `None` means nothing survived.
+fn right_panel_session_from_descriptors(
+    descriptor: RightPanelTaskDescriptor,
+) -> Option<RightPanelSessionState> {
+    if descriptor.surfaces.is_empty() {
+        return None;
+    }
+    let mut state = RightPanelSessionState::empty(false);
+    let mut diff_source = ReviewDiffSource::default();
+    for surface in descriptor.surfaces {
+        match surface {
+            RightPanelSurfaceDescriptor::Terminal { terminal_id } => {
+                state
+                    .surfaces
+                    .push(RightPanelSurface::Terminal(terminal_id));
+            }
+            RightPanelSurfaceDescriptor::File { path } => {
+                state.surfaces.push(RightPanelSurface::File(path));
+            }
+            RightPanelSurfaceDescriptor::Diff { source } => {
+                diff_source = crate::review_diff::source_from_wire(source);
+                state.surfaces.push(RightPanelSurface::Diff);
+            }
+        }
+    }
+    state.active_surface = descriptor
+        .active
+        .filter(|index| *index < state.surfaces.len());
+    state.diff_source = diff_source;
+    Some(state)
+}
+
+/// Whether a workspace-relative file still exists, asked of the daemon so a
+/// remote workspace answers for its own filesystem.
+///
+/// Listing the file's directory answers without reading the file, so a binary
+/// or an enormous file restores the same as a small one; the missing
+/// directory a vanished path leaves behind is a plain `false`, never an error.
+fn workspace_file_exists(
+    workspace: &waku_client::WorkspaceClient,
+    workspace_path: &Path,
+    relative_path: &str,
+) -> bool {
+    let relative = Path::new(relative_path);
+    let Some(file_name) = relative.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let directory = match relative.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => workspace_path.join(parent),
+        _ => workspace_path.to_path_buf(),
+    };
+    match workspace.request(waku_client::WorkspaceOperation::ListTree {
+        root: directory,
+        expanded_paths: Vec::new(),
+    }) {
+        Ok(waku_client::WorkspaceResult::WorkingTree { entries }) => {
+            entries.iter().any(|entry| entry.name == file_name)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum TabScrollFadeSide {
     Left,
@@ -1736,6 +1875,209 @@ mod tests {
             px(0.0)
         );
     }
+
+    #[test]
+    fn persisted_descriptors_keep_only_restorable_surfaces() {
+        let terminal_id = Uuid::new_v4();
+        let surfaces = vec![
+            RightPanelSurface::new_browser(),
+            RightPanelSurface::Terminal(terminal_id),
+            RightPanelSurface::Files,
+            RightPanelSurface::BackgroundWork {
+                key: BackgroundWorkKey::new(BackgroundWorkKind::Process, "process-1"),
+                title: "process".into(),
+            },
+            RightPanelSurface::File("src/main.rs".into()),
+            RightPanelSurface::Diff,
+        ];
+
+        let descriptor =
+            persist_right_panel_descriptors(&surfaces, Some(1), ReviewDiffSource::Unstaged);
+
+        assert_eq!(
+            descriptor.surfaces,
+            vec![
+                RightPanelSurfaceDescriptor::Terminal { terminal_id },
+                RightPanelSurfaceDescriptor::File {
+                    path: "src/main.rs".into(),
+                },
+                RightPanelSurfaceDescriptor::Diff {
+                    source: waku_client::workspace::ReviewDiffSource::Unstaged,
+                },
+            ]
+        );
+        assert_eq!(
+            descriptor.active,
+            Some(0),
+            "the active tab follows its restorable index"
+        );
+    }
+
+    #[test]
+    fn a_panel_whose_active_tab_is_not_restorable_has_no_active_tab() {
+        let surfaces = vec![
+            RightPanelSurface::Terminal(Uuid::new_v4()),
+            RightPanelSurface::Files,
+        ];
+        let descriptor =
+            persist_right_panel_descriptors(&surfaces, Some(1), ReviewDiffSource::default());
+        assert_eq!(descriptor.active, None);
+    }
+
+    #[test]
+    fn restore_drops_a_terminal_or_file_the_rebuild_no_longer_finds() {
+        let gone_terminal = Uuid::new_v4();
+        let live_terminal = Uuid::new_v4();
+        let source = waku_client::workspace::ReviewDiffSource::LastTurn {
+            session_id: Uuid::new_v4(),
+            turn_id: Uuid::new_v4(),
+            turn_count: 3,
+        };
+        let descriptor = RightPanelTaskDescriptor {
+            surfaces: vec![
+                RightPanelSurfaceDescriptor::Terminal {
+                    terminal_id: gone_terminal,
+                },
+                RightPanelSurfaceDescriptor::File {
+                    path: "gone.rs".into(),
+                },
+                RightPanelSurfaceDescriptor::Terminal {
+                    terminal_id: live_terminal,
+                },
+                RightPanelSurfaceDescriptor::Diff { source },
+            ],
+            active: Some(3),
+        };
+
+        let restored = restore_right_panel_descriptors(
+            descriptor,
+            |terminal_id| terminal_id == live_terminal,
+            |path| path == "kept.rs",
+        );
+
+        assert_eq!(
+            restored.surfaces,
+            vec![
+                RightPanelSurfaceDescriptor::Terminal {
+                    terminal_id: live_terminal,
+                },
+                RightPanelSurfaceDescriptor::Diff { source },
+            ]
+        );
+        assert_eq!(restored.active, Some(1));
+    }
+
+    #[test]
+    fn restore_opens_the_first_survivor_when_the_active_tab_was_dropped() {
+        let descriptor = RightPanelTaskDescriptor {
+            surfaces: vec![
+                RightPanelSurfaceDescriptor::File {
+                    path: "gone.rs".into(),
+                },
+                RightPanelSurfaceDescriptor::Diff {
+                    source: waku_client::workspace::ReviewDiffSource::Uncommitted,
+                },
+            ],
+            active: Some(0),
+        };
+
+        let restored = restore_right_panel_descriptors(descriptor, |_| false, |_| false);
+
+        assert_eq!(restored.surfaces.len(), 1);
+        assert_eq!(restored.active, Some(0));
+    }
+
+    #[test]
+    fn restore_of_nothing_keeps_nothing() {
+        let restored = restore_right_panel_descriptors(
+            RightPanelTaskDescriptor {
+                surfaces: vec![RightPanelSurfaceDescriptor::File {
+                    path: "gone.rs".into(),
+                }],
+                active: Some(0),
+            },
+            |_| false,
+            |_| false,
+        );
+        assert!(restored.surfaces.is_empty());
+        assert_eq!(restored.active, None);
+    }
+
+    #[test]
+    fn a_rebuilt_panel_carries_only_durable_identities() {
+        let terminal_id = Uuid::new_v4();
+        let descriptor = RightPanelTaskDescriptor {
+            surfaces: vec![
+                RightPanelSurfaceDescriptor::Terminal { terminal_id },
+                RightPanelSurfaceDescriptor::File {
+                    path: "src/main.rs".into(),
+                },
+                RightPanelSurfaceDescriptor::Diff {
+                    source: waku_client::workspace::ReviewDiffSource::Staged,
+                },
+            ],
+            active: Some(1),
+        };
+
+        let state = right_panel_session_from_descriptors(descriptor).expect("surfaces survived");
+
+        assert_eq!(
+            state.surfaces,
+            vec![
+                RightPanelSurface::Terminal(terminal_id),
+                RightPanelSurface::File("src/main.rs".into()),
+                RightPanelSurface::Diff,
+            ]
+        );
+        assert_eq!(state.active_surface, Some(1));
+        assert_eq!(state.diff_source, ReviewDiffSource::Staged);
+        assert!(state.file_editors.is_empty());
+        assert!(state.expanded_paths.is_empty());
+        assert!(state.files_selected_path.is_none());
+        assert_eq!(state.file_tree_width, DEFAULT_FILE_TREE_WIDTH);
+    }
+
+    #[test]
+    fn a_descriptor_with_no_surfaces_restores_no_panel() {
+        assert!(
+            right_panel_session_from_descriptors(RightPanelTaskDescriptor::default()).is_none()
+        );
+    }
+
+    #[test]
+    fn a_saved_panel_round_trips_into_a_rebuilt_panel() {
+        let terminal_id = Uuid::new_v4();
+        let descriptor = RightPanelTaskDescriptor {
+            surfaces: vec![
+                RightPanelSurfaceDescriptor::Terminal { terminal_id },
+                RightPanelSurfaceDescriptor::File {
+                    path: "src/main.rs".into(),
+                },
+                RightPanelSurfaceDescriptor::Diff {
+                    source: waku_client::workspace::ReviewDiffSource::Branch,
+                },
+            ],
+            active: Some(0),
+        };
+
+        // The window closed and `state.json` was written, then read back in a
+        // rebuilt window; the daemon terminal and the file are both still there.
+        let encoded = serde_json::to_string(&descriptor).expect("serialize panel descriptors");
+        let decoded: RightPanelTaskDescriptor = serde_json::from_str(&encoded).unwrap();
+        let surviving = restore_right_panel_descriptors(decoded, |id| id == terminal_id, |_| true);
+        let state = right_panel_session_from_descriptors(surviving).expect("surfaces survived");
+
+        assert_eq!(
+            state.surfaces,
+            vec![
+                RightPanelSurface::Terminal(terminal_id),
+                RightPanelSurface::File("src/main.rs".into()),
+                RightPanelSurface::Diff,
+            ]
+        );
+        assert_eq!(state.active_surface, Some(0));
+        assert_eq!(state.diff_source, ReviewDiffSource::Branch);
+    }
 }
 
 impl Waku {
@@ -1819,6 +2161,132 @@ impl Waku {
             self.request_active_terminal_focus();
             self.request_active_browser_focus();
         }
+    }
+
+    /// The per-task right-panel descriptors the desktop state store persists.
+    ///
+    /// The selected task's live panel is captured with the panels that were
+    /// swapped out to other tasks; a task with nothing durable open is left
+    /// out so the snapshot stays small. Called from [`Waku::save`] so every
+    /// write of `state.json` carries the panel's current identity.
+    pub(super) fn persisted_right_panel_descriptors(
+        &self,
+    ) -> BTreeMap<Uuid, RightPanelTaskDescriptor> {
+        let mut descriptors = BTreeMap::new();
+        for (session_id, state) in &self.right_panel_session_states {
+            if Some(*session_id) == self.state.selected_session {
+                continue;
+            }
+            let descriptor = persist_right_panel_descriptors(
+                &state.surfaces,
+                state.active_surface,
+                state.diff_source,
+            );
+            if !descriptor.surfaces.is_empty() {
+                descriptors.insert(*session_id, descriptor);
+            }
+        }
+        if let Some(session_id) = self.state.selected_session {
+            let descriptor = persist_right_panel_descriptors(
+                &self.right_panel_surfaces,
+                self.right_panel_active_surface,
+                self.right_panel_diff_source,
+            );
+            if !descriptor.surfaces.is_empty() {
+                descriptors.insert(session_id, descriptor);
+            }
+        }
+        descriptors
+    }
+
+    /// Rebuilds every task's right panel from the persisted descriptors.
+    ///
+    /// This is the entry point a window rebuilt over the same daemon uses: a
+    /// terminal or file descriptor is restored only while its daemon terminal
+    /// or file still exists, a missing one leaves the surface absent with no
+    /// error, and a browser surface was never persisted in the first place.
+    /// The existence checks are daemon round trips, so they run off the UI
+    /// thread and the restored panels land through `cx.notify`.
+    ///
+    /// Called once per workspace, from [`Waku::new`], after task state has
+    /// loaded.
+    pub(super) fn restore_persisted_right_panels(&mut self, cx: &mut Context<Self>) {
+        if self.state.right_panel_descriptors.is_empty() {
+            return;
+        }
+        let descriptors = std::mem::take(&mut self.state.right_panel_descriptors);
+        // Resolve each task's workspace on the UI thread, where the projects
+        // and sessions live; the daemon checks below run without them.
+        let requests = descriptors
+            .into_iter()
+            .filter_map(|(session_id, descriptor)| {
+                let session = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)?;
+                let workspace_path = self.workspace_path_for_session(session)?.to_path_buf();
+                Some((session_id, descriptor, workspace_path))
+            })
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            return;
+        }
+        let daemon = self.daemon.client();
+        let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
+        cx.spawn(async move |waku, cx| {
+            let restored = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut restored = HashMap::new();
+                    for (session_id, descriptor, workspace_path) in requests {
+                        let surviving = restore_right_panel_descriptors(
+                            descriptor,
+                            |terminal_id| {
+                                crate::terminal::daemon_terminal_exists(&daemon, terminal_id)
+                            },
+                            |path| workspace_file_exists(&workspace, &workspace_path, path),
+                        );
+                        if !surviving.surfaces.is_empty() {
+                            restored.insert(session_id, surviving);
+                        }
+                    }
+                    restored
+                })
+                .await;
+            waku.update(cx, |waku, cx| {
+                waku.apply_restored_right_panels(restored, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Applies the descriptors that survived a rebuild. Only the selected
+    /// task's panel reaches the live fields; every other task keeps its state
+    /// until the user switches to it.
+    fn apply_restored_right_panels(
+        &mut self,
+        restored: HashMap<Uuid, RightPanelTaskDescriptor>,
+        cx: &mut Context<Self>,
+    ) {
+        for (session_id, descriptor) in restored {
+            if let Some(mut state) = right_panel_session_from_descriptors(descriptor) {
+                // Panel visibility is the window's, not the descriptor's; carry
+                // it into the restored state so a rebuilt task shows the panel
+                // the way the window has it.
+                state.visible = self.right_panel_visible;
+                self.right_panel_session_states.insert(session_id, state);
+            }
+        }
+        let Some(session_id) = self.state.selected_session else {
+            return;
+        };
+        if !self.right_panel_session_states.contains_key(&session_id) {
+            return;
+        }
+        self.restore_right_panel_state(session_id, cx);
+        cx.notify();
     }
 
     pub(super) fn remove_right_panel_session_state(&mut self, session_id: Uuid) {
