@@ -135,11 +135,14 @@ fabricate one.
 notifications (`subagent-incremental-child-notify`, `subagent-notify`) map to
 `DriverEvent::BackgroundWork` (`BackgroundWorkKind::Subagent`) — the surface that
 already exists for "work that outlives the turn", which is what a workflow child
-is — and everything else becomes a system line in the transcript, the same shape
-Claude and Codex notices take. A message marked `display: false` is stored but
-never rendered, so the local projection keeps matching the provider's session
-tree (Pi hides those in its own TUI; dropping them outright would make the tree
-diverge).
+is. The display flag decides the conversation, not the work surface:
+pi-subagents marks a completed child not for display and a failed or stopped one
+for display, and both are the same kind of event, so both are rendered on the
+detached-work surface and neither adds a chat row. Every other message becomes a
+system line in the transcript, the same shape Claude and Codex notices take, and
+only when the message is marked for display. A message marked `display: false`
+adds no row and nothing is kept beside it: nothing in the client renders it, and
+the provider's own session file is the record of its tree.
 
 **D9 — Extension UI records map onto existing app surfaces.** `notify` becomes
 the app's notice/toast channel with its `notifyType`; `setStatus` a per-session

@@ -20,7 +20,7 @@
 - [x] 3.1 Allow Pi and Oh My Pi to open a turn with no prompt, as Codex, Claude and OpenCode already may, and keep the guard that only a run-start signal opens one; verified by an app test where a `TurnStarted` with no active turn opens one, its deltas land, and a custom message with no run does not
 - [x] 3.2 Decode `role: "custom"` messages — kind, text, display flag — in the transport's inbound stream; verified by driver tests for a custom message and for one marked not for display
 - [x] 3.3 Classify subagent notifications onto the detached-work surface (`BackgroundWork`, kind subagent) and everything else to a transcript system line; verified by driver tests for `subagent-incremental-child-notify`, `subagent-notify` and an unknown type, plus an app test showing the child where detached work is shown
-- [x] 3.4 Keep a message the provider marked not for display in the stored view while rendering nothing for it; verified by a test asserting the session's stored projection holds it and the transcript has no row for it
+- [x] 3.4 Render a detached-work message on the work surface whatever its display flag says and add no conversation row for it, and add no row or stored copy for any other message the provider marked not for display; verified by driver tests asserting one `BackgroundWork` upsert and no `ExtensionMessage` for a hidden child record, and by an app test asserting a hidden notice adds neither a row nor a stored entry
 
 ## 4. Extension UI surfaces
 

@@ -350,7 +350,7 @@ rather than as an assistant reply.
 | `agent_start`, `turn_start` | `TurnStarted` (once per run) |
 | `message_update` → `text_delta` / `thinking_delta` | `TextDelta` / `ReasoningDelta` |
 | `message_end` | fallback text/thinking when no delta was streamed |
-| `message_end` with `role: "custom"` | `BackgroundWork` (kind subagent) for pi-subagents' child and background notifications, `ExtensionMessage` for any other extension message; `display: false` is carried through and never rendered |
+| `message_end` with `role: "custom"` | `BackgroundWork` (kind subagent) for pi-subagents' child and background notifications, which the work surface shows whatever their `display` flag says; `ExtensionMessage` for any other extension message, which the transcript renders only when `display` is true |
 | `tool_execution_start` / `_update` / `_end` | `RichActivity` |
 | `auto_retry_end` | clears or sets the failure flag |
 | `agent_settled` (Pi) / `agent_end` (Oh My Pi) | `TurnFinished`, then resets stream state |

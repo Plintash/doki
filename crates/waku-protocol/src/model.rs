@@ -1997,17 +1997,17 @@ fn is_false(flag: &bool) -> bool {
 /// An extension message from the provider's own session tree (`role:
 /// "custom"`).
 ///
-/// The provider records these itself, so the session keeps every one —
-/// including the ones it marks as not for display — and the transcript renders
-/// only the ones marked for display. Dropping the rest would leave the local
-/// view shorter than the provider's tree.
+/// The transcript renders the ones the provider marked for display as system
+/// lines, and the session keeps those beside the row. A message the provider
+/// withheld from the conversation has no row in the client either, so nothing
+/// is kept for it: the provider's own session file is the record of its tree.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionMessage {
     pub custom_type: String,
     pub text: String,
     /// Whether the provider intends this message to be shown. A message with
-    /// `display: false` is stored and never rendered.
+    /// `display: false` adds no row.
     pub display: bool,
 }
 

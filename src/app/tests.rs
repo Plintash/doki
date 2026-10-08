@@ -24,10 +24,11 @@ use super::{
     response_row_turn_id, returned_messages_draft, session_accepts_turn_output,
     session_is_reapable, set_extension_status, set_extension_widget, set_extension_window_title,
     should_refresh_branch_after_activity, should_show_navigation_rail,
-    should_show_scroll_to_bottom, task_id_from_notification_tag, task_notification_tag,
-    transcript_anchor_end_space, transcript_navigation_turns, transcript_rests_at_tail,
-    transcript_row_kinds, transcript_row_splice, transcript_rows_fingerprint,
-    widened_panel_width_for_file_editor, widened_panel_width_for_review,
+    should_show_scroll_to_bottom, stored_queue_texts, task_id_from_notification_tag,
+    task_notification_tag, transcript_anchor_end_space, transcript_navigation_turns,
+    transcript_rests_at_tail, transcript_row_kinds, transcript_row_splice,
+    transcript_rows_fingerprint, widened_panel_width_for_file_editor,
+    widened_panel_width_for_review,
 };
 use crate::git_branch::BranchEntry;
 use crate::model::{
@@ -85,6 +86,63 @@ fn a_retracted_message_returns_to_the_composer_in_front_of_its_draft() {
         returned_messages_draft(None, &[]).text,
         "",
         "nothing returned leaves the draft alone"
+    );
+}
+
+/// A queued prompt reaches the provider in its resolved form while the
+/// transcript keeps the typed one, so the provider's queue report names the
+/// message by text the transcript never stored. Reading the report back has to
+/// find the message anyway, or a queued template or skill prompt never shows
+/// pending and a stop cannot hand its text back.
+#[test]
+fn a_queue_report_entry_finds_the_typed_prompt_it_resolved_from() {
+    use crate::composer_complete::{CommandScope, SlashCommand};
+
+    let commands = vec![
+        SlashCommand {
+            name: "plan".into(),
+            description: String::new(),
+            scope: CommandScope::Skill,
+            argument_hint: None,
+            template: None,
+        },
+        SlashCommand {
+            name: "ship".into(),
+            description: String::new(),
+            scope: CommandScope::Project,
+            argument_hint: None,
+            template: Some("Release $ARGUMENTS now".into()),
+        },
+    ];
+
+    // Newest first, as the pending mark reads the transcript.
+    let stored = vec!["/plan tomorrow".to_owned(), "/ship it".to_owned()];
+    assert_eq!(
+        stored_queue_texts(
+            ProviderKind::Pi,
+            &commands,
+            &stored,
+            &[
+                "/skill:plan tomorrow".to_owned(),
+                "Release it now".to_owned()
+            ],
+        ),
+        vec!["/plan tomorrow".to_owned(), "/ship it".to_owned()],
+        "a skill and a template both resolve away from the typed text"
+    );
+
+    // An entry that matches a stored prompt directly (a steer keeps the
+    // transport text the provider will echo) and one the client cannot place
+    // are kept as they are, so the pending mark stays the provider's queue and
+    // a message it does not name stays delivered.
+    assert_eq!(
+        stored_queue_texts(
+            ProviderKind::Pi,
+            &commands,
+            &["/plan tomorrow".to_owned()],
+            &["/plan tomorrow".to_owned(), "unrecognised".to_owned()],
+        ),
+        vec!["/plan tomorrow".to_owned(), "unrecognised".to_owned()]
     );
 }
 
@@ -2580,11 +2638,12 @@ fn an_extension_message_that_starts_no_run_opens_no_turn() {
     assert_eq!(session.status, SessionStatus::Idle);
 }
 
-/// The provider hides `display: false` records in its own TUI, but they are
-/// still entries in its session tree. The session keeps the record so the two
-/// views stay the same length, and the transcript shows nothing for it.
+/// The provider hides `display: false` records from the conversation, so the
+/// client adds no row for one and keeps nothing beside it: the provider's own
+/// session file is the record of its tree, and a copy nothing renders would be
+/// a second one.
 #[test]
-fn a_hidden_extension_message_is_stored_without_a_row() {
+fn a_hidden_extension_message_adds_no_row() {
     let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
 
     record_extension_message(
@@ -2594,16 +2653,7 @@ fn a_hidden_extension_message_is_stored_without_a_row() {
         false,
     );
 
-    assert_eq!(session.extension_messages.len(), 1);
-    assert_eq!(
-        session.extension_messages[0].custom_type,
-        "subagent-compaction-resume"
-    );
-    assert_eq!(
-        session.extension_messages[0].text,
-        "Context compaction resumed."
-    );
-    assert!(!session.extension_messages[0].display);
+    assert!(session.extension_messages.is_empty());
     assert!(session.messages.is_empty(), "nothing is rendered for it");
     assert!(folded_transcript_row_kinds(&session, &HashSet::new()).is_empty());
 }

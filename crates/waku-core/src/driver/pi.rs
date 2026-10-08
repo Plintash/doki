@@ -2039,19 +2039,24 @@ fn emit_extension_message(message: &Value, events: &impl DriverEventSink) {
         .and_then(Value::as_str)
         .unwrap_or_default();
     let text = pi_custom_message_text(message.get("content"));
+    let display = message
+        .get("display")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     // pi-subagents reports its detached children through its own custom
     // messages. Those records are the only sign a background child settled,
     // and the client already has a surface for work that outlives the turn.
+    // The flag decides the conversation rather than that surface: pi-subagents
+    // marks a completed child not for display and a failed or stopped one for
+    // display, and both are the same kind of event, so the child's outcome
+    // goes to the detached-work surface either way and never becomes a chat
+    // row.
     if let Some(item) = pi_subagent_background_item(custom_type, &text) {
         let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
             item,
         )));
         return;
     }
-    let display = message
-        .get("display")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
     let _ = events.send(DriverEvent::ExtensionMessage {
         custom_type: custom_type.to_owned(),
         text,
@@ -4336,9 +4341,10 @@ mod tests {
 
     #[test]
     fn an_extension_message_marked_not_for_display_is_still_delivered() {
-        // Pi hides these in its own TUI, but they are records in the
-        // provider's session tree. The client stores them without rendering,
-        // which it can only do if the flag survives the transport.
+        // Pi hides these from its own conversation, so the client adds no
+        // conversation row for one. Which is only possible if the flag survives
+        // the transport. The one exception is pi-subagents' detached-child
+        // records, which the client shows on the work surface instead.
         let (pending, commands, _command_rx, mut state) = harness();
         let (events, event_rx) = unbounded();
         handle_pi_message(

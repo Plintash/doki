@@ -133,6 +133,32 @@ impl Waku {
         self.return_retracted_messages(session_id, &texts, cx);
     }
 
+    /// The stored prompt each provider queue report entry names, in the
+    /// report's order.
+    ///
+    /// A report speaks the transport's language — templates expanded, skills
+    /// in provider syntax — while the transcript keeps what the user typed, so
+    /// each entry is resolved back through the same seam its submission used
+    /// before the pending list is matched against it.
+    fn provider_queue_texts(&self, session_id: Uuid, report: &[String]) -> Vec<String> {
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return report.to_vec();
+        };
+        let stored = session
+            .messages
+            .iter()
+            .rev()
+            .filter(|message| message.role == MessageRole::User)
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+        stored_queue_texts(session.provider, &self.slash_command_index, &stored, report)
+    }
+
     pub(super) fn finish_streaming_assistant(&mut self, session_id: Uuid) {
         if let Some(session) = self.state.session_mut(session_id) {
             for message in &mut session.messages {
@@ -731,6 +757,8 @@ impl Waku {
                 // The provider's own queue is the truth about what is still on
                 // its way: a message in it is queued, and one it leaves out has
                 // been delivered.
+                let steering = self.provider_queue_texts(session_id, &steering);
+                let follow_up = self.provider_queue_texts(session_id, &follow_up);
                 if let Some(session) = self.state.session_mut(session_id)
                     && session.mark_provider_queue(&steering, &follow_up)
                 {
@@ -741,6 +769,7 @@ impl Waku {
                 // No run will carry these, so they leave the transcript and
                 // their text goes back to the user. The settle that caused it
                 // arrives next.
+                let messages = self.provider_queue_texts(session_id, &messages);
                 self.return_retracted_messages(session_id, &messages, cx);
             }
             DriverEvent::PlanUsageUpdated(usage) => {
@@ -1132,24 +1161,61 @@ pub(super) fn returned_messages_draft(
     draft
 }
 
+/// The stored prompt each provider queue report entry names.
+///
+/// The transport text and the transcript text differ wherever submission
+/// resolves one: a template expands, a skill takes the provider's syntax. A
+/// queue report names the message by the transport's text, so each entry is
+/// matched back to the newest stored prompt that resolves to it; an entry
+/// already in transport form (a steer's message) matches its own text as it
+/// is.
+///
+/// `stored` is newest first, so the match agrees with the newest-first rule
+/// the pending mark itself applies.
+pub(super) fn stored_queue_texts(
+    provider: ProviderKind,
+    commands: &[SlashCommand],
+    stored: &[String],
+    report: &[String],
+) -> Vec<String> {
+    report
+        .iter()
+        .map(|entry| {
+            stored
+                .iter()
+                .find(|prompt| {
+                    prompt.as_str() == entry
+                        || crate::composer_complete::resolved_submission(provider, prompt, commands)
+                            .as_deref()
+                            == Some(entry.as_str())
+                })
+                .cloned()
+                .unwrap_or_else(|| entry.clone())
+        })
+        .collect()
+}
+
 /// Records an extension message from the provider's own session tree.
 ///
-/// The provider keeps these records itself, so the session keeps every one —
-/// including the ones it marks as not for display, which must not render. A
-/// message marked for display becomes a transcript notice, the same shape the
-/// app's own system lines take. Recording a message never opens a turn: Pi
-/// announces a run of its own with `agent_start`/`turn_start`, and a notice an
-/// extension appends without one must not fabricate it.
+/// A message the provider marked for display becomes a transcript notice, the
+/// same shape the app's own system lines take, and is kept beside it. Nothing
+/// is kept for a message the provider withheld from the conversation: no row
+/// shows it, so a copy the client never renders would only be a second record
+/// of a tree the provider already owns.
+///
+/// Recording a message never opens a turn: Pi announces a run of its own with
+/// `agent_start`/`turn_start`, and a notice an extension appends without one
+/// must not fabricate it.
 pub(super) fn record_extension_message(
     session: &mut AgentSession,
     custom_type: String,
     text: String,
     display: bool,
 ) {
-    let rendered = display && !text.trim().is_empty();
-    if rendered {
-        session.push_message(MessageRole::System, text.clone());
+    if !display || text.trim().is_empty() {
+        return;
     }
+    session.push_message(MessageRole::System, text.clone());
     session.extension_messages.push(ExtensionMessage {
         custom_type,
         text,
