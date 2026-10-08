@@ -27,6 +27,9 @@ menu.close_window: 关闭窗口
 window.minimize: 最小化
 window.maximize: 最大化
 window.restore: 还原
+window_close.title: 有未保存的更改
+window_close.body: 此窗口中有尚未保存的文件编辑，关闭后将丢弃这些修改。
+window_close.discard: 丢弃并关闭
 updater.update: 更新
 updater.updating: 正在更新…
 updater.up_to_date: Doki 已是最新版本

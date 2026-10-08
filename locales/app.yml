@@ -54,6 +54,12 @@ window.maximize:
   en: Maximize
 window.restore:
   en: Restore
+window_close.title:
+  en: Unsaved changes
+window_close.body:
+  en: This window has unsaved file edits. Closing it discards them.
+window_close.discard:
+  en: Discard and Close
 
 updater.update:
   en: Update

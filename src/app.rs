@@ -1521,6 +1521,12 @@ pub struct Waku {
     right_panel_rendered_width: f32,
     fps_counter_visible: bool,
     panel_resize_drag: Option<PanelResizeDrag>,
+    /// The confirmation an unsaved file editor raises in front of a close.
+    unsaved_edits_guard: UnsavedEditsGuard,
+    /// The confirmation's two choices, so both answer the keyboard as well as
+    /// the pointer.
+    window_close_discard_focus: FocusHandle,
+    window_close_cancel_focus: FocusHandle,
     /// Window-relative PiP position, independent of incoming preview frames.
     computer_use_preview_position: Option<gpui::Point<Pixels>>,
     right_panel_session_states: HashMap<Uuid, RightPanelSessionState>,
@@ -1813,6 +1819,7 @@ mod transcript_view;
 mod usage_meter;
 mod usage_page;
 pub(crate) mod window_chrome;
+mod window_close;
 
 pub use autocomplete::init as init_composer_autocomplete;
 use background_work::{
@@ -1830,6 +1837,8 @@ pub use skills_page::init as init_skills_keys;
 use streaming::*;
 use transcript::*;
 use transcript_view::ConversationNavigationRail;
+use window_close::UnsavedEditsGuard;
+pub use window_close::init as init_window_close_keys;
 
 /// Collapse provider- or page-supplied text into a label that cannot contain
 /// hard line breaks. GPUI's `truncate()` prevents wrapping, but explicit
@@ -3076,6 +3085,9 @@ impl Waku {
                 },
                 fps_counter_visible: false,
                 panel_resize_drag: None,
+                unsaved_edits_guard: UnsavedEditsGuard::default(),
+                window_close_discard_focus: cx.focus_handle(),
+                window_close_cancel_focus: cx.focus_handle(),
                 computer_use_preview_position: None,
                 right_panel_session_states: HashMap::new(),
                 right_panel_surfaces: Vec::new(),
