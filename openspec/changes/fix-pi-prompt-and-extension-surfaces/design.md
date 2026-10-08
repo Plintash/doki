@@ -185,10 +185,12 @@ completion must wake the parent and appear.
   sends without a timeout — its `editor` dialog carries none — waits for the
   user exactly as it would in Pi's own terminal UI. The request is surfaced
   prominently either way.
-- **Live tests need a credentialed Pi and the extension installed.** They must
-  stay runnable without either — the existing live tests in `pi.rs` skip rather
-  than fail when the binary is absent, and the pi-subagents acceptance run is
-  gated the same way.
+- **Live tests need a credentialed Pi and the extension installed.** They skip
+  when the binary is absent, which is what CI has, and the pi-subagents
+  acceptance test stays `#[ignore]`d behind that. An installed but
+  uncredentialed Pi fails them instead of skipping: the suite assumes a
+  developer who has the CLI has signed in, and probing for credentials would
+  hide a startup failure behind a skip.
 
 ## Migration Plan
 
