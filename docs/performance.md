@@ -325,3 +325,62 @@ The harness assumes a debug bundle in `target/debug`; `--app` points it at
 another one. Debug builds overweight layout and scene generics, so treat the
 absolute numbers as structure, not as what users feel, and confirm user-facing
 claims on a release build.
+
+### Where reopen time goes
+
+Issue #41 profiled the rebuild below the milestone resolution to decide whether
+GPUI window or renderer initialization warranted a patch on the pinned GPUI
+fork (`egoist/zed`, branch `waku-webview`, `Cargo.toml`). It does not: a rebuild
+spends most of its time re-loading state from the daemon, not in GPUI.
+
+The split is available from the shipped milestones without new
+instrumentation. On a rebuild `daemon_ready` is recorded when the build
+closure asks the application for its daemon and finds it already connected
+(so `daemon::request` returns immediately), which makes
+`daemon_ready - window_open` the native window plus renderer initialization and
+`tasks_hydrated - daemon_ready` everything the workspace does to load and
+construct itself. To attribute that second span, temporary millisecond spans
+were placed around `Waku::new`'s daemon reads (`ComposerDraftStore::load`,
+`StateStore::load_or_fresh`) and a `sample <pid> 3 -file` capture was taken
+across the launch and rebuild. Four rebuilds (debug build, reference machine,
+2026-10-08):
+
+| Rebuild | Window + renderer init | State load + construction | Latency |
+| --- | --- | --- | --- |
+| 1 | 16.2 ms | 84.5 ms | 100.7 ms |
+| 2 | 17.7 ms | 64.8 ms | 82.6 ms |
+| 3 | 16.1 ms | 68.2 ms | 84.4 ms |
+| 4 | 30.4 ms | 57.7 ms | 88.2 ms |
+
+Inside the second column the temporary spans and the capture agree: the
+synchronous `LoadTaskState` round-trip is the one stable cost, ~52–54 ms in
+every run, and workspace construction after hydration is ~1–3 ms:
+
+| Rebuild | `LoadTaskState` | Composer drafts | View construction |
+| --- | --- | --- | --- |
+| 1 | 54.1 ms | 29.1 ms | 1.1 ms |
+| 2 | 52.2 ms | 9.9 ms | 2.3 ms |
+| 3 | 54.1 ms | 10.5 ms | 3.1 ms |
+| 4 | 52.3 ms | 1.1 ms | 2.3 ms |
+
+The `sample` capture of the rebuild's `open_main_window` path shows the same
+shape: `MacPlatform::open_window` holds ~13 of 1 ms samples against ~41 for
+`Waku::new` → `StateStore::load_or_fresh` → `StateStore::load`, i.e. the daemon
+request. The first-frame render that follows `interactive` was 2.5–18 ms.
+These runs had no selected session (`temp/state.json` in the debug profile has
+`selected_session: null`), so `StateStore::load_or_fresh` skipped the
+selected-session `HydrateSession`; on a profile with a selected task that
+request would extend the same hydration span.
+
+**Decision: no GPUI fork patch.** Window and renderer initialization is
+16–30 ms, roughly a fifth to a third of a rebuild, while the daemon round-trips
+that reload task state into the freshly built workspace are 55–83 ms. A fork
+patch could only address the smaller slice, and the rebuild already comes in
+~5–6× under the 500 ms budget, so the patch would add a third carried change to
+the fork for no user-visible win. The dominant cost is also the one the design
+already knows how to move: `Waku::new` fetches the whole task state (and the
+selected session's detail) synchronously inside the window's build closure, so
+a rebuild re-pays the hydration the cold launch pays even though it reuses the
+running daemon. If the budget ever tightens, the lever is moving or caching
+that hydration in `startup-latency` Phase 3 — app-side work that needs no GPUI
+change — which is why this profile is recorded instead of a patch.
