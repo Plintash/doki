@@ -2,11 +2,11 @@
 
 ## 1. Daemon terminal retention
 
-- [ ] 1.1 Add terminal attach/replay to the wire protocol: an `AttachTerminal` command returning the retained output snapshot and current size, plus tests that the generated bindings round-trip the new fields
+- [x] 1.1 Add terminal attach/replay to the wire protocol: an `AttachTerminal` command returning the retained output snapshot and current size, plus tests that the generated bindings round-trip the new fields
 - [x] 1.2 Add a bounded output ring to the daemon terminal with tests proving drops only happen past the cap and memory stays bounded
 - [x] 1.3 Coalesce daemon terminal output into bounded batches (interval or byte threshold) with tests that a fast producer yields far fewer events than writes
-- [ ] 1.4 Replay the retained ring on attach, including at least one test that a client attaching after output reconstructs the same bytes
-- [ ] 1.5 Reject writes from a client bound to a superseded runtime with a test covering the replacement path
+- [x] 1.4 Replay the retained ring on attach, including at least one test that a client attaching after output reconstructs the same bytes
+- [x] 1.5 Reject writes from a client bound to a superseded runtime with a test covering the replacement path
 - [ ] 1.6 Verify terminal lifecycle: explicit close terminates the shell, task removal disposes its terminals, and a detached terminal keeps running — via daemon unit/integration tests
 
 ## 2. Desktop terminal on the daemon stream
@@ -34,7 +34,7 @@
 ## 5. Startup and reopen latency
 
 - [ ] 5.1 Add startup/reopen milestone tracing behind an opt-in flag and verify a launch and a reopen each emit the full milestone set
-- [ ] 5.2 Move daemon spawn/connect and initial state loads off the window-open path so the first frame paints skeleton content; verify with a deliberately delayed daemon
+- [x] 5.2 Move daemon spawn/connect and initial state loads off the window-open path so the first frame paints skeleton content; verify with a deliberately delayed daemon
 - [ ] 5.3 Record cold-launch and reopen baselines in `docs/performance.md` and set the budgets the harness enforces
 - [ ] 5.4 Add a repeatable latency harness that launches the debug app and checks the recorded budgets, and verify a deliberately slowed build fails it
 - [ ] 5.5 Profile window/renderer initialization; if it dominates the reopen budget, carry the minimal GPUI fork patch and record the profile and decision in the design or performance doc
