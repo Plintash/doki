@@ -13,7 +13,7 @@
 
 - [x] 2.1 Add a desktop terminal session that attaches to the daemon terminal, feeds replayed bytes into the existing Alacritty emulator, and forwards input and resize; verify with daemon-backed tests for attach, input, and resize
 - [x] 2.2 Switch the right-panel terminal surface to the daemon session and delete the desktop-owned PTY spawn path; verify a shell survives a simulated window teardown and reattaches with its grid intact
-- [ ] 2.3 Persist the terminal identity in the right-panel surface descriptor and restore the surface when that daemon terminal still exists, degrading to no surface when it does not — with serialization tests for both cases
+- [x] 2.3 Persist the terminal identity in the right-panel surface descriptor and restore the surface when that daemon terminal still exists, degrading to no surface when it does not — with serialization tests for both cases
 - [x] 2.4 Document the terminal output cadence and batching rule in `docs/performance.md`, verified by re-running the flood scenario and confirming the client stays responsive
 
 ## 3. Window factory and app-scope services
@@ -24,9 +24,9 @@
 
 ## 4. Close, rebuild, and restore policy
 
-- [ ] 4.1 Remove the macOS hide-on-close path so Cmd-W closes the window through AppKit, and delete the fullscreen `orderOut` workaround; verify the committed fullscreen black-screen reproduction no longer occurs
+- [x] 4.1 Remove the macOS hide-on-close path so Cmd-W closes the window through AppKit, and delete the fullscreen `orderOut` workaround; verify the committed fullscreen black-screen reproduction no longer occurs
 - [ ] 4.2 Extend persisted desktop state with the selected project/task and per-task right-panel descriptors, with round-trip tests for the new fields
-- [ ] 4.3 Hydrate a rebuilt window from daemon state plus the desktop snapshot, with generation guards for superseded and window-closed loads covered by tests
+- [x] 4.3 Hydrate a rebuilt window from daemon state plus the desktop snapshot, with generation guards for superseded and window-closed loads covered by tests
 - [ ] 4.4 Add the unsaved-editor confirmation to the close path, with tests for cancel keeping the window and buffer and confirm discarding them
 - [ ] 4.5 Write the restore/drop policy tests: restored task, layout, and terminal; dropped browser, scroll, cursor, and file-tree state
 - [ ] 4.6 Update `CHANGELOG.md` with the close/rebuild behavior and verify the release-note extraction picks the entry up
