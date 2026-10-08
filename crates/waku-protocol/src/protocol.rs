@@ -19,7 +19,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -488,6 +488,11 @@ pub enum ResponsePayload {
     /// Retained terminal output and current size, returned by
     /// [`Command::AttachTerminal`].
     TerminalSnapshot(TerminalSnapshot),
+    /// The daemon holds no terminal under the attached id. Distinct from an
+    /// error so a client can tell "nothing is running here, open one" from a
+    /// transport or RPC failure, which must not be answered by replacing a
+    /// live terminal. Returned only by [`Command::AttachTerminal`].
+    TerminalAbsent,
 }
 
 /// Retained terminal output and current size, replayed on attach.
@@ -616,13 +621,24 @@ mod tests {
     }
 
     #[test]
+    fn terminal_absence_is_its_own_response_not_an_error() {
+        let json = serde_json::to_value(ResponsePayload::TerminalAbsent).unwrap();
+
+        assert_eq!(json["type"], "terminalAbsent");
+        assert!(matches!(
+            serde_json::from_value(json).unwrap(),
+            ResponsePayload::TerminalAbsent
+        ));
+    }
+
+    #[test]
     fn response_fork_command_uses_stable_camel_case_fields() {
         let json =
             serde_json::to_value(Command::ForkSessionFromResponse { turn_count: 7 }).unwrap();
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 
     #[test]
@@ -631,7 +647,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 
     #[test]

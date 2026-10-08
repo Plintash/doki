@@ -781,9 +781,12 @@ impl Backend for WakuBackend {
             }
             Command::AttachTerminal { task_id } => {
                 let terminals = self.terminals.lock();
-                let owned = terminals
-                    .get(&session_id)
-                    .ok_or_else(|| anyhow!("daemon terminal {session_id} is not running"))?;
+                let Some(owned) = terminals.get(&session_id) else {
+                    // Nothing is running under this id: report absence rather
+                    // than an error so the client can open one without
+                    // mistaking a transport failure for the same answer.
+                    return Ok(ResponsePayload::TerminalAbsent);
+                };
                 if owned.runtime_id != runtime_id {
                     bail!(
                         "daemon terminal {session_id} belongs to runtime {}, not {runtime_id}",

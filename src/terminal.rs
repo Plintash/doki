@@ -109,17 +109,20 @@ struct TerminalEventProxy {
     dark_theme: Arc<AtomicBool>,
 }
 
+/// Sends terminal input to the daemon that owns the PTY. Both the bytes a
+/// user types and the bytes the emulator generates for the shell (device-status
+/// replies, palette answers, bracketed-paste requests) take this path, fired
+/// without waiting for a response because no frame may.
+fn write_terminal(daemon: &DaemonClient, terminal_id: Uuid, data: Vec<u8>) {
+    if data.is_empty() {
+        return;
+    }
+    let _ = daemon.notify(terminal_id, terminal_id, Command::WriteTerminal { data });
+}
+
 impl TerminalEventProxy {
     fn write_daemon(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        let bytes = bytes.into().into_owned();
-        if bytes.is_empty() {
-            return;
-        }
-        let _ = self.daemon.notify(
-            self.terminal_id,
-            self.terminal_id,
-            Command::WriteTerminal { data: bytes },
-        );
+        write_terminal(&self.daemon, self.terminal_id, bytes.into().into_owned());
     }
 }
 
@@ -209,21 +212,35 @@ fn attach_snapshot(
 }
 
 /// The replay the daemon retains for `terminal_id`. `Ok(None)` means the daemon
-/// has no terminal under this id yet, which is the only attach failure the
-/// caller recovers from by opening one.
+/// reported no terminal under this id — the only attach outcome the caller
+/// recovers from by opening one. A transport or RPC failure is an `Err`, never
+/// `None`, so a caller cannot mistake it for absence and replace a live
+/// terminal.
 fn request_snapshot(
     daemon: &DaemonClient,
     task_id: Uuid,
     terminal_id: Uuid,
 ) -> Result<Option<TerminalSnapshot>> {
-    let Ok(ResponsePayload::TerminalSnapshot(snapshot)) = daemon.request(
+    let response = daemon.request(
         terminal_id,
         terminal_id,
         Command::AttachTerminal { task_id },
-    ) else {
-        return Ok(None);
-    };
-    Ok(Some(snapshot))
+    )?;
+    terminal_attach_response(response)
+}
+
+/// Interprets the daemon's answer to `AttachTerminal`. Only an explicit
+/// `TerminalAbsent` means "no terminal here"; the version handshake pins the
+/// daemon to a build that answers with exactly this variant or a snapshot, so
+/// any other success is a protocol error rather than a silent absence.
+fn terminal_attach_response(response: ResponsePayload) -> Result<Option<TerminalSnapshot>> {
+    match response {
+        ResponsePayload::TerminalSnapshot(snapshot) => Ok(Some(snapshot)),
+        ResponsePayload::TerminalAbsent => Ok(None),
+        other => Err(anyhow::anyhow!(
+            "Waku daemon returned an invalid terminal attachment: {other:?}"
+        )),
+    }
 }
 
 /// Trims a delivered batch to the bytes past `boundary`, or `None` when the
@@ -241,6 +258,18 @@ fn trim_to_boundary(batch: Vec<u8>, end: u64, boundary: u64) -> Option<(Vec<u8>,
         batch
     };
     (!batch.is_empty()).then_some((batch, end))
+}
+
+/// The output bytes and cumulative end offset of one `terminalOutput` event.
+/// Both fields belong to the same event, so they are decoded together: a batch
+/// is accepted whole or rejected whole, never half-applied.
+fn terminal_output_batch(payload: &serde_json::Value) -> Option<(Vec<u8>, u64)> {
+    let encoded = payload.get("data")?.as_str()?;
+    let end = payload.get("sequence")?.as_u64()?;
+    let batch = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    Some((batch, end))
 }
 
 struct TerminalSession {
@@ -262,7 +291,9 @@ struct TerminalSession {
 /// A rebuilt window restores a terminal surface only while its process
 /// survived: [`TerminalSession::attach`] opens a fresh shell for an id the
 /// daemon never had, which is the opposite of restoring a dead one. The probe
-/// is a read-only `AttachTerminal`, and an unreachable daemon answers `false`
+/// is a read-only `AttachTerminal`: the daemon reports `TerminalAbsent` for an
+/// id it no longer holds, and an unreachable daemon is an error. Both answer
+/// `false` — the probe only distinguishes a live terminal from anything else —
 /// so a missing terminal leaves the surface absent rather than an error.
 pub(crate) fn daemon_terminal_exists(
     daemon: &DaemonClient,
@@ -360,26 +391,14 @@ impl TerminalSession {
                             };
                             match sequenced.event.kind.as_str() {
                                 "terminalOutput" => {
-                                    let Some(encoded) = sequenced
-                                        .event
-                                        .payload
-                                        .get("data")
-                                        .and_then(|value| value.as_str())
-                                    else {
-                                        continue;
-                                    };
-                                    let Ok(batch) = base64::engine::general_purpose::STANDARD
-                                        .decode(encoded)
-                                    else {
-                                        continue;
-                                    };
-                                    let end = sequenced
-                                        .event
-                                        .payload
-                                        .get("sequence")
-                                        .and_then(serde_json::Value::as_u64)
-                                        .expect(
-                                            "terminalOutput did not carry its output sequence",
+                                    // The version handshake guarantees the
+                                    // daemon stamps output with a sequence, so
+                                    // a malformed batch is a protocol
+                                    // violation, not output to skip: parse the
+                                    // bytes and the offset once and fail once.
+                                    let (batch, end) =
+                                        terminal_output_batch(&sequenced.event.payload).expect(
+                                            "terminalOutput did not carry its output data and sequence",
                                         );
                                     let Some((batch, next_boundary)) =
                                         trim_to_boundary(batch, end, boundary)
@@ -421,14 +440,7 @@ impl TerminalSession {
     }
 
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        let bytes = bytes.into().into_owned();
-        if !bytes.is_empty() {
-            let _ = self.daemon.notify(
-                self.terminal_id,
-                self.terminal_id,
-                Command::WriteTerminal { data: bytes },
-            );
-        }
+        write_terminal(&self.daemon, self.terminal_id, bytes.into().into_owned());
     }
 
     fn resize(&mut self, columns: usize, rows: usize, cell_width: f32) {
@@ -2011,6 +2023,55 @@ mod tests {
     use super::*;
     use alacritty_terminal::event::VoidListener;
     use gpui::{Modifiers, point, size};
+
+    #[test]
+    fn attach_opens_only_when_the_daemon_reports_absence() {
+        let snapshot = TerminalSnapshot {
+            data: vec![1, 2, 3],
+            sequence: 3,
+            cols: 80,
+            rows: 24,
+        };
+        let Some(attached) =
+            terminal_attach_response(ResponsePayload::TerminalSnapshot(snapshot)).unwrap()
+        else {
+            panic!("a snapshot response was read as absence");
+        };
+        assert_eq!(attached.data, vec![1, 2, 3]);
+        assert_eq!(attached.sequence, 3);
+        assert_eq!((attached.cols, attached.rows), (80, 24));
+        // Explicit absence is the one outcome the caller answers by opening a
+        // terminal.
+        assert!(
+            terminal_attach_response(ResponsePayload::TerminalAbsent)
+                .unwrap()
+                .is_none()
+        );
+        // Any other success is a protocol error, not an absence, so the attach
+        // path fails instead of replacing whatever terminal the daemon holds.
+        assert!(terminal_attach_response(ResponsePayload::Ack).is_err());
+    }
+
+    #[test]
+    fn terminal_output_batch_requires_data_and_sequence_together() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"hello");
+        assert_eq!(
+            terminal_output_batch(&serde_json::json!({ "data": encoded, "sequence": 9 })),
+            Some((b"hello".to_vec(), 9))
+        );
+        assert_eq!(
+            terminal_output_batch(&serde_json::json!({ "sequence": 9 })),
+            None
+        );
+        assert_eq!(
+            terminal_output_batch(&serde_json::json!({ "data": "aGVsbG8=", "sequence": "9" })),
+            None
+        );
+        assert_eq!(
+            terminal_output_batch(&serde_json::json!({ "data": "not base64!", "sequence": 9 })),
+            None
+        );
+    }
 
     #[test]
     fn boundary_trim_drops_replayed_batches_and_keeps_later_bytes() {

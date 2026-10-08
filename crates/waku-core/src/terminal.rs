@@ -71,7 +71,7 @@ mod platform {
     impl RetainedOutput {
         pub(crate) fn new(capacity: usize) -> Self {
             Self {
-                capacity: capacity.max(1),
+                capacity,
                 bytes: VecDeque::new(),
                 pushed: 0,
             }
@@ -256,12 +256,6 @@ mod platform {
                 size: Mutex::new(normalized_size(cols, rows)),
                 reader: Some(reader),
             })
-        }
-
-        /// The most recent output bytes this terminal produced, oldest dropped
-        /// first, capped at [`RETAINED_OUTPUT_BYTES`].
-        pub fn retained_output(&self) -> Vec<u8> {
-            self.retained.lock().snapshot()
         }
 
         /// The retained bytes and the cumulative output offset at the last
@@ -458,10 +452,6 @@ pub struct DaemonTerminal;
 impl DaemonTerminal {
     pub fn open(_cwd: &Path, _cols: u16, _rows: u16, _events: EventSink) -> anyhow::Result<Self> {
         bail!("daemon terminals are not supported on this platform")
-    }
-
-    pub fn retained_output(&self) -> Vec<u8> {
-        Vec::new()
     }
 
     pub fn size(&self) -> (u16, u16) {
