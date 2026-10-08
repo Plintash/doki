@@ -216,29 +216,21 @@ fn request_snapshot(
     task_id: Uuid,
     terminal_id: Uuid,
 ) -> Result<Option<TerminalSnapshot>> {
-    match daemon.request(
+    let Ok(ResponsePayload::TerminalSnapshot(snapshot)) = daemon.request(
         terminal_id,
         terminal_id,
         Command::AttachTerminal { task_id },
-    ) {
-        Ok(ResponsePayload::TerminalSnapshot(snapshot)) => Ok(Some(snapshot)),
-        Ok(other) => Err(anyhow::anyhow!(
-            "Waku daemon returned an invalid terminal attachment: {other:?}"
-        )),
-        Err(_) => Ok(None),
-    }
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(snapshot))
 }
 
 /// Trims a delivered batch to the bytes past `boundary`, or `None` when the
 /// attach snapshot already replayed it. The daemon stamps every batch with its
 /// cumulative end offset, so a batch that straddles the boundary keeps only its
-/// tail, and the returned offset becomes the next boundary. A batch without a
-/// stamp (an older daemon) is applied as-is.
-fn trim_to_boundary(batch: Vec<u8>, end: Option<u64>, boundary: u64) -> Option<(Vec<u8>, u64)> {
-    let end = match end {
-        Some(end) => end,
-        None => return (!batch.is_empty()).then_some((batch, boundary)),
-    };
+/// tail, and the returned offset becomes the next boundary.
+fn trim_to_boundary(batch: Vec<u8>, end: u64, boundary: u64) -> Option<(Vec<u8>, u64)> {
     if end <= boundary {
         return None;
     }
@@ -385,7 +377,10 @@ impl TerminalSession {
                                         .event
                                         .payload
                                         .get("sequence")
-                                        .and_then(serde_json::Value::as_u64);
+                                        .and_then(serde_json::Value::as_u64)
+                                        .expect(
+                                            "terminalOutput did not carry its output sequence",
+                                        );
                                     let Some((batch, next_boundary)) =
                                         trim_to_boundary(batch, end, boundary)
                                     else {
@@ -2020,23 +2015,18 @@ mod tests {
     #[test]
     fn boundary_trim_drops_replayed_batches_and_keeps_later_bytes() {
         // Wholly at or below the snapshot boundary: already replayed.
-        assert_eq!(trim_to_boundary(b"abcd".to_vec(), Some(4), 4), None);
+        assert_eq!(trim_to_boundary(b"abcd".to_vec(), 4, 4), None);
         // The first batch after the snapshot continues exactly at the boundary.
         assert_eq!(
-            trim_to_boundary(b"efgh".to_vec(), Some(8), 4),
+            trim_to_boundary(b"efgh".to_vec(), 8, 4),
             Some((b"efgh".to_vec(), 8))
         );
         // A batch that straddles the boundary keeps only its tail.
         assert_eq!(
-            trim_to_boundary(b"cdef".to_vec(), Some(6), 4),
+            trim_to_boundary(b"cdef".to_vec(), 6, 4),
             Some((b"ef".to_vec(), 6))
         );
-        // An unstamped batch is applied without moving the boundary.
-        assert_eq!(
-            trim_to_boundary(b"zz".to_vec(), None, 4),
-            Some((b"zz".to_vec(), 4))
-        );
-        assert_eq!(trim_to_boundary(Vec::new(), Some(9), 4), None);
+        assert_eq!(trim_to_boundary(Vec::new(), 9, 4), None);
     }
 
     #[test]
@@ -2050,7 +2040,7 @@ mod tests {
         // The snapshot replayed "one\n" and the boundary sits at its end.
         processor.advance(&mut term, b"one\n");
         // The first live batch overlaps the snapshot and carries the next line.
-        let (tail, boundary) = trim_to_boundary(b"one\ntwo\n".to_vec(), Some(8), 4).unwrap();
+        let (tail, boundary) = trim_to_boundary(b"one\ntwo\n".to_vec(), 8, 4).unwrap();
         processor.advance(&mut term, &tail);
 
         assert_eq!(boundary, 8);

@@ -112,10 +112,12 @@ transcript: the daemon coalesces output and the client renders from state,
 never per byte.
 
 - The daemon reader appends each read to the terminal's bounded ring and emits
-  one `terminalOutput` event per batch. A batch flushes when it reaches
-  `FLUSH_BYTES` (32 KiB) or `FLUSH_INTERVAL` (16 ms) after the previous flush,
-  whichever comes first, so an interactive echo waits at most one frame and a
-  flooding command cannot drive one message per write
+  one `terminalOutput` event per batch. A batch flushes at or just after it
+  reaches `FLUSH_BYTES` (32 KiB) — a read is appended before the check, so a
+  batch is at most `FLUSH_BYTES + READ_CHUNK_BYTES` — or `FLUSH_INTERVAL`
+  (16 ms) after the previous flush, whichever comes first, so an interactive
+  echo waits at most one frame and a flooding command cannot drive one message
+  per write
   ([crates/waku-core/src/terminal.rs](../crates/waku-core/src/terminal.rs)).
   The ring keeps the most recent 1 MiB; the batch and ring caps are what stop a
   flooding producer from growing daemon memory at the stream rate.

@@ -137,14 +137,33 @@ impl Waku {
         // confirmation is up — finds the same confirmation in the same state,
         // so nothing about it is raised twice.
         let already_asking = self.unsaved_edits_guard.is_open();
-        if self.unsaved_edits_guard.request(self.has_unsaved_edits()) == WindowClose::Close {
-            self.persist_window_state(window, cx);
+        let decision = self.unsaved_edits_guard.request(self.has_unsaved_edits());
+        if self.finish_window_close(decision, window, cx) {
             return true;
         }
         if !already_asking {
             self.raise_unsaved_edits_confirmation(window, cx);
         }
         false
+    }
+
+    /// Act on the guard's answer: land the desktop snapshot when the window may
+    /// go, and report whether it may. The application outlives the window, so
+    /// this is the last moment the frame it was left at is known; the quit-time
+    /// save never sees it. Whoever asked removes the window through its own
+    /// route — AppKit on the native close path, `platform::close_window` for
+    /// Waku's own routes.
+    fn finish_window_close(
+        &mut self,
+        decision: WindowClose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if decision != WindowClose::Close {
+            return false;
+        }
+        self.persist_window_state(window, cx);
+        true
     }
 
     /// Close the window from a route Waku owns: Cmd-W, or the close control of
@@ -186,8 +205,8 @@ impl Waku {
     /// The user chose to discard the unsaved edits and close: the buffers go
     /// with the window and are never written.
     pub(super) fn discard_unsaved_edits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.unsaved_edits_guard.discard() == WindowClose::Close {
-            self.persist_window_state(window, cx);
+        let decision = self.unsaved_edits_guard.discard();
+        if self.finish_window_close(decision, window, cx) {
             crate::platform::close_window(window);
         }
     }
@@ -208,21 +227,25 @@ impl Waku {
         let theme = Theme::current(cx);
         let weak = cx.entity().downgrade();
         let discard = window_close_choice(
-            "window-close-discard",
-            &self.window_close_discard_focus,
-            "icons/trash.svg",
-            tr!("window_close.discard"),
-            theme.danger,
+            WindowCloseChoice {
+                id: "window-close-discard",
+                focus: self.window_close_discard_focus.clone(),
+                icon: "icons/trash.svg",
+                label: tr!("window_close.discard"),
+                tint: theme.danger,
+            },
             weak.clone(),
             &theme,
             |waku, window, cx| waku.discard_unsaved_edits(window, cx),
         );
         let cancel = window_close_choice(
-            "window-close-cancel",
-            &self.window_close_cancel_focus,
-            "icons/x.svg",
-            tr!("common.cancel"),
-            theme.text,
+            WindowCloseChoice {
+                id: "window-close-cancel",
+                focus: self.window_close_cancel_focus.clone(),
+                icon: "icons/x.svg",
+                label: tr!("common.cancel"),
+                tint: theme.text,
+            },
             weak,
             &theme,
             |waku, window, cx| waku.cancel_window_close(window, cx),
@@ -309,23 +332,34 @@ impl Waku {
 }
 
 /// One choice in the confirmation, mouse and keyboard alike.
-#[allow(clippy::too_many_arguments)]
-fn window_close_choice(
+struct WindowCloseChoice {
     id: &'static str,
-    focus: &FocusHandle,
-    icon_path: &'static str,
+    focus: FocusHandle,
+    icon: &'static str,
     label: String,
     tint: Hsla,
+}
+
+/// Render one confirmation choice as an activatable row.
+fn window_close_choice(
+    choice: WindowCloseChoice,
     weak: WeakEntity<Waku>,
     theme: &Theme,
     activate: impl Fn(&mut Waku, &mut Window, &mut Context<Waku>) + Clone + 'static,
 ) -> Stateful<Div> {
+    let WindowCloseChoice {
+        id,
+        focus,
+        icon: icon_path,
+        label,
+        tint,
+    } = choice;
     let click_activate = activate.clone();
     let click_weak = weak.clone();
     let key_weak = weak;
     div()
         .id(id)
-        .track_focus(focus)
+        .track_focus(&focus)
         .tab_index(0)
         .h(px(38.0))
         .w_full()

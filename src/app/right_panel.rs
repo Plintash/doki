@@ -1057,9 +1057,7 @@ fn right_panel_session_from_descriptors(
             }
         }
     }
-    state.active_surface = descriptor
-        .active
-        .filter(|index| *index < state.surfaces.len());
+    state.active_surface = descriptor.active;
     state.diff_source = diff_source;
     Some(state)
 }
