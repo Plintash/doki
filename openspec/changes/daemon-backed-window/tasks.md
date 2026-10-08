@@ -25,18 +25,18 @@
 ## 4. Close, rebuild, and restore policy
 
 - [x] 4.1 Remove the macOS hide-on-close path so Cmd-W closes the window through AppKit, and delete the fullscreen `orderOut` workaround; verify the committed fullscreen black-screen reproduction no longer occurs
-- [ ] 4.2 Extend persisted desktop state with the selected project/task and per-task right-panel descriptors, with round-trip tests for the new fields
+- [x] 4.2 Extend persisted desktop state with the selected project/task and per-task right-panel descriptors, with round-trip tests for the new fields
 - [x] 4.3 Hydrate a rebuilt window from daemon state plus the desktop snapshot, with generation guards for superseded and window-closed loads covered by tests
-- [ ] 4.4 Add the unsaved-editor confirmation to the close path, with tests for cancel keeping the window and buffer and confirm discarding them
+- [x] 4.4 Add the unsaved-editor confirmation to the close path, with tests for cancel keeping the window and buffer and confirm discarding them
 - [ ] 4.5 Write the restore/drop policy tests: restored task, layout, and terminal; dropped browser, scroll, cursor, and file-tree state
 - [ ] 4.6 Update `CHANGELOG.md` with the close/rebuild behavior and verify the release-note extraction picks the entry up
 
 ## 5. Startup and reopen latency
 
-- [ ] 5.1 Add startup/reopen milestone tracing behind an opt-in flag and verify a launch and a reopen each emit the full milestone set
+- [x] 5.1 Add startup/reopen milestone tracing behind an opt-in flag and verify a launch and a reopen each emit the full milestone set
 - [x] 5.2 Move daemon spawn/connect and initial state loads off the window-open path so the first frame paints skeleton content; verify with a deliberately delayed daemon
-- [ ] 5.3 Record cold-launch and reopen baselines in `docs/performance.md` and set the budgets the harness enforces
-- [ ] 5.4 Add a repeatable latency harness that launches the debug app and checks the recorded budgets, and verify a deliberately slowed build fails it
+- [x] 5.3 Record cold-launch and reopen baselines in `docs/performance.md` and set the budgets the harness enforces
+- [x] 5.4 Add a repeatable latency harness that launches the debug app and checks the recorded budgets, and verify a deliberately slowed build fails it
 - [ ] 5.5 Profile window/renderer initialization; if it dominates the reopen budget, carry the minimal GPUI fork patch and record the profile and decision in the design or performance doc
 
 ## 6. Integration validation
