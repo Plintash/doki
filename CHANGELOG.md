@@ -16,7 +16,10 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [26.10.8-rc.2]
+
 - Group sidebar tasks by project by default — the date headings it replaced are still in the sidebar's options menu, and switching back keeps them for good
+- Drop the sidebar's tree lines: a project's tasks are indented under it instead of joined by guide rules that ran through the rows they crossed
 
 ## [26.10.8-rc.1]
 
