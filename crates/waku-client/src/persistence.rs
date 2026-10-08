@@ -23,6 +23,7 @@ use waku_protocol::model::{
     ProviderSessionHistory, ProviderSessionSummary, RuntimeMode,
 };
 use waku_protocol::theme::ThemePreference;
+use waku_protocol::workspace::ReviewDiffSource;
 
 pub use waku_protocol::persistence::{
     ComposerDraft, ComposerDraftAttachment, ComposerDraftChange, ComposerDraftKey,
@@ -284,6 +285,28 @@ pub struct PersistedWindowState {
     pub display: Option<Uuid>,
 }
 
+/// One right-panel surface reduced to the identity a rebuilt window can
+/// restore: a daemon terminal id, a workspace-relative file path, or a diff
+/// source. Browsers and view state — scroll position, selection, editor
+/// buffers, file-tree expansion — are deliberately absent; a rebuilt window
+/// restores identities, not page or caret state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RightPanelSurfaceDescriptor {
+    Terminal { terminal_id: Uuid },
+    File { path: String },
+    Diff { source: ReviewDiffSource },
+}
+
+/// One task's persisted right panel: its restorable surfaces and which of them
+/// was active. An empty `surfaces` means the task had nothing durable open.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct RightPanelTaskDescriptor {
+    pub surfaces: Vec<RightPanelSurfaceDescriptor>,
+    pub active: Option<usize>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -393,6 +416,10 @@ struct AppState {
     markdown_preview: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_state: Option<PersistedWindowState>,
+    /// Per-task right-panel descriptors, keyed by task id. Written only by the
+    /// desktop; a document that predates the field reads back empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    right_panel: BTreeMap<Uuid, RightPanelTaskDescriptor>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -456,6 +483,11 @@ pub struct PersistedState {
     pub markdown_preview: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_state: Option<PersistedWindowState>,
+    /// Per-task right-panel descriptors. Desktop-only: the daemon's task store
+    /// never sees them, so they are skipped in [`PersistedState`]'s own
+    /// serialization and travel to disk through `state.json`'s `AppState`.
+    #[serde(skip)]
+    pub right_panel_descriptors: BTreeMap<Uuid, RightPanelTaskDescriptor>,
     #[serde(default = "default_computer_use_enabled")]
     pub computer_use_enabled: bool,
     #[serde(default)]
@@ -519,6 +551,7 @@ impl PersistedState {
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             markdown_preview: false,
             window_state: None,
+            right_panel_descriptors: BTreeMap::new(),
             computer_use_enabled: false,
             computer_use_allowed_apps: Vec::new(),
             disabled_providers: Vec::new(),
@@ -664,6 +697,7 @@ impl PersistedState {
             right_panel_width: self.right_panel_width,
             markdown_preview: self.markdown_preview,
             window_state: self.window_state,
+            right_panel: self.right_panel_descriptors.clone(),
         }
     }
 
@@ -702,6 +736,7 @@ impl PersistedState {
         self.right_panel_width = app_state.right_panel_width;
         self.markdown_preview = app_state.markdown_preview;
         self.window_state = app_state.window_state;
+        self.right_panel_descriptors = app_state.right_panel;
     }
 
     fn persistable_selected_session(&self) -> Option<Uuid> {
@@ -1336,6 +1371,60 @@ mod tests {
 
         assert_eq!(session.runtime_mode, RuntimeMode::Ask);
         assert_eq!(state.app_state().last_runtime_mode, RuntimeMode::Ask);
+    }
+
+    #[test]
+    fn right_panel_descriptors_round_trip_through_app_state() {
+        let task = Uuid::new_v4();
+        let terminal_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let mut state = PersistedState::empty();
+        state.right_panel_descriptors.insert(
+            task,
+            RightPanelTaskDescriptor {
+                surfaces: vec![
+                    RightPanelSurfaceDescriptor::Terminal { terminal_id },
+                    RightPanelSurfaceDescriptor::File {
+                        path: "src/main.rs".into(),
+                    },
+                    RightPanelSurfaceDescriptor::Diff {
+                        source: ReviewDiffSource::LastTurn {
+                            session_id: task,
+                            turn_id,
+                            turn_count: 2,
+                        },
+                    },
+                ],
+                active: Some(2),
+            },
+        );
+
+        let encoded = serde_json::to_value(state.app_state()).unwrap();
+        let mut restored = PersistedState::empty();
+        restored.apply_app_state(serde_json::from_value(encoded).unwrap());
+
+        assert_eq!(
+            restored.right_panel_descriptors,
+            state.right_panel_descriptors
+        );
+    }
+
+    #[test]
+    fn app_state_written_before_panel_descriptors_restores_them_empty() {
+        // An older `state.json` has no `right_panel` key at all; reading it
+        // must not fail, and the panel simply has nothing to restore.
+        let state: AppState = serde_json::from_str(r#"{"app_state_version":1}"#).unwrap();
+        assert!(state.right_panel.is_empty());
+
+        let mut persisted = PersistedState::empty();
+        persisted.apply_app_state(state);
+        assert!(persisted.right_panel_descriptors.is_empty());
+    }
+
+    #[test]
+    fn app_state_skips_the_right_panel_key_when_nothing_is_open() {
+        let encoded = serde_json::to_value(PersistedState::empty().app_state()).unwrap();
+        assert!(encoded.get("right_panel").is_none());
     }
 
     #[test]

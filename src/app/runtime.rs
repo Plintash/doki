@@ -1563,6 +1563,9 @@ impl Waku {
 
     pub(super) fn save(&mut self) {
         self.last_stream_save = Instant::now();
+        // Every write of `state.json` carries the right panel's current
+        // identities, so a window rebuilt later restores them.
+        self.state.right_panel_descriptors = self.persisted_right_panel_descriptors();
         let daemon_error = self
             .daemon
             .update_settings(self.state.daemon_settings())

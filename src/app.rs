@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -56,8 +56,8 @@ use crate::ui::tooltip::Tooltip;
 use crate::browser::BrowserView;
 use crate::persistence::{
     ComposerDraftStore, ComposerDrafts, DEFAULT_RIGHT_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH,
-    FollowUpBehavior, PersistedState, PersistedWindowState, SidebarGrouping, SidebarOrdering,
-    StateStore,
+    FollowUpBehavior, PersistedState, PersistedWindowState, RightPanelSurfaceDescriptor,
+    RightPanelTaskDescriptor, SidebarGrouping, SidebarOrdering, StateStore,
 };
 use crate::query::{Query, QueryCache};
 use crate::review_diff::{Snapshot as ReviewDiffSnapshot, Source as ReviewDiffSource};
@@ -3225,6 +3225,7 @@ impl Waku {
         // first frame.
         entity.update(cx, |this, cx| {
             this.restart_task_state_sync();
+            this.restore_persisted_right_panels(cx);
             for session_id in startup_live_session_ids {
                 this.start_runtime_attachment(session_id, cx);
             }

@@ -277,6 +277,20 @@ struct TerminalSession {
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Whether the daemon still owns a terminal under `terminal_id`.
+///
+/// A rebuilt window restores a terminal surface only while its process
+/// survived: [`TerminalSession::attach`] opens a fresh shell for an id the
+/// daemon never had, which is the opposite of restoring a dead one. The probe
+/// is a read-only `AttachTerminal`, and an unreachable daemon answers `false`
+/// so a missing terminal leaves the surface absent rather than an error.
+pub(crate) fn daemon_terminal_exists(daemon: &DaemonClient, terminal_id: Uuid) -> bool {
+    matches!(
+        daemon.request(terminal_id, terminal_id, Command::AttachTerminal),
+        Ok(ResponsePayload::TerminalSnapshot { .. })
+    )
+}
+
 impl TerminalSession {
     /// Attaches to the daemon-owned shell and starts feeding its output into a
     /// local Alacritty grid. Emulation, selection, search, and scrolling all
