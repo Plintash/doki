@@ -794,7 +794,7 @@ fn command_targets_runtime(command: &Command) -> bool {
             | Command::ForkSessionFromResponse { .. }
             | Command::RewindSessionToMessage { .. }
             | Command::OpenTerminal { .. }
-            | Command::AttachTerminal
+            | Command::AttachTerminal { .. }
             | Command::WriteTerminal { .. }
             | Command::ResizeTerminal { .. }
             | Command::CloseTerminal
@@ -1853,6 +1853,7 @@ mod tests {
         });
 
         let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
         let opener = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
         let opening_events = opener.subscribe(terminal_id, terminal_id);
         opener
@@ -1860,6 +1861,7 @@ mod tests {
                 terminal_id,
                 terminal_id,
                 Command::OpenTerminal {
+                    task_id,
                     cwd: root.clone(),
                     cols: 100,
                     rows: 30,
@@ -1874,14 +1876,16 @@ mod tests {
         // the attach snapshot instead of the ephemeral event stream.
         let attacher = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
         let attached = attacher
-            .request(terminal_id, terminal_id, Command::AttachTerminal)
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::AttachTerminal { task_id },
+            )
             .unwrap();
-        let ResponsePayload::TerminalSnapshot {
-            data, cols, rows, ..
-        } = attached
-        else {
+        let ResponsePayload::TerminalSnapshot(snapshot) = attached else {
             panic!("attach did not return a terminal snapshot: {attached:?}");
         };
+        let data = snapshot.data;
         assert!(
             data.windows(b"retained-attach-marker".len())
                 .any(|window| window == b"retained-attach-marker"),
@@ -1889,7 +1893,7 @@ mod tests {
             String::from_utf8_lossy(&data)
         );
         assert_eq!(
-            (cols, rows),
+            (snapshot.cols, snapshot.rows),
             (100, 30),
             "attach reported the wrong terminal size"
         );
@@ -1906,12 +1910,16 @@ mod tests {
             )
             .unwrap();
         let resized = attacher
-            .request(terminal_id, terminal_id, Command::AttachTerminal)
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::AttachTerminal { task_id },
+            )
             .unwrap();
-        let ResponsePayload::TerminalSnapshot { cols, rows, .. } = resized else {
+        let ResponsePayload::TerminalSnapshot(snapshot) = resized else {
             panic!("attach did not return a terminal snapshot: {resized:?}");
         };
-        assert_eq!((cols, rows), (132, 43));
+        assert_eq!((snapshot.cols, snapshot.rows), (132, 43));
 
         opener.shutdown();
         attacher.shutdown();
@@ -1962,6 +1970,7 @@ mod tests {
         });
 
         let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
         let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
         let events = client.subscribe(terminal_id, terminal_id);
         client
@@ -1969,6 +1978,7 @@ mod tests {
                 terminal_id,
                 terminal_id,
                 Command::OpenTerminal {
+                    task_id,
                     cwd: root.clone(),
                     cols: 80,
                     rows: 24,
@@ -1980,11 +1990,16 @@ mod tests {
         terminal_output_until(&events, b"00000001");
 
         let attached = client
-            .request(terminal_id, terminal_id, Command::AttachTerminal)
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::AttachTerminal { task_id },
+            )
             .unwrap();
-        let ResponsePayload::TerminalSnapshot { data, sequence, .. } = attached else {
+        let ResponsePayload::TerminalSnapshot(snapshot) = attached else {
             panic!("attach did not return a terminal snapshot: {attached:?}");
         };
+        let (data, sequence) = (snapshot.data, snapshot.sequence);
 
         let mut reconstructed = data.clone();
         let mut boundary = sequence;
@@ -2096,6 +2111,7 @@ mod tests {
         });
 
         let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
         let first = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
         let first_events = first.subscribe(terminal_id, terminal_id);
         first
@@ -2103,6 +2119,7 @@ mod tests {
                 terminal_id,
                 terminal_id,
                 Command::OpenTerminal {
+                    task_id,
                     cwd: root.clone(),
                     cols: 80,
                     rows: 24,
@@ -2117,11 +2134,16 @@ mod tests {
         let second = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
         let second_events = second.subscribe(terminal_id, terminal_id);
         let attached = second
-            .request(terminal_id, terminal_id, Command::AttachTerminal)
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::AttachTerminal { task_id },
+            )
             .unwrap();
-        let ResponsePayload::TerminalSnapshot { data, .. } = attached else {
+        let ResponsePayload::TerminalSnapshot(snapshot) = attached else {
             panic!("attach did not return a terminal snapshot: {attached:?}");
         };
+        let data = snapshot.data;
         assert!(
             data.windows(b"daemon-shell-ready".len())
                 .any(|window| window == b"daemon-shell-ready"),
@@ -2143,6 +2165,282 @@ mod tests {
         second.shutdown();
         server.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Closing a terminal is its explicit end: the daemon terminates and reaps
+    /// the shell and releases the terminal, so a later attach has nothing left
+    /// to reattach to.
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_close_terminates_the_shell_and_releases_the_terminal() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'close-ready:%s\\n' \"$$\"; while IFS= read -r line; do :; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let events = client.subscribe(terminal_id, terminal_id);
+        client
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    task_id,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        let ready = terminal_output_until(&events, b"\n");
+        let child_pid: libc::pid_t = String::from_utf8_lossy(&ready)
+            .trim()
+            .strip_prefix("close-ready:")
+            .expect("the shell reported its pid")
+            .parse()
+            .unwrap();
+
+        client
+            .request(terminal_id, terminal_id, Command::CloseTerminal)
+            .unwrap();
+
+        assert!(
+            !process_is_alive(child_pid),
+            "the shell outlived the terminal that closed: pid {child_pid}"
+        );
+        let attached = client.request(
+            terminal_id,
+            terminal_id,
+            Command::AttachTerminal { task_id },
+        );
+        assert!(
+            attached.is_err(),
+            "the closed terminal was still attachable: {attached:?}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Removing a task disposes the terminals it owns — the shell ends with the
+    /// task — while another task's terminal keeps running.    #[cfg(unix)]
+    #[test]
+    fn websocket_removing_a_task_disposes_its_terminals() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'task-shell-ready:%s\\n' \"$$\"; while IFS= read -r line; do :; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let removed_task = Uuid::new_v4();
+        let kept_task = Uuid::new_v4();
+        let removed_terminal = Uuid::new_v4();
+        let kept_terminal = Uuid::new_v4();
+
+        let removed_events = client.subscribe(removed_terminal, removed_terminal);
+        client
+            .request(
+                removed_terminal,
+                removed_terminal,
+                Command::OpenTerminal {
+                    task_id: removed_task,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        let ready = terminal_output_until(&removed_events, b"\n");
+        let child_pid: libc::pid_t = String::from_utf8_lossy(&ready)
+            .trim()
+            .strip_prefix("task-shell-ready:")
+            .expect("the shell reported its pid")
+            .parse()
+            .unwrap();
+
+        let kept_events = client.subscribe(kept_terminal, kept_terminal);
+        client
+            .request(
+                kept_terminal,
+                kept_terminal,
+                Command::OpenTerminal {
+                    task_id: kept_task,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        terminal_output_until(&kept_events, b"\n");
+
+        client
+            .request(removed_task, Uuid::nil(), Command::RemoveSession)
+            .unwrap();
+
+        assert!(
+            !process_is_alive(child_pid),
+            "the removed task's shell kept running: pid {child_pid}"
+        );
+        let attached = client.request(
+            removed_terminal,
+            removed_terminal,
+            Command::AttachTerminal {
+                task_id: removed_task,
+            },
+        );
+        assert!(
+            attached.is_err(),
+            "a removed task's terminal was still attachable: {attached:?}"
+        );
+        let kept = client.request(
+            kept_terminal,
+            kept_terminal,
+            Command::AttachTerminal { task_id: kept_task },
+        );
+        assert!(
+            matches!(kept, Ok(ResponsePayload::TerminalSnapshot(_))),
+            "removing one task took another task's terminal: {kept:?}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A terminal is scoped to the task that opened it, so a client naming
+    /// another task is refused rather than shown a shell it does not own.
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_attach_refuses_another_tasks_terminal() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'owner-ready\\n'; while IFS= read -r line; do :; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let terminal_id = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let events = client.subscribe(terminal_id, terminal_id);
+        client
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    task_id: owner,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        terminal_output_until(&events, b"owner-ready");
+
+        let other = client.request(
+            terminal_id,
+            terminal_id,
+            Command::AttachTerminal {
+                task_id: Uuid::new_v4(),
+            },
+        );
+        assert!(
+            other.is_err(),
+            "another task attached to a terminal it does not own: {other:?}"
+        );
+        let owned = client.request(
+            terminal_id,
+            terminal_id,
+            Command::AttachTerminal { task_id: owner },
+        );
+        assert!(
+            matches!(owned, Ok(ResponsePayload::TerminalSnapshot(_))),
+            "the owning task could not attach: {owned:?}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Whether the process is still in the process table. The daemon reaps a
+    /// shell it terminates, so a terminated one answers `ESRCH`.
+    #[cfg(unix)]
+    fn process_is_alive(pid: libc::pid_t) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
     }
 
     #[cfg(unix)]
@@ -2177,6 +2475,7 @@ mod tests {
         });
 
         let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
         let superseded_runtime = Uuid::new_v4();
         let replacement_runtime = Uuid::new_v4();
         let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
@@ -2186,6 +2485,7 @@ mod tests {
                 terminal_id,
                 superseded_runtime,
                 Command::OpenTerminal {
+                    task_id,
                     cwd: root.clone(),
                     cols: 80,
                     rows: 24,
@@ -2201,6 +2501,7 @@ mod tests {
                 terminal_id,
                 replacement_runtime,
                 Command::OpenTerminal {
+                    task_id,
                     cwd: root.clone(),
                     cols: 80,
                     rows: 24,
@@ -2309,12 +2610,14 @@ mod tests {
         let started = std::time::Instant::now();
         let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
         let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
         let events = client.subscribe(terminal_id, terminal_id);
         client
             .request(
                 terminal_id,
                 terminal_id,
                 Command::OpenTerminal {
+                    task_id,
                     cwd: root.clone(),
                     cols: 80,
                     rows: 24,
@@ -2460,6 +2763,7 @@ mod tests {
 
         let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
         let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
         let events = client.subscribe(terminal_id, terminal_id);
         assert!(matches!(
             client
@@ -2467,6 +2771,7 @@ mod tests {
                     terminal_id,
                     terminal_id,
                     Command::OpenTerminal {
+                        task_id,
                         cwd: root.clone(),
                         cols: 80,
                         rows: 24,

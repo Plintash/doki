@@ -130,6 +130,15 @@ never per byte.
   the grid renderer is unchanged from the pre-daemon terminal, and the view
   polls it on the existing 24 ms pump. Input and resize are fire-and-forget
   daemon notifications, so a keystroke never blocks the frame that produced it.
+- A frame never waits on that reader. The reader holds the grid lock while it
+  advances a batch, and `TerminalView::render` reads the grid with
+  `try_lock_unfair`, repainting the frame it last read when the lock is busy and
+  staying dirty so the next poll reads again. The wait it avoids is not only
+  emulation — timing `Processor::advance` of a 32 KiB plain-text batch into an
+  80×24 `Term` in a debug build lands at 0.15–0.25 ms — but the reader being
+  scheduled at all: a preempted reader holds the lock for a scheduler quantum,
+  which is several frames. The scrollbar's offsets come from that same read, so
+  its paint pass does not take the lock either.
 
 Verify the cadence with
 `cargo test -p waku-core --locked websocket_terminal_flood_delivers_bounded_batches`
@@ -298,6 +307,10 @@ daemon spawn or state load back on the reopen path fails: a rebuild that waits
 on the daemon pays the ~800 ms `daemon_ready` cost the launch pays.
 
 ### Running the harness
+
+The harness is a local development and pre-tag gate, not a hosted CI job: it
+launches the GUI app, which a headless runner has no window server for. Run it
+before tagging a release, on the machine whose bundle it should measure.
 
 The harness launches the debug app with `open -g`, so it never takes focus,
 and terminates the app and its daemon when it is done. A traced cold launch

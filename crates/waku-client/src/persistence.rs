@@ -1409,6 +1409,36 @@ mod tests {
         );
     }
 
+    /// The window snapshot a rebuilt window reads back carries the selected
+    /// task and the layout: the task, the sidebar and right panel's visibility
+    /// and widths.
+    #[test]
+    fn the_window_snapshot_restores_the_selected_task_and_layout() {
+        let project = Project::from_path(PathBuf::from("/workspace"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.begin_turn("restored turn");
+        let mut state = PersistedState::empty();
+        state.projects = vec![project.clone()];
+        state.selected_project = Some(project.id);
+        state.selected_session = Some(session.id);
+        state.sessions = vec![session];
+        state.sidebar_visible = false;
+        state.sidebar_width = 248.0;
+        state.right_panel_visible = true;
+        state.right_panel_width = 420.0;
+
+        let encoded = serde_json::to_value(state.app_state()).unwrap();
+        let mut restored = PersistedState::empty();
+        restored.apply_app_state(serde_json::from_value(encoded).unwrap());
+
+        assert_eq!(restored.selected_project, state.selected_project);
+        assert_eq!(restored.selected_session, state.selected_session);
+        assert!(!restored.sidebar_visible);
+        assert_eq!(restored.sidebar_width, 248.0);
+        assert!(restored.right_panel_visible);
+        assert_eq!(restored.right_panel_width, 420.0);
+    }
+
     #[test]
     fn app_state_written_before_panel_descriptors_restores_them_empty() {
         // An older `state.json` has no `right_panel` key at all; reading it

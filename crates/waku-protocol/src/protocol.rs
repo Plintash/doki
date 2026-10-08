@@ -19,7 +19,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -260,7 +260,13 @@ pub enum Command {
     Workspace {
         operation: WorkspaceOperation,
     },
+    /// Open a terminal in the daemon, owned by the task it works for.
+    ///
+    /// The owning task is what task removal disposes: a client is free to
+    /// close its own surface, but only the task going away ends the shell
+    /// without an explicit close.
     OpenTerminal {
+        task_id: Uuid,
         #[ts(type = "string")]
         cwd: PathBuf,
         cols: u16,
@@ -271,7 +277,9 @@ pub enum Command {
     /// The response carries the retained output and the terminal's current
     /// size; live output then continues through the runtime event stream, so a
     /// client subscribes before attaching to avoid a gap.
-    AttachTerminal,
+    AttachTerminal {
+        task_id: Uuid,
+    },
     WriteTerminal {
         #[serde(with = "base64_bytes")]
         #[ts(type = "string")]
@@ -478,19 +486,26 @@ pub enum ResponsePayload {
         result: WorkspaceResult,
     },
     /// Retained terminal output and current size, returned by
-    /// [`Command::AttachTerminal`]. `data` is base64 on the wire. `sequence`
-    /// is the cumulative number of output bytes the terminal had produced when
-    /// the snapshot was taken, counting bytes the bounded ring already dropped;
-    /// a client drops live `terminalOutput` batches whose own end sequence is
-    /// at or below it, which makes the snapshot/live boundary exact.
-    TerminalSnapshot {
-        #[serde(with = "base64_bytes")]
-        #[ts(type = "string")]
-        data: Vec<u8>,
-        sequence: u64,
-        cols: u16,
-        rows: u16,
-    },
+    /// [`Command::AttachTerminal`].
+    TerminalSnapshot(TerminalSnapshot),
+}
+
+/// Retained terminal output and current size, replayed on attach.
+///
+/// `data` is base64 on the wire. `sequence` is the cumulative number of output
+/// bytes the terminal had produced when the snapshot was taken, counting bytes
+/// the bounded ring already dropped; a client drops live `terminalOutput`
+/// batches whose own end sequence is at or below it, which makes the
+/// snapshot/live boundary exact.
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSnapshot {
+    #[serde(with = "base64_bytes")]
+    #[ts(type = "string")]
+    pub data: Vec<u8>,
+    pub sequence: u64,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -558,16 +573,32 @@ mod tests {
     }
 
     #[test]
-    fn terminal_attach_returns_a_base64_snapshot_with_size() {
-        let command = serde_json::to_value(Command::AttachTerminal).unwrap();
-        assert_eq!(command["type"], "attachTerminal");
+    fn terminal_commands_name_the_task_that_owns_the_terminal() {
+        let task_id = Uuid::from_u128(7);
 
-        let payload = ResponsePayload::TerminalSnapshot {
+        let command = serde_json::to_value(Command::AttachTerminal { task_id }).unwrap();
+        assert_eq!(command["type"], "attachTerminal");
+        assert_eq!(command["taskId"], task_id.to_string());
+
+        let opened = serde_json::to_value(Command::OpenTerminal {
+            task_id,
+            cwd: PathBuf::from("/workspace"),
+            cols: 100,
+            rows: 30,
+        })
+        .unwrap();
+        assert_eq!(opened["type"], "openTerminal");
+        assert_eq!(opened["taskId"], task_id.to_string());
+    }
+
+    #[test]
+    fn terminal_attach_returns_a_base64_snapshot_with_size() {
+        let payload = ResponsePayload::TerminalSnapshot(TerminalSnapshot {
             data: vec![0, 1, 2, 255],
             sequence: 4096,
             cols: 120,
             rows: 40,
-        };
+        });
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["type"], "terminalSnapshot");
         assert_eq!(json["data"], "AAEC/w==");
@@ -575,18 +606,13 @@ mod tests {
         assert_eq!(json["cols"], 120);
         assert_eq!(json["rows"], 40);
 
-        let ResponsePayload::TerminalSnapshot {
-            data,
-            sequence,
-            cols,
-            rows,
-        } = serde_json::from_value(json).unwrap()
+        let ResponsePayload::TerminalSnapshot(snapshot) = serde_json::from_value(json).unwrap()
         else {
             panic!("unexpected payload variant");
         };
-        assert_eq!(data, vec![0, 1, 2, 255]);
-        assert_eq!(sequence, 4096);
-        assert_eq!((cols, rows), (120, 40));
+        assert_eq!(snapshot.data, vec![0, 1, 2, 255]);
+        assert_eq!(snapshot.sequence, 4096);
+        assert_eq!((snapshot.cols, snapshot.rows), (120, 40));
     }
 
     #[test]
@@ -596,7 +622,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 
     #[test]
@@ -605,7 +631,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 
     #[test]
