@@ -7,7 +7,7 @@
 - [x] 1.3 Coalesce daemon terminal output into bounded batches (interval or byte threshold) with tests that a fast producer yields far fewer events than writes
 - [x] 1.4 Replay the retained ring on attach, including at least one test that a client attaching after output reconstructs the same bytes
 - [x] 1.5 Reject writes from a client bound to a superseded runtime with a test covering the replacement path
-- [ ] 1.6 Verify terminal lifecycle: explicit close terminates the shell, task removal disposes its terminals, and a detached terminal keeps running — via daemon unit/integration tests
+- [x] 1.6 Verify terminal lifecycle: explicit close terminates the shell, task removal disposes its terminals, and a detached terminal keeps running — via daemon unit/integration tests
 
 ## 2. Desktop terminal on the daemon stream
 
@@ -28,8 +28,8 @@
 - [x] 4.2 Extend persisted desktop state with the selected project/task and per-task right-panel descriptors, with round-trip tests for the new fields
 - [x] 4.3 Hydrate a rebuilt window from daemon state plus the desktop snapshot, with generation guards for superseded and window-closed loads covered by tests
 - [x] 4.4 Add the unsaved-editor confirmation to the close path, with tests for cancel keeping the window and buffer and confirm discarding them
-- [ ] 4.5 Write the restore/drop policy tests: restored task, layout, and terminal; dropped browser, scroll, cursor, and file-tree state
-- [ ] 4.6 Update `CHANGELOG.md` with the close/rebuild behavior and verify the release-note extraction picks the entry up
+- [x] 4.5 Write the restore/drop policy tests: restored task, layout, and terminal; dropped browser, scroll, cursor, and file-tree state
+- [x] 4.6 Update `CHANGELOG.md` with the close/rebuild behavior and verify the release-note extraction picks the entry up
 
 ## 5. Startup and reopen latency
 
