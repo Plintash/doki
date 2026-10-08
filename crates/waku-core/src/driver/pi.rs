@@ -3060,17 +3060,25 @@ mod tests {
     /// transport, and it is per step rather than for a whole test.
     const LIVE_STEP_TIMEOUT: Duration = Duration::from_secs(90);
 
+    /// A detached workflow has to spawn its own runner, start a child session
+    /// and post the completion, so it gets a budget of its own.
+    const LIVE_WORKFLOW_TIMEOUT: Duration = Duration::from_secs(240);
+
     /// The probe fixture as an extension Pi loads from a path of its own.
     ///
     /// A path per test, because Pi resolves a loaded extension by path: two
     /// sessions naming the same file would have the second read what the first
     /// compiled.
     fn live_probe_extension(name: &str) -> PathBuf {
+        live_fixture(name, include_str!("fixtures/pi_live_probe.js"))
+    }
+
+    /// A fixture extension, written where Pi can load it.
+    fn live_fixture(name: &str, source: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!("waku-pi-live-{name}"));
         std::fs::create_dir_all(&directory).expect("the fixture extension needs a directory");
         let path = directory.join(format!("{name}.js"));
-        std::fs::write(&path, include_str!("fixtures/pi_live_probe.js"))
-            .expect("the fixture extension needs its body");
+        std::fs::write(&path, source).expect("the fixture extension needs its body");
         path
     }
 
@@ -3314,6 +3322,100 @@ mod tests {
         awaited: &str,
     ) -> DriverEvent {
         next_live_event(event_rx, awaited, LIVE_STEP_TIMEOUT)
+    }
+
+    /// The acceptance path this change exists for: `npm:pi-subagents` runs one
+    /// background workflow, and the child's completion wakes the session — the
+    /// completion lands where detached work is shown, the wake opens a turn with
+    /// no Waku prompt, and the reply it produced streams into the transcript.
+    ///
+    /// Ignored because it needs Pi 1.0 authenticated with `npm:pi-subagents`
+    /// installed, and because the extension registers nothing in a process that
+    /// is itself a Pi subagent: it stands down when `PI_SUBAGENT_CHILD` is set,
+    /// which is the case in a session that is one. Run it with
+    /// `env -u PI_SUBAGENT_CHILD cargo test -p waku-core --lib -- --ignored
+    /// pi_subagents`.
+    #[test]
+    #[ignore = "runs one real pi-subagents background workflow"]
+    fn pi_subagents_bring_a_background_child_wakes_the_parent_against_the_real_rpc() {
+        let extension = live_fixture(
+            "subagents_wake",
+            include_str!("fixtures/pi_subagents_wake.js"),
+        );
+        let Some((driver, event_rx)) = real_pi_session(Some(extension)) else {
+            return;
+        };
+
+        // The command's own turn settles with no run: the workflow it launched
+        // is detached, so the wake arrives later, as a run of its own.
+        driver.prompt("/waku-subagents-wake".to_owned());
+
+        let mut command_settled = false;
+        let mut completion = false;
+        let mut child = None;
+        let mut woke = false;
+        let mut reply = String::new();
+        loop {
+            match next_live_event(
+                &event_rx,
+                "the background child's completion",
+                LIVE_WORKFLOW_TIMEOUT,
+            ) {
+                DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) => {
+                    completion = true;
+                    if item.key.kind == BackgroundWorkKind::Subagent {
+                        child = Some(item);
+                    }
+                }
+                DriverEvent::TurnStarted => {
+                    assert!(
+                        completion,
+                        "the wake must follow the completion, not open a turn of its own"
+                    );
+                    woke = true;
+                }
+                DriverEvent::TextDelta(delta) if woke => reply.push_str(&delta),
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished {
+                    success, summary, ..
+                } => {
+                    if !woke {
+                        assert!(
+                            success,
+                            "the command's own turn settles cleanly: {summary:?}"
+                        );
+                        command_settled = true;
+                        continue;
+                    }
+                    assert!(success, "the wake's run should finish: {summary:?}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            command_settled,
+            "the command that launched the workflow settles"
+        );
+        let child = child.expect("the child's completion must land on the detached-work surface");
+        assert_eq!(child.status, BackgroundWorkStatus::Completed);
+        assert!(
+            child.background,
+            "a workflow child outlives the turn it was launched in"
+        );
+        assert!(
+            child
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Background task completed")),
+            "the completion says what became of the child: {:?}",
+            child.detail
+        );
+        assert!(
+            !reply.trim().is_empty(),
+            "the reply the wake produced must stream into the transcript"
+        );
     }
 
     /// Drives the installed Pi RPC through one real provider turn and reads the
