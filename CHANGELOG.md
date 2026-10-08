@@ -16,6 +16,8 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+- Group sidebar tasks by project by default — the date headings it replaced are still in the sidebar's options menu, and switching back keeps them for good
+
 ## [26.10.8-rc.1]
 
 - Pi: a message sent while the agent is still working is delivered instead of refused, and a prompt the provider refuses now reads as undelivered rather than as an answer
