@@ -35,11 +35,13 @@ mod computer_use;
 pub mod daemon;
 mod driver;
 mod input;
+pub mod latency;
 mod main_window;
 mod md;
 mod platform;
 mod query;
 mod review_diff;
+mod startup_trace;
 mod terminal;
 mod theme;
 mod ui;
@@ -49,6 +51,9 @@ pub use waku_client::{
     checkpoint, command_env, composer_complete, git_branch, git_commit, i18n, identity, model,
     model_catalog, persistence, projectless, skills, usage, usage_history, worktree,
 };
+
+// The environment variables the latency harness sets on the app it launches.
+pub use crate::startup_trace::{CLOSE_AFTER_LAUNCH_ENV, TRACE_ENV};
 
 use gpui::{App, KeyBinding, Menu, MenuItem, actions};
 
@@ -112,6 +117,9 @@ actions!(
 );
 
 pub fn run() {
+    // The earliest point the app can measure from; every trace milestone is
+    // relative to it.
+    crate::startup_trace::mark_process_start();
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
         .with_main_window_reopen()
@@ -144,6 +152,9 @@ pub fn run() {
             // is not connected yet: the window opens and paints first, then
             // asks for it.
             cx.set_global(crate::daemon::DaemonState::Idle);
+            // Off unless `WAKU_STARTUP_TRACE` asks for it. Application scope
+            // so a rebuilt window joins the run the process already started.
+            cx.set_global(crate::startup_trace::StartupTrace::from_env());
             cx.on_action(|_: &CheckForUpdates, cx| {
                 if let Some(updater) = &cx.global::<crate::updater::UpdaterState>().0 {
                     updater.check_for_updates();

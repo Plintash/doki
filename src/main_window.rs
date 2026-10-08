@@ -28,6 +28,8 @@ use crate::app::Waku;
 use crate::app::window_chrome::render_window_frame;
 use crate::daemon::{DaemonConnector, DaemonState};
 use crate::identity::{APP_ID, APP_NAME};
+use crate::latency::{Milestone, RunKind};
+use crate::startup_trace;
 use crate::theme::{Theme, sp};
 use crate::ui::icon;
 
@@ -39,6 +41,11 @@ const MIN_WINDOW_HEIGHT: f32 = 680.0;
 /// back by hand.
 const TITLEBAR_GRAB_WIDTH: f32 = 160.0;
 const TITLEBAR_GRAB_HEIGHT: f32 = 22.0;
+
+/// How long a traced cold launch waits after closing its window before it
+/// rebuilds it. Long enough for the removal to land, and not counted in the
+/// rebuild's own latency, which starts when the opener runs.
+const REBUILD_DELAY_MS: u64 = 300;
 
 /// Show the main window: focus the one the application already has, or open it
 /// with `options`.
@@ -61,9 +68,14 @@ pub fn show_main_window<V: 'static + Render>(
                 .ok();
             window
         }
-        None => cx
-            .open_window(options, build)
-            .expect("failed to open Waku window"),
+        None => {
+            // Opening, rather than focusing, is what starts a traced run: the
+            // first window continues the cold launch, a later one is a
+            // rebuild measured from this moment.
+            startup_trace::note_window_open(cx);
+            cx.open_window(options, build)
+                .expect("failed to open Waku window")
+        }
     };
     cx.activate(true);
     window
@@ -125,6 +137,10 @@ impl MainWindow {
     pub(crate) fn sync_daemon_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match crate::daemon::state(cx) {
             DaemonState::Ready(daemon) => {
+                // A rebuild joins a daemon that is already connected; the
+                // milestone is still recorded for this run, at the moment the
+                // window saw it.
+                startup_trace::record(cx, Milestone::DaemonReady);
                 if !matches!(self.content, WindowContent::Workspace(_)) {
                     self.attach_workspace(daemon, window, cx);
                 }
@@ -151,6 +167,7 @@ impl MainWindow {
         // application scope before this window could see it; the workspace
         // only borrows it.
         let workspace = Waku::new(window, cx, daemon);
+        startup_trace::record(cx, Milestone::TasksHydrated);
         let composer_focus = workspace.read(cx).composer_focus(cx);
         window.focus(&composer_focus, cx);
         crate::platform::configure_sidebar_material(window, Theme::current(cx).is_dark);
@@ -202,6 +219,29 @@ pub(crate) fn attach_main_windows(cx: &mut App) {
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The first render of a run is the first frame; the first render that
+        // shows the hydrated workspace is the moment the window is usable.
+        startup_trace::record(cx, Milestone::FirstFrame);
+        if matches!(self.content, WindowContent::Workspace(_))
+            && startup_trace::record(cx, Milestone::Interactive) == Some(RunKind::Cold)
+            && startup_trace::close_after_launch(cx)
+        {
+            // Harness-only: let the cold run's line land, close the window, and
+            // rebuild it through the same opener Dock activation uses, so the
+            // harness can measure the rebuild. Driving AppKit's own reopen from
+            // outside needs accessibility control, which a harness cannot rely
+            // on.
+            window.defer(cx, |window, cx| {
+                window.remove_window();
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(REBUILD_DELAY_MS))
+                        .await;
+                    cx.update(open_main_window);
+                })
+                .detach();
+            });
+        }
         let content = match &self.content {
             WindowContent::Workspace(workspace) => workspace.clone().into_any_element(),
             WindowContent::Connecting => startup_surface(tr!("daemon.phase_connecting"), None, cx),
@@ -449,6 +489,30 @@ mod tests {
 
         assert_eq!(cx.windows().len(), 1);
         assert_eq!(cx.windows()[0].window_id(), window.window_id());
+    }
+
+    /// Opening a window is what starts a traced run, and the first window
+    /// continues the process's cold launch rather than beginning a rebuild.
+    #[gpui::test]
+    fn opening_a_window_starts_the_cold_traced_run(cx: &mut TestAppContext) {
+        use crate::latency::{Milestone, RunKind};
+        use crate::startup_trace::StartupTrace;
+
+        cx.update(|cx| cx.set_global(StartupTrace::collecting(std::time::Instant::now())));
+        cx.update(|cx| {
+            show_main_window(cx, WindowOptions::default(), |_, cx| {
+                cx.new(|_| MainWindowProbe)
+            })
+        });
+
+        let run = cx
+            .read(|cx| cx.global::<StartupTrace>().current_run())
+            .expect("opening the window is traced");
+        assert_eq!(run.kind, RunKind::Cold);
+        assert!(
+            run.reached(Milestone::WindowOpen).is_some(),
+            "the window open milestone is recorded"
+        );
     }
 
     #[gpui::test]
