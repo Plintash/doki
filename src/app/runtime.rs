@@ -2920,6 +2920,7 @@ impl Waku {
                 events: prepared.events,
                 pending_events: VecDeque::new(),
                 pending_steers: VecDeque::new(),
+                delivered_steers: VecDeque::new(),
                 stream_phase: None,
                 park_announced: false,
                 stream_remeasure_pending: false,
@@ -3450,6 +3451,7 @@ impl Waku {
                 .pending_events
                 .retain(|event| matches!(event, DriverEvent::BackgroundWork(_)));
             runtime.pending_steers.clear();
+            runtime.delivered_steers.clear();
             runtime.stream_remeasure_pending = false;
             runtime.stream_phase = None;
             runtime.pending_permission = None;

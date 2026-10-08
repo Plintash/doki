@@ -182,7 +182,15 @@ enum CommandMessage {
 
 enum PendingResponse {
     Request(Sender<Result<Value, String>>),
-    Prompt,
+    /// A prompt whose answer may arrive long after the write — Pi holds it
+    /// until compaction or another built-in finishes. `converted_steer`
+    /// carries the transport text when this prompt was a steer the run could
+    /// no longer take: its acceptance was already reported at write time, so
+    /// a refusal travels back as that steer's rejection instead of as a
+    /// settlement for a run that does not exist.
+    Prompt {
+        converted_steer: Option<String>,
+    },
 }
 
 type PendingResponses = Arc<Mutex<HashMap<String, PendingResponse>>>;
@@ -1059,13 +1067,40 @@ fn send_prompt(
     next_request_id: &mut u64,
     prompt: &str,
 ) -> Result<(), String> {
+    write_prompt(stdin, pending, next_request_id, prompt, false)
+}
+
+/// Sends a prompt for a steer whose run had already settled. The write is
+/// still acknowledged as an accepted steer; the difference is what a refusal
+/// of the prompt means, which is why the prompt carries its origin.
+fn send_converted_steer_prompt(
+    stdin: &mut impl Write,
+    pending: &PendingResponses,
+    next_request_id: &mut u64,
+    prompt: &str,
+) -> Result<(), String> {
+    write_prompt(stdin, pending, next_request_id, prompt, true)
+}
+
+fn write_prompt(
+    stdin: &mut impl Write,
+    pending: &PendingResponses,
+    next_request_id: &mut u64,
+    prompt: &str,
+    converted_steer: bool,
+) -> Result<(), String> {
     *next_request_id += 1;
     let id = format!("waku-{}", next_request_id);
     {
         let mut pending = pending.lock();
         // A response from an older prompt cannot settle the next turn.
         pending.retain(|_, response| matches!(response, PendingResponse::Request(_)));
-        pending.insert(id.clone(), PendingResponse::Prompt);
+        pending.insert(
+            id.clone(),
+            PendingResponse::Prompt {
+                converted_steer: converted_steer.then(|| prompt.to_owned()),
+            },
+        );
     }
     // OMP built-ins can hold the prompt response until compaction or another
     // command finishes. Do not apply the short control-RPC timeout or block
@@ -1125,7 +1160,7 @@ fn send_steer(
         )
         .map(|_| ())
     } else {
-        send_prompt(stdin, pending, next_request_id, &prompt)
+        send_converted_steer_prompt(stdin, pending, next_request_id, &prompt)
     };
     match delivered {
         Ok(_) => {
@@ -1599,8 +1634,11 @@ fn handle_pi_message(
         let Some(id) = value.get("id").and_then(Value::as_str) else {
             return;
         };
-        let prompt_response = matches!(pending.lock().get(id), Some(PendingResponse::Prompt));
-        if prompt_response {
+        let prompt_response = match pending.lock().get(id) {
+            Some(PendingResponse::Prompt { converted_steer }) => Some(converted_steer.clone()),
+            _ => None,
+        };
+        if let Some(converted_steer) = prompt_response {
             let success = value.get("success").and_then(Value::as_bool) == Some(true);
             // Pi answers a prompt with what became of it: `started` and
             // `queued` mean the work is on its way and the run settles the
@@ -1629,11 +1667,12 @@ fn handle_pi_message(
             //
             // A refusal is the delivery failure of the message that asked for
             // the run: it never reached the conversation, so the provider's
-            // own reason travels as the settlement's summary, which is what
-            // marks the message undelivered. Sending it as a transport error
-            // instead would have the client store it as an answer to a
-            // message the agent never saw.
-            let summary = (!success).then(|| {
+            // own reason travels with it — as the settlement's summary for an
+            // ordinary prompt, as the steer's rejection for a converted one —
+            // and that is what marks the message undelivered. Sending it as a
+            // transport error instead would have the client store it as an
+            // answer to a message the agent never saw.
+            let refusal_reason = || {
                 value
                     .get("error")
                     .and_then(Value::as_str)
@@ -1644,12 +1683,26 @@ fn handle_pi_message(
                             provider = flavor.display_name()
                         )
                     })
-            });
-            let _ = events.send(DriverEvent::TurnFinished {
-                interrupted: false,
-                success,
-                summary,
-            });
+            };
+            if let Some(message) = converted_steer {
+                // The steer was already reported accepted when its prompt was
+                // written, so only a refusal is news: it says the provider
+                // never added the message to the conversation, and the app
+                // needs to hear it as that steer's rejection rather than as a
+                // settlement of a run the steer never joined.
+                if !success {
+                    let _ = events.send(DriverEvent::SteerRejected {
+                        message,
+                        reason: refusal_reason(),
+                    });
+                }
+            } else {
+                let _ = events.send(DriverEvent::TurnFinished {
+                    interrupted: false,
+                    success,
+                    summary: (!success).then(refusal_reason),
+                });
+            }
             // No run stands behind this answer — a refusal, or an extension
             // command that consumed the prompt — so nothing is live until the
             // provider announces a run of its own.
@@ -2767,6 +2820,77 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_converted_steer_is_reported_as_that_steers_rejection() {
+        // The steer missed the run, so it went out as a prompt — and the
+        // provider refused that prompt before accepting it. The write was
+        // already acknowledged as an accepted steer, so the refusal has to
+        // travel as that steer's rejection: a TurnFinished here would settle a
+        // run the steer never joined and leave the app believing the message
+        // was delivered.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { .. }
+        ));
+
+        let mut wire = Vec::new();
+        let mut next_request_id = 0;
+        send_steer(
+            &mut wire,
+            &pending,
+            &mut next_request_id,
+            &events,
+            &state.run,
+            "stop doing that".to_owned(),
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerAccepted { message } if message == "stop doing that"
+        ));
+
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "response",
+                "id": "waku-1",
+                "success": false,
+                "error": "Compaction is in progress.",
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerRejected { message, reason }
+                if message == "stop doing that" && reason == "Compaction is in progress."
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a converted steer's refusal is not a settlement of the run it missed"
+        );
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
     fn a_steer_into_the_live_run_is_written_as_a_steer() {
         let (pending, commands, _command_rx, mut state) = harness();
         let (events, event_rx) = unbounded();
@@ -3520,6 +3644,76 @@ mod tests {
             text.contains("QUEUED-OK"),
             "the queued message must be delivered into the turn: {text:?}"
         );
+    }
+
+    /// A steer reaches a run that is still streaming: the provider folds it
+    /// into the same turn, and what it answers with lands in that turn's
+    /// stream. The write's acknowledgement is what the app's transcript row is
+    /// built on, so it has to arrive whether the run takes the steer or the
+    /// driver has to convert it into the next prompt.
+    #[test]
+    fn pi_steers_into_a_streaming_turn_against_the_real_rpc() {
+        const STEER: &str = "Reply with exactly STEERED-OK and nothing else. Do not use any tools.";
+
+        let Some((driver, event_rx)) = real_pi_session(None) else {
+            return;
+        };
+        driver.prompt(
+            "Write a 200-word description of a lighthouse keeper's morning. Plain prose, one \
+             paragraph, no tools, do not shorten it."
+                .to_owned(),
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let mut sent = false;
+        let mut accepted = false;
+        let mut text = String::new();
+        let mut settled_after_steer = false;
+        loop {
+            // The steered generation can arrive at the live run's boundary or,
+            // if the run settled first, as the next prompt, so the token — not
+            // the first settlement — is what says the steer landed.
+            if text.contains("STEERED-OK") && settled_after_steer {
+                break;
+            }
+            let budget = deadline.saturating_duration_since(std::time::Instant::now());
+            if budget.is_zero() {
+                break;
+            }
+            let Ok(event) = event_rx.recv_timeout(budget) else {
+                break;
+            };
+            match event {
+                DriverEvent::TextDelta(delta) => {
+                    if !sent {
+                        // The steer has to race a turn that is streaming.
+                        sent = true;
+                        driver.steer(STEER.to_owned());
+                    }
+                    text.push_str(&delta);
+                }
+                DriverEvent::SteerAccepted { message } => {
+                    if message == STEER {
+                        accepted = true;
+                    }
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished { .. } => {
+                    if text.contains("STEERED-OK") {
+                        settled_after_steer = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(sent, "the turn must stream text before the steer goes out");
+        assert!(accepted, "the provider must acknowledge the steer");
+        assert!(
+            text.contains("STEERED-OK"),
+            "the steered message must land in the provider's conversation: {text:?}"
+        );
+        assert!(settled_after_steer, "the turn the steer joined must settle");
     }
 
     /// A stop takes the message the user had queued out of the provider's queue

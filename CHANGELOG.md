@@ -16,7 +16,8 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
-- Pi: a message sent while the agent is still working is delivered instead of refused, and a prompt the provider refuses now reads as undelivered rather than as an answer
+- Choose whether Enter steers the running turn or queues a follow-up while an agent works; ⌘Enter does the opposite for one message (Settings → General)
+- Pi: a message sent while the agent is still working is delivered instead of refused, and a prompt the provider refuses — including a steer it acknowledged before the refusal — now reads as undelivered rather than as an answer
 - Pi: stopping a turn takes its queued message back and returns the text to you instead of letting the message run afterwards
 - Pi: a background subagent's completion now wakes the task — the child's outcome appears with detached work, and the reply it produced lands in the transcript
 - Pi: an extension's notifications, status, widgets and questions reach the UI instead of being dropped or cancelled on your behalf

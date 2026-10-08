@@ -1652,6 +1652,31 @@ impl AgentSession {
         true
     }
 
+    /// Marks a transcript row as never having reached the provider's
+    /// conversation, when a steer the provider had already acknowledged is
+    /// refused afterwards.
+    ///
+    /// Unlike [`Self::mark_active_prompt_undelivered`], no turn is unwound:
+    /// the turn this message was displayed under belongs to the run it never
+    /// joined, and that run's own prompt and answer must survive. The row
+    /// keeps its place so the user still sees their words, with the
+    /// provider's reason beside them. Returns whether a user message with
+    /// that id was found.
+    pub fn mark_message_undelivered(&mut self, message_id: Uuid, reason: &str) -> bool {
+        let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id && message.role == MessageRole::User)
+        else {
+            return false;
+        };
+        message.turn_id = None;
+        message.pending = false;
+        message.undelivered_reason = Some(reason.to_owned());
+        self.updated_at = unix_time();
+        true
+    }
+
     pub fn mark_active_turn_provider_started(&mut self) {
         if let Some(turn) = self
             .turns
@@ -5473,5 +5498,36 @@ mod tests {
         assert!(projection.transcript_blocks.is_empty());
         assert!(projection.turns.is_empty());
         assert!(projection.queued_messages.is_empty());
+    }
+
+    #[test]
+    fn a_late_steer_refusal_marks_the_row_without_unwinding_the_turn() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Pi);
+        session.begin_turn("run the tests");
+        session.mark_active_turn_provider_started();
+        let steered = session.push_user_message_with_presentation(
+            "also check the docs",
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        session.push_message(MessageRole::Assistant, "answer");
+        session.finish_active_turn(TurnStatus::Completed);
+
+        assert!(session.mark_message_undelivered(steered, "compacting"));
+        let message = session
+            .messages
+            .iter()
+            .find(|message| message.id == steered)
+            .unwrap();
+        assert_eq!(message.undelivered_reason.as_deref(), Some("compacting"));
+        assert!(message.turn_id.is_none());
+        assert_eq!(
+            session.turns.last().map(|turn| turn.status),
+            Some(TurnStatus::Completed),
+            "the turn the steer missed is not the steer's to unwind"
+        );
+        assert!(!session.mark_message_undelivered(Uuid::new_v4(), "missing"));
     }
 }

@@ -941,6 +941,12 @@ struct SessionRuntime {
     /// Presentation metadata for steering messages awaiting the provider's
     /// accepted/rejected acknowledgement, in transport order.
     pending_steers: VecDeque<ComposerSubmission>,
+    /// Transcript rows a provider already accepted as steers, keyed by the
+    /// transport text it echoed. A late refusal — a steer the run could not
+    /// take, converted to a prompt, then refused — needs the row's id to mark
+    /// it undelivered instead of submitting the same text a second time.
+    /// Cleared by the settlement that ends the run those steers joined.
+    delivered_steers: VecDeque<(String, Uuid)>,
     stream_phase: Option<StreamPhase>,
     /// The parked-turn notification has fired for the turn in flight, so a
     /// wake that parks again does not repeat it. Cleared when the turn ends.
