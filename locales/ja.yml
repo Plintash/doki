@@ -80,7 +80,7 @@ settings.providers: プロバイダー
 settings.usage: 使用状況
 settings.daemon: デーモン
 settings.computer_use: コンピュータ操作
-settings.general_keywords: 一般 ローカル プロジェクト 会話 プライバシー アップデート 自動 バージョン 数学 数式 math latex
+settings.general_keywords: 一般 ローカル プロジェクト 会話 プライバシー アップデート 自動 バージョン 数学 数式 math latex フォローアップ キュー 指示 enter
 settings.appearance_keywords: 外観 テーマ システム ライト ダーク 言語 英語 中国語 簡体字 日本語 フォント サイズ 文字 エディタ
 settings.providers_keywords: プロバイダー エージェント モデル CLI バージョン インストール 検出 claude codex cursor opencode amp grok pi
 settings.skills: スキル
@@ -163,6 +163,10 @@ settings.code_font_size: コードのフォントサイズ
 settings.code_font_size_description: ファイルエディタ、差分表示、コードブロック、ツール出力の文字サイズ
 settings.render_math: 数式を描画
 settings.render_math_description: Markdown の数式を整形して表示します。オフにすると LaTeX ソースを表示します。
+settings.follow_up_behavior: フォローアップの動作
+settings.follow_up_behavior_description: エージェントの実行中に Enter が行う動作。%{shortcut} は次のメッセージだけ反対の動作を行います。
+settings.follow_up_behavior_queue: キューに追加
+settings.follow_up_behavior_steer: 指示を追加
 settings.theme_system: システム
 settings.theme_light: ライト
 settings.theme_dark: ダーク
@@ -602,6 +606,7 @@ user_input.progress: "%{current} / %{total}"
 user_input.dismiss: 閉じる
 composer.preparing_task: タスクを準備中…
 composer.queue_followup: フォローアップとしてキューに追加（⏎）
+composer.steer_followup: 現在のターンに指示を追加（⏎）
 composer.message: メッセージ
 composer.queue_placeholder: フォローアップを追加…
 composer.prompt_placeholder: Doki に作業を依頼…

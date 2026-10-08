@@ -16,6 +16,9 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+- Choose whether Enter steers the running turn or queues a follow-up while an agent works; ⌘Enter does the opposite for one message (Settings → General)
+- Pi: a steer the provider acknowledged and then refused now reads as undelivered instead of looking delivered
+
 ## [26.10.8-rc.2]
 
 - Group sidebar tasks by project by default — the date headings it replaced are still in the sidebar's options menu, and switching back keeps them for good
