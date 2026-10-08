@@ -2,9 +2,9 @@
 
 ## Purpose
 
-Makes terminals daemon-owned so a shell outlives any one window, every client
-attaches to the same terminal, and the desktop only renders and emulates the
-byte stream it receives.
+Makes terminals daemon-owned so a shell outlives any one window, clients can
+attach to a running terminal and replay its recent output, and the desktop
+renders and emulates the byte stream it receives without owning the process.
 
 ## ADDED Requirements
 
