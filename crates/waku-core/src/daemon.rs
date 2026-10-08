@@ -748,6 +748,23 @@ impl Backend for WakuBackend {
                 drop(previous);
                 Ok(ResponsePayload::Ack)
             }
+            Command::AttachTerminal => {
+                let terminals = self.terminals.lock();
+                let (active_runtime_id, terminal) = terminals
+                    .get(&session_id)
+                    .ok_or_else(|| anyhow!("daemon terminal {session_id} is not running"))?;
+                if *active_runtime_id != runtime_id {
+                    bail!(
+                        "daemon terminal {session_id} belongs to runtime {active_runtime_id}, not {runtime_id}"
+                    );
+                }
+                let (cols, rows) = terminal.size();
+                Ok(ResponsePayload::TerminalSnapshot {
+                    data: terminal.retained_output(),
+                    cols,
+                    rows,
+                })
+            }
             Command::WriteTerminal { data } => {
                 let terminals = self.terminals.lock();
                 let (active_runtime_id, terminal) = terminals
@@ -1823,6 +1840,7 @@ fn handle_driver_command(
         | Command::ForkProviderSession { .. }
         | Command::Workspace { .. }
         | Command::OpenTerminal { .. }
+        | Command::AttachTerminal
         | Command::WriteTerminal { .. }
         | Command::ResizeTerminal { .. }
         | Command::CloseTerminal

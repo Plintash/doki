@@ -794,6 +794,7 @@ fn command_targets_runtime(command: &Command) -> bool {
             | Command::ForkSessionFromResponse { .. }
             | Command::RewindSessionToMessage { .. }
             | Command::OpenTerminal { .. }
+            | Command::AttachTerminal
             | Command::WriteTerminal { .. }
             | Command::ResizeTerminal { .. }
             | Command::CloseTerminal
@@ -1817,6 +1818,199 @@ mod tests {
         );
 
         drop(terminal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_attach_replays_missed_output_and_size() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'retained-attach-marker\\n'; while IFS= read -r line; do :; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let terminal_id = Uuid::new_v4();
+        let opener = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let opening_events = opener.subscribe(terminal_id, terminal_id);
+        opener
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    cwd: root.clone(),
+                    cols: 100,
+                    rows: 30,
+                },
+            )
+            .unwrap();
+        // Wait until the shell's marker has been delivered, so the retained
+        // output is already final and the terminal is idle.
+        terminal_output_until(&opening_events, b"retained-attach-marker");
+
+        // A client that was never attached reconstructs the missed bytes from
+        // the attach snapshot instead of the ephemeral event stream.
+        let attacher = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let attached = attacher
+            .request(terminal_id, terminal_id, Command::AttachTerminal)
+            .unwrap();
+        let ResponsePayload::TerminalSnapshot { data, cols, rows } = attached else {
+            panic!("attach did not return a terminal snapshot: {attached:?}");
+        };
+        assert!(
+            data.windows(b"retained-attach-marker".len())
+                .any(|window| window == b"retained-attach-marker"),
+            "attach replay did not carry the output the second client missed: {:?}",
+            String::from_utf8_lossy(&data)
+        );
+        assert_eq!(
+            (cols, rows),
+            (100, 30),
+            "attach reported the wrong terminal size"
+        );
+
+        // The reported size follows a resize.
+        opener
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::ResizeTerminal {
+                    cols: 132,
+                    rows: 43,
+                },
+            )
+            .unwrap();
+        let resized = attacher
+            .request(terminal_id, terminal_id, Command::AttachTerminal)
+            .unwrap();
+        let ResponsePayload::TerminalSnapshot { cols, rows, .. } = resized else {
+            panic!("attach did not return a terminal snapshot: {resized:?}");
+        };
+        assert_eq!((cols, rows), (132, 43));
+
+        opener.shutdown();
+        attacher.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_rejects_writes_from_a_superseded_runtime() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'runtime-ready\\n'; while IFS= read -r line; do printf 'received:%s\\n' \"$line\"; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let terminal_id = Uuid::new_v4();
+        let superseded_runtime = Uuid::new_v4();
+        let replacement_runtime = Uuid::new_v4();
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let superseded_events = client.subscribe(terminal_id, superseded_runtime);
+        client
+            .request(
+                terminal_id,
+                superseded_runtime,
+                Command::OpenTerminal {
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        terminal_output_until(&superseded_events, b"runtime-ready");
+
+        // Replacing the runtime swaps the terminal under the same id.
+        let replacement_events = client.subscribe(terminal_id, replacement_runtime);
+        client
+            .request(
+                terminal_id,
+                replacement_runtime,
+                Command::OpenTerminal {
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        terminal_output_until(&replacement_events, b"runtime-ready");
+
+        let stale = client.request(
+            terminal_id,
+            superseded_runtime,
+            Command::WriteTerminal {
+                data: b"stale-write\r".to_vec(),
+            },
+        );
+        assert!(
+            stale.is_err(),
+            "a write from a superseded runtime reached the replacement terminal: {stale:?}"
+        );
+
+        client
+            .request(
+                terminal_id,
+                replacement_runtime,
+                Command::WriteTerminal {
+                    data: b"valid-write\r".to_vec(),
+                },
+            )
+            .unwrap();
+        let output = terminal_output_until(&replacement_events, b"received:valid-write");
+        assert!(
+            !output
+                .windows(b"received:stale-write".len())
+                .any(|window| window == b"received:stale-write"),
+            "the replacement shell executed the superseded runtime's input"
+        );
+
+        client.shutdown();
+        server.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

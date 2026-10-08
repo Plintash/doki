@@ -19,7 +19,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -266,6 +266,12 @@ pub enum Command {
         cols: u16,
         rows: u16,
     },
+    /// Recover a terminal this client was not attached for.
+    ///
+    /// The response carries the retained output and the terminal's current
+    /// size; live output then continues through the runtime event stream, so a
+    /// client subscribes before attaching to avoid a gap.
+    AttachTerminal,
     WriteTerminal {
         #[serde(with = "base64_bytes")]
         #[ts(type = "string")]
@@ -471,6 +477,15 @@ pub enum ResponsePayload {
     Workspace {
         result: WorkspaceResult,
     },
+    /// Retained terminal output and current size, returned by
+    /// [`Command::AttachTerminal`]. `data` is base64 on the wire.
+    TerminalSnapshot {
+        #[serde(with = "base64_bytes")]
+        #[ts(type = "string")]
+        data: Vec<u8>,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -538,13 +553,38 @@ mod tests {
     }
 
     #[test]
+    fn terminal_attach_returns_a_base64_snapshot_with_size() {
+        let command = serde_json::to_value(Command::AttachTerminal).unwrap();
+        assert_eq!(command["type"], "attachTerminal");
+
+        let payload = ResponsePayload::TerminalSnapshot {
+            data: vec![0, 1, 2, 255],
+            cols: 120,
+            rows: 40,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["type"], "terminalSnapshot");
+        assert_eq!(json["data"], "AAEC/w==");
+        assert_eq!(json["cols"], 120);
+        assert_eq!(json["rows"], 40);
+
+        let ResponsePayload::TerminalSnapshot { data, cols, rows } =
+            serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected payload variant");
+        };
+        assert_eq!(data, vec![0, 1, 2, 255]);
+        assert_eq!((cols, rows), (120, 40));
+    }
+
+    #[test]
     fn response_fork_command_uses_stable_camel_case_fields() {
         let json =
             serde_json::to_value(Command::ForkSessionFromResponse { turn_count: 7 }).unwrap();
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]
@@ -553,7 +593,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]
