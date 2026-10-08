@@ -101,6 +101,9 @@ mod platform {
         pty: Arc<Mutex<tty::Pty>>,
         stopped: Arc<AtomicBool>,
         retained: Arc<Mutex<RetainedOutput>>,
+        /// The last size applied to the PTY, so an attach can report the grid
+        /// a reconnecting client should emulate before it resizes.
+        size: Mutex<(u16, u16)>,
         reader: Option<JoinHandle<()>>,
     }
 
@@ -234,6 +237,7 @@ mod platform {
                 pty,
                 stopped,
                 retained,
+                size: Mutex::new(normalized_size(cols, rows)),
                 reader: Some(reader),
             })
         }
@@ -242,6 +246,11 @@ mod platform {
         /// first, capped at [`RETAINED_OUTPUT_BYTES`].
         pub fn retained_output(&self) -> Vec<u8> {
             self.retained.lock().snapshot()
+        }
+
+        /// The columns and rows most recently applied to this terminal.
+        pub fn size(&self) -> (u16, u16) {
+            *self.size.lock()
         }
 
         pub fn write(&self, data: Vec<u8>) -> anyhow::Result<()> {
@@ -256,6 +265,7 @@ mod platform {
         }
 
         pub fn resize(&self, cols: u16, rows: u16) {
+            *self.size.lock() = normalized_size(cols, rows);
             self.pty.lock().on_resize(window_size(cols, rows));
         }
     }
@@ -388,10 +398,15 @@ mod platform {
         }
     }
 
+    fn normalized_size(cols: u16, rows: u16) -> (u16, u16) {
+        (cols.max(MIN_COLUMNS), rows.max(MIN_ROWS))
+    }
+
     fn window_size(cols: u16, rows: u16) -> WindowSize {
+        let (num_cols, num_lines) = normalized_size(cols, rows);
         WindowSize {
-            num_lines: rows.max(MIN_ROWS),
-            num_cols: cols.max(MIN_COLUMNS),
+            num_lines,
+            num_cols,
             cell_width: CELL_WIDTH,
             cell_height: CELL_HEIGHT,
         }
@@ -413,6 +428,14 @@ pub struct DaemonTerminal;
 impl DaemonTerminal {
     pub fn open(_cwd: &Path, _cols: u16, _rows: u16, _events: EventSink) -> anyhow::Result<Self> {
         bail!("daemon terminals are not supported on this platform")
+    }
+
+    pub fn retained_output(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    pub fn size(&self) -> (u16, u16) {
+        (0, 0)
     }
 
     pub fn write(&self, _data: Vec<u8>) -> anyhow::Result<()> {
