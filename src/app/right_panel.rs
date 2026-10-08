@@ -2570,6 +2570,8 @@ impl Waku {
         cx.notify();
     }
 
+    /// Cmd-W: close the right panel's active surface when it has one, and the
+    /// window itself otherwise — the close the unsaved-edits guard answers.
     pub(super) fn close_window_or_right_panel_tab_action(
         &mut self,
         _: &CloseWindow,
@@ -2595,14 +2597,6 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.close_window(window, cx);
-    }
-
-    /// Save the desktop snapshot and close the window. The application keeps
-    /// running with no window, so the frame the user left behind is landed on
-    /// disk here — the quit-time save happens much later, if at all.
-    fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.persist_window_state(window, cx);
-        crate::platform::close_window(window);
     }
 
     pub(super) fn render_right_panel_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -2763,6 +2757,9 @@ impl Waku {
             || self.task_switcher.is_open()
             || self.commit_dialog.is_some()
             || self.image_preview.is_some()
+            // The close confirmation is a full-window modal: a webview left up
+            // would cover the choices that have to be answered.
+            || self.unsaved_edits_guard.is_open()
             || self.composer.read(cx).context_menu_open(cx)
             || self
                 .right_panel_browsers

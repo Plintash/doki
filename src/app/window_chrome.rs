@@ -7,7 +7,7 @@ use gpui::{
     Tiling, Window, div, prelude::*, px, transparent_black,
 };
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-use gpui::{KeyDownEvent, WindowButton};
+use gpui::{KeyDownEvent, WeakEntity, WindowButton};
 
 use super::Waku;
 use crate::theme::Theme;
@@ -151,13 +151,16 @@ impl Waku {
                 WindowControlSide::Left => "client-window-controls-left",
                 WindowControlSide::Right => "client-window-controls-right",
             };
+            // A window control owns the close, so the close control reaches the
+            // workspace that can ask about unsaved edits.
+            let waku = cx.entity().downgrade();
             let controls = buttons.into_iter().flatten().map(|button| {
                 let enabled = match button {
                     WindowButton::Minimize => supported.minimize && window.is_minimizable(),
                     WindowButton::Maximize => supported.maximize && window.is_resizable(),
                     WindowButton::Close => true,
                 };
-                client_window_button(button, enabled, is_maximized, theme, cx)
+                client_window_button(button, enabled, is_maximized, theme, waku.clone(), cx)
             });
 
             Some(
@@ -190,6 +193,7 @@ fn client_window_button(
     enabled: bool,
     is_maximized: bool,
     theme: Theme,
+    waku: WeakEntity<Waku>,
     cx: &mut Context<Waku>,
 ) -> AnyElement {
     let (id, icon_path, label) = match button {
@@ -220,6 +224,8 @@ fn client_window_button(
     } else {
         theme.text_ghost
     };
+    let click_waku = waku.clone();
+    let key_waku = waku;
 
     let control = div().id(id);
     // Windows hit-tests the caption before it dispatches a mouse event.
@@ -262,7 +268,7 @@ fn client_window_button(
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
             if enabled {
-                activate_window_button(button, window);
+                activate_window_button(button, window, &click_waku, cx);
             }
         })
         .on_key_down(move |event: &KeyDownEvent, window, cx| {
@@ -270,7 +276,7 @@ fn client_window_button(
                 && !event.keystroke.modifiers.modified()
                 && matches!(event.keystroke.key.as_str(), "enter" | "space")
             {
-                activate_window_button(button, window);
+                activate_window_button(button, window, &key_waku, cx);
                 cx.stop_propagation();
             }
         })
@@ -278,11 +284,21 @@ fn client_window_button(
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn activate_window_button(button: WindowButton, window: &mut Window) {
+fn activate_window_button(
+    button: WindowButton,
+    window: &mut Window,
+    waku: &WeakEntity<Waku>,
+    cx: &mut App,
+) {
     match button {
         WindowButton::Minimize => window.minimize_window(),
         WindowButton::Maximize => window.zoom_window(),
-        WindowButton::Close => crate::platform::close_window(window),
+        // The window's own close control is the window's to close: it goes
+        // through the unsaved-edits guard, so a dirty editor is never
+        // discarded behind the user's back on a client-decorated window.
+        WindowButton::Close => {
+            let _ = waku.update(cx, |waku, cx| waku.close_window(window, cx));
+        }
     }
 }
 

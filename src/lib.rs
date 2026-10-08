@@ -131,6 +131,7 @@ pub fn run() {
             crate::app::init_image_preview_keys(cx);
             crate::app::init_sidebar_keys(cx);
             crate::app::init_skills_keys(cx);
+            crate::app::init_window_close_keys(cx);
             crate::theme::init(cx);
             crate::platform::init_reduce_motion(cx);
 

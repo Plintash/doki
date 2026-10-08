@@ -27,6 +27,9 @@ menu.close_window: ウインドウを閉じる
 window.minimize: 最小化
 window.maximize: 最大化
 window.restore: 元に戻す
+window_close.title: 未保存の変更
+window_close.body: このウインドウに保存されていないファイル編集があります。閉じると破棄されます。
+window_close.discard: 破棄して閉じる
 
 updater.update: アップデート
 updater.updating: アップデート中…

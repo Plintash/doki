@@ -176,12 +176,17 @@ impl MainWindow {
         }
     }
 
-    /// Land the desktop snapshot this window holds on disk before it is
-    /// destroyed. The application keeps running after the close, so the
-    /// quit-time save never sees the frame the user left the window at.
-    fn persist_before_close(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if let WindowContent::Workspace(workspace) = &self.content {
-            workspace.update(cx, |workspace, cx| workspace.persist_window_state(window, cx));
+    /// AppKit's answer to the window's own close control. The workspace is the
+    /// one that answers: it holds the close back — with a confirmation — while
+    /// a file editor is unsaved, and lands the desktop snapshot when the
+    /// window may go. A window with no workspace yet holds nothing unsaved and
+    /// has nothing to save.
+    fn window_should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match &self.content {
+            WindowContent::Workspace(workspace) => workspace.update(cx, |workspace, cx| {
+                workspace.request_window_close(window, cx)
+            }),
+            WindowContent::Connecting | WindowContent::Failed(_) => true,
         }
     }
 }
@@ -267,13 +272,14 @@ fn open_main_window_with(cx: &mut App, connector: DaemonConnector) -> WindowHand
         move |window, cx| {
             let root = cx.new(|_| MainWindow::connecting());
             root.update(cx, |root, cx| root.connect(window, connector, cx));
-            // AppKit asks before it closes the window from its own control; the
-            // window is the only thing that knows the frame it was left at, and
-            // the application outlives it, so save the snapshot here.
+            // AppKit asks before it closes the window from its own control. The
+            // workspace answers: it holds the close back — with a confirmation —
+            // while a file editor is unsaved, and lands the desktop snapshot
+            // when the window may go. The application outlives the window, so
+            // this is the last moment the frame it was left at is known.
             let closing = root.clone();
             window.on_window_should_close(cx, move |window, cx| {
-                closing.update(cx, |root, cx| root.persist_before_close(window, cx));
-                true
+                closing.update(cx, |root, cx| root.window_should_close(window, cx))
             });
             root
         },
@@ -421,13 +427,21 @@ mod tests {
 
     use anyhow::anyhow;
     use gpui::{
-        AppContext as _, Context, IntoElement, Render, TestAppContext, Window, WindowOptions, div,
+        AppContext as _, Context, IntoElement, Render, TestAppContext, VisualTestContext, Window,
+        WindowOptions, div,
     };
 
     use super::{
         DaemonConnector, DaemonState, MainWindow, WindowContent, open_main_window_with,
         show_main_window,
     };
+
+    /// A daemon that never answers, so the window keeps painting its starting
+    /// surface: the window-level tests below are about the close hook, not the
+    /// workspace behind it.
+    fn unreachable_daemon() -> DaemonConnector {
+        Arc::new(|| Err(anyhow!("the daemon is unreachable")))
+    }
 
     /// Stands in for the window's root view. The guard only cares which window
     /// exists, so the probe keeps the daemon out of the test.
@@ -666,5 +680,31 @@ mod tests {
         });
         assert_eq!(cx.windows().len(), 1);
         assert_ne!(rebuilt.window_id(), first.window_id());
+    }
+
+    /// The unsaved-edits guard sits inside the close hook rather than in place
+    /// of it. A window with nothing unsaved — here one whose daemon never
+    /// answered, so it has no workspace and no editor at all — still answers
+    /// AppKit's close with `true`, and the window comes down when the platform
+    /// closes it. A confirmation that swallowed the answer would leave a
+    /// window that could not be closed.
+    #[gpui::test]
+    fn a_window_with_nothing_unsaved_answers_the_close(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| open_main_window_with(cx, unreachable_daemon()));
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual.simulate_close(),
+            "nothing unsaved, so the close goes through"
+        );
+        assert_eq!(cx.windows().len(), 1, "asking is not closing");
+
+        cx.update(|cx| {
+            window
+                .update(cx, |_, window, _| crate::platform::close_window(window))
+                .unwrap()
+        });
+        assert!(cx.windows().is_empty(), "the window still closes");
     }
 }

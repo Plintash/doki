@@ -248,6 +248,9 @@ impl Render for Waku {
             let command_palette = self.render_command_palette(window, cx);
             let commit_dialog = self.render_commit_dialog(cx);
             let goal_dialog = self.render_goal_dialog(window, cx);
+            // A dirty editor can sit behind the settings page, and its
+            // confirmation is the only way the window may close.
+            let close_confirmation = self.render_window_close_confirmation(cx);
             let toast = self.render_active_toast(cx);
             let content = div()
                 .relative()
@@ -268,6 +271,7 @@ impl Render for Waku {
                 .children(goal_dialog)
                 .children(image_preview)
                 .children(task_switcher)
+                .children(close_confirmation)
                 .into_any_element();
             return content;
         }
@@ -282,6 +286,7 @@ impl Render for Waku {
         let command_palette = self.render_command_palette(window, cx);
         let commit_dialog = self.render_commit_dialog(cx);
         let goal_dialog = self.render_goal_dialog(window, cx);
+        let close_confirmation = self.render_window_close_confirmation(cx);
         let toast = self.render_active_toast(cx);
         let content = div()
             .key_context("Waku")
@@ -427,6 +432,7 @@ impl Render for Waku {
             .children(goal_dialog)
             .children(image_preview)
             .children(task_switcher)
+            .children(close_confirmation)
             .into_any_element();
 
         content
