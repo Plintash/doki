@@ -571,6 +571,7 @@ user_input.back: 上一步
 user_input.next: 下一步
 user_input.submit: 提交
 user_input.progress: "%{current} / %{total}"
+user_input.dismiss: 忽略
 composer.preparing_task: 正在准备任务…
 composer.queue_followup: 排队为后续消息（⏎）
 composer.message: 消息
@@ -586,6 +587,8 @@ composer.suggestions: 输入建议
 composer.loading_suggestions: 正在加载建议…
 composer.remove_attachment: 移除 %{name}
 composer.queued_message_actions: 后续消息操作
+composer.queued_pending: 等待发送
+composer.undelivered: 未送达
 branches.detached_head: 游离 HEAD
 branches.search_project: 搜索 %{project} 的分支
 branches.switching: 正在切换…
