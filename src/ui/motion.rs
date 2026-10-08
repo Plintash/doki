@@ -7,6 +7,11 @@
 //! loader recently, and parks itself once the last lease lapses, so a window
 //! with no loader mounted schedules nothing at all. Every loader shares one
 //! epoch, keeping multi-instance loaders phase-locked.
+//!
+//! Streamed text dissolves start from [`dissolve_lease`]: at the 120 fps
+//! setting they ride a second clock that ticks at display rate, because a
+//! 60 fps notify stride would quantize their travelling gradient into visible
+//! steps; the 60 and 30 settings reuse the loader clock at a stride.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -114,6 +119,83 @@ fn pulse_lease_with_stride(view: EntityId, stride: u32, cx: &mut App) {
                         *view
                     })
                     .collect::<Vec<_>>();
+                for view in due {
+                    cx.notify(view);
+                }
+                false
+            });
+            if parked {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
+/// Tick interval for the dissolve clock: a hair under a 120 Hz vsync, so
+/// timer drift cannot skip a ProMotion frame. GPUI coalesces notifies that
+/// land inside one vsync, so a 60 Hz display runs the same cadence with the
+/// extra wake-ups finding nothing to draw.
+const DISSOLVE_TICK: Duration = Duration::from_nanos(8_000_000);
+
+/// Leases for the dissolve clock. Kept separate from the pulse clock because
+/// the two contracts differ: loaders are content at up to 60 fps, while a
+/// streamed dissolve moves on every frame and quantizes visibly at a stride.
+struct DissolveClock {
+    leases: HashMap<EntityId, Instant>,
+    running: bool,
+}
+
+impl Global for DissolveClock {}
+
+impl Default for DissolveClock {
+    fn default() -> Self {
+        Self {
+            leases: HashMap::new(),
+            running: false,
+        }
+    }
+}
+
+/// Keep `view` re-rendering while a streamed dissolve is in flight, at the
+/// cadence the user chose in Settings. Thirty and sixty ride the shared loader
+/// clock at a stride; 120 uses the separate display clock below, because no
+/// stride on a 60 Hz clock can produce 120 frames. The lease parks once the
+/// last grapheme settles.
+pub fn dissolve_lease(view: EntityId, fps: u32, cx: &mut App) {
+    match fps {
+        30 => pulse_lease_with_stride(view, PULSE_STRIDE, cx),
+        60 => pulse_lease_with_stride(view, 1, cx),
+        _ => display_lease(view, cx),
+    }
+}
+
+/// Keep `view` re-rendering at the display's refresh rate (up to 120 fps)
+/// until the lease lapses. For dissolves whose gradient travels on every
+/// frame: a display-rate notify is still one pane rebuild per frame — the
+/// work a display-rate redraw costs anyway, without the root frame or the
+/// sibling panes — while a 60 fps tick would quantize the wave into visible
+/// steps.
+fn display_lease(view: EntityId, cx: &mut App) {
+    let clock = cx.default_global::<DissolveClock>();
+    let until = Instant::now() + PULSE_LEASE;
+    clock.leases.insert(view, until);
+    if clock.running {
+        return;
+    }
+    clock.running = true;
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(DISSOLVE_TICK).await;
+            let parked = cx.update(|cx| {
+                let clock = cx.default_global::<DissolveClock>();
+                let now = Instant::now();
+                clock.leases.retain(|_, until| *until > now);
+                if clock.leases.is_empty() {
+                    clock.running = false;
+                    return true;
+                }
+                let due = clock.leases.keys().copied().collect::<Vec<_>>();
                 for view in due {
                     cx.notify(view);
                 }

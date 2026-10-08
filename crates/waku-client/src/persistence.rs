@@ -106,6 +106,24 @@ fn default_render_math() -> bool {
     true
 }
 
+/// Frame cadences offered for the streaming dissolve ([`AppSettings::dissolve_fps`]).
+/// The dissolve's gradient travels on every frame, so a slower cadence shows
+/// visible steps on a fast panel; 120 is the ProMotion choice.
+pub const DISSOLVE_FPS_CHOICES: [u32; 3] = [30, 60, 120];
+pub const DEFAULT_DISSOLVE_FPS: u32 = 120;
+
+fn default_dissolve_fps() -> u32 {
+    DEFAULT_DISSOLVE_FPS
+}
+
+/// Bounds a possibly hand-edited cadence to one of the offered choices.
+pub fn sanitized_dissolve_fps(fps: u32) -> u32 {
+    DISSOLVE_FPS_CHOICES
+        .into_iter()
+        .min_by_key(|choice| choice.abs_diff(fps))
+        .unwrap_or(DEFAULT_DISSOLVE_FPS)
+}
+
 fn default_provider() -> ProviderKind {
     ProviderKind::Codex
 }
@@ -281,6 +299,9 @@ pub struct AppSettings {
     /// applied.
     pub code_font_size: f32,
     pub render_math: bool,
+    /// Frame budget for the streaming text dissolve: 30, 60, or 120. See
+    /// [`DISSOLVE_FPS_CHOICES`].
+    pub dissolve_fps: u32,
     /// What the composer's primary send action does while the agent is
     /// working; the primary-modifier chord does the opposite.
     pub follow_up_behavior: FollowUpBehavior,
@@ -300,6 +321,7 @@ impl Default for AppSettings {
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             code_font_size: DEFAULT_CODE_FONT_SIZE,
             render_math: true,
+            dissolve_fps: DEFAULT_DISSOLVE_FPS,
             follow_up_behavior: FollowUpBehavior::Steer,
             daemon_exposure: DaemonExposureSettings::default(),
             open_in_app: None,
@@ -405,6 +427,8 @@ pub struct PersistedState {
     pub code_font_size: f32,
     #[serde(default = "default_render_math")]
     pub render_math: bool,
+    #[serde(default = "default_dissolve_fps")]
+    pub dissolve_fps: u32,
     #[serde(default)]
     pub follow_up_behavior: FollowUpBehavior,
     #[serde(default)]
@@ -482,6 +506,7 @@ impl PersistedState {
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             code_font_size: DEFAULT_CODE_FONT_SIZE,
             render_math: true,
+            dissolve_fps: DEFAULT_DISSOLVE_FPS,
             follow_up_behavior: FollowUpBehavior::Steer,
             daemon_exposure: DaemonExposureSettings::default(),
             open_in_app: None,
@@ -611,6 +636,7 @@ impl PersistedState {
             ui_font_size: self.ui_font_size,
             code_font_size: self.code_font_size,
             render_math: self.render_math,
+            dissolve_fps: self.dissolve_fps,
             follow_up_behavior: self.follow_up_behavior,
             daemon_exposure: self.daemon_exposure.clone(),
             open_in_app: self.open_in_app.clone(),
@@ -648,6 +674,7 @@ impl PersistedState {
         self.ui_font_size = sanitized_ui_font_size(settings.ui_font_size);
         self.code_font_size = sanitized_code_font_size(settings.code_font_size);
         self.render_math = settings.render_math;
+        self.dissolve_fps = sanitized_dissolve_fps(settings.dissolve_fps);
         self.follow_up_behavior = settings.follow_up_behavior;
         self.daemon_exposure = settings.daemon_exposure;
         self.open_in_app = settings.open_in_app;
@@ -1211,6 +1238,23 @@ mod tests {
         let mut restored = PersistedState::empty();
         restored.apply_app_settings(serde_json::from_value(settings).unwrap());
         assert!(!restored.render_math);
+    }
+
+    #[test]
+    fn dissolve_fps_defaults_to_the_fastest_choice_and_snaps_hand_edits() {
+        let defaults: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.dissolve_fps, DEFAULT_DISSOLVE_FPS);
+        assert_eq!(PersistedState::empty().dissolve_fps, DEFAULT_DISSOLVE_FPS);
+        assert_eq!(sanitized_dissolve_fps(0), 30);
+        assert_eq!(sanitized_dissolve_fps(59), 60);
+        assert_eq!(sanitized_dissolve_fps(144), 120);
+        let mut state = PersistedState::empty();
+        state.dissolve_fps = 60;
+        let settings = serde_json::to_value(state.app_settings()).unwrap();
+        assert_eq!(settings["dissolve_fps"], 60);
+        let mut restored = PersistedState::empty();
+        restored.apply_app_settings(serde_json::from_value(settings).unwrap());
+        assert_eq!(restored.dissolve_fps, 60);
     }
 
     #[test]

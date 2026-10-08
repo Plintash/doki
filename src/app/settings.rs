@@ -428,6 +428,32 @@ impl Waku {
         let updater_available = cx
             .try_global::<crate::updater::UpdaterState>()
             .is_some_and(|updater| updater.0.is_some());
+        let selected_dissolve_fps = self.state.dissolve_fps;
+        let weak = cx.entity().downgrade();
+        let dissolve_fps_handle = self.menu_handle("dissolve-fps-selector", cx);
+        let dissolve_fps_selector = dropdown_menu(
+            MenuChip::new("dissolve-fps-selector")
+                .label(dissolve_fps_label(selected_dissolve_fps))
+                .outlined()
+                .selected(dissolve_fps_handle.is_open())
+                .w(px(116.0))
+                .justify_between(),
+            "dissolve-fps-selector-menu",
+            &dissolve_fps_handle,
+            MenuAlign::BelowRight,
+            move |_| {
+                waku_client::persistence::DISSOLVE_FPS_CHOICES
+                    .into_iter()
+                    .map(|fps| {
+                        let weak = weak.clone();
+                        MenuItem::new(dissolve_fps_label(fps), move |_window, cx| {
+                            let _ = weak.update(cx, |this, cx| this.set_dissolve_fps(fps, cx));
+                        })
+                        .selected(fps == selected_dissolve_fps)
+                    })
+                    .collect()
+            },
+        );
         let selected_follow_up = self.state.follow_up_behavior;
         let weak = cx.entity().downgrade();
         let follow_up_handle = self.menu_handle("follow-up-behavior-selector", cx);
@@ -524,6 +550,40 @@ impl Waku {
                             move |this, _, cx| this.set_render_math(!enabled, cx)
                         },
                     )),
+            )
+            .child(
+                div()
+                    .mt(px(15.0))
+                    .w_full()
+                    .min_h(px(60.0))
+                    .px(px(20.0))
+                    .py(px(12.0))
+                    .rounded(px(13.0))
+                    .bg(theme.raised)
+                    .flex()
+                    .items_center()
+                    .gap(px(24.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(sp(13.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(tr!("settings.stream_dissolve")),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(5.0))
+                                    .text_size(sp(12.5))
+                                    .line_height(sp(18.0))
+                                    .text_color(theme.text_secondary)
+                                    .child(tr!("settings.stream_dissolve_description")),
+                            ),
+                    )
+                    .child(dissolve_fps_selector),
             )
             .child(
                 div()
@@ -1567,6 +1627,16 @@ impl Waku {
         cx.notify();
     }
 
+    fn set_dissolve_fps(&mut self, fps: u32, cx: &mut Context<Self>) {
+        let fps = waku_client::persistence::sanitized_dissolve_fps(fps);
+        if self.state.dissolve_fps == fps {
+            return;
+        }
+        self.state.dissolve_fps = fps;
+        self.save();
+        cx.notify();
+    }
+
     fn set_follow_up_behavior(&mut self, behavior: FollowUpBehavior, cx: &mut Context<Self>) {
         if self.state.follow_up_behavior == behavior {
             return;
@@ -2547,6 +2617,11 @@ fn font_size_label(size: f32) -> String {
     } else {
         format!("{size} px")
     }
+}
+
+/// "60 fps" reads the same in every locale; the unit is not translated.
+fn dissolve_fps_label(fps: u32) -> String {
+    format!("{fps} fps")
 }
 
 fn follow_up_behavior_label(behavior: FollowUpBehavior) -> String {

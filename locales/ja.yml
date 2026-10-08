@@ -163,6 +163,8 @@ settings.code_font_size: コードのフォントサイズ
 settings.code_font_size_description: ファイルエディタ、差分表示、コードブロック、ツール出力の文字サイズ
 settings.render_math: 数式を描画
 settings.render_math_description: Markdown の数式を整形して表示します。オフにすると LaTeX ソースを表示します。
+settings.stream_dissolve: ストリーミングのフェード
+settings.stream_dissolve_description: 流れてくるテキストのフェードに使うフレームレート。高リフレッシュレートの画面では高いほど滑らかで、低いほど省電力です。
 settings.follow_up_behavior: フォローアップの動作
 settings.follow_up_behavior_description: エージェントの実行中に Enter が行う動作。%{shortcut} は次のメッセージだけ反対の動作を行います。
 settings.follow_up_behavior_queue: キューに追加

@@ -1,63 +1,99 @@
-//! Paint-only fade for newly appended streaming Markdown text.
+//! Paint-only paced dissolve for newly appended streaming Markdown text.
 //!
 //! The complete text enters layout immediately. Only the colors of newly
 //! appended byte ranges animate, so the fade cannot change shaping, wrapping,
 //! selection offsets, or row height.
+//!
+//! The reveal is paced like lobehub/streamdown's: each appended grapheme is
+//! born one pace after the grapheme before it, and every birth starts its own
+//! fade. A stream commit therefore reads as a wave travelling through the new
+//! text instead of one uniformly dimmed block. Births chain across commits, so
+//! the wave stays continuous however the provider chops its deltas, and the
+//! chain is capped one commit gap plus one fade ahead of the frame, so a burst
+//! can never park more than one dissolve of text in the invisible queue.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::TextRun;
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
-pub const VEIL_EMA_SEED_MS: f32 = 160.0;
-pub const VEIL_MIN_FADE_MS: f32 = 120.0;
-pub const VEIL_MAX_FADE_MS: f32 = 400.0;
-pub const VEIL_CURVE_POW: f32 = 1.6;
-const VEIL_GAP_CLAMP_MS: f32 = 1_000.0;
-
-#[derive(Clone, Debug)]
-struct Chunk {
-    range: Range<usize>,
-    started: Instant,
-    duration_ms: f32,
-}
+/// How long one grapheme takes to dissolve in.
+pub const VEIL_FADE_MS: f32 = 180.0;
+/// Fastest and slowest per-grapheme cadence. The fast end is the rate a
+/// sustained burst drains at; the slow end keeps a sparse drip from landing as
+/// one step.
+const VEIL_MIN_PACE_MS: f32 = 2.0;
+const VEIL_MAX_PACE_MS: f32 = 18.0;
+/// Inter-commit gap fed into the pace, clamped so provider jitter cannot
+/// stretch or collapse the wave.
+const VEIL_GAP_MIN_MS: f32 = 16.0;
+const VEIL_GAP_CLAMP_MS: f32 = 160.0;
+/// Opacity bands that adjacent graphemes are merged into before painting.
+/// Without them a second of backlog would split the runs at every grapheme;
+/// sixteen bands are finer than the eye reads on a 180 ms fade.
+const VEIL_OPACITY_LEVELS: f32 = 16.0;
 
 pub type VeilSpan = (Range<usize>, f32);
 
+/// Streamdown's dissolve curve, `cubic-bezier(0.33, 0, 0.67, 1)`: a slow
+/// start and a soft landing, so text never pops to half opacity on the frame
+/// it lands.
 pub fn veil_opacity(progress: f32) -> f32 {
-    1.0 - (1.0 - progress.clamp(0.0, 1.0)).powf(VEIL_CURVE_POW)
-}
-
-pub fn veil_duration_ms(ema_ms: f32) -> f32 {
-    (ema_ms * 3.0).clamp(VEIL_MIN_FADE_MS, VEIL_MAX_FADE_MS)
-}
-
-pub fn veil_boost(active_chunks: usize) -> f32 {
-    1.0 + 0.3 * active_chunks.saturating_sub(2) as f32
-}
-
-pub fn veil_ema_next(ema_ms: f32, gap_ms: f32) -> f32 {
-    ema_ms * 0.7 + gap_ms.min(VEIL_GAP_CLAMP_MS) * 0.3
-}
-
-#[derive(Debug)]
-struct ElementVeil {
-    previous: String,
-    chunks: Vec<Chunk>,
-    ema_ms: f32,
-    last_append: Option<Instant>,
-}
-
-impl Default for ElementVeil {
-    fn default() -> Self {
-        Self {
-            previous: String::new(),
-            chunks: Vec::new(),
-            ema_ms: VEIL_EMA_SEED_MS,
-            last_append: None,
+    let progress = progress.clamp(0.0, 1.0);
+    if progress <= 0.0 {
+        return 0.0;
+    }
+    if progress >= 1.0 {
+        return 1.0;
+    }
+    // `x(t)` is monotone for these control points, so a bisection inverts it
+    // exactly enough at this scale; `y(t)` then evaluates the curve.
+    let (mut low, mut high) = (0.0_f32, 1.0_f32);
+    for _ in 0..24 {
+        let mid = 0.5 * (low + high);
+        if bezier_x(mid) < progress {
+            low = mid;
+        } else {
+            high = mid;
         }
     }
+    bezier_y(0.5 * (low + high))
+}
+
+fn bezier_x(t: f32) -> f32 {
+    let inverse = 1.0 - t;
+    3.0 * inverse * inverse * t * 0.33 + 3.0 * inverse * t * t * 0.67 + t * t * t
+}
+
+fn bezier_y(t: f32) -> f32 {
+    let inverse = 1.0 - t;
+    3.0 * inverse * t * t + t * t * t
+}
+
+fn millis_between(earlier: Instant, later: Instant) -> f32 {
+    later.saturating_duration_since(earlier).as_secs_f32() * 1_000.0
+}
+
+fn millis(ms: f32) -> Duration {
+    Duration::from_secs_f32(ms / 1_000.0)
+}
+
+/// One queued grapheme: the bytes it covers and the instant its fade starts.
+#[derive(Clone, Debug)]
+struct Unit {
+    range: Range<usize>,
+    birth: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ElementVeil {
+    previous: String,
+    units: Vec<Unit>,
+    /// Birth the next appended grapheme would take if the wave is running.
+    next_birth: Option<Instant>,
+    last_append: Option<Instant>,
 }
 
 fn common_prefix(a: &str, b: &str) -> usize {
@@ -73,10 +109,60 @@ fn common_prefix(a: &str, b: &str) -> usize {
     prefix
 }
 
+fn is_grapheme_boundary(text: &str, index: usize) -> bool {
+    let mut cursor = GraphemeCursor::new(index, text.len(), true);
+    matches!(cursor.is_boundary(text, 0), Ok(true))
+}
+
+/// Longest shared prefix that is also a grapheme boundary in the new text.
+/// The common prefix of a Markdown rewrite can otherwise land between a base
+/// character and its combining mark, and the retained span would split a
+/// cluster the shaper wants whole.
+fn grapheme_prefix(previous: &str, text: &str) -> usize {
+    let mut prefix = common_prefix(previous, text);
+    while prefix > 0 && !is_grapheme_boundary(text, prefix) {
+        prefix -= 1;
+    }
+    prefix
+}
+
 impl ElementVeil {
     fn seed(&mut self, text: &str) {
         self.previous.clear();
         self.previous.push_str(text);
+        self.units.clear();
+        self.next_birth = None;
+        self.last_append = None;
+    }
+
+    /// Queue the appended tail as one grapheme per pace, chained after
+    /// whatever is still fading in. The cap is what keeps a burst from
+    /// spending seconds invisible: once the queue would run more than one
+    /// commit gap plus one fade ahead, the rest is born at the cap and lands
+    /// together.
+    fn append(&mut self, text: &str, prefix: usize, now: Instant) {
+        let gap_ms = self
+            .last_append
+            .map_or(VEIL_GAP_CLAMP_MS, |last| millis_between(last, now))
+            .clamp(VEIL_GAP_MIN_MS, VEIL_GAP_CLAMP_MS);
+        let count = text[prefix..].graphemes(true).count().max(1) as f32;
+        let pace = millis((gap_ms / count).clamp(VEIL_MIN_PACE_MS, VEIL_MAX_PACE_MS));
+        let cap = now + millis(gap_ms + VEIL_FADE_MS);
+
+        let mut chain = self.next_birth.unwrap_or(now);
+        let mut offset = prefix;
+        for grapheme in text[prefix..].graphemes(true) {
+            let birth = chain.max(now).min(cap);
+            let end = offset + grapheme.len();
+            self.units.push(Unit {
+                range: offset..end,
+                birth,
+            });
+            offset = end;
+            chain = birth + pace;
+        }
+        self.next_birth = Some(chain);
+        self.last_append = Some(now);
     }
 
     fn advance(&mut self, text: &str, now: Instant) -> Vec<VeilSpan> {
@@ -84,46 +170,50 @@ impl ElementVeil {
             // A streaming Markdown reparse can replace delimiter characters
             // with styled text. Preserve the common prefix and re-veil only
             // the changed tail instead of flashing the whole block.
-            let prefix = common_prefix(&self.previous, text);
-            self.chunks.retain_mut(|chunk| {
-                chunk.range.end = chunk.range.end.min(prefix);
-                chunk.range.start < chunk.range.end
+            let prefix = grapheme_prefix(&self.previous, text);
+            self.units.retain_mut(|unit| {
+                unit.range.end = unit.range.end.min(prefix);
+                unit.range.start < unit.range.end
             });
             if text.len() > prefix {
-                if let Some(last_append) = self.last_append {
-                    let gap_ms = now.saturating_duration_since(last_append).as_secs_f32() * 1_000.0;
-                    self.ema_ms = veil_ema_next(self.ema_ms, gap_ms);
-                }
-                self.last_append = Some(now);
-                self.chunks.push(Chunk {
-                    range: prefix..text.len(),
-                    started: now,
-                    duration_ms: veil_duration_ms(self.ema_ms),
-                });
+                self.append(text, prefix, now);
             }
             self.previous.clear();
             self.previous.push_str(text);
         }
 
-        let boost = veil_boost(self.chunks.len());
-        self.chunks.retain(|chunk| {
-            now.saturating_duration_since(chunk.started).as_secs_f32() * 1_000.0 * boost
-                < chunk.duration_ms
-        });
-        let boost = veil_boost(self.chunks.len());
-        self.chunks
+        // Units settle in birth order; drop the ones that already landed.
+        let settled = self
+            .units
             .iter()
-            .map(|chunk| {
-                let elapsed_ms =
-                    now.saturating_duration_since(chunk.started).as_secs_f32() * 1_000.0;
-                let progress = (elapsed_ms * boost / chunk.duration_ms).clamp(0.0, 1.0);
-                (chunk.range.clone(), veil_opacity(progress))
-            })
+            .position(|unit| millis_between(unit.birth, now) < VEIL_FADE_MS)
+            .unwrap_or(self.units.len());
+        self.units.drain(..settled);
+
+        let mut spans: Vec<(Range<usize>, u8)> = Vec::new();
+        for unit in &self.units {
+            let opacity = if unit.birth > now {
+                0.0
+            } else {
+                veil_opacity(millis_between(unit.birth, now) / VEIL_FADE_MS)
+            };
+            let level = (opacity * VEIL_OPACITY_LEVELS).round() as u8;
+            match spans.last_mut() {
+                Some((range, last)) if *last == level && range.end == unit.range.start => {
+                    range.end = unit.range.end;
+                }
+                _ if level as f32 >= VEIL_OPACITY_LEVELS => {}
+                _ => spans.push((unit.range.clone(), level)),
+            }
+        }
+        spans
+            .into_iter()
+            .map(|(range, level)| (range, level as f32 / VEIL_OPACITY_LEVELS))
             .collect()
     }
 
     fn is_fading(&self) -> bool {
-        !self.chunks.is_empty()
+        !self.units.is_empty()
     }
 }
 
@@ -231,7 +321,6 @@ pub fn apply_veil(runs: Vec<TextRun>, spans: &[VeilSpan]) -> Vec<TextRun> {
 mod tests {
     use super::*;
     use gpui::{TextRun, font};
-    use std::time::Duration;
 
     fn at(base: Instant, millis: u64) -> Instant {
         base + Duration::from_millis(millis)
@@ -248,18 +337,106 @@ mod tests {
         }
     }
 
+    fn advance(veil: &mut ElementVeil, text: &str, now: Instant) -> Vec<VeilSpan> {
+        veil.advance(text, now)
+    }
+
     #[test]
-    fn appended_chunks_fade_once_and_independently() {
+    fn a_commit_lands_as_a_wave_not_a_block() {
         let start = Instant::now();
         let mut veil = ElementVeil::default();
-        assert_eq!(veil.advance("one ", start), vec![(0..4, 0.0)]);
-        let spans = veil.advance("one two", at(start, 100));
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0].0, 0..4);
-        assert_eq!(spans[1].0, 4..7);
-        assert!(spans[0].1 > spans[1].1);
-        assert!(veil.advance("one two", at(start, 600)).is_empty());
-        assert!(veil.advance("one two", at(start, 700)).is_empty());
+        // Four graphemes with no prior commit: the 160 ms default gap gives
+        // the 18 ms pace, so on the commit frame everything is still dark.
+        assert_eq!(advance(&mut veil, "one ", start), vec![(0..4, 0.0)]);
+
+        // Halfway through the wave the oldest grapheme leads and the newest
+        // trails: one gradient rather than two uniform blocks.
+        let spans = advance(&mut veil, "one ", at(start, 100));
+        assert!(spans.len() > 1, "expected a gradient, got {spans:?}");
+        assert_eq!(spans.first().unwrap().0.start, 0);
+        assert_eq!(spans.last().unwrap().0.end, 4);
+        assert!(
+            spans.windows(2).all(|pair| pair[0].1 > pair[1].1),
+            "expected a descending gradient, got {spans:?}"
+        );
+
+        assert!(advance(&mut veil, "one ", at(start, 400)).is_empty());
+        assert!(!veil.is_fading());
+    }
+
+    #[test]
+    fn the_wave_keeps_its_cadence_across_commits() {
+        let start = Instant::now();
+        let mut veil = ElementVeil::default();
+        advance(&mut veil, "one ", start);
+        // The next commit arrives 100 ms later. Its graphemes chain after the
+        // first commit's queue instead of restarting the wave at full
+        // opacity, so the appended tail is still dark on arrival.
+        let spans = advance(&mut veil, "one two", at(start, 100));
+        assert_eq!(spans.last().unwrap().0.end, 7);
+        assert_eq!(*spans.last().unwrap(), (4..7, 0.0));
+    }
+
+    #[test]
+    fn a_burst_is_born_within_one_gap_and_fade() {
+        let start = Instant::now();
+        let mut veil = ElementVeil::default();
+        let burst = "a".repeat(1_000);
+        advance(&mut veil, &burst, start);
+
+        // Nothing is scheduled later than one commit gap plus one fade: a
+        // burst lands as fast-revealed text, never as seconds of invisible
+        // backlog.
+        let cap = start + millis(VEIL_GAP_CLAMP_MS + VEIL_FADE_MS);
+        assert!(veil.units.iter().all(|unit| unit.birth <= cap));
+        // The queue is still spread into a wave rather than landing as one
+        // step, so the capped tail rides a continuous dissolve.
+        let distinct = veil
+            .units
+            .iter()
+            .map(|unit| unit.birth)
+            .collect::<HashSet<_>>()
+            .len();
+        assert!(
+            distinct > 100,
+            "expected a spread wave, got {distinct} births"
+        );
+
+        // And the whole burst is fully painted one fade after the cap.
+        assert!(
+            advance(
+                &mut veil,
+                &burst,
+                cap + millis(VEIL_FADE_MS) + Duration::from_millis(1)
+            )
+            .is_empty()
+        );
+        assert!(!veil.is_fading());
+    }
+
+    #[test]
+    fn grapheme_clusters_are_never_split() {
+        let start = Instant::now();
+        let mut veil = ElementVeil::default();
+        // A combining mark belongs to the grapheme before it; no span may
+        // start or end between the two bytes.
+        let spans = advance(&mut veil, "e\u{301}x", start);
+        assert!(
+            spans
+                .iter()
+                .all(|(range, _)| range.start != 1 && range.end != 1)
+        );
+
+        // A rewrite whose shared prefix ends inside the cluster re-veils the
+        // whole cluster instead of splitting it.
+        let mut rewrite = ElementVeil::default();
+        advance(&mut rewrite, "e", start);
+        let spans = advance(&mut rewrite, "e\u{301}x", at(start, 100));
+        assert!(
+            spans
+                .iter()
+                .all(|(range, _)| range.start != 1 && range.end != 1)
+        );
     }
 
     #[test]
@@ -278,10 +455,17 @@ mod tests {
     fn markdown_rewrites_keep_the_common_prefix() {
         let start = Instant::now();
         let mut veil = ElementVeil::default();
-        veil.advance("intro **bol", start);
-        let spans = veil.advance("intro bold", at(start, 100));
-        assert_eq!(spans[0].0, 0..6);
-        assert_eq!(spans[1].0, 6..10);
+        advance(&mut veil, "intro **bol", start);
+        // The rewrite keeps the shared prefix's history and queues only the
+        // changed tail; nothing is faded past the new text's end.
+        let spans = advance(&mut veil, "intro bold", at(start, 100));
+        assert!(spans.iter().all(|(range, _)| range.end <= 10));
+        let tail = spans
+            .iter()
+            .find(|(range, _)| range.start >= 6)
+            .expect("the rewritten tail should be queued");
+        assert_eq!(tail.0.start, 6);
+        assert_eq!(spans.last().unwrap().0.end, 10);
     }
 
     #[test]
@@ -299,13 +483,18 @@ mod tests {
     }
 
     #[test]
-    fn cadence_curve_matches_spec() {
-        assert_eq!(veil_duration_ms(160.0), 400.0);
-        assert_eq!(veil_duration_ms(30.0), 120.0);
-        assert_eq!(veil_boost(2), 1.0);
-        assert!((veil_boost(3) - 1.3).abs() < f32::EPSILON);
+    fn dissolve_curve_eases_in_and_out() {
         assert_eq!(veil_opacity(0.0), 0.0);
         assert_eq!(veil_opacity(1.0), 1.0);
-        assert!(veil_opacity(0.5) > 0.5);
+        assert!((veil_opacity(0.5) - 0.5).abs() < 0.02);
+        // A slow start is the difference between dissolving and flashing.
+        assert!(veil_opacity(0.25) < 0.2, "{}", veil_opacity(0.25));
+        assert!(veil_opacity(0.75) > 0.8, "{}", veil_opacity(0.75));
+        let mut previous = -1.0;
+        for step in 0..=64 {
+            let value = veil_opacity(step as f32 / 64.0);
+            assert!(value >= previous);
+            previous = value;
+        }
     }
 }

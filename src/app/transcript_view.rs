@@ -2539,18 +2539,19 @@ impl Waku {
                         cx,
                     );
                     if animate_streaming && view.is_some_and(MarkdownView::is_fading) {
-                        // Advance the dissolve from the shared pulse clock,
-                        // not `request_animation_frame`: chunks land every
-                        // stream commit, so a fade is active for essentially
-                        // the whole response and a display-rate re-arm held
-                        // the window at 120 Hz — and every one of those
-                        // frames rebuilds each visible row. ~30 fps across a
-                        // 120-400 ms dissolve is visually equivalent at a
-                        // quarter of the redraws, the same trade the loaders
-                        // make, and the lease parks once the last chunk
-                        // settles. Leasing `current_view` (the transcript
-                        // pane) keeps the tick from busting sibling islands.
-                        motion::pulse_lease(window.current_view(), cx);
+                        // Advance the dissolve from a shared clock, not
+                        // `request_animation_frame`: chunks land every stream
+                        // commit, so a fade is active for essentially the
+                        // whole response and a display-rate re-arm held the
+                        // window at 120 Hz — and every one of those frames
+                        // rebuilt the root and busted sibling pane caches. The
+                        // paced grapheme wave moves on every display frame, so
+                        // it leases the cadence chosen in Settings (120 fps
+                        // rides the display clock; 60 and 30 stride the loader
+                        // clock). A lease is still one notify on the transcript
+                        // pane (the current view), so a tick costs one pane
+                        // rebuild, and it parks once the last grapheme settles.
+                        motion::dissolve_lease(window.current_view(), self.state.dissolve_fps, cx);
                     }
                     rendered
                 })
