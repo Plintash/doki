@@ -1812,7 +1812,7 @@ mod transcript_search;
 mod transcript_view;
 mod usage_meter;
 mod usage_page;
-mod window_chrome;
+pub(crate) mod window_chrome;
 
 pub use autocomplete::init as init_composer_autocomplete;
 use background_work::{

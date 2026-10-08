@@ -269,7 +269,7 @@ impl Render for Waku {
                 .children(image_preview)
                 .children(task_switcher)
                 .into_any_element();
-            return self.render_window_frame(content, window, cx);
+            return content;
         }
         // Re-armed every frame this window shows time labels; parks while
         // settings covers them and while the window isn't drawing at all.
@@ -429,7 +429,7 @@ impl Render for Waku {
             .children(task_switcher)
             .into_any_element();
 
-        self.render_window_frame(content, window, cx)
+        content
     }
 }
 

@@ -7,21 +7,32 @@ use gpui::{App, Global};
 
 /// App-wide handle to the daemon supervisor.
 ///
-/// Windows borrow this and never own it, so closing a window leaves the daemon
-/// running and a rebuilt window reattaches to the same process: the supervisor
-/// only reaps its daemon once the last handle, this one, is dropped with the
-/// application.
-pub struct DaemonState(pub waku_client::DaemonSupervisor);
+/// The window opens before the daemon answers, so this starts empty and the
+/// window that connects fills it in. Windows borrow it and never own it, so
+/// closing a window leaves the daemon running and a rebuilt window reattaches
+/// to the same process: the supervisor only reaps its daemon once the last
+/// handle, this one, is dropped with the application.
+pub struct DaemonState(pub Option<waku_client::DaemonSupervisor>);
 
 impl Global for DaemonState {}
 
-/// The daemon supervisor this application supervises. Set before the first
-/// window opens.
-pub fn supervisor(cx: &App) -> waku_client::DaemonSupervisor {
-    cx.global::<DaemonState>().0.clone()
+/// The connected daemon, once a window has attached one.
+pub fn connected(cx: &App) -> Option<waku_client::DaemonSupervisor> {
+    cx.try_global::<DaemonState>()
+        .and_then(|state| state.0.clone())
 }
 
-pub fn start_process() -> anyhow::Result<waku_client::DaemonSupervisor> {
+/// Publish the connected daemon at application scope, so a window built later
+/// reattaches to it instead of starting a second one.
+pub fn publish(cx: &mut App, daemon: waku_client::DaemonSupervisor) {
+    cx.set_global(DaemonState(Some(daemon)));
+}
+
+/// Connect to a daemon managed elsewhere, or start and supervise the local one.
+///
+/// Blocking: callers run this off the UI thread, and the main window paints
+/// skeleton content until it answers.
+pub fn connect() -> anyhow::Result<waku_client::DaemonSupervisor> {
     let address = std::env::var(waku_client::DAEMON_ADDRESS_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty());

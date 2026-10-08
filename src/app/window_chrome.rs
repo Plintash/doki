@@ -3,7 +3,7 @@ use gpui::WindowButtonLayout;
 #[cfg(target_os = "windows")]
 use gpui::WindowControlArea;
 use gpui::{
-    AnyElement, BoxShadow, Context, Decorations, Div, Hsla, IntoElement, MouseButton, ResizeEdge,
+    AnyElement, App, BoxShadow, Decorations, Div, Hsla, IntoElement, MouseButton, ResizeEdge,
     Tiling, Window, div, prelude::*, px, transparent_black,
 };
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -23,85 +23,84 @@ pub(super) enum WindowControlSide {
     Right,
 }
 
+/// Draw the frame a Wayland compositor delegates back to the client.
+/// Server-decorated windows pass through untouched, so X11 and Wayland
+/// compositors that provide native chrome keep doing so.
+pub(crate) fn render_window_frame(
+    content: AnyElement,
+    window: &mut Window,
+    cx: &App,
+) -> AnyElement {
+    let Decorations::Client { tiling } = window.window_decorations() else {
+        window.set_client_inset(px(0.0));
+        return content;
+    };
+
+    let inset = px(CLIENT_FRAME_INSET);
+    let rounding = px(CLIENT_FRAME_ROUNDING);
+    let border = px(1.0);
+    let theme = Theme::current(cx);
+    window.set_client_inset(inset);
+
+    let frame = div()
+        .relative()
+        .size_full()
+        .overflow_hidden()
+        .when(!(tiling.top || tiling.left), |frame| {
+            frame.rounded_tl(rounding)
+        })
+        .when(!(tiling.top || tiling.right), |frame| {
+            frame.rounded_tr(rounding)
+        })
+        .when(!(tiling.bottom || tiling.left), |frame| {
+            frame.rounded_bl(rounding)
+        })
+        .when(!(tiling.bottom || tiling.right), |frame| {
+            frame.rounded_br(rounding)
+        })
+        .when(!tiling.top, |frame| frame.border_t(border))
+        .when(!tiling.bottom, |frame| frame.border_b(border))
+        .when(!tiling.left, |frame| frame.border_l(border))
+        .when(!tiling.right, |frame| frame.border_r(border))
+        .border_color(theme.border_strong)
+        .when(!tiling.is_tiled(), |frame| {
+            frame.shadow(vec![
+                BoxShadow::new(
+                    px(0.0),
+                    px(0.0),
+                    Hsla {
+                        h: 0.0,
+                        s: 0.0,
+                        l: 0.0,
+                        a: if theme.is_dark { 0.5 } else { 0.25 },
+                    },
+                )
+                .blur_radius(inset / 2.0),
+            ])
+        })
+        .child(content);
+
+    div()
+        .id("client-window-backdrop")
+        .relative()
+        .size_full()
+        .bg(transparent_black())
+        .when(!tiling.top, |backdrop| backdrop.pt(inset))
+        .when(!tiling.bottom, |backdrop| backdrop.pb(inset))
+        .when(!tiling.left, |backdrop| backdrop.pl(inset))
+        .when(!tiling.right, |backdrop| backdrop.pr(inset))
+        .child(frame)
+        .children(
+            window
+                .is_resizable()
+                .then(|| client_resize_handles(tiling, inset))
+                .into_iter()
+                .flatten(),
+        )
+        .into_any_element()
+}
+
 impl Waku {
-    /// Draw the frame a Wayland compositor delegates back to the client.
-    /// Server-decorated windows pass through untouched, so X11 and Wayland
-    /// compositors that provide native chrome keep doing so.
-    pub(super) fn render_window_frame(
-        &self,
-        content: AnyElement,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Decorations::Client { tiling } = window.window_decorations() else {
-            window.set_client_inset(px(0.0));
-            return content;
-        };
-
-        let inset = px(CLIENT_FRAME_INSET);
-        let rounding = px(CLIENT_FRAME_ROUNDING);
-        let border = px(1.0);
-        let theme = Theme::current(cx);
-        window.set_client_inset(inset);
-
-        let frame = div()
-            .relative()
-            .size_full()
-            .overflow_hidden()
-            .when(!(tiling.top || tiling.left), |frame| {
-                frame.rounded_tl(rounding)
-            })
-            .when(!(tiling.top || tiling.right), |frame| {
-                frame.rounded_tr(rounding)
-            })
-            .when(!(tiling.bottom || tiling.left), |frame| {
-                frame.rounded_bl(rounding)
-            })
-            .when(!(tiling.bottom || tiling.right), |frame| {
-                frame.rounded_br(rounding)
-            })
-            .when(!tiling.top, |frame| frame.border_t(border))
-            .when(!tiling.bottom, |frame| frame.border_b(border))
-            .when(!tiling.left, |frame| frame.border_l(border))
-            .when(!tiling.right, |frame| frame.border_r(border))
-            .border_color(theme.border_strong)
-            .when(!tiling.is_tiled(), |frame| {
-                frame.shadow(vec![
-                    BoxShadow::new(
-                        px(0.0),
-                        px(0.0),
-                        Hsla {
-                            h: 0.0,
-                            s: 0.0,
-                            l: 0.0,
-                            a: if theme.is_dark { 0.5 } else { 0.25 },
-                        },
-                    )
-                    .blur_radius(inset / 2.0),
-                ])
-            })
-            .child(content);
-
-        div()
-            .id("client-window-backdrop")
-            .relative()
-            .size_full()
-            .bg(transparent_black())
-            .when(!tiling.top, |backdrop| backdrop.pt(inset))
-            .when(!tiling.bottom, |backdrop| backdrop.pb(inset))
-            .when(!tiling.left, |backdrop| backdrop.pl(inset))
-            .when(!tiling.right, |backdrop| backdrop.pr(inset))
-            .child(frame)
-            .children(
-                window
-                    .is_resizable()
-                    .then(|| client_resize_handles(tiling, inset))
-                    .into_iter()
-                    .flatten(),
-            )
-            .into_any_element()
-    }
-
     /// Render the window controls Waku owns: the desktop's configured button
     /// order when GPUI had to fall back from server-side to client-side
     /// decorations, and the platform order on Windows.
