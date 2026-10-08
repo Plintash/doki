@@ -3060,6 +3060,20 @@ mod tests {
     /// transport, and it is per step rather than for a whole test.
     const LIVE_STEP_TIMEOUT: Duration = Duration::from_secs(90);
 
+    /// The probe fixture as an extension Pi loads from a path of its own.
+    ///
+    /// A path per test, because Pi resolves a loaded extension by path: two
+    /// sessions naming the same file would have the second read what the first
+    /// compiled.
+    fn live_probe_extension(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("waku-pi-live-{name}"));
+        std::fs::create_dir_all(&directory).expect("the fixture extension needs a directory");
+        let path = directory.join(format!("{name}.js"));
+        std::fs::write(&path, include_str!("fixtures/pi_live_probe.js"))
+            .expect("the fixture extension needs its body");
+        path
+    }
+
     /// A driver on a real `pi --mode rpc`, started the way the app starts one,
     /// with `extension` loaded through the launch's own `--extension` flag, and
     /// its native session already announced.
@@ -3103,6 +3117,183 @@ mod tests {
             }
         }
         Some((driver, event_rx))
+    }
+
+    /// A run the extension starts on its own reaches the transcript: the
+    /// message that caused it has a home, one turn opens with no Waku prompt,
+    /// and the reply streams into that same turn — the shape a background
+    /// subagent's completion wake takes.
+    #[test]
+    fn pi_streams_a_run_an_extension_starts_against_the_real_rpc() {
+        let Some((driver, event_rx)) = real_pi_session(Some(live_probe_extension("wake"))) else {
+            return;
+        };
+        driver.prompt("/waku-live-wake".to_owned());
+
+        let mut started = 0;
+        let mut woken = None;
+        let mut text = String::new();
+        loop {
+            match next_live_step(&event_rx, "the run the extension started to settle") {
+                DriverEvent::TurnStarted => started += 1,
+                DriverEvent::ExtensionMessage {
+                    custom_type,
+                    text: body,
+                    display,
+                } => {
+                    woken = Some((custom_type, body, display));
+                }
+                DriverEvent::TextDelta(delta) => text.push_str(&delta),
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished {
+                    success, summary, ..
+                } => {
+                    assert!(success, "the wake's run should finish: {summary:?}");
+                    assert_eq!(
+                        started, 1,
+                        "a run with no Waku prompt of its own still opens one turn"
+                    );
+                    assert!(
+                        woken.is_some() && text.contains("WAKU-LIVE-WAKE"),
+                        "the run's message and reply must land in the turn that settles"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // A second turn for the same run would arrive right behind the first
+        // settle — the empty completed turn the answer used to open — so the
+        // window after it is where that has to be ruled out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(event) =
+            event_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            match event {
+                DriverEvent::TurnStarted => {
+                    panic!("one run must open one turn, not settle an empty one and start another")
+                }
+                DriverEvent::TurnFinished { .. } => panic!("one run must settle once"),
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(started, 1, "a run settles its turn once");
+        assert_eq!(
+            woken,
+            Some((
+                "waku-live-wake".to_owned(),
+                "Reply with exactly: WAKU-LIVE-WAKE. Do not use any tools.".to_owned(),
+                true
+            )),
+            "the extension message that started the run must reach the client"
+        );
+        assert!(
+            text.contains("WAKU-LIVE-WAKE"),
+            "the run's reply must stream into the transcript: {text:?}"
+        );
+    }
+
+    /// The extension's own messages reach their surfaces — a subagent's child
+    /// notification as detached work, anything else as an extension message,
+    /// and one marked not for display as such — and the question it asks is
+    /// answered instead of cancelled on the user's behalf.
+    #[test]
+    fn pi_surfaces_extension_messages_and_answers_its_question_against_the_real_rpc() {
+        let Some((driver, event_rx)) = real_pi_session(Some(live_probe_extension("probe"))) else {
+            return;
+        };
+        driver.prompt("/waku-live-probe".to_owned());
+
+        let mut notice = None;
+        let mut child = None;
+        let mut hidden = None;
+        let mut question = None;
+        let mut answer = None;
+        let mut started = false;
+        loop {
+            match next_live_step(&event_rx, "the extension's messages and question") {
+                DriverEvent::ExtensionMessage {
+                    custom_type,
+                    text,
+                    display,
+                } => match custom_type.as_str() {
+                    "waku-live-notice" => notice = Some((text, display)),
+                    "waku-live-hidden" => hidden = Some((text, display)),
+                    "waku-live-answer" => answer = Some(text),
+                    other => panic!("an extension message was not classified: {other}"),
+                },
+                DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) => {
+                    child = Some(item)
+                }
+                DriverEvent::UserInputRequested {
+                    request_id,
+                    questions,
+                } => {
+                    assert!(question.is_none(), "the probe asks exactly one question");
+                    assert_eq!(questions.len(), 1, "a dialog is one question");
+                    assert_eq!(
+                        questions[0].id, request_id,
+                        "the question id is the provider's request id"
+                    );
+                    assert!(
+                        questions[0]
+                            .options
+                            .iter()
+                            .any(|option| option.label == PI_CONFIRM_ACCEPT),
+                        "a confirmation offers its own answers"
+                    );
+                    question = Some(questions[0].question.clone());
+                    driver.respond_user_input(
+                        request_id.clone(),
+                        vec![UserInputAnswer {
+                            question_id: request_id,
+                            answers: vec![PI_CONFIRM_ACCEPT.to_owned()],
+                        }],
+                    );
+                }
+                DriverEvent::TurnStarted => started = true,
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished { success, .. } => {
+                    assert!(success, "an extension command settles the turn it consumed");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            notice,
+            Some(("probe notice".to_owned(), true)),
+            "a plain extension message reaches the client"
+        );
+        let child =
+            child.expect("the subagent notification must land on the detached-work surface");
+        assert_eq!(child.key.kind, BackgroundWorkKind::Subagent);
+        assert_eq!(child.key.provider_id, "probe-child");
+        assert_eq!(child.title, "probe-child");
+        assert_eq!(child.status, BackgroundWorkStatus::Completed);
+        assert!(child.background, "a workflow child outlives the turn");
+        assert_eq!(
+            hidden,
+            Some(("hidden probe".to_owned(), false)),
+            "a message marked not for display is still delivered as one"
+        );
+        assert!(
+            question.is_some_and(|question| question == "Answer the probe?"),
+            "the extension's question reaches the client"
+        );
+        assert_eq!(
+            answer,
+            Some("answer=true".to_owned()),
+            "the extension receives the user's answer, not a cancellation"
+        );
+        assert!(
+            !started,
+            "a message an extension appends without a run opens no turn"
+        );
     }
 
     /// The next event from the live provider. A provider that goes quiet is a
