@@ -211,17 +211,13 @@ fn attach_snapshot(
             rows: rows.min(u16::MAX as usize) as u16,
         },
     )?;
-    request_snapshot(daemon, terminal_id)?.ok_or_else(|| {
-        anyhow::anyhow!("Waku daemon did not retain the terminal it just opened")
-    })
+    request_snapshot(daemon, terminal_id)?
+        .ok_or_else(|| anyhow::anyhow!("Waku daemon did not retain the terminal it just opened"))
 }
 
 /// `Ok(None)` means the daemon has no terminal under this id yet, which is the
 /// only attach failure the caller recovers from by opening one.
-fn request_snapshot(
-    daemon: &DaemonClient,
-    terminal_id: Uuid,
-) -> Result<Option<AttachedTerminal>> {
+fn request_snapshot(daemon: &DaemonClient, terminal_id: Uuid) -> Result<Option<AttachedTerminal>> {
     match daemon.request(terminal_id, terminal_id, Command::AttachTerminal) {
         Ok(ResponsePayload::TerminalSnapshot {
             data,
@@ -846,11 +842,9 @@ impl TerminalView {
         cx.spawn(async move |this, cx| {
             let started = cx
                 .background_executor()
-                .spawn(
-                    async move {
-                        TerminalSession::attach(daemon, terminal_id, &terminal_cwd, 52, 36)
-                    },
-                )
+                .spawn(async move {
+                    TerminalSession::attach(daemon, terminal_id, &terminal_cwd, 52, 36)
+                })
                 .await;
             if this
                 .update(cx, |this, cx| {
@@ -2014,8 +2008,15 @@ mod tests {
             .display_iter
             .map(|cell| cell.cell.c)
             .collect();
-        assert_eq!(text.matches("one").count(), 1, "replayed output was repeated");
-        assert!(text.contains("two"), "live output past the boundary was lost");
+        assert_eq!(
+            text.matches("one").count(),
+            1,
+            "replayed output was repeated"
+        );
+        assert!(
+            text.contains("two"),
+            "live output past the boundary was lost"
+        );
     }
 
     fn key(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {

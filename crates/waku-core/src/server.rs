@@ -1982,12 +1982,7 @@ mod tests {
         let attached = client
             .request(terminal_id, terminal_id, Command::AttachTerminal)
             .unwrap();
-        let ResponsePayload::TerminalSnapshot {
-            data,
-            sequence,
-            ..
-        } = attached
-        else {
+        let ResponsePayload::TerminalSnapshot { data, sequence, .. } = attached else {
             panic!("attach did not return a terminal snapshot: {attached:?}");
         };
 
@@ -2047,7 +2042,10 @@ mod tests {
             previous = Some(value);
             counted += 1;
         }
-        assert!(counted > 4, "the reconstruction held too little output to judge");
+        assert!(
+            counted > 4,
+            "the reconstruction held too little output to judge"
+        );
 
         // Let the burst finish before stopping the server so its shell exits
         // on its own; killing a shell mid-write leaves the PTY child stuck
