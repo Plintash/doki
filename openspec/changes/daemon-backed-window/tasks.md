@@ -11,10 +11,10 @@
 
 ## 2. Desktop terminal on the daemon stream
 
-- [ ] 2.1 Add a desktop terminal session that attaches to the daemon terminal, feeds replayed bytes into the existing Alacritty emulator, and forwards input and resize; verify with daemon-backed tests for attach, input, and resize
-- [ ] 2.2 Switch the right-panel terminal surface to the daemon session and delete the desktop-owned PTY spawn path; verify a shell survives a simulated window teardown and reattaches with its grid intact
+- [x] 2.1 Add a desktop terminal session that attaches to the daemon terminal, feeds replayed bytes into the existing Alacritty emulator, and forwards input and resize; verify with daemon-backed tests for attach, input, and resize
+- [x] 2.2 Switch the right-panel terminal surface to the daemon session and delete the desktop-owned PTY spawn path; verify a shell survives a simulated window teardown and reattaches with its grid intact
 - [ ] 2.3 Persist the terminal identity in the right-panel surface descriptor and restore the surface when that daemon terminal still exists, degrading to no surface when it does not — with serialization tests for both cases
-- [ ] 2.4 Document the terminal output cadence and batching rule in `docs/performance.md`, verified by re-running the flood scenario and confirming the client stays responsive
+- [x] 2.4 Document the terminal output cadence and batching rule in `docs/performance.md`, verified by re-running the flood scenario and confirming the client stays responsive
 
 ## 3. Window factory and app-scope services
 
