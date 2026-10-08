@@ -125,21 +125,26 @@ the extension appends without starting a run MUST NOT.
 - **WHEN** an extension appends a message without triggering a run
 - **THEN** no turn is opened for it
 
-### Requirement: Extension messages are surfaced at their place in the session
+### Requirement: A message about detached work is shown where that work lives
 
 Waku SHALL decode the provider's extension messages — their kind, text and
-display flag — and SHALL place each where the session tree has it: a message
-about work that outlives the turn belongs to the client's background-work
-surface, and every other message to the transcript. Such a message is rendered
-on that surface whether or not the provider marked it for display, because the
-provider places it there itself and its status is what a row would have said; it
-MUST NOT also add a conversation row. A message of any other kind adds a
-conversation row only when the provider marked it for display.
+display flag — and SHALL place a message about work that outlives the turn on
+the client's background-work surface, whatever the provider's display flag says:
+that surface is where the provider puts such a message itself, and the item's
+status is what a conversation row would have said. Such a message MUST NOT also
+add a conversation row.
 
 #### Scenario: A child's completion is visible
 
 - **WHEN** a background subagent child completes or fails
 - **THEN** the client shows that outcome where it shows detached work, named after the child
+
+### Requirement: A message not meant for the conversation adds no row
+
+Waku SHALL add a conversation row for an extension message only when the
+provider marked that message for display. A message the provider did not mark
+SHALL add nothing the user sees, and MUST NOT be copied into a second place to
+be kept.
 
 #### Scenario: A message not meant for the conversation adds no row
 
