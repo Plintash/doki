@@ -1076,6 +1076,15 @@ impl StateStore {
             .iter()
             .filter(|session| dirty_ids.contains(&session.id))
             .cloned()
+            .collect::<Vec<AgentSession>>();
+        // `detail_loaded` is process-local and does not cross the wire, so a
+        // skeleton arrives at the daemon looking like a fully loaded but empty
+        // session. Name the projections here; the daemon restores the marker
+        // before it merges and saves them.
+        let skeleton_session_ids = sessions
+            .iter()
+            .filter(|session| !session.detail_loaded)
+            .map(|session| session.id)
             .collect();
         let live_session_ids = state.sessions.iter().map(|session| session.id).collect();
         self.daemon
@@ -1086,6 +1095,7 @@ impl StateStore {
                 Command::SaveTaskState {
                     projects: state.projects.clone(),
                     live_session_ids,
+                    skeleton_session_ids,
                     sessions,
                 },
             )
