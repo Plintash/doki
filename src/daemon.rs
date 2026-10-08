@@ -3,6 +3,23 @@
 use std::path::PathBuf;
 
 use anyhow::{Context as _, anyhow, bail};
+use gpui::{App, Global};
+
+/// App-wide handle to the daemon supervisor.
+///
+/// Windows borrow this and never own it, so closing a window leaves the daemon
+/// running and a rebuilt window reattaches to the same process: the supervisor
+/// only reaps its daemon once the last handle, this one, is dropped with the
+/// application.
+pub struct DaemonState(pub waku_client::DaemonSupervisor);
+
+impl Global for DaemonState {}
+
+/// The daemon supervisor this application supervises. Set before the first
+/// window opens.
+pub fn supervisor(cx: &App) -> waku_client::DaemonSupervisor {
+    cx.global::<DaemonState>().0.clone()
+}
 
 pub fn start_process() -> anyhow::Result<waku_client::DaemonSupervisor> {
     let address = std::env::var(waku_client::DAEMON_ADDRESS_ENV)

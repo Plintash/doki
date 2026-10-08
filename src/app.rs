@@ -1153,9 +1153,11 @@ impl Default for ActivityScrollViewport {
 }
 
 pub struct Waku {
-    /// Owns the headless provider process for exactly as long as the desktop
-    /// app entity. Debug builds can replace it independently after a rebuild;
-    /// all live driver handles below are lightweight RPC proxies.
+    /// A clone of the application-scope daemon supervisor, not its owner: the
+    /// app keeps the daemon alive, so closing this window leaves the process
+    /// running and a rebuilt window reattaches to it. Debug builds can replace
+    /// it independently after a rebuild; all live driver handles below are
+    /// lightweight RPC proxies.
     daemon: waku_client::DaemonSupervisor,
     /// Cached once at construction for the Daemon settings connection URL;
     /// rendering must not query account or network configuration.
