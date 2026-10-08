@@ -3,8 +3,8 @@
 ## 1. Daemon terminal retention
 
 - [ ] 1.1 Add terminal attach/replay to the wire protocol: an `AttachTerminal` command returning the retained output snapshot and current size, plus tests that the generated bindings round-trip the new fields
-- [ ] 1.2 Add a bounded output ring to the daemon terminal with tests proving drops only happen past the cap and memory stays bounded
-- [ ] 1.3 Coalesce daemon terminal output into bounded batches (interval or byte threshold) with tests that a fast producer yields far fewer events than writes
+- [x] 1.2 Add a bounded output ring to the daemon terminal with tests proving drops only happen past the cap and memory stays bounded
+- [x] 1.3 Coalesce daemon terminal output into bounded batches (interval or byte threshold) with tests that a fast producer yields far fewer events than writes
 - [ ] 1.4 Replay the retained ring on attach, including at least one test that a client attaching after output reconstructs the same bytes
 - [ ] 1.5 Reject writes from a client bound to a superseded runtime with a test covering the replacement path
 - [ ] 1.6 Verify terminal lifecycle: explicit close terminates the shell, task removal disposes its terminals, and a detached terminal keeps running — via daemon unit/integration tests
