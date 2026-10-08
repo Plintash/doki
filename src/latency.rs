@@ -207,7 +207,8 @@ pub struct Budgets {
 }
 
 /// The budgets the latency harness enforces. Keep in step with the baselines
-/// and budget table in `docs/performance.md`.
+/// and budget table in `docs/performance.md`, which also records the reopen
+/// breakdown behind the fork decision under "Where reopen time goes".
 ///
 /// Debug-build baselines on the reference machine (2026-10-08): cold launch
 /// 271-933 ms (the first launch after a build is the slow one), reopen
