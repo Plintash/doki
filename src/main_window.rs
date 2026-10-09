@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::app::Waku;
 use crate::app::window_chrome::render_window_frame;
 use crate::daemon::{DaemonConnector, DaemonState};
-use crate::identity::{APP_ID, APP_NAME};
+use crate::identity::APP_ID;
 use crate::latency::{Milestone, RunKind};
 use crate::persistence::AppSettings;
 use crate::startup_trace;
@@ -420,7 +420,7 @@ fn main_window_options(
 ) -> WindowOptions {
     WindowOptions {
         titlebar: Some(TitlebarOptions {
-            title: Some(APP_NAME.into()),
+            title: Some(crate::instance::window_title().into()),
             // Windows creates the window without `WS_CAPTION`
             // either way; asking for the transparent titlebar
             // is what extends the client area over the frame

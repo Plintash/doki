@@ -2130,6 +2130,29 @@ impl Waku {
                                 .text_color(theme.text_secondary)
                                 .child(icon("icons/bot.svg", 10.5, theme.text_tertiary))
                                 .child(div().min_w_0().truncate().child(SharedString::from(label)))
+                        }))
+                        // Several debug builds can run side by side, each on its
+                        // own checkout's database; the badge says which is
+                        // which. Release builds have one app and no badge.
+                        .children(crate::instance::debug_label().map(|label| {
+                            div()
+                                .id("debug-instance")
+                                .h(px(22.0))
+                                .max_w(px(240.0))
+                                .px(px(6.0))
+                                .rounded(px(6.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .bg(theme.overlay)
+                                .text_size(sp(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text_ghost)
+                                .tooltip(Tooltip::text(format!(
+                                    "debug build · database {}",
+                                    crate::instance::database_path()
+                                )))
+                                .child(div().min_w_0().truncate().child(SharedString::from(label)))
                         })),
                     cx,
                 ),

@@ -35,6 +35,7 @@ mod computer_use;
 pub mod daemon;
 mod driver;
 mod input;
+mod instance;
 pub mod latency;
 mod main_window;
 mod md;
