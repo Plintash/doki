@@ -110,6 +110,9 @@ fn common_prefix(a: &str, b: &str) -> usize {
 }
 
 fn is_grapheme_boundary(text: &str, index: usize) -> bool {
+    if !text.is_char_boundary(index) {
+        return false;
+    }
     let mut cursor = GraphemeCursor::new(index, text.len(), true);
     matches!(cursor.is_boundary(text, 0), Ok(true))
 }
@@ -121,7 +124,13 @@ fn is_grapheme_boundary(text: &str, index: usize) -> bool {
 fn grapheme_prefix(previous: &str, text: &str) -> usize {
     let mut prefix = common_prefix(previous, text);
     while prefix > 0 && !is_grapheme_boundary(text, prefix) {
+        // Step to the previous *character* boundary. A one-byte step can land
+        // inside a multi-byte character, and asking whether that index is a
+        // grapheme boundary is a slicing panic rather than a `false`.
         prefix -= 1;
+        while prefix > 0 && !text.is_char_boundary(prefix) {
+            prefix -= 1;
+        }
     }
     prefix
 }
@@ -484,6 +493,22 @@ mod tests {
         assert!(faded.iter().all(|run| run.font == runs[0].font));
         assert_eq!(faded[0].color.a, 1.0);
         assert_eq!(faded[1].color.a, 0.5);
+    }
+
+    /// A rewrite's shared prefix can end on a character boundary that is not
+    /// a grapheme boundary — `é` followed by a combining mark, say. Walking
+    /// back one byte at a time then lands inside a multi-byte character, and
+    /// the boundary check would slice-panic instead of answering `false`.
+    #[test]
+    fn grapheme_prefix_never_splits_a_multibyte_character() {
+        let text = "é\u{0301}";
+        assert_eq!(grapheme_prefix("é", text), 0);
+
+        // The shared prefix backs off to the cluster's start: the combining
+        // mark binds to `b`, so the prefix is 1, not 2.
+        assert_eq!(grapheme_prefix("ab", "ab\u{0301}c"), 1);
+        assert_eq!(grapheme_prefix("abc", "abc"), 3);
+        assert_eq!(grapheme_prefix("界", "界界"), "界".len());
     }
 
     #[test]
