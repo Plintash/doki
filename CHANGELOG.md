@@ -16,7 +16,7 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
-- Closing the window leaves the app running in the Dock: in-flight turns and terminals keep going, reopening restores the last task, layout, and terminal, and unsaved file edits ask before the window closes — with a right-panel tab open, ⌘W closes that tab first
+- Closing the window leaves the app running in the Dock: in-flight turns and terminals keep going, reopening restores the last task, layout, terminal, and browser tabs by URL, and unsaved file edits ask before the window closes — with a right-panel tab open, ⌘W closes that tab first
 
 ## [26.10.8-rc.3]
 

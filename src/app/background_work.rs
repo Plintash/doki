@@ -969,7 +969,7 @@ impl Waku {
         crate::platform::open_path_in_app(path, bundle_id);
         if self.state.open_in_app.as_deref() != Some(app_id) {
             self.state.open_in_app = Some(app_id.to_owned());
-            self.save();
+            self.save(cx);
             cx.notify();
         }
     }

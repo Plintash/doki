@@ -1297,6 +1297,12 @@ impl BrowserView {
         cx.notify();
     }
 
+    /// The last URL the page committed, for a persisted tab descriptor. `None`
+    /// until the first navigation, which a rebuild restores blank.
+    pub fn current_url(&self) -> Option<&str> {
+        self.current_url.as_deref()
+    }
+
     /// The label the right panel tab shows for this surface.
     pub fn tab_label(&self) -> Option<String> {
         if let Some(title) = self.page_title.as_deref().filter(|t| !t.trim().is_empty()) {

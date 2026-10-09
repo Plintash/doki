@@ -1213,7 +1213,7 @@ impl Waku {
             self.reset_visible_state();
             self.reset_transcript_rows(self.transcript_row_count());
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1561,11 +1561,11 @@ impl Waku {
             .unwrap_or(&[])
     }
 
-    pub(super) fn save(&mut self) {
+    pub(super) fn save(&mut self, cx: &App) {
         self.last_stream_save = Instant::now();
         // Every write of `state.json` carries the right panel's current
         // identities, so a window rebuilt later restores them.
-        self.state.right_panel_descriptors = self.persisted_right_panel_descriptors();
+        self.state.right_panel_descriptors = self.persisted_right_panel_descriptors(cx);
         let daemon_error = self
             .daemon
             .update_settings(self.state.daemon_settings())
@@ -1752,7 +1752,7 @@ impl Waku {
                         // turn's final stream save can disappear on relaunch.
                         cx.spawn(async move |waku, cx| {
                             cx.background_executor().timer(STREAM_FRAME_INTERVAL).await;
-                            let _ = waku.update(cx, |waku, _| waku.save());
+                            let _ = waku.update(cx, |waku, cx| waku.save(cx));
                         })
                         .detach();
                     }
@@ -2904,7 +2904,7 @@ impl Waku {
                 return;
             }
         }
-        self.save();
+        self.save(cx);
         self.drain_queued_message(session_id, cx);
         cx.notify();
     }
@@ -3086,7 +3086,7 @@ impl Waku {
                 .push(submission.into_queued_message());
             session.updated_at = unix_time();
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -3101,7 +3101,7 @@ impl Waku {
                 .queued_messages
                 .retain(|message| message.id != message_id);
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -3126,7 +3126,7 @@ impl Waku {
         self.restore_composer_submission(ComposerSubmission::from_queued_message(message), cx);
         let focus_handle = self.composer_focus(cx);
         window.focus(&focus_handle, cx);
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -3149,7 +3149,7 @@ impl Waku {
         }) else {
             return;
         };
-        self.save();
+        self.save(cx);
         self.steer_composer_submission(ComposerSubmission::from_queued_message(message), cx);
     }
 
@@ -3519,7 +3519,7 @@ impl Waku {
         // hold the final preparation frame motionless.
         cx.spawn(async move |waku, cx| {
             cx.background_executor().timer(STREAM_FRAME_INTERVAL).await;
-            let _ = waku.update(cx, |waku, _| waku.save());
+            let _ = waku.update(cx, |waku, cx| waku.save(cx));
         })
         .detach();
     }
@@ -3701,7 +3701,7 @@ impl Waku {
         if self.stream_state_dirty
             && (force_save || self.last_stream_save.elapsed() >= STREAM_SAVE_INTERVAL)
         {
-            self.save();
+            self.save(cx);
         }
         changed || selected_changed
     }

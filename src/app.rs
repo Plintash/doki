@@ -1585,6 +1585,10 @@ pub struct Waku {
     workspace_queries_stale: bool,
     right_panel_terminals: HashMap<Uuid, Entity<TerminalView>>,
     right_panel_browsers: HashMap<Uuid, Entity<BrowserView>>,
+    /// URLs a restored browser tab must navigate to on its first render, keyed
+    /// by surface id. The surface id is the tab's identity; the URL is held
+    /// here until the render builds the webview host it needs.
+    right_panel_pending_browser_urls: HashMap<Uuid, String>,
     /// A Browser surface was just opened; the next right panel render moves
     /// focus into its address bar.
     right_panel_pending_browser_focus: Option<Uuid>,
@@ -2674,8 +2678,8 @@ impl Waku {
 
             // Window-frame changes are only mirrored in memory; the quit save
             // is what lands the final position and size on disk.
-            cx.on_app_quit(|this, _| {
-                this.save();
+            cx.on_app_quit(|this, cx| {
+                this.save(cx);
                 async {}
             })
             .detach();
@@ -3134,6 +3138,7 @@ impl Waku {
                 workspace_queries_stale: false,
                 right_panel_terminals: HashMap::new(),
                 right_panel_browsers: HashMap::new(),
+                right_panel_pending_browser_urls: HashMap::new(),
                 right_panel_pending_browser_focus: None,
                 scene_overlay_enabled,
                 settings_page: None,
