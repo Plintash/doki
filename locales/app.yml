@@ -46,6 +46,8 @@ menu.window:
   en: Window
 menu.toggle_fps_counter:
   en: Toggle FPS Counter
+menu.toggle_full_screen:
+  en: Toggle Full Screen
 menu.close_window:
   en: Close Window
 window.minimize:

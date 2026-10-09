@@ -75,6 +75,7 @@ actions!(
         ToggleCommandPalette,
         OpenResumePicker,
         ToggleFpsCounter,
+        ToggleFullScreen,
         NavigateBack,
         NavigateForward,
         SwitchTaskForward,
@@ -256,6 +257,16 @@ pub fn run() {
                 KeyBinding::new("escape", BrowserAddressCancel, Some("BrowserAddress")),
             ]);
 
+            // The standard full screen command. macOS delivers its Globe-F
+            // shortcut through the Window menu's ⌃⌘F equivalent, and AppKit's
+            // automatic item does not survive a menu bar rebuilt in another
+            // language; owning the item and this binding keeps both the menu
+            // and the shortcut working from any focused surface.
+            #[cfg(target_os = "macos")]
+            cx.bind_keys([KeyBinding::new("ctrl-secondary-f", ToggleFullScreen, None)]);
+            #[cfg(not(target_os = "macos"))]
+            cx.bind_keys([KeyBinding::new("f11", ToggleFullScreen, None)]);
+
             cx.on_action(|_: &Quit, cx| cx.quit());
 
             // Unlike AppKit, Linux has no Dock activation path that can
@@ -346,6 +357,7 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
             items: vec![
                 MenuItem::action(tr!("menu.toggle_fps_counter"), ToggleFpsCounter),
                 MenuItem::action(tr!("menu.close_window"), CloseWindow),
+                MenuItem::action(tr!("menu.toggle_full_screen"), ToggleFullScreen),
             ],
         },
     ]);

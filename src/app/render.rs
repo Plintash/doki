@@ -299,6 +299,7 @@ impl Render for Waku {
             .on_action(cx.listener(Self::toggle_command_palette_action))
             .on_action(cx.listener(Self::open_resume_picker_action))
             .on_action(cx.listener(Self::toggle_fps_counter_action))
+            .on_action(cx.listener(Self::toggle_full_screen_action))
             .on_action(cx.listener(Self::navigate_back_action))
             .on_action(cx.listener(Self::navigate_forward_action))
             .on_action(cx.listener(Self::switch_task_forward_action))

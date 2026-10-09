@@ -23,6 +23,7 @@ menu.toggle_model_picker: 打开或关闭模型选择器
 menu.toggle_usage_panel: 打开或关闭用量面板
 menu.window: 窗口
 menu.toggle_fps_counter: 显示或隐藏帧率
+menu.toggle_full_screen: 切换全屏
 menu.close_window: 关闭窗口
 window.minimize: 最小化
 window.maximize: 最大化

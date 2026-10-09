@@ -75,8 +75,8 @@ use crate::{
     FocusPrev, NavigateBack, NavigateForward, NewProject, NewSession, OpenFind, OpenFindReplace,
     OpenResumePicker, OpenSettings, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask,
     SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette, ToggleFindCaseSensitive,
-    ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel,
-    ToggleSidebar, ToggleUsagePanel,
+    ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter, ToggleFullScreen, ToggleModelPicker,
+    ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]

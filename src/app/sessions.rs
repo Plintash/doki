@@ -504,6 +504,17 @@ impl Waku {
         cx.notify();
     }
 
+    /// The platform's full screen command, registered on the workspace root so
+    /// it works whatever surface has focus.
+    pub(super) fn toggle_full_screen_action(
+        &mut self,
+        _: &ToggleFullScreen,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        window.toggle_fullscreen();
+    }
+
     pub(super) fn set_sidebar_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.sidebar_visible == visible {
             return;

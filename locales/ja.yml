@@ -23,6 +23,7 @@ menu.toggle_model_picker: モデル選択の表示を切り替える
 menu.toggle_usage_panel: 使用状況パネルの表示を切り替える
 menu.window: ウインドウ
 menu.toggle_fps_counter: FPS カウンターの表示を切り替える
+menu.toggle_full_screen: フルスクリーンを切り替え
 menu.close_window: ウインドウを閉じる
 window.minimize: 最小化
 window.maximize: 最大化

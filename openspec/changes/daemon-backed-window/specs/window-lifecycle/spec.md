@@ -110,6 +110,23 @@ comes back blank.
 - **THEN** the rebuilt right panel contains a browser tab navigated to that URL,
   without any guarantee for form values or in-page scroll
 
+### Requirement: The standard full screen command works from any surface
+
+On macOS the app SHALL own the system's full screen command: a Window-menu item
+carrying the ⌃⌘F equivalent, so ⌃⌘F and the system's Globe-F shortcut both
+toggle full screen from any focused surface and survive a menu bar rebuilt in
+another language. Windows and Linux SHALL bind F11.
+
+#### Scenario: Globe-F toggles full screen
+
+- **WHEN** the user presses Globe-F while any surface has focus
+- **THEN** the window enters full screen, and pressing it again leaves
+
+#### Scenario: The command survives a language change
+
+- **WHEN** the menu bar is rebuilt because the language changed
+- **THEN** the Window menu still carries the full screen item and its shortcut
+
 ### Requirement: Unsaved edits block close
 
 Closing the window while any file editor holds unsaved changes SHALL present a

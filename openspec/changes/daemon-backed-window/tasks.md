@@ -52,6 +52,7 @@
 - [x] 7.3 Persist browser tabs by URL and restore them across a rebuild, blank when the URL was never observed, page state not guaranteed; verify with tests (#47)
 - [x] 7.4 Cmd-W closes a right-panel tab only while the panel is visible; a hidden panel leaves the window close alone (#48)
 - [x] 7.5 A debug window names its checkout and database (header badge + window title), resolved once and absent in release (#49)
+- [x] 7.6 The standard full screen command is owned by the app - Window-menu item with ⌃⌘F on macOS, F11 elsewhere - so Globe-F and the menu both work from any focused surface (#50)
 
 ## Workflow follow-up
 
