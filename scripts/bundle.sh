@@ -38,7 +38,12 @@ else
 fi
 case "$profile" in
   debug)
-    app_name="Doki Debug"
+    # Each checkout's debug build is named after the checkout, so several
+    # worktrees running at once stay distinguishable in the Dock, the menu bar
+    # and the app switcher. The watcher passes the exact name in; the fallback
+    # keeps a direct `scripts/bundle.sh debug` invocation working.
+    checkout_name=$(basename "$(cd "$(dirname "$0")/.." && pwd)")
+    app_name="${WAKU_DEBUG_APP_NAME:-Doki Debug ($checkout_name)}"
     helper_name="Doki Debug Computer Use"
     bundle_identifier="sh.doki.dev"
     icon_file="AppIconDev.icns"

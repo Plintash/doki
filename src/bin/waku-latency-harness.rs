@@ -36,10 +36,21 @@ use anyhow::{Context as _, bail};
 use waku::latency::{BUDGETS, Budgets, Milestone, ParsedTrace, RunKind};
 use waku::{CLOSE_AFTER_LAUNCH_ENV, TRACE_ENV};
 
-const DEFAULT_APP: &str = "target/debug/Doki Debug.app";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The debug bundle the watcher builds: named after the checkout, so several
+/// worktrees' builds can run side by side without colliding.
+fn default_app() -> PathBuf {
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Doki Debug".to_owned());
+    Path::new("target")
+        .join("debug")
+        .join(format!("Doki Debug ({checkout}).app"))
+}
 
 struct Args {
     app: PathBuf,
@@ -51,7 +62,7 @@ struct Args {
 impl Args {
     fn parse(arguments: impl Iterator<Item = String>) -> anyhow::Result<Self> {
         let mut args = Self {
-            app: PathBuf::from(DEFAULT_APP),
+            app: default_app(),
             trace: std::env::temp_dir().join(format!("waku-latency-{}.log", std::process::id())),
             budgets: BUDGETS,
             timeout: DEFAULT_TIMEOUT,

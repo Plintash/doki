@@ -2,7 +2,7 @@
 
 import { lstat, readdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, basename, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 const projectRoot = resolve(import.meta.dir, "..");
@@ -10,8 +10,14 @@ const userHome = homedir();
 const library = join(userHome, "Library");
 const debugBundleIdentifiers = ["sh.doki.dev", "sh.waku.dev", "codes.waku.dev"];
 // The debug app was called "Waku Debug" before the Doki rename; both names are
-// cleaned so a stale bundle from before the rename cannot linger.
-const debugAppNames = ["Doki Debug", "Waku Debug"];
+// cleaned so a stale bundle from before the rename cannot linger. Each
+// checkout names its own build after itself, so the current name is listed
+// first.
+const debugAppNames = [
+  `Doki Debug (${basename(projectRoot)})`,
+  "Doki Debug",
+  "Waku Debug",
+];
 
 type Target = {
   path: string;
@@ -25,7 +31,7 @@ function addCandidate(path: string): void {
 }
 
 function isDebugDiagnostic(name: string): boolean {
-  return /^(?:Doki|Waku) Debug(?: Computer Use)?[-_.]/.test(name);
+  return /^(?:Doki|Waku) Debug(?:\s*\([^)]*\))?(?: Computer Use)?[-_.]/.test(name);
 }
 
 async function addMatchingChildren(
@@ -164,7 +170,13 @@ for (const target of targets) {
   console.log(`  [${target.kind}] ${target.path}`);
 }
 
-const runningProcesses = ["Doki Debug", "Doki Debug Computer Use", "Waku Debug", "Waku Debug Computer Use"].filter(
+const runningProcesses = [
+  `Doki Debug (${basename(projectRoot)})`,
+  "Doki Debug",
+  "Doki Debug Computer Use",
+  "Waku Debug",
+  "Waku Debug Computer Use",
+].filter(
   (name) =>
     Bun.spawnSync(["/usr/bin/pgrep", "-x", name], {
       stdout: "ignore",

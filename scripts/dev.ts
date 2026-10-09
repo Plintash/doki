@@ -3,15 +3,19 @@
 import { $ } from "bun";
 import { bundleComputerUse } from "./cua-driver";
 import { watch, type FSWatcher } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, basename, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "..");
 const isMacOS = process.platform === "darwin";
-const appName = "Doki Debug";
+// Several worktrees can run a debug build at once; naming each bundle after
+// its checkout keeps them apart in the Dock, the menu bar and the app
+// switcher. `scripts/bundle.sh` derives the same name when it is called
+// directly.
+const appName = `Doki Debug (${basename(root)})`;
 const targetDir = resolve(root, process.env.CARGO_TARGET_DIR || "target");
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
 const appPath = isMacOS
-  ? join(targetDir, "debug/Doki Debug.app")
+  ? join(targetDir, `debug/${appName}.app`)
   : join(targetDir, `debug/waku${executableSuffix}`);
 const daemonPath = join(
   targetDir,
@@ -317,7 +321,9 @@ async function build(target: BuildTarget): Promise<boolean> {
     return false;
   }
   const result = isMacOS
-    ? await $`${join(root, "scripts/bundle.sh")} debug`.nothrow()
+    ? await $`${join(root, "scripts/bundle.sh")} debug`
+        .env({ WAKU_DEBUG_APP_NAME: appName })
+        .nothrow()
     : await $`cargo build --package waku --bin waku --bin waku_js_repl --package waku-computer-use --bin waku_computer_use`.nothrow();
   if (result.exitCode !== 0) {
     console.error("[waku-dev] Build failed; keeping the current app open.");
