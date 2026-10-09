@@ -919,6 +919,23 @@ pub fn load_or_create_app_settings() -> io::Result<AppSettings> {
     Ok(settings)
 }
 
+/// The app preferences hydration applies.
+///
+/// A window reads the persisted settings once before its first frame and hands
+/// that snapshot to the store; when it does, hydration uses the snapshot rather
+/// than reading the file a second time, which is what keeps the skeleton and
+/// the workspace from disagreeing about theme, language, or font size. A store
+/// with no snapshot still reads the file.
+fn hydration_app_settings(
+    preloaded: Option<&AppSettings>,
+    read_from_disk: impl FnOnce() -> io::Result<Option<AppSettings>>,
+) -> io::Result<Option<AppSettings>> {
+    match preloaded {
+        Some(settings) => Ok(Some(settings.clone())),
+        None => read_from_disk(),
+    }
+}
+
 /// Desktop state store: app files stay local, task data crosses RPC.
 pub struct StateStore {
     path: PathBuf,
@@ -927,6 +944,11 @@ pub struct StateStore {
     legacy_settings_paths: Vec<PathBuf>,
     daemon: DaemonSupervisor,
     remote_default_cwd: Mutex<Option<PathBuf>>,
+    /// The app preferences a window already read before its first frame. When
+    /// present, hydration applies them instead of reading the file again, so
+    /// the skeleton and the workspace cannot disagree about theme, language,
+    /// or font size.
+    preloaded_app_settings: Option<AppSettings>,
     /// A task snapshot may only be written after this client has successfully
     /// loaded the daemon's authoritative state. Falling back to an empty UI
     /// after a transient RPC failure must never turn the next ordinary save
@@ -959,7 +981,20 @@ impl StateStore {
             path: Self::default_path(),
             daemon,
             remote_default_cwd: Mutex::new(None),
+            preloaded_app_settings: None,
             task_state_loaded: AtomicBool::new(false),
+        }
+    }
+
+    /// A store that hydrates the app preferences a window already read.
+    ///
+    /// The window reads the persisted settings once, before its first frame,
+    /// and passes the same snapshot here so hydration applies exactly what the
+    /// skeleton painted rather than risking a second, different read.
+    pub fn remote_with_settings(daemon: DaemonSupervisor, app_settings: AppSettings) -> Self {
+        Self {
+            preloaded_app_settings: Some(app_settings),
+            ..Self::remote(daemon)
         }
     }
 
@@ -1089,7 +1124,10 @@ impl StateStore {
         state.projects = projects;
         state.sessions = sessions;
         let app_settings_missing = !self.app_settings_path.is_file();
-        if let Some(settings) = self.read_app_settings()? {
+        let settings = hydration_app_settings(self.preloaded_app_settings.as_ref(), || {
+            self.read_app_settings()
+        })?;
+        if let Some(settings) = settings {
             state.apply_app_settings(settings);
         }
         let app_state = read_app_state_file(&self.app_state_path);
@@ -1338,6 +1376,32 @@ mod tests {
                 [configuration_directory().join("settings.json")]
             );
         }
+    }
+
+    #[test]
+    fn a_window_snapshot_replaces_the_settings_read_during_hydration() {
+        let snapshot = AppSettings {
+            theme: ThemePreference::Dark,
+            ..AppSettings::default()
+        };
+        let mut reads = 0;
+        let applied = hydration_app_settings(Some(&snapshot), || {
+            reads += 1;
+            Ok(Some(AppSettings::default()))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(reads, 0, "a window snapshot skips the file read");
+        assert_eq!(applied.theme, ThemePreference::Dark);
+
+        let applied = hydration_app_settings(None, || {
+            reads += 1;
+            Ok(Some(AppSettings::default()))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(reads, 1, "a store without a snapshot reads the file");
+        assert_eq!(applied.theme, ThemePreference::System);
     }
 
     #[test]

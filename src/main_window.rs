@@ -29,6 +29,7 @@ use crate::app::window_chrome::render_window_frame;
 use crate::daemon::{DaemonConnector, DaemonState};
 use crate::identity::{APP_ID, APP_NAME};
 use crate::latency::{Milestone, RunKind};
+use crate::persistence::AppSettings;
 use crate::startup_trace;
 use crate::theme::{Theme, sp};
 use crate::ui::icon;
@@ -92,6 +93,11 @@ pub struct MainWindow {
     /// status flag, so "connecting", "failed", and "hydrated" cannot
     /// disagree with each other.
     content: WindowContent,
+    /// The persisted preferences the window painted its first frame with.
+    /// Hydration applies the same snapshot, so the workspace cannot switch the
+    /// theme, language, or font size under a skeleton that already showed
+    /// them.
+    preferences: AppSettings,
     /// The task a notification asked for before the workspace existed. A
     /// notification click can beat a slow daemon, and the tag has to survive
     /// until there is a workspace to select the task in.
@@ -110,10 +116,12 @@ enum WindowContent {
 
 impl MainWindow {
     /// A window with no workspace yet: it paints skeleton content while the
-    /// daemon connection runs.
-    fn connecting() -> Self {
+    /// daemon connection runs, using the persisted preferences it was opened
+    /// with.
+    fn connecting(preferences: AppSettings) -> Self {
         Self {
             content: WindowContent::Connecting,
+            preferences,
             requested_task: None,
         }
     }
@@ -166,7 +174,7 @@ impl MainWindow {
         // The connection is the application's, so the daemon was published at
         // application scope before this window could see it; the workspace
         // only borrows it.
-        let workspace = Waku::new(window, cx, daemon);
+        let workspace = Waku::new(window, cx, daemon, self.preferences.clone());
         startup_trace::record(cx, Milestone::TasksHydrated);
         let composer_focus = workspace.read(cx).composer_focus(cx);
         window.focus(&composer_focus, cx);
@@ -299,18 +307,48 @@ fn startup_surface(title: String, detail: Option<String>, cx: &App) -> AnyElemen
 /// The daemon is reached after the window is on screen, so the first frame
 /// paints skeleton content.
 pub fn open_main_window(cx: &mut App) -> WindowHandle<MainWindow> {
-    open_main_window_with(cx, Arc::new(crate::daemon::connect))
+    open_main_window_with(
+        cx,
+        Arc::new(crate::daemon::connect),
+        load_persisted_preferences(),
+    )
 }
 
-/// Open the main window over an explicit daemon connector. Tests drive the
-/// startup path with one that answers without a daemon.
-fn open_main_window_with(cx: &mut App, connector: DaemonConnector) -> WindowHandle<MainWindow> {
+/// Read the persisted preferences once, ahead of the window's first frame.
+///
+/// This is a local one-shot file read, and it runs before the window opens, so
+/// the first frame already carries the saved theme, language, and font size
+/// instead of the system fallbacks `theme::init` published. A read failure
+/// leaves the defaults in place rather than holding up the window; the settings
+/// UI can correct them afterwards.
+fn load_persisted_preferences() -> AppSettings {
+    match crate::persistence::load_or_create_app_settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("could not load persisted preferences: {error:#}");
+            AppSettings::default()
+        }
+    }
+}
+
+/// The main window over an explicit daemon connector and preference snapshot.
+/// Tests drive the startup path with a connector that answers without a daemon
+/// and a snapshot that need not come from disk.
+fn open_main_window_with(
+    cx: &mut App,
+    connector: DaemonConnector,
+    preferences: AppSettings,
+) -> WindowHandle<MainWindow> {
     let (window_bounds, display_id) = restored_window_placement(cx);
     show_main_window(
         cx,
         main_window_options(window_bounds, display_id),
         move |window, cx| {
-            let root = cx.new(|_| MainWindow::connecting());
+            // Put the persisted preferences in effect before the root view
+            // exists, so the skeleton's first frame already shows them and
+            // hydration only re-applies the same values.
+            apply_persisted_preferences(&preferences, window, cx);
+            let root = cx.new(|_| MainWindow::connecting(preferences));
             root.update(cx, |root, cx| root.connect(window, connector, cx));
             let closing = root.clone();
             window.on_window_should_close(cx, move |window, cx| {
@@ -319,6 +357,21 @@ fn open_main_window_with(cx: &mut App, connector: DaemonConnector) -> WindowHand
             root
         },
     )
+}
+
+/// Put a persisted preference snapshot in effect on the window that is about to
+/// paint. `theme::init` publishes the system theme before any window exists, so
+/// a window opened without this would show system colors, the default locale,
+/// and GPUI's 16px rem until hydration corrected them. Applying the same
+/// snapshot here and again in `Waku::new` is idempotent by construction.
+fn apply_persisted_preferences(settings: &AppSettings, window: &mut Window, cx: &mut App) {
+    crate::i18n::set_language(settings.language);
+    crate::theme::apply_theme_preference(settings.theme, window, cx);
+    // Chrome text is authored in `sp` rems against the default UI font size,
+    // so the window's rem size *is* the UI font size setting.
+    window.set_rem_size(px(waku_client::persistence::sanitized_ui_font_size(
+        settings.ui_font_size,
+    )));
 }
 
 /// Deliver a system-notification click to the main window, opening one when
@@ -463,13 +516,16 @@ mod tests {
     use anyhow::anyhow;
     use gpui::{
         AppContext as _, Context, IntoElement, Render, TestAppContext, VisualTestContext, Window,
-        WindowOptions, div,
+        WindowOptions, div, px,
     };
 
     use super::{
-        DaemonConnector, DaemonState, MainWindow, WindowContent, open_main_window_with,
-        show_main_window,
+        DaemonConnector, DaemonState, MainWindow, WindowContent, apply_persisted_preferences,
+        open_main_window_with, show_main_window,
     };
+    use crate::i18n::AppLanguage;
+    use crate::persistence::AppSettings;
+    use crate::theme::{Theme, ThemePreference};
 
     /// A daemon that never answers, so the window keeps painting its starting
     /// surface: the window-level tests below are about the close hook, not the
@@ -578,7 +634,7 @@ mod tests {
             })
         };
 
-        let window = cx.update(|cx| open_main_window_with(cx, connector));
+        let window = cx.update(|cx| open_main_window_with(cx, connector, AppSettings::default()));
 
         assert_eq!(cx.windows().len(), 1, "the window opens with no daemon");
         assert_eq!(
@@ -617,6 +673,75 @@ mod tests {
         );
     }
 
+    /// A rebuilt window paints the persisted theme, language, and font size
+    /// from its first frame: the opener reads them once, puts them in effect
+    /// before the root view exists, and keeps the snapshot so hydration can
+    /// re-apply the same values instead of reading a second, possibly
+    /// different copy. Re-applying them here stands in for hydration and must
+    /// leave the window unchanged.
+    #[gpui::test]
+    fn the_window_paints_the_persisted_preferences_before_it_hydrates(cx: &mut TestAppContext) {
+        let preferences = AppSettings {
+            theme: ThemePreference::Dark,
+            language: AppLanguage::Japanese,
+            ui_font_size: 18.0,
+            ..AppSettings::default()
+        };
+
+        let window =
+            cx.update(|cx| open_main_window_with(cx, unreachable_daemon(), preferences.clone()));
+
+        assert!(
+            window
+                .read_with(cx, |root: &MainWindow, _| matches!(
+                    root.content,
+                    WindowContent::Connecting
+                ))
+                .unwrap(),
+            "the skeleton is up before hydration"
+        );
+        assert!(
+            cx.read(|cx| Theme::current(cx).is_dark),
+            "the first frame uses the persisted theme, not the system one"
+        );
+        assert_eq!(
+            crate::i18n::translate("menu.file"),
+            "ファイル",
+            "the skeleton renders in the persisted language"
+        );
+        assert_eq!(
+            window.update(cx, |_, window, _| window.rem_size()).unwrap(),
+            px(18.0),
+            "the skeleton uses the persisted font size"
+        );
+        assert_eq!(
+            window
+                .read_with(cx, |root: &MainWindow, _| root.preferences.theme)
+                .unwrap(),
+            ThemePreference::Dark,
+            "the window keeps the snapshot hydration will apply"
+        );
+
+        // Hydration re-applies the snapshot the window was opened with.
+        cx.update(|cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    apply_persisted_preferences(&preferences, window, cx)
+                })
+                .unwrap()
+        });
+        assert!(cx.read(|cx| Theme::current(cx).is_dark));
+        assert_eq!(crate::i18n::translate("menu.file"), "ファイル");
+        assert_eq!(
+            window.update(cx, |_, window, _| window.rem_size()).unwrap(),
+            px(18.0)
+        );
+
+        // The locale is process-global; leave it where the rest of the binary
+        // expects it.
+        crate::i18n::set_language(AppLanguage::English);
+    }
+
     /// A connection request belongs to the application, not to the window that
     /// made it. A window that closes while the daemon is answering must not
     /// drop the supervisor — which would reap the daemon it just started — and
@@ -632,7 +757,9 @@ mod tests {
             })
         };
 
-        let first = cx.update(|cx| open_main_window_with(cx, connector(connections.clone())));
+        let first = cx.update(|cx| {
+            open_main_window_with(cx, connector(connections.clone()), AppSettings::default())
+        });
         // The window closes before its daemon answers.
         cx.update(|cx| {
             first
@@ -643,7 +770,9 @@ mod tests {
 
         // Activating the app opens a window while that request is still in
         // flight.
-        let reopened = cx.update(|cx| open_main_window_with(cx, connector(connections.clone())));
+        let reopened = cx.update(|cx| {
+            open_main_window_with(cx, connector(connections.clone()), AppSettings::default())
+        });
         cx.run_until_parked();
 
         assert_eq!(
@@ -677,7 +806,7 @@ mod tests {
                 Err(anyhow!("the daemon is unreachable"))
             })
         };
-        let window = cx.update(|cx| open_main_window_with(cx, connector));
+        let window = cx.update(|cx| open_main_window_with(cx, connector, AppSettings::default()));
 
         // The window closes while its connection is still in flight.
         cx.update(|cx| {
@@ -749,7 +878,8 @@ mod tests {
     /// window that could not be closed.
     #[gpui::test]
     fn a_window_with_nothing_unsaved_answers_the_close(cx: &mut TestAppContext) {
-        let window = cx.update(|cx| open_main_window_with(cx, unreachable_daemon()));
+        let window =
+            cx.update(|cx| open_main_window_with(cx, unreachable_daemon(), AppSettings::default()));
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);

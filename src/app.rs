@@ -55,9 +55,10 @@ use crate::ui::tooltip::Tooltip;
 
 use crate::browser::BrowserView;
 use crate::persistence::{
-    ComposerDraftStore, ComposerDrafts, DEFAULT_RIGHT_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH,
-    FollowUpBehavior, PersistedState, PersistedWindowState, RightPanelSurfaceDescriptor,
-    RightPanelTaskDescriptor, SidebarGrouping, SidebarOrdering, StateStore,
+    AppSettings, ComposerDraftStore, ComposerDrafts, DEFAULT_RIGHT_PANEL_WIDTH,
+    DEFAULT_SIDEBAR_WIDTH, FollowUpBehavior, PersistedState, PersistedWindowState,
+    RightPanelSurfaceDescriptor, RightPanelTaskDescriptor, SidebarGrouping, SidebarOrdering,
+    StateStore,
 };
 use crate::query::{Query, QueryCache};
 use crate::review_diff::{Snapshot as ReviewDiffSnapshot, Source as ReviewDiffSource};
@@ -2127,9 +2128,13 @@ impl Waku {
         window: &mut Window,
         cx: &mut App,
         daemon: waku_client::DaemonSupervisor,
+        preferences: AppSettings,
     ) -> Entity<Self> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let store = StateStore::remote(daemon.clone());
+        // The window read these once before its first frame; hydrating from the
+        // same snapshot is what keeps the workspace from switching the theme,
+        // language, or font size under the skeleton that is already on screen.
+        let store = StateStore::remote_with_settings(daemon.clone(), preferences);
         let daemon_hostname = crate::daemon::local_hostname().unwrap_or_else(|| "this-mac".into());
         let composer_draft_store = ComposerDraftStore::remote(daemon.clone());
         let composer_drafts = composer_draft_store.load().unwrap_or_default();
