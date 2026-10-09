@@ -413,6 +413,14 @@ thread_local! {
 #[cfg(target_os = "macos")]
 const SIDEBAR_WIDTH: f64 = 252.0;
 
+/// Whether the window is backed by a real AppKit view. GPUI's headless test
+/// windows have no `HasWindowHandle` implementation, so the appearance helpers
+/// below must not reach for one from a unit test.
+#[cfg(target_os = "macos")]
+fn has_native_window() -> bool {
+    !cfg!(test)
+}
+
 pub fn start_window_move(window: &Window) {
     window.start_window_move();
 }
@@ -449,6 +457,9 @@ pub fn configure_sidebar_material(window: &Window, dark: bool) {
     };
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+    if !has_native_window() {
+        return;
+    }
     let Ok(handle) = HasWindowHandle::window_handle(window) else {
         return;
     };
@@ -531,6 +542,9 @@ pub fn set_sidebar_material_width(window: &Window, width: f32) {
     use objc2_app_kit::NSView;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+    if !has_native_window() {
+        return;
+    }
     let Ok(handle) = HasWindowHandle::window_handle(window) else {
         return;
     };
@@ -576,6 +590,9 @@ pub fn set_window_appearance(window: &Window, dark: Option<bool>) {
     };
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+    if !has_native_window() {
+        return;
+    }
     let Ok(handle) = HasWindowHandle::window_handle(window) else {
         return;
     };
