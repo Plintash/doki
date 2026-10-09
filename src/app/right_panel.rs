@@ -955,6 +955,17 @@ fn reusable_surface_index(
     }
 }
 
+/// Which of ⌘W's two targets a keypress closes: a right-panel tab, or the
+/// window.
+///
+/// A hidden panel keeps its surfaces in memory so it can come back where it was,
+/// but a tab the user cannot see must not swallow the close. The active surface
+/// alone therefore cannot decide; the panel has to be visible for the tab to
+/// win.
+fn cmd_w_target(panel_visible: bool, active_surface: Option<usize>) -> Option<usize> {
+    if panel_visible { active_surface } else { None }
+}
+
 /// The URL a browser tab's descriptor carries.
 ///
 /// The live entity's committed URL is the tab's identity as soon as the tab has
@@ -2000,6 +2011,17 @@ mod tests {
         );
     }
 
+    /// ⌘W closes a right-panel tab only while the panel is on screen. A hidden
+    /// panel keeps its surfaces in memory, and a tab the user cannot see must
+    /// not swallow the close.
+    #[test]
+    fn cmd_w_closes_a_tab_only_while_the_panel_is_visible() {
+        assert_eq!(cmd_w_target(true, Some(2)), Some(2));
+        assert_eq!(cmd_w_target(true, None), None);
+        assert_eq!(cmd_w_target(false, Some(2)), None);
+        assert_eq!(cmd_w_target(false, None), None);
+    }
+
     #[test]
     fn a_panel_whose_active_tab_is_not_restorable_has_no_active_tab() {
         let surfaces = vec![
@@ -2777,7 +2799,9 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(active) = self.right_panel_active_surface {
+        if let Some(active) =
+            cmd_w_target(self.right_panel_visible, self.right_panel_active_surface)
+        {
             self.close_right_panel_surface(active, cx);
             if self.right_panel_surfaces.is_empty() {
                 let focus_handle = self.composer_focus(cx);

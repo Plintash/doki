@@ -10,11 +10,12 @@ small desktop snapshot, and no durable work or unsaved edit is lost in between.
 
 ### Requirement: Window close is a native close
 
-On macOS, with no right-panel tab open, Cmd-W and the window's close control
-SHALL close the window through AppKit's standard close path, and the
-application MUST remain running in the Dock. With a right-panel tab open,
-Cmd-W closes that tab first and leaves the window open. Closing the last
-window on other platforms keeps quitting the app.
+On macOS, with no right-panel tab on screen, Cmd-W and the window's close
+control SHALL close the window through AppKit's standard close path, and the
+application MUST remain running in the Dock. While the right panel is visible
+with a tab open, Cmd-W closes that tab first and leaves the window open; a
+hidden panel keeps its tabs but does not capture Cmd-W. Closing the last window
+on other platforms keeps quitting the app.
 
 #### Scenario: Close while fullscreen
 
@@ -24,8 +25,15 @@ window on other platforms keeps quitting the app.
 
 #### Scenario: Close a right-panel tab first
 
-- **WHEN** the user presses Cmd-W while a right-panel tab is open
+- **WHEN** the user presses Cmd-W while the right panel is visible with a tab
+  open
 - **THEN** that tab closes and the window stays open
+
+#### Scenario: A hidden panel does not capture Cmd-W
+
+- **WHEN** the user presses Cmd-W while the right panel is hidden and it still
+  holds a tab
+- **THEN** the window closes and the hidden tab is left alone
 
 #### Scenario: Close while windowed
 
