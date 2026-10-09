@@ -107,7 +107,7 @@ impl Waku {
                                     }
                                     waku.visible_branch_snapshot = Some((fetch_path, snapshot));
                                     if persisted_branch_changed {
-                                        waku.save();
+                                        waku.save(cx);
                                     }
                                 }
                                 Ok(None) => waku.visible_branch_snapshot = None,
@@ -165,7 +165,7 @@ impl Waku {
                 true
             });
             if changed {
-                self.save();
+                self.save(cx);
                 cx.notify();
             }
             return true;
@@ -364,7 +364,7 @@ impl Waku {
                             }
                             waku.invalidate_workspace_queries(cx);
                             waku.reload_clean_right_panel_file_editors(cx);
-                            waku.save();
+                            waku.save(cx);
                         }
                     }
                     Err(error) => {

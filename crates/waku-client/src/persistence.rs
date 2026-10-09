@@ -286,16 +286,30 @@ pub struct PersistedWindowState {
 }
 
 /// One right-panel surface reduced to the identity a rebuilt window can
-/// restore: a daemon terminal id, a workspace-relative file path, or a diff
-/// source. Browsers and view state — scroll position, selection, editor
-/// buffers, file-tree expansion — are deliberately absent; a rebuilt window
-/// restores identities, not page or caret state.
+/// restore: a daemon terminal id, a browser tab's last observed URL, a
+/// workspace-relative file path, or a diff source. View state — scroll
+/// position, selection, editor buffers, file-tree expansion, and a browser
+/// page's in-page state — is deliberately absent; a rebuilt window restores
+/// identities, not page or caret state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RightPanelSurfaceDescriptor {
-    Terminal { terminal_id: Uuid },
-    File { path: String },
-    Diff { source: ReviewDiffSource },
+    Terminal {
+        terminal_id: Uuid,
+    },
+    /// A browser tab. `url` is the last URL the page committed, or `None` for
+    /// a tab whose page was never observed, which a rebuilt window restores
+    /// blank.
+    Browser {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    File {
+        path: String,
+    },
+    Diff {
+        source: ReviewDiffSource,
+    },
 }
 
 /// One task's persisted right panel: its restorable surfaces and which of them
@@ -1384,6 +1398,10 @@ mod tests {
             RightPanelTaskDescriptor {
                 surfaces: vec![
                     RightPanelSurfaceDescriptor::Terminal { terminal_id },
+                    RightPanelSurfaceDescriptor::Browser {
+                        url: Some("https://example.com/docs".into()),
+                    },
+                    RightPanelSurfaceDescriptor::Browser { url: None },
                     RightPanelSurfaceDescriptor::File {
                         path: "src/main.rs".into(),
                     },
@@ -1395,7 +1413,7 @@ mod tests {
                         },
                     },
                 ],
-                active: Some(2),
+                active: Some(4),
             },
         );
 
@@ -1407,6 +1425,22 @@ mod tests {
             restored.right_panel_descriptors,
             state.right_panel_descriptors
         );
+    }
+
+    #[test]
+    fn a_browser_descriptor_without_a_url_reads_back_blank() {
+        // A tab whose page was never observed persists without a `url` field;
+        // reading it back must yield the blank tab, not an error.
+        let descriptor: RightPanelSurfaceDescriptor =
+            serde_json::from_str(r#"{"kind":"browser"}"#).unwrap();
+        assert_eq!(
+            descriptor,
+            RightPanelSurfaceDescriptor::Browser { url: None }
+        );
+
+        let encoded =
+            serde_json::to_value(RightPanelSurfaceDescriptor::Browser { url: None }).unwrap();
+        assert!(encoded.get("url").is_none());
     }
 
     /// The window snapshot a rebuilt window reads back carries the selected

@@ -1322,7 +1322,7 @@ impl Waku {
         let needs_restart = self.state.daemon_exposure.enabled || settings.enabled;
         if !needs_restart {
             self.state.daemon_exposure = settings;
-            self.save();
+            self.save(cx);
             cx.notify();
             return;
         }
@@ -1347,7 +1347,7 @@ impl Waku {
                         this.daemon_origins_input.update(cx, |input, cx| {
                             input.set_content(applied.allowed_origins_text(), cx)
                         });
-                        this.save();
+                        this.save(cx);
                         this.show_success_toast(tr!("daemon.settings_applied"));
                     }
                     Err(error) => {
@@ -1623,7 +1623,7 @@ impl Waku {
         }
         self.state.render_math = enabled;
         self.remeasure_font_sized_surfaces();
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1633,7 +1633,7 @@ impl Waku {
             return;
         }
         self.state.dissolve_fps = fps;
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1642,7 +1642,7 @@ impl Waku {
             return;
         }
         self.state.follow_up_behavior = behavior;
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1655,7 +1655,7 @@ impl Waku {
         // Chrome is authored in `sp` rems; the rem size is the setting.
         window.set_rem_size(px(size));
         self.remeasure_font_sized_surfaces();
-        self.save();
+        self.save(cx);
         window.refresh();
         cx.notify();
     }
@@ -1667,7 +1667,7 @@ impl Waku {
         }
         self.state.code_font_size = size;
         self.remeasure_font_sized_surfaces();
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -2095,7 +2095,7 @@ impl Waku {
         } else {
             self.state.provider_binary_overrides.insert(provider, text);
         }
-        self.save();
+        self.save(cx);
         self.refresh_provider_detection(Some(provider));
         self.refresh_composer_sources(cx);
         cx.notify();
@@ -2149,7 +2149,7 @@ impl Waku {
                 }
             }
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -2401,7 +2401,7 @@ impl Waku {
 
     fn set_computer_use_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.state.computer_use_enabled = enabled;
-        self.save();
+        self.save(cx);
         if enabled {
             self.request_computer_permissions(true, cx);
         }
@@ -2445,7 +2445,7 @@ impl Waku {
         self.state
             .computer_use_allowed_apps
             .retain(|grant| grant.key() != key);
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -2539,7 +2539,7 @@ impl Waku {
         }
         self.state.theme = preference;
         crate::theme::apply_theme_preference(preference, window, cx);
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -2600,7 +2600,7 @@ impl Waku {
             .and_then(|updater| updater.0.as_ref())
             .is_some();
         crate::set_app_menus(cx, updater_available);
-        self.save();
+        self.save(cx);
         window.refresh();
         cx.notify();
     }

@@ -240,7 +240,7 @@ impl Waku {
         }
         self.refresh_composer_sources(cx);
         self.reset_transcript_rows(self.transcript_row_count());
-        self.save();
+        self.save(cx);
         if self
             .selected_session()
             .is_some_and(AgentSession::has_started)
@@ -307,7 +307,7 @@ impl Waku {
             return;
         }
         session.workspace = workspace;
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -405,7 +405,7 @@ impl Waku {
                 self.create_session_for(project_id, self.state.last_provider, cx);
             }
         } else {
-            self.save();
+            self.save(cx);
             cx.notify();
         }
 
@@ -510,7 +510,7 @@ impl Waku {
         }
         self.sidebar_visible = visible;
         self.sidebar_slide = self.begin_panel_slide(self.sidebar_rendered_width, cx);
-        self.persist_panel_layout();
+        self.persist_panel_layout(cx);
         cx.notify();
     }
 
@@ -533,16 +533,16 @@ impl Waku {
         }
         self.right_panel_visible = visible;
         self.right_panel_slide = self.begin_panel_slide(self.right_panel_rendered_width, cx);
-        self.persist_panel_layout();
+        self.persist_panel_layout(cx);
         cx.notify();
     }
 
-    pub(super) fn persist_panel_layout(&mut self) {
+    pub(super) fn persist_panel_layout(&mut self, cx: &App) {
         self.state.sidebar_visible = self.sidebar_visible;
         self.state.right_panel_visible = self.right_panel_visible;
         self.state.sidebar_width = self.sidebar_width;
         self.state.right_panel_width = self.right_panel_width;
-        self.save();
+        self.save(cx);
     }
 
     /// Mirror the live window frame into persisted state and land the snapshot
@@ -552,7 +552,7 @@ impl Waku {
     /// window that calls it on close lives outside this module.
     pub(crate) fn persist_window_state(&mut self, window: &Window, cx: &App) {
         self.capture_window_state(window, cx);
-        self.save();
+        self.save(cx);
     }
 
     /// Mirror the live window frame into persisted state; disk waits for the
@@ -694,7 +694,7 @@ impl Waku {
             && let Some(drag) = self.panel_resize_drag.take()
         {
             if drag.target != PanelResizeTarget::FileTree {
-                self.persist_panel_layout();
+                self.persist_panel_layout(cx);
             }
             cx.notify();
         }
@@ -978,7 +978,7 @@ impl Waku {
             } else {
                 self.apply_session_options(session_id, cx);
             }
-            self.save();
+            self.save(cx);
             cx.notify();
         }
     }
@@ -1075,7 +1075,7 @@ impl Waku {
                 .favorite_models
                 .push(FavoriteModel { provider, model });
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1095,7 +1095,7 @@ impl Waku {
         }
         if session_changed || remembered_changed {
             self.state.last_runtime_mode = mode;
-            self.save();
+            self.save(cx);
             cx.notify();
         }
     }
@@ -1109,7 +1109,7 @@ impl Waku {
             self.state.last_reasoning_effort = Some(effort);
             self.remember_selected_model_traits();
             self.apply_session_options(session_id, cx);
-            self.save();
+            self.save(cx);
             cx.notify();
         }
     }
@@ -1123,7 +1123,7 @@ impl Waku {
             self.state.last_service_tier = Some(tier);
             self.remember_selected_model_traits();
             self.apply_session_options(session_id, cx);
-            self.save();
+            self.save(cx);
             cx.notify();
         }
     }
@@ -1137,7 +1137,7 @@ impl Waku {
             self.state.last_context_window = Some(window);
             self.remember_selected_model_traits();
             self.apply_session_options(session_id, cx);
-            self.save();
+            self.save(cx);
             cx.notify();
         }
     }
@@ -1166,7 +1166,7 @@ impl Waku {
             // no-op. It also closes the narrow race where a blank runtime was
             // prepared but had not reported its native session yet.
             self.reset_session_runtime(session_id);
-            self.save();
+            self.save(cx);
             cx.notify();
         }
     }
@@ -1277,7 +1277,7 @@ impl Waku {
             runtime.driver.close();
         }
         self.remeasure_transcript_tail();
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1606,7 +1606,7 @@ impl Waku {
                     .any(|existing| existing.key() == grant.key())
                 {
                     self.state.computer_use_allowed_apps.push(grant);
-                    self.save();
+                    self.save(cx);
                 }
             }
             runtime.driver.run_computer_tool(pending.request);

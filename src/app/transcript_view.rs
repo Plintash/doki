@@ -891,7 +891,7 @@ impl Waku {
                 }
             }
             if changed {
-                self.save();
+                self.save(cx);
             }
         }
         self.close_annotation_editor(cx);
@@ -927,7 +927,7 @@ impl Waku {
             }
         }
         if changed {
-            self.save();
+            self.save(cx);
         }
     }
 

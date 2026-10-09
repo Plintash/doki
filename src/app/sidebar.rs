@@ -1671,7 +1671,7 @@ impl Waku {
             item_ix: 0,
             offset_in_item: Pixels::ZERO,
         });
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1685,7 +1685,7 @@ impl Waku {
             item_ix: 0,
             offset_in_item: Pixels::ZERO,
         });
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1738,7 +1738,7 @@ impl Waku {
                 .session_mut(session_id)
                 .is_some_and(|session| session.set_title(&title))
         {
-            self.save();
+            self.save(cx);
         }
         cx.notify();
     }
