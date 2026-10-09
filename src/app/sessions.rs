@@ -980,7 +980,6 @@ impl Waku {
             }
             // The pick is persisted the moment it is made: a window rebuilt
             // before any turn still reads this model from the daemon.
-            self.state.mark_session_dirty(session_id);
             self.save(cx);
             cx.notify();
         }
@@ -1114,7 +1113,6 @@ impl Waku {
             self.apply_session_options(session_id, cx);
             // A thinking-level pick outlives the window even with no turn: it
             // is saved against the session now, not on the next submission.
-            self.state.mark_session_dirty(session_id);
             self.save(cx);
             cx.notify();
         }
@@ -1129,7 +1127,6 @@ impl Waku {
             self.state.last_service_tier = Some(tier);
             self.remember_selected_model_traits();
             self.apply_session_options(session_id, cx);
-            self.state.mark_session_dirty(session_id);
             self.save(cx);
             cx.notify();
         }
@@ -1144,7 +1141,6 @@ impl Waku {
             self.state.last_context_window = Some(window);
             self.remember_selected_model_traits();
             self.apply_session_options(session_id, cx);
-            self.state.mark_session_dirty(session_id);
             self.save(cx);
             cx.notify();
         }

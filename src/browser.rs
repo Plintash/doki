@@ -1599,6 +1599,23 @@ impl BrowserView {
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn navigate_to_url(&mut self, url: String, cx: &mut Context<Self>) {
+        self.begin_navigation(url, true, cx);
+    }
+
+    /// Loads a restored tab's page without handing the page the keyboard.
+    ///
+    /// A rebuilt window focuses the composer before its restored right panel
+    /// lands, so a tab coming back must load its URL without taking the
+    /// keyboard from it.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn navigate_to_url_without_focus(&mut self, url: String, cx: &mut Context<Self>) {
+        self.begin_navigation(url, false, cx);
+    }
+
+    /// Loads `url` into the page and marks the tab as navigated. `takes_keyboard`
+    /// hands the page the keyboard; nothing else about the navigation differs.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn begin_navigation(&mut self, url: String, takes_keyboard: bool, cx: &mut Context<Self>) {
         let Some(host) = &self.host else {
             #[cfg(target_os = "windows")]
             {
@@ -1614,12 +1631,17 @@ impl BrowserView {
         self.current_url = Some(url);
         self.address_dirty = false;
         self.echo_page_url(cx);
-        self.focus_page(cx);
+        if takes_keyboard {
+            self.focus_page(cx);
+        }
         cx.notify();
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub fn navigate_to_url(&mut self, _url: String, _cx: &mut Context<Self>) {}
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub fn navigate_to_url_without_focus(&mut self, _url: String, _cx: &mut Context<Self>) {}
 
     /// Hand the keyboard to the page. `makeFirstResponder` runs responder
     /// callbacks synchronously and this is reached from inside an entity

@@ -955,6 +955,17 @@ fn reusable_surface_index(
     }
 }
 
+/// The URL a browser tab's descriptor carries.
+///
+/// The live entity's committed URL is the tab's identity as soon as the tab has
+/// rendered. Before that — a save that lands between the restore and the tab's
+/// first frame, the close save most of all — the URL the restore is still
+/// holding is the only one there is, and a descriptor written without it makes
+/// the rebuilt panel come back blank.
+fn persisted_browser_url(live_url: Option<String>, pending_url: Option<String>) -> Option<String> {
+    live_url.or(pending_url)
+}
+
 /// The right-panel descriptor a rebuilt window persists for one task.
 ///
 /// Only durable identities are captured: a terminal's daemon id, a browser
@@ -966,8 +977,9 @@ fn reusable_surface_index(
 /// was on screen; a tab whose descriptor does not survive the rebuild is
 /// dropped from the active index too.
 ///
-/// `browser_url` reads a live browser entity's committed URL; it answers `None`
-/// for a tab that was never rendered, which a rebuild restores blank.
+/// `browser_url` answers a browser tab's identity: the URL a live entity last
+/// committed, or the URL a restore is holding for a tab that has not rendered
+/// yet. A tab with neither restores blank.
 fn persist_right_panel_descriptors(
     surfaces: &[RightPanelSurface],
     active_surface: Option<usize>,
@@ -1955,6 +1967,39 @@ mod tests {
         );
     }
 
+    /// A save can land between the restore and the tab's first frame — the
+    /// close save does. No live entity has committed a URL yet, so the
+    /// descriptor has to carry the URL the restore is still holding, or the
+    /// rebuilt panel comes back blank.
+    #[test]
+    fn a_save_before_a_restored_browser_renders_keeps_its_url() {
+        let browser_id = Uuid::new_v4();
+        let pending_urls = HashMap::from([(browser_id, "https://example.com/docs".to_owned())]);
+
+        let descriptor = persist_right_panel_descriptors(
+            &[RightPanelSurface::Browser(browser_id)],
+            Some(0),
+            ReviewDiffSource::default(),
+            |browser_id| persisted_browser_url(None, pending_urls.get(&browser_id).cloned()),
+        );
+
+        assert_eq!(
+            descriptor.surfaces,
+            vec![RightPanelSurfaceDescriptor::Browser {
+                url: Some("https://example.com/docs".into()),
+            }],
+            "the held URL is the tab's only identity before it renders"
+        );
+        assert_eq!(
+            persisted_browser_url(
+                Some("https://committed.example.com".to_owned()),
+                Some("https://held.example.com".to_owned()),
+            ),
+            Some("https://committed.example.com".to_owned()),
+            "a tab that has rendered keeps the URL its page committed"
+        );
+    }
+
     #[test]
     fn a_panel_whose_active_tab_is_not_restorable_has_no_active_tab() {
         let surfaces = vec![
@@ -2273,9 +2318,9 @@ impl Waku {
     /// The selected task's live panel is captured with the panels that were
     /// swapped out to other tasks; a task with nothing durable open is left
     /// out so the snapshot stays small. Called from [`Waku::save`] so every
-    /// write of `state.json` carries the panel's current identity. `cx` reads
-    /// the live browser entities, whose committed URL is the only place a
-    /// browser tab's identity lives.
+    /// write of `state.json` carries the panel's current identity: `cx` reads
+    /// each live browser entity's committed URL, and a tab restored but not yet
+    /// rendered falls back to the URL its restore is holding.
     pub(super) fn persisted_right_panel_descriptors(
         &self,
         cx: &App,
@@ -2310,12 +2355,21 @@ impl Waku {
         descriptors
     }
 
-    /// The URL a live browser entity last committed, or `None` while its tab
-    /// has never rendered — in which case a rebuild restores it blank.
+    /// The URL a browser tab's descriptor carries: the live entity's committed
+    /// URL once the tab has rendered, otherwise the URL its restore still
+    /// holds. A tab with neither is a blank tab, and a rebuild restores it
+    /// blank.
     fn right_panel_browser_url(&self, browser_id: Uuid, cx: &App) -> Option<String> {
-        self.right_panel_browsers
+        let live_url = self
+            .right_panel_browsers
             .get(&browser_id)
-            .and_then(|browser| browser.read(cx).current_url().map(str::to_owned))
+            .and_then(|browser| browser.read(cx).current_url().map(str::to_owned));
+        persisted_browser_url(
+            live_url,
+            self.right_panel_pending_browser_urls
+                .get(&browser_id)
+                .cloned(),
+        )
     }
 
     /// Rebuilds every task's right panel from the persisted descriptors.
@@ -2416,6 +2470,11 @@ impl Waku {
             return;
         }
         self.restore_right_panel_state(session_id, cx);
+        // A rebuilt window is not a task switch: the window focused the composer
+        // before this restore landed, so the browser focus the state restore
+        // queued is dropped here. The tab still loads, quietly, on its first
+        // render.
+        self.right_panel_pending_browser_focus = None;
         cx.notify();
     }
 
@@ -2858,9 +2917,11 @@ impl Waku {
         let browser = cx.new(|cx| crate::browser::BrowserView::new(window, cx));
         // A restored tab navigates as soon as it has the host its first render
         // built; the URL is held off the surface so the surface keeps its
-        // identity. A tab with no held URL stays blank.
+        // identity. A tab with no held URL stays blank. The navigation is quiet:
+        // the window focused the composer before this restore landed, and a tab
+        // coming back must not take the keyboard from it.
         if let Some(url) = self.right_panel_pending_browser_urls.remove(&browser_id) {
-            browser.update(cx, |view, cx| view.navigate_to_url(url, cx));
+            browser.update(cx, |view, cx| view.navigate_to_url_without_focus(url, cx));
         }
         // Tab titles and toolbar state live on the browser entity; the panel
         // chrome re-renders when they move.

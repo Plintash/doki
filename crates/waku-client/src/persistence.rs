@@ -1451,11 +1451,12 @@ mod tests {
         assert_eq!(state.app_state().last_runtime_mode, RuntimeMode::Ask);
     }
 
-    /// A composer model or thinking-level pick mutates the selected session
-    /// through [`PersistedState::session_mut`], the accessor every picker
-    /// handler uses. That is what queues the choice for the next daemon save,
-    /// so a pick made and then abandoned (no following turn) still reaches the
-    /// daemon and the rebuilt window's task-list load.
+    /// A composer pick — model, thinking level, service tier, context window —
+    /// mutates the selected session through [`PersistedState::session_mut`],
+    /// the accessor every picker handler uses. That is what queues the choice
+    /// for the next daemon save, so a pick made and then abandoned (no
+    /// following turn) still reaches the daemon and the rebuilt window's
+    /// task-list load.
     #[test]
     fn a_composer_pick_is_queued_for_the_next_daemon_save() {
         let mut state = PersistedState::fresh(PathBuf::from("/tmp/pick"));
@@ -1467,6 +1468,8 @@ mod tests {
             .expect("the selected session exists");
         session.model = Some("gpt-5".into());
         session.reasoning_effort = Some("high".into());
+        session.service_tier = Some("fast".into());
+        session.context_window = Some("1m".into());
 
         assert!(
             state.dirty_sessions.contains(&session_id),
