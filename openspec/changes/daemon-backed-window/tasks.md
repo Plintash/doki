@@ -47,9 +47,9 @@
 
 ## 7. Post-acceptance polish
 
-- [ ] 7.1 Preload persisted theme, language, and font size before the window's first frame and apply them to the skeleton, including native appearance and sidebar material; verify no switch happens at hydration (#45)
-- [ ] 7.2 Persist model and thinking-level picks immediately by marking the session dirty, and stop the composer jumping during hydration; verify close and rebuild show the same values (#46)
-- [ ] 7.3 Persist browser tabs by URL and restore them across a rebuild, blank when the URL was never observed, page state not guaranteed; verify with tests (#47)
+- [x] 7.1 Preload persisted theme, language, and font size before the window's first frame and apply them to the skeleton, including native appearance and sidebar material; verify no switch happens at hydration (#45)
+- [x] 7.2 Persist model and thinking-level picks immediately by marking the session dirty, and stop the composer jumping during hydration; verify close and rebuild show the same values (#46)
+- [x] 7.3 Persist browser tabs by URL and restore them across a rebuild, blank when the URL was never observed, page state not guaranteed; verify with tests (#47)
 
 ## Workflow follow-up
 
