@@ -794,6 +794,7 @@ fn command_targets_runtime(command: &Command) -> bool {
             | Command::ForkSessionFromResponse { .. }
             | Command::RewindSessionToMessage { .. }
             | Command::OpenTerminal { .. }
+            | Command::AttachTerminal { .. }
             | Command::WriteTerminal { .. }
             | Command::ResizeTerminal { .. }
             | Command::CloseTerminal
@@ -1076,7 +1077,7 @@ mod tests {
     use crate::daemon::WakuBackend;
     #[cfg(unix)]
     use crate::model::Project;
-    use crate::model::{AgentSession, ProviderKind};
+    use crate::model::{AgentSession, ProviderKind, RuntimeMode};
     #[cfg(unix)]
     use crate::persistence::StateStore;
     #[cfg(unix)]
@@ -1476,6 +1477,94 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A composer pick made without a following turn must reach a rebuilt
+    /// window. Both the pick and the rebuild's task-list load cross the daemon,
+    /// so the pick is saved by id and the list projection has to carry the
+    /// model, its traits, the runtime mode, and the agent preset back —
+    /// otherwise the composer shows the defaults until `HydrateSession` lands
+    /// and then jumps.
+    #[cfg(unix)]
+    #[test]
+    fn a_pick_saved_without_a_turn_returns_the_composer_picks_in_the_rebuild_projection() {
+        let root = std::env::temp_dir().join(format!("waku-pick-rebuild-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("app.db");
+        let hub = Arc::new(Hub::default());
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(database.clone()),
+        )
+        .unwrap();
+        let sink = || hub.event_sink(Uuid::nil(), Uuid::nil());
+        let request = |command: Command| Request {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            runtime_id: Uuid::nil(),
+            command,
+        };
+
+        let project = Project::from_path(root.join("repo"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.begin_turn("ask once");
+        session.push_message(crate::model::MessageRole::Assistant, "answer");
+        let session_id = session.id;
+        let save = |session: AgentSession, skeletons: Vec<Uuid>| {
+            backend
+                .handle(
+                    request(Command::SaveTaskState {
+                        projects: vec![project.clone()],
+                        live_session_ids: vec![session_id],
+                        skeleton_session_ids: skeletons,
+                        sessions: vec![session],
+                    }),
+                    sink(),
+                )
+                .unwrap()
+        };
+        save(session, Vec::new());
+
+        // The selected session is hydrated, the pick is applied to it, and the
+        // pick's save carries no skeleton id — the same shape every composer
+        // picker handler produces.
+        let ResponsePayload::Session {
+            session: Some(picked),
+        } = backend
+            .handle(request(Command::HydrateSession { session_id }), sink())
+            .unwrap()
+        else {
+            panic!("the stored task hydrates")
+        };
+        let mut picked = picked;
+        picked.model = Some("gpt-5".into());
+        picked.reasoning_effort = Some("high".into());
+        picked.service_tier = Some("fast".into());
+        picked.context_window = Some("1m".into());
+        picked.runtime_mode = RuntimeMode::Ask;
+        picked.agent_preset = Some("code".into());
+        save(picked, Vec::new());
+
+        let ResponsePayload::TaskState { sessions, .. } = backend
+            .handle(request(Command::LoadTaskState), sink())
+            .unwrap()
+        else {
+            panic!("expected daemon task state")
+        };
+        let projection = &sessions[0];
+        assert!(!projection.detail_loaded, "the list is still a projection");
+        assert_eq!(projection.model.as_deref(), Some("gpt-5"));
+        assert_eq!(projection.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(projection.service_tier.as_deref(), Some("fast"));
+        assert_eq!(projection.context_window.as_deref(), Some("1m"));
+        assert_eq!(projection.runtime_mode, RuntimeMode::Ask);
+        assert_eq!(projection.agent_preset.as_deref(), Some("code"));
+        assert!(
+            projection.messages.is_empty(),
+            "the transcript stays detail the list never carries"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn websocket_round_trip_sequences_provider_events() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1746,6 +1835,999 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn daemon_terminal_retains_a_bounded_recent_window() {
+        // A small window keeps the fixture cheap; the daemon's production
+        // window is `RETAINED_OUTPUT_BYTES`, and the retention semantics are
+        // the same for either size.
+        const RETAINED_BYTES: usize = 8 * 1024;
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        hub.begin_runtime(session_id, runtime_id);
+        let (messages, events) = unbounded();
+        let (subscriber, _kicked) = Subscriber::new(messages);
+        hub.subscribe(&[], subscriber);
+        let terminal = crate::terminal::DaemonTerminal::open_with_shell_and_retention(
+            &root,
+            80,
+            24,
+            hub.event_sink(session_id, runtime_id),
+            terminal_test_shell(
+                "printf 'oldest-window\\n'; awk 'BEGIN { while (i++ < 60000) printf \"x\" }'; printf 'newest-window\\n'",
+            ),
+            RETAINED_BYTES,
+        )
+        .unwrap();
+
+        // Collect everything the terminal delivers until the shell exits, so
+        // the retained window is final and teardown starts from an idle shell.
+        let mut delivered = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon terminal never exited"
+            );
+            let Ok(message) = events.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            let ServerMessage::Event(event) = message else {
+                continue;
+            };
+            match event.event.kind.as_str() {
+                "terminalOutput" => delivered.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(event.event.payload["data"].as_str().unwrap())
+                        .unwrap(),
+                ),
+                "terminalExited" => break,
+                _ => {}
+            }
+        }
+
+        let retained = terminal.retained_snapshot().0;
+        assert!(
+            delivered.len() > RETAINED_BYTES,
+            "fixture did not produce more output than the retained window: {} bytes",
+            delivered.len()
+        );
+        assert_eq!(
+            retained,
+            delivered[delivered.len() - RETAINED_BYTES..],
+            "retained output is not exactly the newest delivered bytes"
+        );
+        assert!(
+            !retained
+                .windows(b"oldest-window".len())
+                .any(|window| window == b"oldest-window"),
+            "output older than the retention window was not dropped"
+        );
+
+        drop(terminal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_attach_replays_missed_output_and_size() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'retained-attach-marker\\n'; while IFS= read -r line; do :; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let opener = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let opening_events = opener.subscribe(terminal_id, terminal_id);
+        opener
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    task_id,
+                    cwd: root.clone(),
+                    cols: 100,
+                    rows: 30,
+                },
+            )
+            .unwrap();
+        // Wait until the shell's marker has been delivered, so the retained
+        // output is already final and the terminal is idle.
+        terminal_output_until(&opening_events, b"retained-attach-marker");
+
+        // A client that was never attached reconstructs the missed bytes from
+        // the attach snapshot instead of the ephemeral event stream.
+        let attacher = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let attached = attacher
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::AttachTerminal { task_id },
+            )
+            .unwrap();
+        let ResponsePayload::TerminalSnapshot(snapshot) = attached else {
+            panic!("attach did not return a terminal snapshot: {attached:?}");
+        };
+        let data = snapshot.data;
+        assert!(
+            data.windows(b"retained-attach-marker".len())
+                .any(|window| window == b"retained-attach-marker"),
+            "attach replay did not carry the output the second client missed: {:?}",
+            String::from_utf8_lossy(&data)
+        );
+        assert_eq!(
+            (snapshot.cols, snapshot.rows),
+            (100, 30),
+            "attach reported the wrong terminal size"
+        );
+
+        // The reported size follows a resize.
+        opener
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::ResizeTerminal {
+                    cols: 132,
+                    rows: 43,
+                },
+            )
+            .unwrap();
+        let resized = attacher
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::AttachTerminal { task_id },
+            )
+            .unwrap();
+        let ResponsePayload::TerminalSnapshot(snapshot) = resized else {
+            panic!("attach did not return a terminal snapshot: {resized:?}");
+        };
+        assert_eq!((snapshot.cols, snapshot.rows), (132, 43));
+
+        opener.shutdown();
+        attacher.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A client that attaches while the shell is still writing must combine
+    /// the attach snapshot with the live events that follow it. The snapshot
+    /// and the first live emission share the terminal's retained lock, so the
+    /// boundary is exact: every advertised byte appears once, and a hole is
+    /// detectable as a jump in the per-terminal output sequence instead of
+    /// silently duplicating or dropping output.
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_attach_boundary_has_no_duplicates_or_gaps() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            // A finite numbered stream, then a marker and a natural exit so
+            // teardown reaps an exited shell instead of killing one stuck
+            // mid-write. The stream is long enough that attaching lands
+            // mid-burst, and the leading counter makes duplicates and gaps
+            // observable. Filler keeps the producer from one write per byte.
+            "awk 'BEGIN { pad = sprintf(\"%64s\", \"\"); i = 0; while (i < 3000) { printf \"%08d%s\\n\", i, pad; i++ }; printf \"burst-done\\n\" }'",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let events = client.subscribe(terminal_id, terminal_id);
+        client
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    task_id,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        // Wait until the shell is mid-flood before attaching, so the snapshot
+        // and the live stream genuinely overlap.
+        terminal_output_until(&events, b"00000001");
+
+        let attached = client
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::AttachTerminal { task_id },
+            )
+            .unwrap();
+        let ResponsePayload::TerminalSnapshot(snapshot) = attached else {
+            panic!("attach did not return a terminal snapshot: {attached:?}");
+        };
+        let (data, sequence) = (snapshot.data, snapshot.sequence);
+
+        let mut reconstructed = data.clone();
+        let mut boundary = sequence;
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline && reconstructed.len() < data.len() + 50_000 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let Ok(event) = events.recv_timeout(remaining) else {
+                break;
+            };
+            if event.event.kind != "terminalOutput" {
+                continue;
+            }
+            let batch = base64::engine::general_purpose::STANDARD
+                .decode(event.event.payload["data"].as_str().unwrap())
+                .unwrap();
+            let end = event.event.payload["sequence"]
+                .as_u64()
+                .expect("terminalOutput did not carry its output sequence");
+            let start = end - batch.len() as u64;
+            if end <= boundary {
+                // Wholly covered by the snapshot the client already replayed.
+                continue;
+            }
+            assert_eq!(
+                start, boundary,
+                "the live stream jumped from sequence {boundary} to {start}"
+            );
+            reconstructed.extend_from_slice(&batch);
+            boundary = end;
+        }
+        assert!(
+            reconstructed.len() > data.len(),
+            "attach did not observe live output after the snapshot"
+        );
+
+        // Every line leads with a fixed-width counter, so a duplicated or
+        // skipped byte shows up as a non-consecutive pair of line numbers. The
+        // reconstruction may begin or end mid-line, so only a leading counter
+        // followed by non-digit filler counts.
+        let mut previous: Option<u64> = None;
+        let mut counted = 0_usize;
+        for line in reconstructed.split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.len() < 9 || !line[..8].iter().all(u8::is_ascii_digit) {
+                continue;
+            }
+            let value: u64 = std::str::from_utf8(&line[..8]).unwrap().parse().unwrap();
+            if let Some(previous) = previous {
+                assert_eq!(
+                    value,
+                    previous + 1,
+                    "the reconstructed terminal stream duplicated or skipped output at {value}"
+                );
+            }
+            previous = Some(value);
+            counted += 1;
+        }
+        assert!(
+            counted > 4,
+            "the reconstruction held too little output to judge"
+        );
+
+        // Let the burst finish before stopping the server so its shell exits
+        // on its own; killing a shell mid-write leaves the PTY child stuck
+        // exiting and blocks the daemon teardown.
+        terminal_output_until(&events, b"burst-done");
+
+        shutdown.store(true, Ordering::Release);
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Closing the surface (or the window) drops the desktop's client without
+    /// ending the shell. A client that arrives afterwards attaches to the same
+    /// terminal, reconstructs the grid from the replay, and finds the process
+    /// still able to answer input.
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_survives_client_disconnect_and_reattaches() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'daemon-shell-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    // The first client disconnects by shutting its own socket
+                    // down; a client-owned shutdown must not end the daemon.
+                    allow_shutdown: false,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let first = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let first_events = first.subscribe(terminal_id, terminal_id);
+        first
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    task_id,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        terminal_output_until(&first_events, b"daemon-shell-ready");
+        // Simulates the window tearing down: the client goes away, the daemon
+        // and its shell do not.
+        first.shutdown();
+
+        let second = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let second_events = second.subscribe(terminal_id, terminal_id);
+        let attached = second
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::AttachTerminal { task_id },
+            )
+            .unwrap();
+        let ResponsePayload::TerminalSnapshot(snapshot) = attached else {
+            panic!("attach did not return a terminal snapshot: {attached:?}");
+        };
+        let data = snapshot.data;
+        assert!(
+            data.windows(b"daemon-shell-ready".len())
+                .any(|window| window == b"daemon-shell-ready"),
+            "reattach did not replay the grid the disconnected client saw"
+        );
+
+        second
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::WriteTerminal {
+                    data: b"still-alive\r".to_vec(),
+                },
+            )
+            .unwrap();
+        terminal_output_until(&second_events, b"echo:still-alive");
+
+        shutdown.store(true, Ordering::Release);
+        second.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Closing a terminal is its explicit end: the daemon terminates and reaps
+    /// the shell and releases the terminal, so a later attach has nothing left
+    /// to reattach to.
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_close_terminates_the_shell_and_releases_the_terminal() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'close-ready:%s\\n' \"$$\"; while IFS= read -r line; do :; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let events = client.subscribe(terminal_id, terminal_id);
+        client
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    task_id,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        let ready = terminal_output_until(&events, b"\n");
+        let child_pid: libc::pid_t = String::from_utf8_lossy(&ready)
+            .trim()
+            .strip_prefix("close-ready:")
+            .expect("the shell reported its pid")
+            .parse()
+            .unwrap();
+
+        client
+            .request(terminal_id, terminal_id, Command::CloseTerminal)
+            .unwrap();
+
+        assert!(
+            !process_is_alive(child_pid),
+            "the shell outlived the terminal that closed: pid {child_pid}"
+        );
+        let attached = client.request(
+            terminal_id,
+            terminal_id,
+            Command::AttachTerminal { task_id },
+        );
+        assert!(
+            matches!(attached, Ok(ResponsePayload::TerminalAbsent)),
+            "the closed terminal was still attachable: {attached:?}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Removing a task disposes the terminals it owns — the shell ends with the
+    /// task — while another task's terminal keeps running.    #[cfg(unix)]
+    #[test]
+    fn websocket_removing_a_task_disposes_its_terminals() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'task-shell-ready:%s\\n' \"$$\"; while IFS= read -r line; do :; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let removed_task = Uuid::new_v4();
+        let kept_task = Uuid::new_v4();
+        let removed_terminal = Uuid::new_v4();
+        let kept_terminal = Uuid::new_v4();
+
+        let removed_events = client.subscribe(removed_terminal, removed_terminal);
+        client
+            .request(
+                removed_terminal,
+                removed_terminal,
+                Command::OpenTerminal {
+                    task_id: removed_task,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        let ready = terminal_output_until(&removed_events, b"\n");
+        let child_pid: libc::pid_t = String::from_utf8_lossy(&ready)
+            .trim()
+            .strip_prefix("task-shell-ready:")
+            .expect("the shell reported its pid")
+            .parse()
+            .unwrap();
+
+        let kept_events = client.subscribe(kept_terminal, kept_terminal);
+        client
+            .request(
+                kept_terminal,
+                kept_terminal,
+                Command::OpenTerminal {
+                    task_id: kept_task,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        terminal_output_until(&kept_events, b"\n");
+
+        client
+            .request(removed_task, Uuid::nil(), Command::RemoveSession)
+            .unwrap();
+
+        assert!(
+            !process_is_alive(child_pid),
+            "the removed task's shell kept running: pid {child_pid}"
+        );
+        let attached = client.request(
+            removed_terminal,
+            removed_terminal,
+            Command::AttachTerminal {
+                task_id: removed_task,
+            },
+        );
+        assert!(
+            matches!(attached, Ok(ResponsePayload::TerminalAbsent)),
+            "a removed task's terminal was still attachable: {attached:?}"
+        );
+        let kept = client.request(
+            kept_terminal,
+            kept_terminal,
+            Command::AttachTerminal { task_id: kept_task },
+        );
+        assert!(
+            matches!(kept, Ok(ResponsePayload::TerminalSnapshot(_))),
+            "removing one task took another task's terminal: {kept:?}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An attach to an id the daemon never opened reports explicit absence and
+    /// creates nothing, so a client can open a terminal there without an error
+    /// being indistinguishable from a live terminal's loss.
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_attach_reports_absence_for_an_unknown_terminal() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        for attach in [1, 2] {
+            let response = client
+                .request(
+                    terminal_id,
+                    terminal_id,
+                    Command::AttachTerminal { task_id },
+                )
+                .unwrap();
+            assert!(
+                matches!(response, ResponsePayload::TerminalAbsent),
+                "attach {attach} did not report absence: {response:?}"
+            );
+        }
+
+        shutdown.store(true, Ordering::Release);
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A terminal is scoped to the task that opened it, so a client naming
+    /// another task is refused rather than shown a shell it does not own.
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_attach_refuses_another_tasks_terminal() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'owner-ready\\n'; while IFS= read -r line; do :; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let terminal_id = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let events = client.subscribe(terminal_id, terminal_id);
+        client
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    task_id: owner,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        terminal_output_until(&events, b"owner-ready");
+
+        let other = client.request(
+            terminal_id,
+            terminal_id,
+            Command::AttachTerminal {
+                task_id: Uuid::new_v4(),
+            },
+        );
+        assert!(
+            other.is_err(),
+            "another task attached to a terminal it does not own: {other:?}"
+        );
+        let owned = client.request(
+            terminal_id,
+            terminal_id,
+            Command::AttachTerminal { task_id: owner },
+        );
+        assert!(
+            matches!(owned, Ok(ResponsePayload::TerminalSnapshot(_))),
+            "the owning task could not attach: {owned:?}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Whether the process is still in the process table. The daemon reaps a
+    /// shell it terminates, so a terminated one answers `ESRCH`.
+    #[cfg(unix)]
+    fn process_is_alive(pid: libc::pid_t) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_rejects_writes_from_a_superseded_runtime() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(
+            "printf 'runtime-ready\\n'; while IFS= read -r line; do printf 'received:%s\\n' \"$line\"; done",
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let superseded_runtime = Uuid::new_v4();
+        let replacement_runtime = Uuid::new_v4();
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let superseded_events = client.subscribe(terminal_id, superseded_runtime);
+        client
+            .request(
+                terminal_id,
+                superseded_runtime,
+                Command::OpenTerminal {
+                    task_id,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        terminal_output_until(&superseded_events, b"runtime-ready");
+
+        // Replacing the runtime swaps the terminal under the same id.
+        let replacement_events = client.subscribe(terminal_id, replacement_runtime);
+        client
+            .request(
+                terminal_id,
+                replacement_runtime,
+                Command::OpenTerminal {
+                    task_id,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        terminal_output_until(&replacement_events, b"runtime-ready");
+
+        let stale = client.request(
+            terminal_id,
+            superseded_runtime,
+            Command::WriteTerminal {
+                data: b"stale-write\r".to_vec(),
+            },
+        );
+        assert!(
+            stale.is_err(),
+            "a write from a superseded runtime reached the replacement terminal: {stale:?}"
+        );
+
+        client
+            .request(
+                terminal_id,
+                replacement_runtime,
+                Command::WriteTerminal {
+                    data: b"valid-write\r".to_vec(),
+                },
+            )
+            .unwrap();
+        let output = terminal_output_until(&replacement_events, b"received:valid-write");
+        assert!(
+            !output
+                .windows(b"received:stale-write".len())
+                .any(|window| window == b"received:stale-write"),
+            "the replacement shell executed the superseded runtime's input"
+        );
+
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_flood_delivers_bounded_batches() {
+        websocket_terminal_output_shape(
+            "awk 'BEGIN { while (i++ < 30000) printf \"xxxxxxxxxx\" }'; printf '\\nflood-done\\n'",
+            b"flood-done",
+            b'x',
+            300_000,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn websocket_terminal_coalesces_many_small_writes() {
+        websocket_terminal_output_shape(
+            "i=0; while [ $i -lt 2000 ]; do printf 'x'; i=$((i+1)); done; printf '\\nsmall-done\\n'",
+            b"small-done",
+            b'x',
+            2000,
+        );
+    }
+
+    /// Runs a shell that writes `marker`-terminated output containing
+    /// `expected_filler` bytes of `filler`, then asserts output still arrives
+    /// in full while the delivered `terminalOutput` events stay within the
+    /// daemon's flush cadence: at most one event per flush interval, plus one
+    /// per `FLUSH_BYTES` of output, however many writes the shell made.
+    #[cfg(unix)]
+    fn websocket_terminal_output_shape(
+        script: &str,
+        marker: &[u8],
+        filler: u8,
+        expected_filler: usize,
+    ) {
+        const MAX_EVENT_BYTES: usize = 64 * 1024;
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_terminal_shell(terminal_test_shell(script));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        // Measured from before the terminal starts, so the batching bound
+        // below covers the whole window the daemon could have flushed in.
+        let started = std::time::Instant::now();
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let events = client.subscribe(terminal_id, terminal_id);
+        client
+            .request(
+                terminal_id,
+                terminal_id,
+                Command::OpenTerminal {
+                    task_id,
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+
+        let deadline = started + Duration::from_secs(30);
+        let mut delivered = Vec::new();
+        let mut output_events = 0_usize;
+        let mut largest_event = 0_usize;
+        while std::time::Instant::now() < deadline
+            && !delivered
+                .windows(marker.len())
+                .any(|window| window == marker)
+        {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let Ok(event) = events.recv_timeout(remaining) else {
+                break;
+            };
+            if event.event.kind != "terminalOutput" {
+                continue;
+            }
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(event.event.payload["data"].as_str().unwrap())
+                .unwrap();
+            output_events += 1;
+            largest_event = largest_event.max(data.len());
+            delivered.extend(data);
+        }
+
+        assert!(
+            delivered
+                .windows(marker.len())
+                .any(|window| window == marker),
+            "terminal output never reached {marker:?}"
+        );
+        let filler_bytes = delivered.iter().filter(|byte| **byte == filler).count();
+        assert_eq!(
+            filler_bytes, expected_filler,
+            "terminal delivery dropped or duplicated output bytes"
+        );
+        // The daemon flushes at most once per interval and once per threshold,
+        // so the event count is bounded by output size and elapsed time rather
+        // than by how many writes the shell made. The slack absorbs the first
+        // flush, which is immediate, plus scheduling jitter.
+        let elapsed = started.elapsed();
+        let max_events = 4
+            + delivered.len() / crate::terminal::FLUSH_BYTES
+            + elapsed.as_millis() as usize
+                / crate::terminal::FLUSH_INTERVAL.as_millis().max(1) as usize;
+        assert!(
+            output_events <= max_events,
+            "terminal delivery was not batched: {output_events} events (bound {max_events}) for {} output bytes in {elapsed:?}",
+            delivered.len()
+        );
+        assert!(
+            largest_event <= MAX_EVENT_BYTES,
+            "a single terminal event carried {largest_event} bytes"
+        );
+
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dropping_an_idle_terminal_does_not_wait_for_output() {
         let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -1823,6 +2905,7 @@ mod tests {
 
         let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
         let terminal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
         let events = client.subscribe(terminal_id, terminal_id);
         assert!(matches!(
             client
@@ -1830,6 +2913,7 @@ mod tests {
                     terminal_id,
                     terminal_id,
                     Command::OpenTerminal {
+                        task_id,
                         cwd: root.clone(),
                         cols: 80,
                         rows: 24,

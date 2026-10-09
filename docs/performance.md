@@ -105,6 +105,48 @@ one-shot wake for hold expiry and rides the pulse clock only through the
 350 ms fade. Driving frames through the hold pinned the pane at pulse rate the
 moment any scrollbar became visible.
 
+## Terminal output
+
+A terminal is a second streaming source, and it obeys the same rule as the
+transcript: the daemon coalesces output and the client renders from state,
+never per byte.
+
+- The daemon reader appends each read to the terminal's bounded ring and emits
+  one `terminalOutput` event per batch. A batch flushes at or just after it
+  reaches `FLUSH_BYTES` (32 KiB) — a read is appended before the check, so a
+  batch is at most `FLUSH_BYTES + READ_CHUNK_BYTES` — or `FLUSH_INTERVAL`
+  (16 ms) after the previous flush, whichever comes first, so an interactive
+  echo waits at most one frame and a flooding command cannot drive one message
+  per write
+  ([crates/waku-core/src/terminal.rs](../crates/waku-core/src/terminal.rs)).
+  The ring keeps the most recent 1 MiB; the batch and ring caps are what stop a
+  flooding producer from growing daemon memory at the stream rate.
+- Attach replay and the live stream meet at an exact sequence boundary. The
+  terminal stamps every batch with its cumulative end offset, and
+  `AttachTerminal` returns the retained bytes with the offset at their last
+  byte, taken under the same lock the reader holds while appending and
+  delivering a batch. The client drops any batch at or below that offset, so a
+  byte cannot reach the emulator twice or slip through the gap.
+- The desktop driver is `TerminalSession` ([src/terminal.rs](../src/terminal.rs)):
+  a background reader feeds bytes into the Alacritty grid off the UI thread,
+  the grid renderer is unchanged from the pre-daemon terminal, and the view
+  polls it on the existing 24 ms pump. Input and resize are fire-and-forget
+  daemon notifications, so a keystroke never blocks the frame that produced it.
+- A frame never waits on that reader. The reader holds the grid lock while it
+  advances a batch, and `TerminalView::render` reads the grid with
+  `try_lock_unfair`, repainting the frame it last read when the lock is busy and
+  staying dirty so the next poll reads again. The wait it avoids is not only
+  emulation — timing `Processor::advance` of a 32 KiB plain-text batch into an
+  80×24 `Term` in a debug build lands at 0.15–0.25 ms — but the reader being
+  scheduled at all: a preempted reader holds the lock for a scheduler quantum,
+  which is several frames. The scrollbar's offsets come from that same read, so
+  its paint pass does not take the lock either.
+
+Verify the cadence with
+`cargo test -p waku-core --locked websocket_terminal_flood_delivers_bounded_batches`
+and the boundary with
+`cargo test -p waku-core --locked websocket_terminal_attach_boundary_has_no_duplicates_or_gaps`.
+
 ## Bounding what is visible
 
 - The transcript is virtualized with `list()`; per-commit invalidation is the
@@ -194,3 +236,166 @@ alternatively fold activities into the virtualized list as block-granularity
 rows. Smaller levers, in memory and unproven: stable
 `StyledText` element ids for gpui's per-element layout memo, and the per-row
 `Message` clones in the row builder.
+
+## Startup and reopen latency
+
+The window paints before the daemon answers, and closing it destroys it, so
+both the first launch and the rebuild that follows a Dock activation are
+measured properties with recorded budgets. Instrumentation is opt-in:
+
+- `WAKU_STARTUP_TRACE=1` (or `stderr`) writes one milestone line per completed
+  launch or rebuild to stderr.
+- `WAKU_STARTUP_TRACE=<path>` appends the same lines to a file, which is what
+  the harness uses because `open` sends an app's stderr to the unified log.
+
+A line is written when a run reaches `interactive`, from a writer thread rather
+than the frame that got there. `src/latency.rs` owns the format, the parser,
+and the budgets; `src/startup_trace.rs` owns the collection. Both are unit
+tested; only the launch timing itself needs the harness.
+
+```
+startup-trace pid=97892 run=0 kind=cold start_ms=0.000 process_start_ms=0.000 \
+  window_open_ms=55.000 first_frame_ms=108.000 daemon_ready_ms=190.000 \
+  tasks_hydrated_ms=303.000 interactive_ms=306.000
+```
+
+Every timestamp is milliseconds since the process started, and `start_ms` is
+the activation that produced the run: zero for the cold launch, the moment the
+window opener ran for a rebuild. A run's latency is `interactive - start_ms`,
+which is what the budgets bound. `run` and `kind` separate the two runs in one
+process's trace file.
+
+| Milestone | Recorded at |
+| --- | --- |
+| `process_start` | The first line of `run`, before GPUI is built; always 0 |
+| `window_open` | Just before `open_window`, and only when opening rather than focusing |
+| `first_frame` | The window's first render — skeleton content on a cold launch |
+| `daemon_ready` | The window observing `DaemonState::Ready`; for a rebuild the daemon was already connected |
+| `tasks_hydrated` | `Waku::new` returned, task state loaded from the daemon |
+| `interactive` | The first frame showing the hydrated workspace |
+
+`first_frame` and `interactive` are render passes, not confirmed presents:
+GPUI exposes no presented-frame callback, and the two are the same frame on a
+rebuild because the workspace is built while the window is constructed.
+
+### Baselines and budgets
+
+Measured on the reference machine (Apple silicon, debug build, 2026-10-08)
+over five warm runs plus the first launch after a bundle:
+
+| Run | `window_open` | `first_frame` | `daemon_ready` | `tasks_hydrated` | `interactive` | Latency |
+| --- | --- | --- | --- | --- | --- | --- |
+| Cold launch | 50–59 | 99–112 | 160–185 | 269–293 | 271–295 | **271–295 ms** |
+| Cold launch, first after a build | 51 | 95 | 809 | 929 | 933 | **933 ms** |
+| Reopen | 592–616 | 677–719 | 608–632 | 677–719 | 677–719 | **74–111 ms** |
+
+The first launch after a build is the slow one: the daemon binary is cold in
+the page cache, so `daemon_ready` alone is ~800 ms against ~170 ms warm. The
+rebuild reuses the running daemon and its process is warm, which is why it is
+an order of magnitude faster than the launch.
+
+Budgets are set from those baselines in `BUDGETS` (`src/latency.rs`) and
+repeated here; re-derive them on a materially slower machine rather than
+raising them on a hunch:
+
+| Budget | Baseline | Budget |
+| --- | --- | --- |
+| Cold launch | 271–933 ms | **3000 ms** |
+| Reopen | 74–111 ms | **500 ms** |
+
+The headroom is roughly three to five times the worst observed run. That is
+loose enough for a cold page cache and tight enough that putting a blocking
+daemon spawn or state load back on the reopen path fails: a rebuild that waits
+on the daemon pays the ~800 ms `daemon_ready` cost the launch pays.
+
+### Running the harness
+
+The harness is a local development and pre-tag gate, not a hosted CI job: it
+launches the GUI app, which a headless runner has no window server for. Run it
+before tagging a release, on the machine whose bundle it should measure.
+
+The harness launches the debug app with `open -g`, so it never takes focus,
+and terminates the app and its daemon when it is done. A traced cold launch
+closes its own window and rebuilds it through the same opener Dock activation
+uses, which is what produces the reopen run; driving AppKit's own reopen from
+outside needs accessibility control a repeatable harness cannot rely on.
+
+```sh
+cargo build --package waku-daemon --bin waku-daemon
+scripts/bundle.sh debug
+cargo run --bin waku-latency-harness
+```
+
+It prints each run's milestones and both budget verdicts, and exits non-zero
+when either budget is missed. Two ways to check the gate itself:
+
+- `cargo run --bin waku-latency-harness -- --reopen-budget-ms 1` fails without
+  rebuilding, which shows the comparison is live.
+- A deliberately slowed build fails for real. Adding a 1200 ms sleep to the
+  reopen path (`MainWindow::attach_workspace`, before `Waku::new`) pushes the
+  rebuild to ~1300 ms against the 500 ms budget while the cold launch stays
+  inside its own budget, and the harness reports the overrun.
+
+The harness assumes a debug bundle in `target/debug`; `--app` points it at
+another one. Debug builds overweight layout and scene generics, so treat the
+absolute numbers as structure, not as what users feel, and confirm user-facing
+claims on a release build.
+
+### Where reopen time goes
+
+Issue #41 profiled the rebuild below the milestone resolution to decide whether
+GPUI window or renderer initialization warranted a patch on the pinned GPUI
+fork (`egoist/zed`, branch `waku-webview`, `Cargo.toml`). It does not: a rebuild
+spends most of its time re-loading state from the daemon, not in GPUI.
+
+The split is available from the shipped milestones without new
+instrumentation. On a rebuild `daemon_ready` is recorded when the build
+closure asks the application for its daemon and finds it already connected
+(so `daemon::request` returns immediately), which makes
+`daemon_ready - window_open` the native window plus renderer initialization and
+`tasks_hydrated - daemon_ready` everything the workspace does to load and
+construct itself. To attribute that second span, temporary millisecond spans
+were placed around `Waku::new`'s daemon reads (`ComposerDraftStore::load`,
+`StateStore::load_or_fresh`) and a `sample <pid> 3 -file` capture was taken
+across the launch and rebuild. Four rebuilds (debug build, reference machine,
+2026-10-08):
+
+| Rebuild | Window + renderer init | State load + construction | Latency |
+| --- | --- | --- | --- |
+| 1 | 16.2 ms | 84.5 ms | 100.7 ms |
+| 2 | 17.7 ms | 64.8 ms | 82.6 ms |
+| 3 | 16.1 ms | 68.2 ms | 84.4 ms |
+| 4 | 30.4 ms | 57.7 ms | 88.2 ms |
+
+Inside the second column the temporary spans and the capture agree: the
+synchronous `LoadTaskState` round-trip is the one stable cost, ~52–54 ms in
+every run, and workspace construction after hydration is ~1–3 ms:
+
+| Rebuild | `LoadTaskState` | Composer drafts | View construction |
+| --- | --- | --- | --- |
+| 1 | 54.1 ms | 29.1 ms | 1.1 ms |
+| 2 | 52.2 ms | 9.9 ms | 2.3 ms |
+| 3 | 54.1 ms | 10.5 ms | 3.1 ms |
+| 4 | 52.3 ms | 1.1 ms | 2.3 ms |
+
+The `sample` capture of the rebuild's `open_main_window` path shows the same
+shape: `MacPlatform::open_window` holds ~13 of 1 ms samples against ~41 for
+`Waku::new` → `StateStore::load_or_fresh` → `StateStore::load`, i.e. the daemon
+request. The first-frame render that follows `interactive` was 2.5–18 ms.
+These runs had no selected session (`temp/state.json` in the debug profile has
+`selected_session: null`), so `StateStore::load_or_fresh` skipped the
+selected-session `HydrateSession`; on a profile with a selected task that
+request would extend the same hydration span.
+
+**Decision: no GPUI fork patch.** Window and renderer initialization is
+16–30 ms, roughly a fifth to a third of a rebuild, while the daemon round-trips
+that reload task state into the freshly built workspace are 55–83 ms. A fork
+patch could only address the smaller slice, and the rebuild already comes in
+~5–6× under the 500 ms budget, so the patch would add a third carried change to
+the fork for no user-visible win. The dominant cost is also the one the design
+already knows how to move: `Waku::new` fetches the whole task state (and the
+selected session's detail) synchronously inside the window's build closure, so
+a rebuild re-pays the hydration the cold launch pays even though it reuses the
+running daemon. If the budget ever tightens, the lever is moving or caching
+that hydration in `startup-latency` Phase 3 — app-side work that needs no GPUI
+change — which is why this profile is recorded instead of a patch.

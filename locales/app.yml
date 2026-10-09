@@ -46,6 +46,8 @@ menu.window:
   en: Window
 menu.toggle_fps_counter:
   en: Toggle FPS Counter
+menu.toggle_full_screen:
+  en: Toggle Full Screen
 menu.close_window:
   en: Close Window
 window.minimize:
@@ -54,6 +56,12 @@ window.maximize:
   en: Maximize
 window.restore:
   en: Restore
+window_close.title:
+  en: Unsaved changes
+window_close.body:
+  en: This window has unsaved file edits. Closing it discards them.
+window_close.discard:
+  en: Discard and Close
 
 updater.update:
   en: Update

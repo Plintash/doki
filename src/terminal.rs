@@ -3,12 +3,11 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crate::ui::menu::{ContextMenuHandle, MenuItem, context_menu};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::{BidirectionalIterator, Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point as TerminalPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -16,10 +15,10 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::tty::{self, Shell};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use anyhow::{Context as _, Result};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use base64::Engine as _;
+use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontFallbacks,
     FontStyle, FontWeight, Hsla, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
@@ -29,6 +28,9 @@ use gpui::{
     UnderlineStyle, Window, canvas, div, font, px, rgb,
 };
 use parking_lot::Mutex;
+use uuid::Uuid;
+
+use waku_client::{Command, DaemonClient, ResponsePayload, TerminalSnapshot};
 
 use crate::persistence::DEFAULT_RIGHT_PANEL_WIDTH;
 use crate::theme::{Theme, sp};
@@ -95,19 +97,32 @@ enum TerminalUiEvent {
 #[derive(Clone)]
 struct TerminalEventProxy {
     dirty: Arc<AtomicBool>,
-    sender: Arc<OnceLock<EventLoopSender>>,
+    /// Bytes the emulator generates for the shell (device-status replies, OSC
+    /// palette answers, bracketed-paste requests) go back over the daemon
+    /// connection, which owns the PTY.
+    daemon: DaemonClient,
+    terminal_id: Uuid,
     ui_events: Sender<TerminalUiEvent>,
     window_size: Arc<Mutex<WindowSize>>,
-    /// Palette OSC replies run on the PTY thread; `snapshot` refreshes this
+    /// Palette OSC replies run on the stream thread; `snapshot` refreshes this
     /// so they track the active theme.
     dark_theme: Arc<AtomicBool>,
 }
 
+/// Sends terminal input to the daemon that owns the PTY. Both the bytes a
+/// user types and the bytes the emulator generates for the shell (device-status
+/// replies, palette answers, bracketed-paste requests) take this path, fired
+/// without waiting for a response because no frame may.
+fn write_terminal(daemon: &DaemonClient, terminal_id: Uuid, data: Vec<u8>) {
+    if data.is_empty() {
+        return;
+    }
+    let _ = daemon.notify(terminal_id, terminal_id, Command::WriteTerminal { data });
+}
+
 impl TerminalEventProxy {
-    fn write_pty(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        if let Some(sender) = self.sender.get() {
-            let _ = sender.send(Msg::Input(bytes.into()));
-        }
+    fn write_daemon(&self, bytes: impl Into<Cow<'static, [u8]>>) {
+        write_terminal(&self.daemon, self.terminal_id, bytes.into().into_owned());
     }
 }
 
@@ -131,13 +146,13 @@ impl EventListener for TerminalEventProxy {
                     .ui_events
                     .send(TerminalUiEvent::ClipboardLoad(formatter));
             }
-            Event::PtyWrite(text) => self.write_pty(text.into_bytes()),
+            Event::PtyWrite(text) => self.write_daemon(text.into_bytes()),
             Event::ColorRequest(index, formatter) => {
                 let is_dark = self.dark_theme.load(Ordering::Acquire);
-                self.write_pty(formatter(terminal_rgb(index, is_dark)).into_bytes());
+                self.write_daemon(formatter(terminal_rgb(index, is_dark)).into_bytes());
             }
             Event::TextAreaSizeRequest(formatter) => {
-                self.write_pty(formatter(*self.window_size.lock()).into_bytes());
+                self.write_daemon(formatter(*self.window_size.lock()).into_bytes());
             }
             Event::Bell => {}
             Event::Exit | Event::ChildExit(_) => {
@@ -167,21 +182,154 @@ impl Dimensions for TerminalDimensions {
     }
 }
 
+/// Attaches to the daemon terminal `terminal_id`, opening it if this is its
+/// first client. Attaching rather than opening first matters: `OpenTerminal`
+/// replaces and kills an existing shell, which is the opposite of restoring
+/// one across a surface or window teardown.
+fn attach_snapshot(
+    daemon: &DaemonClient,
+    task_id: Uuid,
+    terminal_id: Uuid,
+    working_directory: &Path,
+    columns: usize,
+    rows: usize,
+) -> Result<TerminalSnapshot> {
+    if let Some(snapshot) = request_snapshot(daemon, task_id, terminal_id)? {
+        return Ok(snapshot);
+    }
+    daemon.request(
+        terminal_id,
+        terminal_id,
+        Command::OpenTerminal {
+            task_id,
+            cwd: working_directory.to_path_buf(),
+            cols: columns.min(u16::MAX as usize) as u16,
+            rows: rows.min(u16::MAX as usize) as u16,
+        },
+    )?;
+    request_snapshot(daemon, task_id, terminal_id)?
+        .ok_or_else(|| anyhow::anyhow!("Waku daemon did not retain the terminal it just opened"))
+}
+
+/// The replay the daemon retains for `terminal_id`. `Ok(None)` means the daemon
+/// reported no terminal under this id — the only attach outcome the caller
+/// recovers from by opening one. A transport or RPC failure is an `Err`, never
+/// `None`, so a caller cannot mistake it for absence and replace a live
+/// terminal.
+fn request_snapshot(
+    daemon: &DaemonClient,
+    task_id: Uuid,
+    terminal_id: Uuid,
+) -> Result<Option<TerminalSnapshot>> {
+    let response = daemon.request(
+        terminal_id,
+        terminal_id,
+        Command::AttachTerminal { task_id },
+    )?;
+    terminal_attach_response(response)
+}
+
+/// Interprets the daemon's answer to `AttachTerminal`. Only an explicit
+/// `TerminalAbsent` means "no terminal here"; the version handshake pins the
+/// daemon to a build that answers with exactly this variant or a snapshot, so
+/// any other success is a protocol error rather than a silent absence.
+fn terminal_attach_response(response: ResponsePayload) -> Result<Option<TerminalSnapshot>> {
+    match response {
+        ResponsePayload::TerminalSnapshot(snapshot) => Ok(Some(snapshot)),
+        ResponsePayload::TerminalAbsent => Ok(None),
+        other => Err(anyhow::anyhow!(
+            "Waku daemon returned an invalid terminal attachment: {other:?}"
+        )),
+    }
+}
+
+/// Trims a delivered batch to the bytes past `boundary`, or `None` when the
+/// attach snapshot already replayed it. The daemon stamps every batch with its
+/// cumulative end offset, so a batch that straddles the boundary keeps only its
+/// tail, and the returned offset becomes the next boundary.
+fn trim_to_boundary(batch: Vec<u8>, end: u64, boundary: u64) -> Option<(Vec<u8>, u64)> {
+    if end <= boundary {
+        return None;
+    }
+    let start = end.saturating_sub(batch.len() as u64);
+    let batch = if start < boundary {
+        batch[(boundary - start) as usize..].to_vec()
+    } else {
+        batch
+    };
+    (!batch.is_empty()).then_some((batch, end))
+}
+
+/// The output bytes and cumulative end offset of one `terminalOutput` event.
+/// Both fields belong to the same event, so they are decoded together: a batch
+/// is accepted whole or rejected whole, never half-applied.
+fn terminal_output_batch(payload: &serde_json::Value) -> Option<(Vec<u8>, u64)> {
+    let encoded = payload.get("data")?.as_str()?;
+    let end = payload.get("sequence")?.as_u64()?;
+    let batch = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    Some((batch, end))
+}
+
 struct TerminalSession {
     term: Arc<FairMutex<Term<TerminalEventProxy>>>,
-    sender: EventLoopSender,
     dirty: Arc<AtomicBool>,
     ui_events: Receiver<TerminalUiEvent>,
     window_size: Arc<Mutex<WindowSize>>,
     grid_size: (usize, usize),
     dark_theme: Arc<AtomicBool>,
     url_regex: RegexSearch,
+    daemon: DaemonClient,
+    terminal_id: Uuid,
+    shutdown: Sender<()>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Whether the daemon still owns a terminal under `terminal_id`.
+///
+/// A rebuilt window restores a terminal surface only while its process
+/// survived: [`TerminalSession::attach`] opens a fresh shell for an id the
+/// daemon never had, which is the opposite of restoring a dead one. The probe
+/// is a read-only `AttachTerminal`: the daemon reports `TerminalAbsent` for an
+/// id it no longer holds, and an unreachable daemon is an error. Both answer
+/// `false` — the probe only distinguishes a live terminal from anything else —
+/// so a missing terminal leaves the surface absent rather than an error.
+pub(crate) fn daemon_terminal_exists(
+    daemon: &DaemonClient,
+    task_id: Uuid,
+    terminal_id: Uuid,
+) -> bool {
+    matches!(request_snapshot(daemon, task_id, terminal_id), Ok(Some(_)))
 }
 
 impl TerminalSession {
-    fn new(working_directory: &Path, columns: usize, rows: usize) -> Result<Self> {
-        let columns = columns.max(TERMINAL_MIN_COLUMNS);
-        let rows = rows.max(TERMINAL_MIN_ROWS);
+    /// Attaches to the daemon-owned shell and starts feeding its output into a
+    /// local Alacritty grid. Emulation, selection, search, and scrolling all
+    /// stay here; only bytes and control messages cross the daemon boundary.
+    fn attach(
+        daemon: DaemonClient,
+        task_id: Uuid,
+        terminal_id: Uuid,
+        working_directory: &Path,
+        columns: usize,
+        rows: usize,
+    ) -> Result<Self> {
+        // Subscribe before attaching: the connection buffers output events
+        // from this point, and the snapshot's sequence marks which of them the
+        // replay already covers.
+        let events = daemon.subscribe(terminal_id, terminal_id);
+        let snapshot = attach_snapshot(
+            &daemon,
+            task_id,
+            terminal_id,
+            working_directory,
+            columns,
+            rows,
+        )?;
+
+        let columns = (snapshot.cols as usize).max(TERMINAL_MIN_COLUMNS);
+        let rows = (snapshot.rows as usize).max(TERMINAL_MIN_ROWS);
         let window_size = WindowSize {
             num_lines: rows.min(u16::MAX as usize) as u16,
             num_cols: columns.min(u16::MAX as usize) as u16,
@@ -190,14 +338,15 @@ impl TerminalSession {
         };
         let shared_window_size = Arc::new(Mutex::new(window_size));
         let dirty = Arc::new(AtomicBool::new(true));
-        let sender_slot = Arc::new(OnceLock::new());
         let dark_theme = Arc::new(AtomicBool::new(true));
         let (ui_event_tx, ui_events) = unbounded();
+        let reader_ui_events = ui_event_tx.clone();
         let url_regex = RegexSearch::new(TERMINAL_LINK_REGEX)
             .map_err(|error| anyhow::anyhow!("compile terminal link regex: {error}"))?;
         let proxy = TerminalEventProxy {
             dirty: dirty.clone(),
-            sender: sender_slot.clone(),
+            daemon: daemon.clone(),
+            terminal_id,
             ui_events: ui_event_tx,
             window_size: shared_window_size.clone(),
             dark_theme: dark_theme.clone(),
@@ -208,55 +357,90 @@ impl TerminalSession {
             ..Default::default()
         };
         let dimensions = TerminalDimensions { columns, rows };
-        let term = Arc::new(FairMutex::new(Term::new(
-            config,
-            &dimensions,
-            proxy.clone(),
-        )));
+        let term = Arc::new(FairMutex::new(Term::new(config, &dimensions, proxy)));
 
-        let shell = crate::command_env::default_terminal_shell();
-        let shell_args = crate::command_env::default_terminal_shell_args(&shell);
-        let mut options = tty::Options {
-            shell: Some(Shell::new(shell.to_string_lossy().into_owned(), shell_args)),
-            working_directory: Some(working_directory.to_path_buf()),
-            drain_on_exit: false,
-            ..Default::default()
-        };
-        options.env.insert("TERM".into(), "xterm-256color".into());
-        options.env.insert("COLORTERM".into(), "truecolor".into());
-        if let Some(path) = crate::command_env::executable_search_path() {
-            options
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+        // Replay the snapshot before the live stream, so the grid is complete
+        // before any post-attach batch is applied. A Processor is stateful: it
+        // must carry partial escape sequences across batches, so the same one
+        // feeds the replay here and the live stream on the reader thread.
+        let mut processor: Processor = Processor::new();
+        {
+            let mut term = term.lock();
+            processor.advance(&mut *term, &snapshot.data);
         }
 
-        let pty = tty::new(&options, window_size, 0)
-            .with_context(|| format!("spawn terminal in {}", working_directory.display()))?;
-        let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)
-            .context("create Alacritty PTY event loop")?;
-        let sender = event_loop.channel();
-        sender_slot
-            .set(sender.clone())
-            .map_err(|_| anyhow::anyhow!("initialize Alacritty PTY sender"))?;
-        event_loop.spawn();
+        let (shutdown, shutdown_rx) = bounded(1);
+        let reader_term = term.clone();
+        let reader_dirty = dirty.clone();
+        let boundary = snapshot.sequence;
+        let reader = std::thread::Builder::new()
+            .name(format!("waku-terminal-{terminal_id}"))
+            .spawn(move || {
+                let mut processor = processor;
+                let mut boundary = boundary;
+                loop {
+                    select! {
+                        recv(shutdown_rx) -> _ => return,
+                        recv(events) -> sequenced => {
+                            let Ok(sequenced) = sequenced else {
+                                // The connection dropped; the grid keeps the
+                                // last output and the view shows the exit.
+                                let _ = reader_ui_events.send(TerminalUiEvent::Exited);
+                                reader_dirty.store(true, Ordering::Release);
+                                return;
+                            };
+                            match sequenced.event.kind.as_str() {
+                                "terminalOutput" => {
+                                    // The version handshake guarantees the
+                                    // daemon stamps output with a sequence, so
+                                    // a malformed batch is a protocol
+                                    // violation, not output to skip: parse the
+                                    // bytes and the offset once and fail once.
+                                    let (batch, end) =
+                                        terminal_output_batch(&sequenced.event.payload).expect(
+                                            "terminalOutput did not carry its output data and sequence",
+                                        );
+                                    let Some((batch, next_boundary)) =
+                                        trim_to_boundary(batch, end, boundary)
+                                    else {
+                                        continue;
+                                    };
+                                    {
+                                        let mut term = reader_term.lock();
+                                        processor.advance(&mut *term, &batch);
+                                    }
+                                    boundary = next_boundary;
+                                    reader_dirty.store(true, Ordering::Release);
+                                }
+                                "terminalExited" | "terminalError" => {
+                                    let _ = reader_ui_events.send(TerminalUiEvent::Exited);
+                                    reader_dirty.store(true, Ordering::Release);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            })
+            .context("start daemon terminal reader")?;
 
         Ok(Self {
             term,
-            sender,
             dirty,
             ui_events,
             window_size: shared_window_size,
             grid_size: (columns, rows),
             dark_theme,
             url_regex,
+            daemon,
+            terminal_id,
+            shutdown,
+            reader: Some(reader),
         })
     }
 
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        let bytes = bytes.into();
-        if !bytes.is_empty() {
-            let _ = self.sender.send(Msg::Input(bytes));
-        }
+        write_terminal(&self.daemon, self.terminal_id, bytes.into().into_owned());
     }
 
     fn resize(&mut self, columns: usize, rows: usize, cell_width: f32) {
@@ -266,9 +450,16 @@ impl TerminalSession {
             return;
         }
 
+        // The reader may be mid-batch, and a frame may not wait on it: leave
+        // the resize for the next frame, and stay dirty so there is one.
+        let Some(mut term) = self.term.try_lock_unfair() else {
+            self.dirty.store(true, Ordering::Release);
+            return;
+        };
         self.grid_size = (columns, rows);
         let dimensions = TerminalDimensions { columns, rows };
-        self.term.lock().resize(dimensions);
+        term.resize(dimensions);
+        drop(term);
         let size = WindowSize {
             num_lines: rows.min(u16::MAX as usize) as u16,
             num_cols: columns.min(u16::MAX as usize) as u16,
@@ -276,7 +467,14 @@ impl TerminalSession {
             cell_height: TERMINAL_CELL_HEIGHT.round() as u16,
         };
         *self.window_size.lock() = size;
-        let _ = self.sender.send(Msg::Resize(size));
+        let _ = self.daemon.notify(
+            self.terminal_id,
+            self.terminal_id,
+            Command::ResizeTerminal {
+                cols: size.num_cols,
+                rows: size.num_lines,
+            },
+        );
         self.dirty.store(true, Ordering::Release);
     }
 
@@ -306,15 +504,22 @@ impl TerminalSession {
         Some(TerminalLink { value, bounds })
     }
 
-    fn snapshot(
+    /// One frame's read of the grid, taken only while the daemon reader is
+    /// between batches.
+    ///
+    /// The reader holds this lock while it advances a batch of output, so a
+    /// frame that waited on it would stall the UI behind emulation no frame
+    /// budget can see. `None` means the reader is mid-batch: the view keeps the
+    /// frame it last painted, and the reader's dirty flag brings the next read.
+    fn frame(
         &self,
         theme: Theme,
         selection_color: Hsla,
         cursor_style: TerminalCursorStyle,
         hovered_link: Option<&Match>,
-    ) -> TerminalSnapshot {
+    ) -> Option<TerminalFrame> {
         self.dark_theme.store(theme.is_dark, Ordering::Release);
-        let term = self.term.lock();
+        let term = self.term.try_lock_unfair()?;
         let content = term.renderable_content();
         let columns = self.grid_size.0;
         let rows = self.grid_size.1;
@@ -417,27 +622,43 @@ impl TerminalSession {
             rendered_rows.push(TerminalRow { text, runs });
         }
 
-        TerminalSnapshot {
+        let history_size = term.grid().history_size();
+        Some(TerminalFrame {
             rows: rendered_rows,
             outline_cursor,
-        }
+            max_offset: px(history_size as f32 * TERMINAL_CELL_HEIGHT),
+            scrolled: px(
+                history_size.saturating_sub(content.display_offset) as f32 * TERMINAL_CELL_HEIGHT
+            ),
+        })
     }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = self.sender.send(Msg::Shutdown);
+        // Closing the surface stops this client's reader but must not end the
+        // shell: the daemon owns the terminal until its task is removed, so a
+        // later attach replays the grid and keeps the process.
+        let _ = self.shutdown.try_send(());
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
-/// Adapts the alacritty grid to the overlay scrollbar: the scrollback history
-/// is the content above the viewport, and `display_offset` is how far back up
-/// into it the view currently sits (0 = pinned to the live bottom).
+/// Adapts the frame's grid read to the overlay scrollbar: the scrollback
+/// history is the content above the viewport, and `display_offset` is how far
+/// back up into it the view currently sits (0 = pinned to the live bottom).
+///
+/// The offsets come from the frame's non-blocking read, so the bar's paint pass
+/// never waits on the daemon reader either.
 #[derive(Clone)]
 struct TerminalScrollbarTarget {
     term: Arc<FairMutex<Term<TerminalEventProxy>>>,
     dirty: Arc<AtomicBool>,
     viewport_rows: usize,
+    max_offset: Pixels,
+    scrolled: Pixels,
 }
 
 impl scrollbar::Scrollable for TerminalScrollbarTarget {
@@ -446,16 +667,15 @@ impl scrollbar::Scrollable for TerminalScrollbarTarget {
     }
 
     fn max_offset(&self) -> Pixels {
-        px(self.term.lock().grid().history_size() as f32 * TERMINAL_CELL_HEIGHT)
+        self.max_offset
     }
 
     fn scrolled(&self) -> Pixels {
-        let term = self.term.lock();
-        let grid = term.grid();
-        let lines_above = grid.history_size().saturating_sub(grid.display_offset());
-        px(lines_above as f32 * TERMINAL_CELL_HEIGHT)
+        self.scrolled
     }
 
+    /// A grab or track click is a user action, not a frame, so it may take the
+    /// grid lock outright.
     fn scroll_to(&self, offset: Pixels) {
         let mut term = self.term.lock();
         let target_offset = (term.grid().history_size() as f32
@@ -515,9 +735,15 @@ struct TerminalRow {
     runs: Vec<TerminalRun>,
 }
 
-struct TerminalSnapshot {
+/// What one frame paints from the grid: the rendered rows, the outline cursor,
+/// and the overlay scrollbar's offsets, all taken in the same read.
+struct TerminalFrame {
     rows: Vec<TerminalRow>,
     outline_cursor: Option<(usize, usize)>,
+    /// History above the viewport, and how far back into it the view sits, in
+    /// pixels.
+    max_offset: Pixels,
+    scrolled: Pixels,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -636,6 +862,9 @@ pub struct TerminalView {
     grid_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     selecting: bool,
     hovered_link: Option<TerminalLink>,
+    /// The grid read the last frame painted, repainted when the reader holds
+    /// the grid mid-batch; see [`TerminalSession::frame`].
+    last_frame: Option<TerminalFrame>,
     cursor_blink: gpui::Entity<TerminalCursorBlink>,
     cursor_focus_tracking_started: bool,
     context_menu: ContextMenuHandle,
@@ -643,12 +872,20 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
-    pub fn new(working_directory: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        daemon: DaemonClient,
+        task_id: Uuid,
+        terminal_id: Uuid,
+        working_directory: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let terminal_cwd = working_directory.clone();
         cx.spawn(async move |this, cx| {
             let started = cx
                 .background_executor()
-                .spawn(async move { TerminalSession::new(&terminal_cwd, 52, 36) })
+                .spawn(async move {
+                    TerminalSession::attach(daemon, task_id, terminal_id, &terminal_cwd, 52, 36)
+                })
                 .await;
             if this
                 .update(cx, |this, cx| {
@@ -698,6 +935,7 @@ impl TerminalView {
             grid_bounds: Rc::new(Cell::new(None)),
             selecting: false,
             hovered_link: None,
+            last_frame: None,
             cursor_blink,
             cursor_focus_tracking_started: false,
             context_menu,
@@ -1098,10 +1336,19 @@ impl Render for TerminalView {
             );
         }
         let hovered_link = self.hovered_link.as_ref().map(|link| &link.bounds);
-        let snapshot = self
+        // A frame repaints the grid it last read when the reader holds the grid
+        // mid-batch, and stays dirty so the next poll reads again; see
+        // [`TerminalSession::frame`].
+        if let Some(frame) = self
             .session
             .as_ref()
-            .map(|session| session.snapshot(theme, selection_color, cursor_style, hovered_link));
+            .and_then(|session| session.frame(theme, selection_color, cursor_style, hovered_link))
+        {
+            self.last_frame = Some(frame);
+        } else if let Some(session) = self.session.as_ref() {
+            session.dirty.store(true, Ordering::Release);
+        }
+        let frame = self.last_frame.as_ref();
         let title = if self.title.trim().is_empty() {
             tr!("right_panel.terminal")
         } else {
@@ -1134,15 +1381,16 @@ impl Render for TerminalView {
             screen = screen.cursor_pointer();
         }
 
-        if let Some(snapshot) = snapshot {
-            let TerminalSnapshot {
-                rows: snapshot_rows,
+        if let Some(frame) = frame {
+            let TerminalFrame {
+                rows,
                 outline_cursor,
-            } = snapshot;
-            for row in snapshot_rows {
+                ..
+            } = frame;
+            for row in rows {
                 let runs = row
                     .runs
-                    .into_iter()
+                    .iter()
                     .map(|run| {
                         let mut run_font = terminal_font();
                         if run.style.bold {
@@ -1176,10 +1424,10 @@ impl Render for TerminalView {
                         .whitespace_nowrap()
                         .text_size(px(TERMINAL_FONT_SIZE))
                         .line_height(px(TERMINAL_CELL_HEIGHT))
-                        .child(StyledText::new(row.text).with_runs(runs)),
+                        .child(StyledText::new(row.text.clone()).with_runs(runs)),
                 );
             }
-            if let Some((row, column)) = outline_cursor {
+            if let Some((row, column)) = *outline_cursor {
                 screen = screen.child(
                     div()
                         .absolute()
@@ -1261,12 +1509,14 @@ impl Render for TerminalView {
             },
         );
 
-        let scrollbar = self.session.as_ref().map(|session| {
+        let scrollbar = self.session.as_ref().zip(frame).map(|(session, frame)| {
             scrollbar::vertical(
                 &TerminalScrollbarTarget {
                     term: session.term.clone(),
                     dirty: session.dirty.clone(),
                     viewport_rows: session.grid_size.1,
+                    max_offset: frame.max_offset,
+                    scrolled: frame.scrolled,
                 },
                 &self.scrollbar_state,
             )
@@ -1290,6 +1540,10 @@ impl Render for TerminalView {
             .id("alacritty-terminal")
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
+            // One tab stop for the whole pane: the grid is the only control in
+            // it, and focus is visible as the solid cursor.
+            .tab_index(0)
+            .tab_group()
             .size_full()
             .min_h_0()
             .min_w_0()
@@ -1768,8 +2022,104 @@ fn terminal_rgb(index: usize, is_dark: bool) -> Rgb {
 mod tests {
     use super::*;
     use alacritty_terminal::event::VoidListener;
-    use alacritty_terminal::vte::ansi::Processor;
     use gpui::{Modifiers, point, size};
+
+    #[test]
+    fn attach_opens_only_when_the_daemon_reports_absence() {
+        let snapshot = TerminalSnapshot {
+            data: vec![1, 2, 3],
+            sequence: 3,
+            cols: 80,
+            rows: 24,
+        };
+        let Some(attached) =
+            terminal_attach_response(ResponsePayload::TerminalSnapshot(snapshot)).unwrap()
+        else {
+            panic!("a snapshot response was read as absence");
+        };
+        assert_eq!(attached.data, vec![1, 2, 3]);
+        assert_eq!(attached.sequence, 3);
+        assert_eq!((attached.cols, attached.rows), (80, 24));
+        // Explicit absence is the one outcome the caller answers by opening a
+        // terminal.
+        assert!(
+            terminal_attach_response(ResponsePayload::TerminalAbsent)
+                .unwrap()
+                .is_none()
+        );
+        // Any other success is a protocol error, not an absence, so the attach
+        // path fails instead of replacing whatever terminal the daemon holds.
+        assert!(terminal_attach_response(ResponsePayload::Ack).is_err());
+    }
+
+    #[test]
+    fn terminal_output_batch_requires_data_and_sequence_together() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"hello");
+        assert_eq!(
+            terminal_output_batch(&serde_json::json!({ "data": encoded, "sequence": 9 })),
+            Some((b"hello".to_vec(), 9))
+        );
+        assert_eq!(
+            terminal_output_batch(&serde_json::json!({ "sequence": 9 })),
+            None
+        );
+        assert_eq!(
+            terminal_output_batch(&serde_json::json!({ "data": "aGVsbG8=", "sequence": "9" })),
+            None
+        );
+        assert_eq!(
+            terminal_output_batch(&serde_json::json!({ "data": "not base64!", "sequence": 9 })),
+            None
+        );
+    }
+
+    #[test]
+    fn boundary_trim_drops_replayed_batches_and_keeps_later_bytes() {
+        // Wholly at or below the snapshot boundary: already replayed.
+        assert_eq!(trim_to_boundary(b"abcd".to_vec(), 4, 4), None);
+        // The first batch after the snapshot continues exactly at the boundary.
+        assert_eq!(
+            trim_to_boundary(b"efgh".to_vec(), 8, 4),
+            Some((b"efgh".to_vec(), 8))
+        );
+        // A batch that straddles the boundary keeps only its tail.
+        assert_eq!(
+            trim_to_boundary(b"cdef".to_vec(), 6, 4),
+            Some((b"ef".to_vec(), 6))
+        );
+        assert_eq!(trim_to_boundary(Vec::new(), 9, 4), None);
+    }
+
+    #[test]
+    fn replayed_snapshot_and_live_batch_do_not_repeat_output() {
+        let dimensions = TerminalDimensions {
+            columns: 20,
+            rows: 3,
+        };
+        let mut term = Term::new(Config::default(), &dimensions, VoidListener);
+        let mut processor: Processor = Processor::new();
+        // The snapshot replayed "one\n" and the boundary sits at its end.
+        processor.advance(&mut term, b"one\n");
+        // The first live batch overlaps the snapshot and carries the next line.
+        let (tail, boundary) = trim_to_boundary(b"one\ntwo\n".to_vec(), 8, 4).unwrap();
+        processor.advance(&mut term, &tail);
+
+        assert_eq!(boundary, 8);
+        let text: String = term
+            .renderable_content()
+            .display_iter
+            .map(|cell| cell.cell.c)
+            .collect();
+        assert_eq!(
+            text.matches("one").count(),
+            1,
+            "replayed output was repeated"
+        );
+        assert!(
+            text.contains("two"),
+            "live output past the boundary was lost"
+        );
+    }
 
     fn key(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
         Keystroke {
