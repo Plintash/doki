@@ -1077,7 +1077,7 @@ mod tests {
     use crate::daemon::WakuBackend;
     #[cfg(unix)]
     use crate::model::Project;
-    use crate::model::{AgentSession, ProviderKind};
+    use crate::model::{AgentSession, ProviderKind, RuntimeMode};
     #[cfg(unix)]
     use crate::persistence::StateStore;
     #[cfg(unix)]
@@ -1477,14 +1477,15 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A model or thinking-level pick made without a following turn must reach
-    /// a rebuilt window. Both the pick and the rebuild's task-list load cross
-    /// the daemon, so the pick is saved by id and the list projection has to
-    /// carry the model and its traits back — otherwise the composer shows the
-    /// model default until `HydrateSession` lands and then jumps.
+    /// A composer pick made without a following turn must reach a rebuilt
+    /// window. Both the pick and the rebuild's task-list load cross the daemon,
+    /// so the pick is saved by id and the list projection has to carry the
+    /// model, its traits, the runtime mode, and the agent preset back —
+    /// otherwise the composer shows the defaults until `HydrateSession` lands
+    /// and then jumps.
     #[cfg(unix)]
     #[test]
-    fn a_pick_saved_without_a_turn_returns_model_and_traits_in_the_rebuild_projection() {
+    fn a_pick_saved_without_a_turn_returns_the_composer_picks_in_the_rebuild_projection() {
         let root = std::env::temp_dir().join(format!("waku-pick-rebuild-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let database = root.join("app.db");
@@ -1538,6 +1539,8 @@ mod tests {
         picked.reasoning_effort = Some("high".into());
         picked.service_tier = Some("fast".into());
         picked.context_window = Some("1m".into());
+        picked.runtime_mode = RuntimeMode::Ask;
+        picked.agent_preset = Some("code".into());
         save(picked, Vec::new());
 
         let ResponsePayload::TaskState { sessions, .. } = backend
@@ -1552,6 +1555,8 @@ mod tests {
         assert_eq!(projection.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(projection.service_tier.as_deref(), Some("fast"));
         assert_eq!(projection.context_window.as_deref(), Some("1m"));
+        assert_eq!(projection.runtime_mode, RuntimeMode::Ask);
+        assert_eq!(projection.agent_preset.as_deref(), Some("code"));
         assert!(
             projection.messages.is_empty(),
             "the transcript stays detail the list never carries"
