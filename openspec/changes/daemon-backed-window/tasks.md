@@ -41,8 +41,8 @@
 
 ## 6. Integration validation
 
-- [ ] 6.1 Run the full acceptance pass on the dev-watcher build: fullscreen close, close during streaming, close with a running terminal, reopen restores task/layout/terminal, dirty guard, browser tabs restored by URL
-- [ ] 6.2 Confirm daemon unavailability degrades gracefully (window opens and reports the failure) without a blank or hung frame
+- [x] 6.1 Run the full acceptance pass on the dev-watcher build: fullscreen close, close during streaming, close with a running terminal, reopen restores task/layout/terminal, dirty guard, browser tabs restored by URL
+- [x] 6.2 Confirm daemon unavailability degrades gracefully (window opens and reports the failure) without a blank or hung frame
 - [ ] 6.3 Capture screenshots or a short recording of close, reopen, and the fullscreen case for the pull request
 
 ## 7. Post-acceptance polish

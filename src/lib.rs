@@ -263,7 +263,14 @@ pub fn run() {
             // language; owning the item and this binding keeps both the menu
             // and the shortcut working from any focused surface.
             #[cfg(target_os = "macos")]
-            cx.bind_keys([KeyBinding::new("ctrl-secondary-f", ToggleFullScreen, None)]);
+            cx.bind_keys([
+                KeyBinding::new("ctrl-secondary-f", ToggleFullScreen, None),
+                // macOS delivers the Globe-F shortcut with only the function
+                // modifier set, and GPUI's window view claims key equivalents
+                // before AppKit can offer them to the menu, so the app owns
+                // this keystroke too.
+                KeyBinding::new("fn-f", ToggleFullScreen, None),
+            ]);
             #[cfg(not(target_os = "macos"))]
             cx.bind_keys([KeyBinding::new("f11", ToggleFullScreen, None)]);
 
