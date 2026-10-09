@@ -125,13 +125,23 @@ fn run(args: &Args) -> anyhow::Result<()> {
     }
     // The app finds its daemon inside a release bundle or beside itself in a
     // debug build directory; without one the launch never reaches the
-    // workspace and the harness would only report a timeout.
+    // workspace and the harness would only report a timeout. A debug directory
+    // may hold either the watcher's dev-binary daemon or a plain one built by
+    // hand.
     let bundled_daemon = app.join("Contents/MacOS/waku-daemon");
-    let sibling_daemon = app.parent().map(|directory| directory.join("waku-daemon"));
-    if !bundled_daemon.exists() && !sibling_daemon.is_some_and(|daemon| daemon.exists()) {
+    let sibling_daemons = app.parent().map(|directory| {
+        [
+            directory.join("waku-daemon"),
+            directory.join("waku-debug-daemon"),
+        ]
+    });
+    let sibling_found = sibling_daemons
+        .as_ref()
+        .is_some_and(|daemons| daemons.iter().any(|daemon| daemon.exists()));
+    if !bundled_daemon.exists() && !sibling_found {
         bail!(
-            "no daemon beside {}; build it with `cargo build --package waku-daemon --bin \
-             waku-daemon`",
+            "no daemon beside {}; build one with `cargo build --package waku-daemon --features \
+             dev-binary --bin waku-debug-daemon`",
             app.display()
         );
     }

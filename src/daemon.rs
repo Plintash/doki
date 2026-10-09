@@ -155,16 +155,22 @@ fn daemon_executable_path() -> anyhow::Result<PathBuf> {
     let current = std::env::current_exe().context("could not locate the Waku executable")?;
 
     // Development keeps the daemon beside Cargo's debug artifacts rather than
-    // inside Waku Debug.app. The supervisor watches this file and swaps only
-    // the daemon when the development watcher relinks it.
+    // inside Waku Debug.app. The watcher builds the dev-binary daemon
+    // (`waku-debug-daemon`) and normally passes its path in; a debug app
+    // launched outside the watcher - a harness, or a bundle opened by hand -
+    // still has to find a daemon, so the debug directory is searched for both
+    // names. The supervisor watches whichever one it picks, so a relink still
+    // hot-swaps only the daemon.
     #[cfg(debug_assertions)]
     if let Some(debug_directory) = current
         .ancestors()
         .find(|candidate| candidate.file_name().is_some_and(|name| name == "debug"))
     {
-        let external = debug_directory.join(&executable);
-        if external.is_file() {
-            return Ok(external);
+        for name in ["waku-debug-daemon", "waku-daemon"] {
+            let candidate = debug_directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
     }
 
@@ -177,7 +183,7 @@ fn daemon_executable_path() -> anyhow::Result<PathBuf> {
     }
     #[cfg(debug_assertions)]
     bail!(
-        "Waku daemon was not found in Cargo's debug directory or next to the app executable: {}",
+        "Waku daemon was not found in Cargo's debug directory or next to the app executable: {} (looked for waku-debug-daemon and waku-daemon)",
         sibling.display(),
     );
     #[cfg(not(debug_assertions))]
