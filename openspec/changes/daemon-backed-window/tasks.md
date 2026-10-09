@@ -28,7 +28,7 @@
 - [x] 4.2 Extend persisted desktop state with the selected project/task and per-task right-panel descriptors, with round-trip tests for the new fields
 - [x] 4.3 Hydrate a rebuilt window from daemon state plus the desktop snapshot, with generation guards for superseded and window-closed loads covered by tests
 - [x] 4.4 Add the unsaved-editor confirmation to the close path, with tests for cancel keeping the window and buffer and confirm discarding them
-- [x] 4.5 Write the restore/drop policy tests: restored task, layout, and terminal; dropped browser, scroll, cursor, and file-tree state
+- [x] 4.5 Write the restore/drop policy tests: restored task, layout, terminal, and browser-by-URL; dropped scroll, cursor, file-tree, and in-page browser state
 - [x] 4.6 Update `CHANGELOG.md` with the close/rebuild behavior and verify the release-note extraction picks the entry up
 
 ## 5. Startup and reopen latency
@@ -41,9 +41,15 @@
 
 ## 6. Integration validation
 
-- [ ] 6.1 Run the full acceptance pass on the dev-watcher build: fullscreen close, close during streaming, close with a running terminal, reopen restores task/layout/terminal, dirty guard, browser not restored
+- [ ] 6.1 Run the full acceptance pass on the dev-watcher build: fullscreen close, close during streaming, close with a running terminal, reopen restores task/layout/terminal, dirty guard, browser tabs restored by URL
 - [ ] 6.2 Confirm daemon unavailability degrades gracefully (window opens and reports the failure) without a blank or hung frame
 - [ ] 6.3 Capture screenshots or a short recording of close, reopen, and the fullscreen case for the pull request
+
+## 7. Post-acceptance polish
+
+- [ ] 7.1 Preload persisted theme, language, and font size before the window's first frame and apply them to the skeleton, including native appearance and sidebar material; verify no switch happens at hydration (#45)
+- [ ] 7.2 Persist model and thinking-level picks immediately by marking the session dirty, and stop the composer jumping during hydration; verify close and rebuild show the same values (#46)
+- [ ] 7.3 Persist browser tabs by URL and restore them across a rebuild, blank when the URL was never observed, page state not guaranteed; verify with tests (#47)
 
 ## Workflow follow-up
 

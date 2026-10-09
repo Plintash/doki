@@ -73,7 +73,8 @@ draft state, or terminate an accepted terminal process.
 A rebuilt window SHALL restore the last window frame and display, theme,
 language and font-size preferences, sidebar and right-panel visibility and
 widths, and the last selected project and task. Per-task right-panel surface
-descriptors (terminal identities, file and diff paths) MAY be restored.
+descriptors (terminal identities, browser tabs by URL, file and diff paths)
+MAY be restored.
 
 #### Scenario: Reopen returns to the previous task and layout
 
@@ -82,21 +83,24 @@ descriptors (terminal identities, file and diff paths) MAY be restored.
 - **THEN** the rebuilt window shows the same task, sidebar visibility and panel
   width, and reattaches the terminal surface
 
-### Requirement: Transient view state is never restored
+### Requirement: In-page state is not restored
 
-A rebuild MUST NOT restore browser tabs or page state, editor cursor, scroll or
-selection, file-tree expansion, transcript scroll position, transient overlays,
-or animation state.
+A rebuild MUST NOT restore browser page content, form values, in-page scroll or
+navigation history, editor cursor, scroll or selection, file-tree expansion,
+transcript scroll position, transient overlays, or animation state. Browser
+tabs themselves are restored by URL, and a tab whose URL was never observed
+comes back blank.
 
 #### Scenario: Scroll position resets
 
 - **WHEN** the user scrolls the transcript, closes the window, and reopens it
 - **THEN** the transcript opens at its default position
 
-#### Scenario: Browser surfaces do not return
+#### Scenario: Browser tabs return by URL
 
-- **WHEN** the user closes a window that had a browser surface open
-- **THEN** the rebuilt right panel contains no browser surface
+- **WHEN** the user closes a window that had a browser tab open on a page
+- **THEN** the rebuilt right panel contains a browser tab navigated to that URL,
+  without any guarantee for form values or in-page scroll
 
 ### Requirement: Unsaved edits block close
 

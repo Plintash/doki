@@ -40,8 +40,8 @@ See `proposal.md` — Why. Current state that shapes the approach:
 - A daemon that outlives the desktop process. The supervisor still reaps the
   daemon with its parent; terminals therefore survive window rebuilds but not
   app restarts.
-- Browser restoration or renewal work. The browser surface stays experimental
-  and reopened windows never restore it.
+- Browser page state. Browser tabs are restored by URL, but form values,
+  in-page scroll and navigation history are not.
 - Multiple simultaneous windows. The invariant stays "at most one main window".
 
 ## Decisions
@@ -96,13 +96,15 @@ Two stores back a rebuilt window:
   theme/language/font size, selected project and task, and per-task right-panel
   descriptors (terminal id, file path, diff source).
 
-Explicitly dropped: browser tabs and page state, editor cursor/scroll/selection,
+Explicitly dropped: browser page state (form values, in-page scroll and
+history), editor cursor/scroll/selection,
 file-tree expansion, transcript scroll position, overlays, and animation state.
 Descriptors are restored only when the referenced daemon object still exists;
 missing terminals or files simply leave the surface absent.
 
 Alternatives: persist full right-panel state (rejected: the user asked for
-trade-offs and the browser is experimental); persist nothing beyond the selected
+trade-offs and the browser is experimental, so browser tabs restore by URL
+only); persist nothing beyond the selected
 task (rejected: terminal and file tabs are cheap identities and make reopen feel
 continuous).
 
@@ -141,8 +143,8 @@ pinned `egoist/zed` fork come into scope, carried the same way the existing
   budgets measured on the interactive moment, not first paint alone.
 - The dirty-editor guard races the macOS close animation → return `false`, ask,
   then remove the window asynchronously.
-- Losing browser surfaces on close may annoy someone using them → accepted by
-  product direction; the surface is marked experimental and is not restored.
+- Browser tabs come back by URL while page state does not → recorded as the
+  restore policy so the loss is expected.
 - Terminals do not survive an app restart (daemon is parent-owned) → no
   regression versus today, and the future daemon-detach work is explicitly out
   of scope.
