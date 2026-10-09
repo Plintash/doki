@@ -1097,6 +1097,10 @@ impl AgentSession {
     /// A daemon can hold hydrated sessions in memory, but catalog refreshes
     /// must never clone or transmit their transcripts. Clients hydrate one
     /// selected session explicitly when they need its detail.
+    ///
+    /// The model and its traits are list columns, not transcript detail: the
+    /// composer renders them straight from this projection until hydration
+    /// lands, so they travel with the list or the chip jumps when it does.
     pub fn list_projection(&self) -> Self {
         Self {
             id: self.id,
@@ -1107,9 +1111,9 @@ impl AgentSession {
             provider: self.provider,
             model: self.model.clone(),
             runtime_mode: RuntimeMode::default(),
-            reasoning_effort: None,
-            service_tier: None,
-            context_window: None,
+            reasoning_effort: self.reasoning_effort.clone(),
+            service_tier: self.service_tier.clone(),
+            context_window: self.context_window.clone(),
             agent_preset: None,
             status: self.status,
             created_at: self.created_at,
@@ -5498,6 +5502,34 @@ mod tests {
         assert!(projection.transcript_blocks.is_empty());
         assert!(projection.turns.is_empty());
         assert!(projection.queued_messages.is_empty());
+    }
+
+    /// A rebuilt window renders the composer from the list projection until the
+    /// selected session's transcript is hydrated. If the projection dropped the
+    /// model's traits, the thinking-level chip would show the model default and
+    /// then jump to the stored value when `HydrateSession` landed.
+    #[test]
+    fn list_projection_keeps_the_model_traits_the_composer_renders() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.model = Some("gpt-5".into());
+        session.reasoning_effort = Some("high".into());
+        session.service_tier = Some("fast".into());
+        session.context_window = Some("1m".into());
+        session.begin_turn("A large prompt");
+        session
+            .messages
+            .push(Message::new(MessageRole::Assistant, "An answer"));
+
+        let projection = session.list_projection();
+
+        assert_eq!(projection.model.as_deref(), Some("gpt-5"));
+        assert_eq!(projection.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(projection.service_tier.as_deref(), Some("fast"));
+        assert_eq!(projection.context_window.as_deref(), Some("1m"));
+        // The transcript is still detail the list never carries.
+        assert!(projection.messages.is_empty());
+        assert!(projection.turns.is_empty());
     }
 
     #[test]

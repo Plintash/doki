@@ -1477,6 +1477,89 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A model or thinking-level pick made without a following turn must reach
+    /// a rebuilt window. Both the pick and the rebuild's task-list load cross
+    /// the daemon, so the pick is saved by id and the list projection has to
+    /// carry the model and its traits back — otherwise the composer shows the
+    /// model default until `HydrateSession` lands and then jumps.
+    #[cfg(unix)]
+    #[test]
+    fn a_pick_saved_without_a_turn_returns_model_and_traits_in_the_rebuild_projection() {
+        let root = std::env::temp_dir().join(format!("waku-pick-rebuild-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("app.db");
+        let hub = Arc::new(Hub::default());
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(database.clone()),
+        )
+        .unwrap();
+        let sink = || hub.event_sink(Uuid::nil(), Uuid::nil());
+        let request = |command: Command| Request {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            runtime_id: Uuid::nil(),
+            command,
+        };
+
+        let project = Project::from_path(root.join("repo"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.begin_turn("ask once");
+        session.push_message(crate::model::MessageRole::Assistant, "answer");
+        let session_id = session.id;
+        let save = |session: AgentSession, skeletons: Vec<Uuid>| {
+            backend
+                .handle(
+                    request(Command::SaveTaskState {
+                        projects: vec![project.clone()],
+                        live_session_ids: vec![session_id],
+                        skeleton_session_ids: skeletons,
+                        sessions: vec![session],
+                    }),
+                    sink(),
+                )
+                .unwrap()
+        };
+        save(session, Vec::new());
+
+        // The selected session is hydrated, the pick is applied to it, and the
+        // pick's save carries no skeleton id — the same shape every composer
+        // picker handler produces.
+        let ResponsePayload::Session {
+            session: Some(picked),
+        } = backend
+            .handle(request(Command::HydrateSession { session_id }), sink())
+            .unwrap()
+        else {
+            panic!("the stored task hydrates")
+        };
+        let mut picked = picked;
+        picked.model = Some("gpt-5".into());
+        picked.reasoning_effort = Some("high".into());
+        picked.service_tier = Some("fast".into());
+        picked.context_window = Some("1m".into());
+        save(picked, Vec::new());
+
+        let ResponsePayload::TaskState { sessions, .. } = backend
+            .handle(request(Command::LoadTaskState), sink())
+            .unwrap()
+        else {
+            panic!("expected daemon task state")
+        };
+        let projection = &sessions[0];
+        assert!(!projection.detail_loaded, "the list is still a projection");
+        assert_eq!(projection.model.as_deref(), Some("gpt-5"));
+        assert_eq!(projection.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(projection.service_tier.as_deref(), Some("fast"));
+        assert_eq!(projection.context_window.as_deref(), Some("1m"));
+        assert!(
+            projection.messages.is_empty(),
+            "the transcript stays detail the list never carries"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn websocket_round_trip_sequences_provider_events() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
