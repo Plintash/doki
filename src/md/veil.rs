@@ -246,8 +246,12 @@ impl RowVeil {
     }
 
     pub fn finish_frame(&mut self) {
+        // A windowed body may not build every block a frame: a dissolve still
+        // in flight in an off-screen tail block must keep its units, or the
+        // fade would restart from the block's full text when the window
+        // returns to it. Settled unseen elements are droppable.
         self.elements
-            .retain(|element, _| self.seen_this_frame.contains(element));
+            .retain(|element, veil| self.seen_this_frame.contains(element) || veil.is_fading());
         self.finish_seeding();
     }
 

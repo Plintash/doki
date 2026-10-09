@@ -1715,6 +1715,11 @@ pub struct Waku {
     /// swallow the re-engage.
     transcript_tail_recheck: Rc<Cell<bool>>,
     transcript_is_scrolled: Rc<Cell<bool>>,
+    /// Whether the transcript's newest row sat at the viewport's bottom on the
+    /// last measured frame. Only this state paces the streaming reveal; a
+    /// reader parked in scrollback gets the body whole. Held across a frame
+    /// whose tail bounds are unmeasurable, like the affordance's own answer.
+    transcript_rests_at_tail: Cell<bool>,
     /// Last decided visibility of the scroll-to-tail affordance. The tail's
     /// position is unknowable on the frames a stream commit remeasures it, and
     /// those arrive at commit cadence — deciding "show" from that silence
@@ -3183,6 +3188,7 @@ impl Waku {
                 transcript_anchor_following,
                 transcript_tail_recheck,
                 transcript_is_scrolled,
+                transcript_rests_at_tail: Cell::new(true),
                 transcript_scroll_to_bottom_visible: Cell::new(false),
                 transcript_scrollbar_dragging: Cell::new(false),
                 transcript_layout_width: Cell::new(Pixels::ZERO),

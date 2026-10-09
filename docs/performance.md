@@ -127,6 +127,35 @@ moment any scrollbar became visible.
   (`block_ix << 16 | position`, [src/md/render.rs](../src/md/render.rs)) let
   a capped walk hand settled blocks the same flatten-cache and veil keys as a
   full walk.
+- The live response body is **windowed by measured block offset**
+  (`markdown_windowed`, [src/md/render.rs](../src/md/render.rs)). A message
+  row is one `list()` item, so the whole body rebuilds whenever any of it is
+  visible; the dissolve lease then repeats that at up to 120 fps. The renderer
+  records each block's height as it lays it out and builds only the blocks the
+  transcript viewport can reach (plus `MARKDOWN_WINDOW_MARGIN` above and
+  below, and the volatile tail) with spacers sized from the same ledger, so
+  the row still measures exactly as tall as the full body. Appends keep the
+  ledger; a wrap-width, metric, or rewrite change drops it, and the next
+  frame's full pass re-measures. Bodies containing an image or formula are
+  never windowed, because those blocks can change height after their first
+  frame and a spacer would freeze the old value, and a body with a search or
+  annotation mark keeps the full walk because a reveal reads its geometry
+  back from the frame's registry. On a 400-block reply this
+  takes the streaming frame from ~2.65 ms to ~0.21 ms in the debug build
+  (`cargo test --locked -p waku --lib bench_markdown_frame -- --ignored
+  --nocapture`).
+- The live response **is revealed at the dissolve's pace, not the provider's**
+  (`MarkdownView::set_revealing_text`, [src/md/render.rs](../src/md/render.rs)).
+  Handing a whole commit's text to layout grows the row in one step, and the
+  tail pin then moves every row above it by that step — a vertical hitch even
+  when the grapheme fade is smooth. The view keeps a byte cursor into the
+  arrived body and parses only the revealed prefix, advanced toward the
+  arrival over `REVEAL_DRAIN_MS` and capped at `REVEAL_MAX_BYTES_PER_SECOND`,
+  so layout grows a few graphemes at a time and the scroll moves
+  continuously. The commits stay at ~8.3 Hz; the reveal, now a frame client,
+  supplies the motion between them. Settling, a rewrite, a body that shrank,
+  or a frame after the row was scrolled out of view reveals everything at
+  once, so nothing ever stays hidden.
 - `MarkdownView::set_text` derives the mended display tail only when content
   or the streaming flag changed — the derivation re-parses the final block and
   runs for every visible row every frame.
@@ -187,10 +216,11 @@ claims on a release build.
 ## Known floor and next levers
 
 With both cadences enforced, a streaming frame still rebuilds every visible
-row (gpui `list()` semantics). If that ever needs to shrink: fork-level cached
-list rows need a measure-once extension to `ViewElement` caching (cached views
-lay out from style, not content, which breaks the list's measurement as-is);
-alternatively fold activities into the virtualized list as block-granularity
-rows. Smaller levers, in memory and unproven: stable
-`StyledText` element ids for gpui's per-element layout memo, and the per-row
-`Message` clones in the row builder.
+row (gpui `list()` semantics), and every visible row except the windowed
+streaming body lays out its whole content. If that ever needs to shrink:
+fork-level cached list rows need a measure-once extension to `ViewElement`
+caching (cached views lay out from style, not content, which breaks the
+list's measurement as-is); alternatively fold activities into the
+virtualized list as block-granularity rows. Smaller levers, in memory and
+unproven: stable `StyledText` element ids for gpui's per-element layout memo,
+and the per-row `Message` clones in the row builder.

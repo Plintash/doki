@@ -385,6 +385,9 @@ pub(super) struct MessageRender<'a> {
     pub(super) attachments_can_reveal: bool,
     /// The parsed human or assistant body. System messages remain verbatim.
     pub(super) markdown: Option<&'a MarkdownView>,
+    /// Set for the live streaming response: the slice of the body the
+    /// transcript viewport can see, used to window a long reply.
+    pub(super) body_window: Option<MessageBodyWindow>,
     pub(super) ctx: &'a MarkdownCtx<'a>,
     pub(super) menu: ContextMenuHandle,
     pub(super) waku: gpui::WeakEntity<Waku>,
@@ -541,14 +544,37 @@ fn render_sent_message_attachments(
     Some(row.into_any_element())
 }
 
+/// The part of a long streaming body the transcript viewport can see, in the
+/// row's own pixel coordinates. The renderer builds only the blocks that
+/// intersect this range (plus a margin and the volatile tail), so a dissolve
+/// tick costs the visible body rather than the whole response.
+#[derive(Clone, Copy)]
+pub(super) struct MessageBodyWindow {
+    pub(super) visible_top: f32,
+    pub(super) visible_height: f32,
+    pub(super) width: f32,
+}
+
 fn render_markdown_message_body<'a>(
     content: &str,
     markdown: Option<&'a MarkdownView>,
+    window: Option<MessageBodyWindow>,
     theme: &Theme,
     ctx: &MarkdownCtx<'a>,
 ) -> AnyElement {
     markdown
-        .and_then(|markdown| md::render::markdown(markdown, ctx))
+        .and_then(|markdown| match window {
+            Some(window) if !ctx.has_search() && !ctx.has_annotations() => {
+                md::render::markdown_windowed(
+                    markdown,
+                    ctx,
+                    window.visible_top,
+                    window.visible_height,
+                    window.width,
+                )
+            }
+            _ => md::render::markdown(markdown, ctx),
+        })
         // Empty or not-yet-parsed content still needs a selectable fallback.
         .unwrap_or_else(|| {
             md::render::plain_text(
@@ -720,6 +746,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
         attachment_images,
         attachments_can_reveal,
         markdown,
+        body_window,
         ctx,
         menu,
         waku,
@@ -849,7 +876,8 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                 );
             } else {
                 if !content.trim().is_empty() {
-                    let body = render_markdown_message_body(&content, markdown, theme, ctx);
+                    let body =
+                        render_markdown_message_body(&content, markdown, body_window, theme, ctx);
                     column = column.child(
                         div()
                             .id(SharedString::from(format!(
@@ -1036,7 +1064,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
         }
         MessageRole::Assistant => {
             let group_name = SharedString::from(format!("assistant-message-{message_id}"));
-            let body = render_markdown_message_body(&content, markdown, theme, ctx);
+            let body = render_markdown_message_body(&content, markdown, body_window, theme, ctx);
             let mut column = div()
                 .w_full()
                 .min_w_0()
