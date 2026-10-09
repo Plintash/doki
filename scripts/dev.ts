@@ -322,7 +322,9 @@ async function build(target: BuildTarget): Promise<boolean> {
   }
   const result = isMacOS
     ? await $`${join(root, "scripts/bundle.sh")} debug`
-        .env({ WAKU_DEBUG_APP_NAME: appName })
+        // `env` replaces the whole environment, so the shell keeps the
+        // process's own PATH and toolchain variables.
+        .env({ ...process.env, WAKU_DEBUG_APP_NAME: appName })
         .nothrow()
     : await $`cargo build --package waku --bin waku --bin waku_js_repl --package waku-computer-use --bin waku_computer_use`.nothrow();
   if (result.exitCode !== 0) {
