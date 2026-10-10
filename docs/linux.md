@@ -98,8 +98,7 @@ and settings stay in `~/.waku`; delete that directory to remove them too.
 
 ## Building from source
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for build prerequisites, then
-install Bun for the SDK artifact assembler, then produce the same archive
+Install Bun for the SDK artifact assembler, then produce the same archive
 this page installs with:
 
 ```sh
