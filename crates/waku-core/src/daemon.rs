@@ -2083,7 +2083,11 @@ mod tests {
             epoch,
             sequence: 7,
         });
-        assert!(session_projection_precedes(&existing, &stale, Some(runtime_id)));
+        assert!(session_projection_precedes(
+            &existing,
+            &stale,
+            Some(runtime_id)
+        ));
 
         merge_stale_session_metadata(&mut existing, stale);
 

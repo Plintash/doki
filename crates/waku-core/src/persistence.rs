@@ -1897,10 +1897,7 @@ fn session_params(session: &AgentSession) -> Vec<rusqlite::types::Value> {
             .blocked_reason
             .clone()
             .map_or(Value::Null, Value::Text),
-        session
-            .objective
-            .clone()
-            .map_or(Value::Null, Value::Text),
+        session.objective.clone().map_or(Value::Null, Value::Text),
         session
             .turn_count
             .map_or(Value::Null, |count| Value::Integer(count as i64)),
@@ -3618,12 +3615,12 @@ mod tests {
         assert!(last_reply.is_some(), "a submitted turn sets last_reply_at");
         assert_eq!(objective.as_deref(), session.objective.as_deref());
         assert_eq!(blocked_since.map(|at| at as u64), session.blocked_since);
-        assert_eq!(
-            blocked_reason.as_deref(),
-            session.blocked_reason.as_deref()
-        );
+        assert_eq!(blocked_reason.as_deref(), session.blocked_reason.as_deref());
         assert_eq!(turn_count.map(|count| count as u32), session.turn_count);
-        assert_eq!(changed_files.map(|count| count as u32), session.changed_files);
+        assert_eq!(
+            changed_files.map(|count| count as u32),
+            session.changed_files
+        );
         assert_eq!(archived_at.map(|at| at as u64), session.archived_at);
 
         // And the columns come back through the list load, not just the JSON.
@@ -3703,7 +3700,10 @@ mod tests {
             .find(|session| session.id == session_id)
             .expect("the row survives the reload");
 
-        assert!(session.archived_at.is_none(), "an old store stays unarchived");
+        assert!(
+            session.archived_at.is_none(),
+            "an old store stays unarchived"
+        );
         assert!(session.blocked_since.is_none());
         assert!(session.blocked_reason.is_none());
         assert!(session.turn_count.is_none());
@@ -3720,7 +3720,10 @@ mod tests {
         state.sessions[0].begin_turn("Ask");
         state.sessions[0].finish_active_turn(crate::model::TurnStatus::Completed);
         let session_id = state.sessions[0].id;
-        state.session_mut(session_id).expect("the session").archived_at = Some(1_700_000_000);
+        state
+            .session_mut(session_id)
+            .expect("the session")
+            .archived_at = Some(1_700_000_000);
         store.save(&mut state).unwrap();
 
         let mut reloaded = load_hydrated(&store_in(&directory));

@@ -5634,7 +5634,10 @@ mod tests {
 
         let projection = session.list_projection();
 
-        assert_eq!(projection.objective.as_deref(), session.objective.as_deref());
+        assert_eq!(
+            projection.objective.as_deref(),
+            session.objective.as_deref()
+        );
         assert_eq!(projection.blocked_since, session.blocked_since);
         assert_eq!(
             projection.blocked_reason.as_deref(),
@@ -5650,7 +5653,9 @@ mod tests {
         let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
 
         session.set_status(SessionStatus::Waiting);
-        let stamped = session.blocked_since.expect("entering Waiting stamps the time");
+        let stamped = session
+            .blocked_since
+            .expect("entering Waiting stamps the time");
         session.set_blocked_reason("Waiting for the npm test decision");
         assert_eq!(
             session.blocked_reason.as_deref(),
@@ -5674,7 +5679,10 @@ mod tests {
         assert!(session.blocked_since.is_some());
 
         session.set_status(SessionStatus::Working);
-        assert!(session.blocked_since.is_none(), "running again is not blocked");
+        assert!(
+            session.blocked_since.is_none(),
+            "running again is not blocked"
+        );
         assert!(session.blocked_reason.is_none());
 
         // A reason arriving late, after the task left the blocked status, is
