@@ -369,6 +369,9 @@ activity.described_command_failed: "コマンドの実行に失敗しました�
 activity.running_command: コマンドを実行中
 activity.ran_command: コマンドを実行しました
 activity.command_failed: コマンドの実行に失敗しました
+activity.compacting_context: コンテキストを圧縮中
+activity.compacted_context: コンテキストを圧縮しました
+activity.compaction_failed: コンテキストの圧縮に失敗しました
 activity.edit_file: ファイルを編集
 activity.write_file: ファイルに書き込む
 activity.editing_named_file: "%{file} を編集中"
@@ -573,6 +576,7 @@ skills.enable_named: "%{name} を有効にする"
 skills.disable_named: "%{name} を無効にする"
 
 commands.fast_description: 高速モードを切り替え
+commands.compact_description: コンテキストを圧縮
 commands.fast_enabled: 高速モードを有効にしました
 commands.fast_disabled: 高速モードを無効にしました
 commands.goal_description: このタスクが継続して追求するゴールを設定
@@ -739,6 +743,8 @@ errors.provider_rejected_steer: "%{provider} が追加の指示を拒否しま�
 errors.provider_stopped_receiving: "%{provider} はメッセージの受信を停止しました"
 errors.provider_initialize_session: "%{provider} はこのセッションを初期化できませんでした"
 errors.provider_rejected_prompt: "%{provider} は実行前にプロンプトを拒否しました"
+errors.compact_turn_running: コンテキストを圧縮する前に、実行中のターンを停止してください
+errors.compact_queued_until_settled: 圧縮は実行中のターンが終わるまで待機します
 errors.provider_complete_turn: "%{provider} はこのターンを完了できませんでした"
 errors.provider_reported_error: "%{provider} からエラーが報告されました"
 

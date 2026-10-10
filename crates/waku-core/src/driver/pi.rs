@@ -25,7 +25,7 @@ use crate::driver::{
     DriverControl, DriverEventSender, DriverEventSink, DriverStartOptions, SessionOptions,
 };
 use crate::model::{
-    ActivityKind, BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKind,
+    ActivityItem, ActivityKind, BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKind,
     BackgroundWorkStatus, DriverEvent, ExtensionWidgetPlacement, NotificationSeverity,
     ProviderResumeCursor, ReportedCommand, RuntimeMode, UserInputAnswer, UserInputOption,
     UserInputQuestion,
@@ -690,28 +690,15 @@ impl PiDriver {
                 while let Ok(message) = command_rx.recv() {
                     match message {
                         CommandMessage::Prompt(prompt) => {
-                            let result = send_prompt(
+                            dispatch_prompt(
                                 &mut stdin,
                                 &writer_pending,
                                 &mut next_request_id,
-                                &prompt,
+                                &writer_events,
+                                &run,
+                                flavor,
+                                prompt,
                             );
-                            if let Err(error) = result {
-                                // The prompt never reached the provider, so
-                                // this is the submitted message's delivery
-                                // failure: the reason settles the turn with
-                                // it, rather than arriving as an error the
-                                // app would render as its answer.
-                                let _ = writer_events.send(DriverEvent::TurnFinished {
-                                    interrupted: false,
-                                    success: false,
-                                    summary: Some(tr!(
-                                        "errors.provider_rejected_prompt_detail",
-                                        provider = flavor.display_name(),
-                                        error = error
-                                    )),
-                                });
-                            }
                         }
                         CommandMessage::Steer(prompt) => {
                             send_steer(
@@ -720,6 +707,7 @@ impl PiDriver {
                                 &mut next_request_id,
                                 &writer_events,
                                 &run,
+                                flavor,
                                 prompt,
                             );
                         }
@@ -1138,6 +1126,84 @@ fn write_prompt(
     Ok(())
 }
 
+/// The compaction this prompt asks this flavour to run, when it is one.
+///
+/// Pi's built-in slash commands are the interactive CLI's dispatch, so the
+/// transport is what recognises the invocation; Oh My Pi's RPC surface has no
+/// verified compaction command and keeps the prompt.
+fn pi_compact_invocation(
+    flavor: PiFlavor,
+    prompt: &str,
+) -> Option<waku_protocol::composer::CompactInvocation> {
+    if flavor != PiFlavor::Pi {
+        return None;
+    }
+    waku_protocol::composer::parse_compact_invocation(prompt)
+}
+
+/// Delivers a submitted prompt, or runs the one provider command Waku bridges
+/// in its place.
+///
+/// Pi's own slash commands are the interactive CLI's dispatch; its RPC prompt
+/// path expands extension commands, skills and prompt templates and nothing
+/// else, so a typed `/compact` would otherwise land in the model's context as
+/// literal text. The transport recognises the invocation here — where Pi
+/// itself dispatches built-ins, ahead of extension commands — and writes the
+/// compaction request instead.
+///
+/// A live run is never aborted for it: Pi's `session.compact()` aborts the
+/// agent operation before it starts, so a compaction that races a run is
+/// reported as that submission's delivery failure, exactly like a refused
+/// prompt, rather than stopping work the user did not stop.
+fn dispatch_prompt(
+    stdin: &mut impl Write,
+    pending: &PendingResponses,
+    next_request_id: &mut u64,
+    events: &impl DriverEventSink,
+    run: &RunLiveness,
+    flavor: PiFlavor,
+    prompt: String,
+) {
+    let delivered = if let Some(invocation) = pi_compact_invocation(flavor, &prompt) {
+        if run.is_live() {
+            Err(tr!("errors.compact_turn_running"))
+        } else {
+            write_compact(stdin, invocation.instructions())
+        }
+    } else {
+        send_prompt(stdin, pending, next_request_id, &prompt)
+    };
+    if let Err(error) = delivered {
+        // The message never reached the provider, so this is its delivery
+        // failure: the reason settles the turn with it, rather than arriving
+        // as an error the app would render as its answer.
+        let _ = events.send(DriverEvent::TurnFinished {
+            interrupted: false,
+            success: false,
+            summary: Some(tr!(
+                "errors.provider_rejected_prompt_detail",
+                provider = flavor.display_name(),
+                error = error
+            )),
+        });
+    }
+}
+
+/// Writes the provider's compaction request.
+///
+/// No request id, like `abort` and `clear_queue`: every outcome the provider
+/// reports — progress, usage and the end itself — arrives as an event, so
+/// there is nothing to await. Summarizing a full context routinely outlasts
+/// the control timeout besides, and the writer has to stay free for the stop
+/// that cancels it.
+fn write_compact(stdin: &mut impl Write, instructions: Option<String>) -> Result<(), String> {
+    let mut request = json!({"type": "compact"});
+    if let Some(instructions) = instructions {
+        request["customInstructions"] = Value::String(instructions);
+    }
+    write_json_line(stdin, &request).map_err(|error| format!("transport write failed: {error}"))
+}
+
 /// Hands a steering message to the provider.
 ///
 /// The provider queues a steer whether or not a run is open, and a message it
@@ -1150,14 +1216,28 @@ fn write_prompt(
 /// acknowledged as accepted too, because that is what the app needs to keep the
 /// message in the transcript — reporting it as a rejected steer would have the
 /// app submit the same text a second time.
+///
+/// A Pi `/compact` is not a steer at all: it is a command, and the transport
+/// runs it itself. Steering it would write the text into the model's context
+/// or park it across turn boundaries, so it is rejected here — the client
+/// queues the message instead, and the queue runs it through the prompt path
+/// where the command is recognised.
 fn send_steer(
     stdin: &mut impl Write,
     pending: &PendingResponses,
     next_request_id: &mut u64,
     events: &impl DriverEventSink,
     run: &RunLiveness,
+    flavor: PiFlavor,
     prompt: String,
 ) {
+    if pi_compact_invocation(flavor, &prompt).is_some() {
+        let _ = events.send(DriverEvent::SteerRejected {
+            message: prompt,
+            reason: tr!("errors.compact_queued_until_settled"),
+        });
+        return;
+    }
     let delivered = if run.is_live() {
         send_request(
             stdin,
@@ -1349,6 +1429,35 @@ impl ChunkAssembly {
             .map(Some)
             .map_err(|error| format!("chunked frame was not valid JSON: {error}"))
     }
+}
+
+/// One row of Pi's compaction activity.
+fn compaction_activity(
+    id: String,
+    title: String,
+    output: Option<&Value>,
+    failed: bool,
+    complete: bool,
+) -> ActivityItem {
+    activity::tool_activity(
+        Some(id),
+        ActivityKind::Tool,
+        title,
+        None,
+        output,
+        None,
+        failed,
+        complete,
+    )
+}
+
+/// Reports the context occupancy the provider just computed. The window is
+/// unchanged, and `None` keeps the one the meter already has.
+fn report_context_tokens(events: &impl DriverEventSink, tokens: u64) {
+    let _ = events.send(DriverEvent::UsageUpdated {
+        context_tokens: Some(tokens),
+        context_window: None,
+    });
 }
 
 /// Pi already computes context occupancy for its own footer. Prefer that
@@ -1607,6 +1716,10 @@ struct PiStreamState {
     /// The messages the provider's last queue report still held, in the order
     /// it reported them. Empty on a provider that reports no queue.
     queued: Vec<String>,
+    /// The activity row of the compaction currently running, so its end event
+    /// completes the same row. Pi names no compaction, so Waku counts them.
+    open_compaction: Option<String>,
+    compaction_sequence: u64,
     /// The detached pi-subagents runs the extension's own status widget last
     /// reported, by run id. The widget is a level signal — a run that left it
     /// is settled or gone — so keeping the last report is what turns its
@@ -1618,15 +1731,23 @@ impl PiStreamState {
     /// Clears the per-run stream state between runs. The run handle and the
     /// dialogs survive, because the writer thread reads liveness through its
     /// own clone of the run and a dialog the client has not answered yet must
-    /// not be forgotten. The extension's detached runs outlive the turn that
+    /// not be forgotten. The compaction state survives too: a row's id is
+    /// matched against every row this session already has, so a second
+    /// compaction must not reuse the first one's id even in a later turn, and
+    /// a compaction that outlives the settlement still completes the row its
+    /// start opened. The extension's detached runs outlive the turn that
     /// started them, so their last report survives too.
     fn reset(&mut self) {
         let run = self.run.clone();
         let dialogs = self.dialogs.clone();
+        let compaction_sequence = self.compaction_sequence;
+        let open_compaction = self.open_compaction.take();
         let async_runs = std::mem::take(&mut self.async_runs);
         *self = Self {
             run,
             dialogs,
+            compaction_sequence,
+            open_compaction,
             async_runs,
             ..Self::default()
         };
@@ -1818,6 +1939,70 @@ fn handle_pi_message(
                 follow_up,
             });
         }
+        "compaction_start" => {
+            // Pi compacts both on request and on its own (the threshold or an
+            // overflow). Both are the same two events, so both get the same
+            // row; an automatic compaction belongs to the run already open.
+            state.compaction_sequence += 1;
+            let id = format!("pi-compaction-{}", state.compaction_sequence);
+            state.open_compaction = Some(id.clone());
+            let item =
+                compaction_activity(id, tr!("activity.compacting_context"), None, false, false);
+            let _ = events.send(DriverEvent::RichActivity(item));
+        }
+        "compaction_end" => {
+            let manual = value.get("reason").and_then(Value::as_str) == Some("manual");
+            let aborted = value.get("aborted").and_then(Value::as_bool) == Some(true);
+            let result = value.get("result");
+            let compaction_tokens = result
+                .and_then(|result| result.get("estimatedTokensAfter"))
+                .and_then(Value::as_u64);
+            // A row exists while a start is open; the end completes that one.
+            // Pi emits the start before the end, so a row can only be missing
+            // for an end the stream never opened one for, and then there is
+            // nothing to complete.
+            if let Some(id) = state.open_compaction.take() {
+                let item = if aborted {
+                    // The stop that aborted it already said what happened; the
+                    // row only has to stop being live.
+                    compaction_activity(id, tr!("activity.compacting_context"), None, false, true)
+                } else if let Some(result) = result {
+                    // The summary is the compaction's own text; the row keeps
+                    // it for the detail view.
+                    compaction_activity(
+                        id,
+                        tr!("activity.compacted_context"),
+                        result.get("summary"),
+                        false,
+                        true,
+                    )
+                } else {
+                    let message = pi_error_message(flavor, &value);
+                    compaction_activity(
+                        id,
+                        tr!("activity.compaction_failed"),
+                        Some(&Value::String(message)),
+                        true,
+                        true,
+                    )
+                };
+                let _ = events.send(DriverEvent::RichActivity(item));
+            }
+            if let Some(tokens) = compaction_tokens {
+                report_context_tokens(events, tokens);
+            }
+            if manual {
+                // A manual compaction has no run behind it, so its end event
+                // settles the turn that submitted it. A failed compaction is
+                // still a completed turn: the failed row is the record, and
+                // the task must not read as failed because maintenance did.
+                let _ = events.send(DriverEvent::TurnFinished {
+                    interrupted: aborted,
+                    success: true,
+                    summary: None,
+                });
+            }
+        }
         "command_output" => {
             if let Some(text) = value
                 .get("text")
@@ -1886,10 +2071,7 @@ fn handle_pi_message(
                     // This is the context the next call starts from, not the
                     // cumulative billed total for the whole session.
                     if let Some(tokens) = message.and_then(pi_message_context_tokens) {
-                        let _ = events.send(DriverEvent::UsageUpdated {
-                            context_tokens: Some(tokens),
-                            context_window: None,
-                        });
+                        report_context_tokens(events, tokens);
                     }
                     emit_completed_message_fallback(message, events, state);
                 }
@@ -2965,6 +3147,7 @@ mod tests {
             &mut next_request_id,
             &events,
             &state.run,
+            PiFlavor::Pi,
             "stop doing that".to_owned(),
         );
 
@@ -3025,6 +3208,7 @@ mod tests {
             &mut next_request_id,
             &events,
             &state.run,
+            PiFlavor::Pi,
             "stop doing that".to_owned(),
         );
         assert!(matches!(
@@ -3140,6 +3324,7 @@ mod tests {
             &mut next_request_id,
             &events,
             &state.run,
+            PiFlavor::Pi,
             "never mind".to_owned(),
         );
         let frames = wire_frames(&wire);
@@ -3181,6 +3366,7 @@ mod tests {
                 &mut next_request_id,
                 &writer_events,
                 &writer_run,
+                PiFlavor::Pi,
                 writer_prompt,
             );
         });
@@ -5424,5 +5610,362 @@ mod tests {
             harness.command_rx.try_recv().is_err(),
             "the settled run's dialog is not answered afterwards"
         );
+    }
+
+    #[test]
+    fn a_pi_compact_prompt_becomes_the_providers_compaction_command() {
+        // Pi's RPC prompt path expands extension commands, skills and prompt
+        // templates and nothing else: a typed `/compact` would otherwise reach
+        // the model as literal text. The transport recognises the invocation
+        // and writes the compaction request instead.
+        let (pending, _commands, _command_rx, _state) = harness();
+        let (events, event_rx) = unbounded();
+        let mut wire = Vec::new();
+        let mut next_request_id = 0;
+        dispatch_prompt(
+            &mut wire,
+            &pending,
+            &mut next_request_id,
+            &events,
+            &RunLiveness::default(),
+            PiFlavor::Pi,
+            "/compact focus on the API".into(),
+        );
+
+        let writes = wire_lines(&wire);
+        assert_eq!(writes.len(), 1, "a compaction is not also a prompt");
+        assert_eq!(writes[0]["type"], "compact");
+        assert_eq!(writes[0]["customInstructions"], "focus on the API");
+        assert!(
+            writes[0].get("id").is_none(),
+            "the command answers through its events, so it awaits nothing"
+        );
+        assert!(pending.lock().is_empty());
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the command settles no turn yet"
+        );
+
+        // The bare form carries no instructions at all.
+        let mut wire = Vec::new();
+        dispatch_prompt(
+            &mut wire,
+            &pending,
+            &mut next_request_id,
+            &events,
+            &RunLiveness::default(),
+            PiFlavor::Pi,
+            "/compact".into(),
+        );
+        let writes = wire_lines(&wire);
+        assert_eq!(writes[0]["type"], "compact");
+        assert!(writes[0].get("customInstructions").is_none());
+
+        // Oh My Pi's flavour has no verified compaction command, so its own
+        // behaviour is unchanged.
+        let mut wire = Vec::new();
+        dispatch_prompt(
+            &mut wire,
+            &pending,
+            &mut next_request_id,
+            &events,
+            &RunLiveness::default(),
+            PiFlavor::OhMyPi,
+            "/compact".into(),
+        );
+        assert_eq!(wire_lines(&wire)[0]["type"], "prompt");
+    }
+
+    #[test]
+    fn a_compact_prompt_never_aborts_a_live_run() {
+        // Pi's `session.compact()` aborts the agent's operation first. A
+        // compaction a submission asked for must not stop work the user did
+        // not stop, so it is refused as that submission's delivery failure.
+        let (pending, _commands, _command_rx, _state) = harness();
+        let (events, event_rx) = unbounded();
+        let run = RunLiveness::default();
+        run.open();
+        let mut wire = Vec::new();
+        dispatch_prompt(
+            &mut wire,
+            &pending,
+            &mut 0,
+            &events,
+            &run,
+            PiFlavor::Pi,
+            "/compact".into(),
+        );
+
+        assert!(wire.is_empty(), "no command may reach a run in flight");
+        let DriverEvent::TurnFinished {
+            success,
+            summary,
+            interrupted,
+        } = event_rx.recv().unwrap()
+        else {
+            panic!("a refused compaction settles its submission")
+        };
+        assert!(!success);
+        assert!(!interrupted);
+        assert!(
+            summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("Stop the running turn")),
+            "the refusal names what to do about it"
+        );
+    }
+
+    #[test]
+    fn a_compact_steer_is_rejected_so_the_client_queues_it() {
+        // A steer joins the live turn's boundary; a compaction there would
+        // reach the model or wait for a later turn. The transport rejects it
+        // as a steer, which is what has the client queue it and run it
+        // through the prompt path where the command is recognised.
+        let (pending, _commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        state.run.open();
+        let mut wire = Vec::new();
+        send_steer(
+            &mut wire,
+            &pending,
+            &mut 0,
+            &events,
+            &state.run,
+            PiFlavor::Pi,
+            "/compact".to_owned(),
+        );
+
+        assert!(wire.is_empty(), "a compact steer writes nothing");
+        let DriverEvent::SteerRejected { message, reason } = event_rx.recv().unwrap() else {
+            panic!("a compact steer is rejected so the client queues it")
+        };
+        assert_eq!(message, "/compact");
+        assert!(reason.contains("compaction waits"));
+    }
+
+    #[test]
+    fn a_manual_compaction_reports_progress_usage_and_settlement() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "compaction_start", "reason": "manual"}),
+            json!({
+                "type": "compaction_end",
+                "reason": "manual",
+                "result": {
+                    "summary": "Kept notes about the API",
+                    "firstKeptEntryId": "abc123",
+                    "tokensBefore": 150000,
+                    "estimatedTokensAfter": 32000,
+                },
+                "aborted": false,
+                "willRetry": false,
+            }),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        let DriverEvent::RichActivity(start) = event_rx.recv().unwrap() else {
+            panic!("a compaction starts with its own row")
+        };
+        assert_eq!(start.title, tr!("activity.compacting_context"));
+        assert!(!start.complete);
+        let DriverEvent::RichActivity(end) = event_rx.recv().unwrap() else {
+            panic!("the compaction's end completes the row")
+        };
+        assert_eq!(end.source_id, start.source_id, "one row per compaction");
+        assert_eq!(end.title, tr!("activity.compacted_context"));
+        assert!(end.complete && !end.failed);
+        assert_eq!(end.output.as_deref(), Some("Kept notes about the API"));
+        let DriverEvent::UsageUpdated {
+            context_tokens,
+            context_window,
+        } = event_rx.recv().unwrap()
+        else {
+            panic!("the meter follows the provider's post-compaction estimate")
+        };
+        assert_eq!(context_tokens, Some(32_000));
+        assert_eq!(context_window, None, "the known window is kept");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished {
+                success: true,
+                interrupted: false,
+                ..
+            }
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_failed_compaction_keeps_the_reason_and_still_settles_the_turn() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "compaction_start", "reason": "manual"}),
+            json!({
+                "type": "compaction_end",
+                "reason": "manual",
+                "aborted": false,
+                "willRetry": false,
+                "errorMessage": "No model selected",
+            }),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::RichActivity(item) if !item.complete
+        ));
+        let DriverEvent::RichActivity(failed) = event_rx.recv().unwrap() else {
+            panic!("the failure completes the row")
+        };
+        assert!(failed.complete && failed.failed);
+        assert_eq!(failed.title, tr!("activity.compaction_failed"));
+        assert_eq!(failed.detail.as_deref(), Some("No model selected"));
+        assert!(
+            matches!(
+                event_rx.recv().unwrap(),
+                DriverEvent::TurnFinished {
+                    success: true,
+                    interrupted: false,
+                    ..
+                }
+            ),
+            "maintenance failing is not the task failing"
+        );
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_automatic_compaction_is_visible_but_settles_no_turn() {
+        // Threshold and overflow compaction happen inside a run, so the run's
+        // own settlement is the turn's; the events only add the row and the
+        // refreshed meter.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "compaction_start", "reason": "threshold"}),
+            json!({
+                "type": "compaction_end",
+                "reason": "threshold",
+                "result": {"summary": "Summary", "estimatedTokensAfter": 41000},
+                "aborted": false,
+                "willRetry": false,
+            }),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::RichActivity(item) if !item.complete
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::RichActivity(item) if item.complete
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::UsageUpdated {
+                context_tokens: Some(41_000),
+                ..
+            }
+        ));
+        assert!(event_rx.try_recv().is_err(), "no turn is settled for it");
+    }
+
+    #[test]
+    fn a_compaction_end_without_its_start_completes_no_row() {
+        // The row belongs to a start this session saw. An end on its own is
+        // not a compaction anyone watched, so it reports no row — only the
+        // meter it can still refresh and the settlement it owns.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "compaction_end",
+                "reason": "manual",
+                "result": {"summary": "Summary", "estimatedTokensAfter": 32000},
+                "aborted": false,
+                "willRetry": false,
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::UsageUpdated {
+                context_tokens: Some(32_000),
+                ..
+            }
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished {
+                success: true,
+                interrupted: false,
+                ..
+            }
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn consecutive_compactions_do_not_reuse_a_row_id() {
+        // The app matches an end event to its row by id across the whole
+        // transcript, so a counter that reset with the run would over the
+        // next turn reopen the previous compaction's completed row instead
+        // of adding one.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "compaction_start", "reason": "manual"}),
+            json!({"type": "agent_settled"}),
+            json!({"type": "compaction_start", "reason": "manual"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        let DriverEvent::RichActivity(first) = event_rx.recv().unwrap() else {
+            panic!("the first compaction opens a row")
+        };
+        let DriverEvent::RichActivity(second) = event_rx.recv().unwrap() else {
+            panic!("the second compaction opens its own row")
+        };
+        assert_ne!(first.source_id, second.source_id);
     }
 }

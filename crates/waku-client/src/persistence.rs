@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::{Command, DaemonExposureSettings, DaemonSettings, DaemonSupervisor, ResponsePayload};
 use waku_protocol::computer_use::ComputerAppGrant;
 use waku_protocol::i18n::AppLanguage;
-use waku_protocol::identity::DATA_DIRECTORY_NAME;
+use waku_protocol::identity::data_directory_name;
 use waku_protocol::model::{
     AgentSession, FavoriteModel, Project, ProviderKind, ProviderResumeCursor,
     ProviderSessionHistory, ProviderSessionSummary, RuntimeMode,
@@ -982,7 +982,7 @@ impl StateStore {
         } else {
             dirs::data_local_dir()
                 .unwrap_or_else(std::env::temp_dir)
-                .join(DATA_DIRECTORY_NAME)
+                .join(data_directory_name())
                 .join("app.db")
         }
     }

@@ -37,6 +37,7 @@ the original feature bullet instead of adding separate entries for them.
 - Pi: a background subagent's completion now wakes the task — the child's outcome appears with detached work, and the reply it produced lands in the transcript
 - Pi: a background subagent keeps the task busy while it runs — the run appears with detached work and the task reads as waiting for it instead of looking finished
 - Pi: an extension's notifications, status, widgets and questions reach the UI instead of being dropped or cancelled on your behalf
+- Pi: type `/compact` to run its context compaction — offered in the composer, never sent to the model, with its progress and the refreshed context meter visible
 
 ## [26.9.21]
 

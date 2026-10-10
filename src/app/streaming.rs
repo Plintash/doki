@@ -907,6 +907,18 @@ impl Waku {
                 summary,
                 interrupted,
             } => {
+                // A manual compaction's settlement carries no turn id, so the
+                // recorded compaction turn only decides whether this turn skips
+                // the fallback line. Taking it consumes the record either way,
+                // so a command the provider ignored cannot swallow the next
+                // turn's settlement.
+                let active_turn = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .and_then(AgentSession::active_turn_id);
+                let compaction_turn = runtime.compaction_turn.take();
                 // A settlement ends the run those steers joined, so their
                 // accepted rows need no later-refusal correlation.
                 runtime.delivered_steers.clear();
@@ -937,14 +949,7 @@ impl Waku {
                 {
                     self.plan_usage_stale.insert(provider);
                 }
-                if self
-                    .state
-                    .sessions
-                    .iter()
-                    .find(|session| session.id == session_id)
-                    .and_then(AgentSession::active_turn_id)
-                    .is_none()
-                {
+                if active_turn.is_none() {
                     return true;
                 }
                 let task_notification = cx.active_window().is_none().then(|| {
@@ -970,7 +975,15 @@ impl Waku {
                 self.complete_turn_blocks(session_id);
                 runtime.stream_phase = None;
                 runtime.park_announced = false;
-                let needs_fallback = !self.turn_has_assistant_message(session_id);
+                // A provider command whose transport answers without a model
+                // turn (Pi's `/compact`) settles with its activity row as the
+                // whole record; the answerless-turn fallback would add a
+                // synthetic reply under it. Only the recorded turn skips it,
+                // so a settlement for any other turn reads as usual.
+                let compaction_settlement =
+                    compaction_turn.is_some() && compaction_turn == active_turn;
+                let needs_fallback =
+                    !self.turn_has_assistant_message(session_id) && !compaction_settlement;
                 if let Some(session) = self.state.session_mut(session_id) {
                     // A provider-side user stop — the Stop button, or a denied
                     // permission the provider aborted on — settles like the

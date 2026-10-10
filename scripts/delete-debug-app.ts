@@ -31,7 +31,7 @@ function addCandidate(path: string): void {
 }
 
 function isDebugDiagnostic(name: string): boolean {
-  return /^(?:Doki|Waku) Debug(?:\s*\([^)]*\))?(?: Computer Use)?[-_.]/.test(name);
+  return /^(?:Doki|Waku) Debug(?: Computer Use)?(?:[-_. ]|$)/.test(name);
 }
 
 async function addMatchingChildren(
@@ -170,22 +170,19 @@ for (const target of targets) {
   console.log(`  [${target.kind}] ${target.path}`);
 }
 
-const runningProcesses = [
-  `Doki Debug (${basename(projectRoot)})`,
-  "Doki Debug",
-  "Doki Debug Computer Use",
-  "Waku Debug",
-  "Waku Debug Computer Use",
-].filter(
-  (name) =>
-    Bun.spawnSync(["/usr/bin/pgrep", "-x", name], {
-      stdout: "ignore",
-      stderr: "ignore",
-    }).exitCode === 0,
-);
+// Every checkout's watcher names its bundle for what it tests, so the plain
+// names are not enough: any debug app executable path counts.
+const runningProcesses = Bun.spawnSync(
+  ["/usr/bin/pgrep", "-lf", "/Contents/MacOS/(?:Doki|Waku) Debug"],
+  { stdout: "pipe", stderr: "ignore" },
+)
+  .stdout.toString()
+  .trim()
+  .split("\n")
+  .filter((line) => line.length > 0);
 if (runningProcesses.length > 0) {
   console.warn(
-    `\nWarning: ${runningProcesses.join(" and ")} is running. Quit it before confirming, or it may recreate debug data.`,
+    `\nWarning: debug app processes are still running (${runningProcesses.join(", ")}). Quit them before confirming, or they may recreate debug data.`,
   );
 }
 

@@ -58,7 +58,7 @@ pub use crate::startup_trace::{CLOSE_AFTER_LAUNCH_ENV, TRACE_ENV};
 
 use gpui::{App, KeyBinding, Menu, MenuItem, actions};
 
-use crate::identity::{APP_ID, APP_NAME};
+use crate::identity::{app_id, app_name};
 use crate::main_window::WakuApplicationExt as _;
 actions!(
     waku,
@@ -129,7 +129,7 @@ pub fn run() {
             // Linux uses this for Wayland app_id/X11 WM_CLASS and notification
             // attribution. Other platforms also benefit from one stable
             // process identity.
-            cx.set_app_identity(APP_ID, APP_NAME);
+            cx.set_app_identity(app_id(), app_name());
             crate::assets::register_fonts(cx).expect("failed to register bundled fonts");
             crate::input::init(cx);
             crate::ui::menu::init(cx);
@@ -305,10 +305,10 @@ pub fn run() {
 pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
     cx.set_menus(vec![
         Menu {
-            name: APP_NAME.into(),
+            name: app_name().into(),
             disabled: false,
             items: {
-                let mut items = vec![MenuItem::action(tr!("menu.about", app = APP_NAME), About)];
+                let mut items = vec![MenuItem::action(tr!("menu.about", app = app_name()), About)];
                 if updater_available {
                     items.push(MenuItem::action(
                         tr!("menu.check_for_updates"),
@@ -319,7 +319,7 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
                 items.extend([
                     MenuItem::action(tr!("menu.settings"), OpenSettings),
                     MenuItem::separator(),
-                    MenuItem::action(tr!("menu.quit", app = APP_NAME), Quit),
+                    MenuItem::action(tr!("menu.quit", app = app_name()), Quit),
                 ]);
                 items
             },

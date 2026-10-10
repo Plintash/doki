@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::app::Waku;
 use crate::app::window_chrome::render_window_frame;
 use crate::daemon::{DaemonConnector, DaemonState};
-use crate::identity::APP_ID;
+use crate::identity::app_id;
 use crate::latency::{Milestone, RunKind};
 use crate::persistence::AppSettings;
 use crate::startup_trace;
@@ -439,7 +439,7 @@ fn main_window_options(
         } else {
             gpui::WindowBackgroundAppearance::Opaque
         },
-        app_id: Some(APP_ID.to_owned()),
+        app_id: Some(app_id().to_owned()),
         // GPUI defaults to compositor/server decorations. If a
         // Wayland compositor declines them, it reports the
         // client fallback and Waku renders that frame itself.

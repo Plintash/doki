@@ -968,6 +968,11 @@ struct SessionRuntime {
     /// Background-process snapshots are provider IPC. Keep the polling clock
     /// on the runtime so switching tasks never creates duplicate probes.
     last_background_refresh_at: Instant,
+    /// The turn that exists only because the user submitted Pi's `/compact`.
+    /// The command answers without a model turn, so its activity row is the
+    /// whole record and its settlement must not add the answerless-turn
+    /// fallback line. Consumed by the next settlement either way.
+    compaction_turn: Option<Uuid>,
 }
 
 #[derive(Clone)]

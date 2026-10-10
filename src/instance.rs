@@ -52,8 +52,8 @@ pub fn database_path() -> &'static str {
 /// The window title: the app name, plus the instance identity in a debug build.
 pub fn window_title() -> String {
     match debug_label() {
-        Some(label) => format!("{} — {label}", crate::identity::APP_NAME),
-        None => crate::identity::APP_NAME.to_owned(),
+        Some(label) => format!("{} — {label}", crate::identity::app_name()),
+        None => crate::identity::app_name().to_owned(),
     }
 }
 
