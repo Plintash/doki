@@ -190,6 +190,13 @@ original LaTeX byte ranges. The manual measurement is
 
 ## Measuring
 
+`docs/fixtures/streaming-stress.md` is the long mixed-Markdown payload used to
+exercise the streaming path by eye: roughly 200 top-level blocks, tall code
+blocks, tables and nested lists, no images or formulas so the windowed body
+stays on the windowed path. Replay it into the streaming playground when one
+exists, or open it in the transcript to check the dissolve and the container
+height against a worst case.
+
 Sampling alone misled this investigation for hours; counters cracked it in one
 run. In order of usefulness:
 
