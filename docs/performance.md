@@ -152,8 +152,9 @@ moment any scrollbar became visible.
   disabled, it renders as static source text, though the body still keeps the
   full walk), and a body with a search or annotation mark keeps the full walk
   because a reveal reads its geometry back from the frame's registry — as does
-  a body with a live selection, whose spans and drag anchor a shift-click
-  resolves against that same registry.
+  the streaming body whenever any selection is live anywhere in the
+  transcript: its spans and drag anchor live in the same registry a shift-click
+  resolves against, so a hidden block could not be extended into.
   On a 400-block reply this takes the streaming frame from ~2.65 ms to ~0.21
   ms in the debug build
   (`cargo test --locked -p waku --lib bench_markdown_frame -- --ignored
@@ -164,8 +165,10 @@ moment any scrollbar became visible.
   tail pin follows, so pinning the measured height makes every wrap a vertical
   jolt however smooth the grapheme fade is. The row instead reports a height
   that leads the measured body through a critically damped spring fed by the
-  body's smoothed growth rate, so a layout step changes acceleration rather
-  than position. The clip stays at or above the height measured on the
+  body's smoothed growth rate, so a layout step mostly goes into acceleration
+  rather than position — it steps only by growth beyond the lead the spring has
+  already banked (at most `CLIP_RUNWAY_MAX`), which steady streaming stays
+  inside. The clip stays at or above the height measured on the
   previous frame, so a line laid out this frame lands in space that already
   exists and only text appended since that measurement ever sits below the
   clip edge — and the veil has not painted that yet, because a newly appended

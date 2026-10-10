@@ -544,17 +544,6 @@ fn render_sent_message_attachments(
     Some(row.into_any_element())
 }
 
-/// The part of a long streaming body the transcript viewport can see, in the
-/// row's own pixel coordinates. The renderer builds only the blocks that
-/// intersect this range (plus a margin and the volatile tail), so a dissolve
-/// tick costs the visible body rather than the whole response.
-#[derive(Clone, Copy)]
-pub(super) struct MessageBodyWindow {
-    pub(super) visible_top: f32,
-    pub(super) visible_height: f32,
-    pub(super) width: f32,
-}
-
 fn render_markdown_message_body<'a>(
     content: &str,
     markdown: Option<&'a MarkdownView>,
@@ -565,13 +554,7 @@ fn render_markdown_message_body<'a>(
     let body = markdown
         .and_then(|markdown| match window {
             Some(window) if !ctx.has_search() && !ctx.has_annotations() && !ctx.has_selection() => {
-                md::render::markdown_windowed(
-                    markdown,
-                    ctx,
-                    window.visible_top,
-                    window.visible_height,
-                    window.width,
-                )
+                md::render::markdown_windowed(markdown, ctx, window)
             }
             _ => md::render::markdown(markdown, ctx),
         })

@@ -43,8 +43,8 @@ use crate::model::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::md::render::{
-    Ctx as MarkdownCtx, MarkdownView, Metrics as MarkdownMetrics, Palette as MarkdownPalette,
-    TranscriptSelection,
+    Ctx as MarkdownCtx, MarkdownView, MessageBodyWindow, Metrics as MarkdownMetrics,
+    Palette as MarkdownPalette, TranscriptSelection,
 };
 use crate::ui::menu::{
     ConfirmEntry, ContextMenuHandle, DismissMenu, MenuAlign, MenuItem, SelectNextEntry,

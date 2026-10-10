@@ -494,8 +494,8 @@ pub fn flatten_plain(
 
 // ── Per-message state ──────────────────────────────────────────────────────
 
-/// How long the clipped body height takes to drain the gap to the real body
-/// height, and the ceiling on that speed.
+/// Ceiling, in pixels, on how far the leading height may run ahead of the
+/// measured body; also caps the feed-forward lookahead on a fast stream.
 const CLIP_RUNWAY_MAX: f32 = 44.0;
 
 /// Everything the renderer keeps between frames for one markdown body.
@@ -542,11 +542,6 @@ pub struct MarkdownView {
     /// without being rebuilt; the window planner refuses to stand in for
     /// blocks it cannot re-measure.
     async_blocks: Cell<bool>,
-    /// Block count the async scan last ran at. Re-walking the whole document
-    /// on every commit would put back the O(document) cost the window exists
-    /// to avoid, and only a block boundary can move a block out of the
-    /// volatile region the scan cares about.
-    async_blocks_at: Cell<usize>,
     /// Height the streaming body is clipped to while it grows. `None` shows
     /// the whole body; the controller keeps it continuous so the row never
     /// jumps by a line, and never lets it fall behind the measured body.
@@ -583,7 +578,6 @@ impl MarkdownView {
             copied_code_blocks: Rc::new(RefCell::new(HashMap::new())),
             streaming: Cell::new(false),
             async_blocks: Cell::new(false),
-            async_blocks_at: Cell::new(0),
             clip: Cell::new(None),
             body_height: Rc::new(Cell::new(None)),
             clip_at: Cell::new(Instant::now()),
@@ -676,10 +670,11 @@ impl MarkdownView {
                     .borrow_mut()
                     .retain(|ordinal, _| *ordinal < boundary);
             }
-            let blocks = self.blocks().count();
-            let structural = !append || mend != was_streaming;
-            let resized = blocks != self.async_blocks_at.replace(blocks);
-            if structural || resized {
+            if changed {
+                // Inline math or an image can arrive inside an existing block
+                // without moving a block boundary, so the block count is no
+                // test for whether the async content changed: scan whenever
+                // the content did.
                 self.async_blocks
                     .set(self.blocks().any(block_has_async_content));
             }
@@ -1730,8 +1725,10 @@ pub fn markdown_tail<'a>(
     markdown_capped(view, ctx, max_blocks)
 }
 
-/// Extra pixels above and below the viewport that a windowed body renders, so
-/// a scroll between frames never exposes a block that was left unbuilt.
+/// Extra pixels above and below the viewport that a windowed body renders.
+/// It covers a scroll between frames: the plan is built from the row bounds of
+/// the previous frame, so a jump larger than this leaves the dropped blocks
+/// unbuilt until the bounds catch up on the next frame.
 pub const MARKDOWN_WINDOW_MARGIN: f32 = 600.0;
 
 /// The prologue every body pass shares: the document's top-level blocks, the
@@ -1750,17 +1747,17 @@ struct BodyPass<'a> {
 /// straight through.
 fn begin_body<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<BodyPass<'a>> {
     let blocks = view.top_blocks().collect::<Vec<_>>();
+    let animate = ctx.animate_streaming && view.streaming.get();
     if blocks.is_empty() {
-        if ctx.animate_streaming && view.streaming.get() {
+        if animate {
             let mut veil = view.veil.borrow_mut();
             veil.begin_frame();
-            veil.finish_frame();
+            veil.finish_frame(ctx.now);
         }
         return None;
     }
 
     view.sync_style(ctx.palette, &ctx.metrics);
-    let animate = ctx.animate_streaming && view.streaming.get();
     if animate {
         view.veil.borrow_mut().begin_frame();
     }
@@ -1781,6 +1778,17 @@ fn begin_body<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<BodyPass<'a>>
     })
 }
 
+/// The part of a long streaming body the transcript viewport can see, in the
+/// row's own pixel coordinates. The renderer builds only the blocks that
+/// intersect this range (plus a margin and the volatile tail), so a dissolve
+/// tick costs the visible body rather than the whole response.
+#[derive(Clone, Copy)]
+pub struct MessageBodyWindow {
+    pub visible_top: f32,
+    pub visible_height: f32,
+    pub width: f32,
+}
+
 /// Render only the part of a long streaming body that a frame can show.
 ///
 /// A streaming response row is one virtualized list item: the moment any part
@@ -1793,11 +1801,9 @@ fn begin_body<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<BodyPass<'a>>
 pub fn markdown_windowed<'a>(
     view: &'a MarkdownView,
     ctx: &Ctx<'a>,
-    visible_top: f32,
-    visible_height: f32,
-    width: f32,
+    window: MessageBodyWindow,
 ) -> Option<AnyElement> {
-    view.set_render_width(width);
+    view.set_render_width(window.width);
     if view.has_async_blocks() {
         return markdown_capped(view, ctx, usize::MAX);
     }
@@ -1813,8 +1819,8 @@ pub fn markdown_windowed<'a>(
         &heights,
         &blocks,
         gap,
-        visible_top,
-        visible_height,
+        window.visible_top,
+        window.visible_height,
         view.parser.display_tail_start(),
     );
 
@@ -1827,7 +1833,7 @@ pub fn markdown_windowed<'a>(
     }
 
     if animate {
-        view.veil.borrow_mut().finish_frame();
+        view.veil.borrow_mut().finish_frame(ctx.now);
     }
 
     Some(block_column(children, &ctx).into_any_element())
@@ -1970,7 +1976,7 @@ fn markdown_capped<'a>(
     if animate {
         // Every element visible on the attach pass has synchronously adopted
         // its baseline. Elements introduced by later appends should now fade.
-        view.veil.borrow_mut().finish_frame();
+        view.veil.borrow_mut().finish_frame(ctx.now);
     }
 
     let element = block_column(children, &ctx);
@@ -3211,7 +3217,15 @@ mod tests {
                     TranscriptSelection::default(),
                 );
                 let body = match data.window {
-                    Some((top, height)) => markdown_windowed(&data.view, &ctx, top, height, 700.0),
+                    Some((top, height)) => markdown_windowed(
+                        &data.view,
+                        &ctx,
+                        MessageBodyWindow {
+                            visible_top: top,
+                            visible_height: height,
+                            width: 700.0,
+                        },
+                    ),
                     None => markdown(&data.view, &ctx),
                 };
                 div()
@@ -3495,6 +3509,22 @@ mod tests {
         assert!(!code.has_async_blocks(), "math in code stays literal");
     }
 
+    /// Inline math can arrive inside an existing block without moving a block
+    /// boundary, so the async scan cannot be skipped when the block count
+    /// holds: `see $x` is one literal block and `see $x$` is one math block,
+    /// and only the scan sees the difference.
+    #[test]
+    fn async_content_is_rescanned_on_a_pure_append() {
+        let mut view = MarkdownView::new();
+        view.set_text("see $x", true);
+        assert!(!view.has_async_blocks(), "an unclosed $ stays literal");
+        view.set_text("see $x$", true);
+        assert!(
+            view.has_async_blocks(),
+            "inline math arrived on a pure append"
+        );
+    }
+
     /// A live selection parks spans and a drag anchor in the frame registry,
     /// which is the same geometry a search reveal reads back: a windowed body
     /// must keep the full walk while one exists.
@@ -3614,7 +3644,15 @@ mod tests {
                     TranscriptSelection::default(),
                 );
                 let body = match self.window.get() {
-                    Some((top, height)) => markdown_windowed(&self.view, &ctx, top, height, 700.0),
+                    Some((top, height)) => markdown_windowed(
+                        &self.view,
+                        &ctx,
+                        MessageBodyWindow {
+                            visible_top: top,
+                            visible_height: height,
+                            width: 700.0,
+                        },
+                    ),
                     None => markdown(&self.view, &ctx),
                 };
                 // The recorder reads the body column's own bounds: the window

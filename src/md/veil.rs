@@ -260,15 +260,25 @@ impl RowVeil {
         self.seeding = false;
     }
 
-    pub fn finish_frame(&mut self) {
+    pub fn finish_frame(&mut self, now: Instant) {
         // A windowed body may not build every block a frame: a dissolve still
         // in flight in an off-screen tail block must keep its units, or the
         // fade would restart from the block's full text when the window
-        // returns to it. A settled unseen element is droppable — the block
-        // outside the window owes nothing to the frame — and `seen` adopts it
-        // at full opacity when the window builds it again.
-        self.elements
-            .retain(|element, veil| self.seen_this_frame.contains(element) || veil.is_fading());
+        // returns to it. `advance` is the only place units drain, and it runs
+        // only for a built element, so an element the window dropped mid-fade
+        // has to expire here on the wall clock — otherwise `is_fading` stays
+        // true with nothing fading on screen and the dissolve lease never
+        // parks. A settled unseen element is droppable — the block outside the
+        // window owes nothing to the frame — and `seen` adopts it at full
+        // opacity when the window builds it again.
+        self.elements.retain(|element, veil| {
+            if self.seen_this_frame.contains(element) {
+                return true;
+            }
+            veil.units
+                .retain(|unit| millis_between(unit.birth, now) < VEIL_FADE_MS);
+            !veil.units.is_empty()
+        });
         self.finish_seeding();
     }
 
@@ -493,14 +503,14 @@ mod tests {
         let mut veil = RowVeil::default();
         assert_eq!(veil.advance(3, "already read", start), vec![(0..12, 0.0)]);
         // The dissolve lands on a frame that still builds the element.
-        veil.finish_frame();
+        veil.finish_frame(start);
         veil.begin_frame();
         assert!(veil.advance(3, "already read", at(start, 500)).is_empty());
         assert!(!veil.is_fading());
         // The next frame builds other elements only, which drops this one.
-        veil.finish_frame();
+        veil.finish_frame(at(start, 500));
         veil.begin_frame();
-        veil.finish_frame();
+        veil.finish_frame(at(start, 500));
         assert!(
             veil.advance(3, "already read", at(start, 600)).is_empty(),
             "a block re-entering the window must not dissolve again"
@@ -513,15 +523,42 @@ mod tests {
         );
     }
 
+    /// A block that leaves the window mid-dissolve has no `advance` to drain
+    /// its queue, so its units must expire on the wall clock. Otherwise
+    /// `is_fading` stays true with nothing on screen and the dissolve lease
+    /// re-arms forever, holding the transcript at the chosen fps for the rest
+    /// of the stream.
+    #[test]
+    fn a_block_dropped_mid_fade_still_expires() {
+        let start = Instant::now();
+        let mut veil = RowVeil::default();
+        assert_eq!(veil.advance(3, "still landing", start), vec![(0..13, 0.0)]);
+        // The dissolve's last grapheme is queued for later than the start.
+        veil.finish_frame(start);
+        veil.begin_frame();
+        assert!(veil.is_fading());
+        // Still inside the fade: the dropped units stay put, so a window that
+        // returns before they land resumes the same dissolve.
+        veil.finish_frame(at(start, 100));
+        assert!(veil.is_fading());
+        veil.begin_frame();
+        // Past the last unit's fade: the off-window element is done fading.
+        veil.finish_frame(at(start, 500));
+        assert!(
+            !veil.is_fading(),
+            "an off-window fade must expire, or the dissolve lease never parks"
+        );
+    }
+
     /// A block that has never been built is still a first sight: the window
     /// returning to an unseen block must dissolve it like any other append.
     #[test]
     fn a_never_built_block_still_dissolves() {
         let start = Instant::now();
         let mut veil = RowVeil::default();
-        veil.finish_frame();
+        veil.finish_frame(start);
         veil.begin_frame();
-        veil.finish_frame();
+        veil.finish_frame(start);
         assert_eq!(veil.advance(7, "fresh text", start), vec![(0..10, 0.0)]);
     }
 
