@@ -497,6 +497,14 @@ sidebar.grouping_project:
   en: Project
 sidebar.grouping_updated:
   en: Updated
+sidebar.grouping_status:
+  en: Status
+sidebar.section_needs_you:
+  en: Needs you
+sidebar.section_running:
+  en: Running
+sidebar.section_recent:
+  en: Recent
 sidebar.ordering:
   en: Ordering
 sidebar.ordering_newest:

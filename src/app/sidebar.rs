@@ -61,14 +61,48 @@ impl SessionDateGroup {
     }
 }
 
-/// Stable identity for a collapsible sidebar section. Keeping both variants in
-/// one set preserves each view's disclosure state when the user switches
-/// between Project and Updated grouping.
+/// One section of the status view, in the order [`Self::ALL`] lists them:
+/// what needs the user first, what is running next, and the settled tasks
+/// last.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum SidebarStatusSection {
+    NeedsYou,
+    Running,
+    Recent,
+}
+
+impl SidebarStatusSection {
+    pub(super) const ALL: [Self; 3] = [Self::NeedsYou, Self::Running, Self::Recent];
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|section| *section == self)
+            .expect("every section is listed in ALL")
+    }
+
+    /// The stable identity the section's collapsed state is kept under.
+    fn group(self) -> SidebarGroup {
+        match self {
+            Self::NeedsYou => SidebarGroup::NeedsYou,
+            Self::Running => SidebarGroup::Running,
+            Self::Recent => SidebarGroup::Recent,
+        }
+    }
+}
+
+/// Stable identity for a collapsible sidebar section. Keeping every view's
+/// sections in one set preserves disclosure state when the user switches
+/// between Project, Updated and Status grouping; a status section shares its
+/// identity with no other section, so folding one takes nothing else with it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum SidebarGroup {
     Updated(SessionDateGroup),
     Project(Uuid),
     Projectless,
+    NeedsYou,
+    Running,
+    Recent,
 }
 
 impl SidebarGroup {
@@ -77,6 +111,9 @@ impl SidebarGroup {
             Self::Updated(group) => format!("updated-{}", group.index()).into(),
             Self::Project(project_id) => format!("project-{project_id}").into(),
             Self::Projectless => "projectless".into(),
+            Self::NeedsYou => "status-needs-you".into(),
+            Self::Running => "status-running".into(),
+            Self::Recent => "status-recent".into(),
         }
     }
 
@@ -85,6 +122,9 @@ impl SidebarGroup {
             Self::Updated(group) => mix(fingerprint, group.index() as u64 + 1),
             Self::Project(project_id) => mix_uuid(mix(fingerprint, 0x100), project_id),
             Self::Projectless => mix(fingerprint, 0x200),
+            Self::NeedsYou => mix(fingerprint, 0x300),
+            Self::Running => mix(fingerprint, 0x301),
+            Self::Recent => mix(fingerprint, 0x302),
         }
     }
 }
@@ -93,6 +133,7 @@ fn sidebar_grouping_label(grouping: SidebarGrouping) -> String {
     match grouping {
         SidebarGrouping::Project => tr!("sidebar.grouping_project"),
         SidebarGrouping::Updated => tr!("sidebar.grouping_updated"),
+        SidebarGrouping::Status => tr!("sidebar.grouping_status"),
     }
 }
 
@@ -257,6 +298,89 @@ fn sort_sidebar_sessions(sessions: &mut Vec<&AgentSession>, ordering: SidebarOrd
             sessions.sort_by_key(|session| sidebar_session_timestamp(session))
         }
     }
+}
+
+/// Folds one started task's row facts into the snapshot fingerprint: exactly
+/// the values [`Waku::sidebar_rows`] decides a row's place by.
+///
+/// Status and archive state belong here even though only the status view
+/// sections by them, because a flip has to re-section the rows instead of
+/// leaving the old snapshot in place. The title and `updated_at` are
+/// deliberately absent: a metadata edit must not move a row.
+fn mix_sidebar_session_facts(fingerprint: u64, session: &AgentSession) -> u64 {
+    let status = match session.status {
+        SessionStatus::Idle => 1,
+        SessionStatus::Connecting => 2,
+        SessionStatus::Working => 3,
+        SessionStatus::Waiting => 4,
+        SessionStatus::Background => 5,
+        SessionStatus::Failed => 6,
+    };
+    let fingerprint = mix_uuid(fingerprint, session.id);
+    let fingerprint = mix_uuid(fingerprint, session.project_id);
+    let fingerprint = mix(fingerprint, sidebar_session_timestamp(session));
+    let fingerprint = mix(fingerprint, status);
+    mix(fingerprint, u64::from(session.archived_at.is_some()))
+}
+
+/// The active status section a task belongs to, or none while the task is
+/// archived: an archived task belongs to the trailing archived section and
+/// must not be mixed into the three active ones, whatever its status.
+fn status_section_of(session: &AgentSession) -> Option<SidebarStatusSection> {
+    if session.archived_at.is_some() {
+        return None;
+    }
+    Some(match session.status {
+        // A provider question and a failure both leave the task on the user.
+        SessionStatus::Waiting | SessionStatus::Failed => SidebarStatusSection::NeedsYou,
+        // The turn is live: the provider is connecting, thinking, or parked on
+        // detached work it will wake the turn for.
+        SessionStatus::Connecting | SessionStatus::Working | SessionStatus::Background => {
+            SidebarStatusSection::Running
+        }
+        SessionStatus::Idle => SidebarStatusSection::Recent,
+    })
+}
+
+/// The stamp "needs you" orders by: when the task entered `Waiting` or
+/// `Failed`, or, for a task that was blocked before that field existed, its
+/// newest turn activity — the closest thing it has to a blockage clock.
+fn blocked_since_or_turn_activity(session: &AgentSession) -> u64 {
+    session
+        .blocked_since
+        .unwrap_or_else(|| sidebar_session_timestamp(session))
+}
+
+/// The status view's sections, each already in render order and holding the
+/// ids to list under it. A task appears in exactly one section.
+///
+/// "Needs you" leads with the longest blockage, and the other two read the
+/// same conversation recency the project view sorts by, newest first. The task
+/// id breaks every tie, so two tasks that share a stamp keep one order across
+/// launches rather than following whatever order the list was collected in.
+fn status_sidebar_sections(sessions: &[&AgentSession]) -> [Vec<Uuid>; 3] {
+    let mut sections: [Vec<&AgentSession>; 3] = std::array::from_fn(|_| Vec::new());
+    for session in sessions.iter().copied() {
+        if let Some(section) = status_section_of(session) {
+            sections[section.index()].push(session);
+        }
+    }
+    for section in SidebarStatusSection::ALL {
+        let sessions = &mut sections[section.index()];
+        match section {
+            SidebarStatusSection::NeedsYou => sessions
+                .sort_by_key(|session| (blocked_since_or_turn_activity(session), session.id)),
+            SidebarStatusSection::Running | SidebarStatusSection::Recent => {
+                sessions.sort_by_key(|session| {
+                    (
+                        std::cmp::Reverse(sidebar_session_timestamp(session)),
+                        session.id,
+                    )
+                })
+            }
+        }
+    }
+    sections.map(|section| section.into_iter().map(|session| session.id).collect())
 }
 
 fn project_sidebar_groups(
@@ -619,30 +743,39 @@ impl Waku {
             move |_| {
                 let grouping_weak = weak.clone();
                 let ordering_weak = weak.clone();
-                vec![
-                    MenuItem::submenu_with_value(
-                        tr!("sidebar.grouping"),
-                        sidebar_grouping_label(grouping),
-                        move |_| {
-                            let project_weak = grouping_weak.clone();
-                            let updated_weak = grouping_weak.clone();
-                            vec![
-                                MenuItem::new(tr!("sidebar.grouping_project"), move |_, cx| {
-                                    let _ = project_weak.update(cx, |this, cx| {
-                                        this.set_sidebar_grouping(SidebarGrouping::Project, cx);
-                                    });
-                                })
-                                .selected(grouping == SidebarGrouping::Project),
-                                MenuItem::new(tr!("sidebar.grouping_updated"), move |_, cx| {
-                                    let _ = updated_weak.update(cx, |this, cx| {
-                                        this.set_sidebar_grouping(SidebarGrouping::Updated, cx);
-                                    });
-                                })
-                                .selected(grouping == SidebarGrouping::Updated),
-                            ]
-                        },
-                    ),
-                    MenuItem::submenu_with_value(
+                let mut items = vec![MenuItem::submenu_with_value(
+                    tr!("sidebar.grouping"),
+                    sidebar_grouping_label(grouping),
+                    move |_| {
+                        let project_weak = grouping_weak.clone();
+                        let updated_weak = grouping_weak.clone();
+                        let status_weak = grouping_weak.clone();
+                        vec![
+                            MenuItem::new(tr!("sidebar.grouping_project"), move |_, cx| {
+                                let _ = project_weak.update(cx, |this, cx| {
+                                    this.set_sidebar_grouping(SidebarGrouping::Project, cx);
+                                });
+                            })
+                            .selected(grouping == SidebarGrouping::Project),
+                            MenuItem::new(tr!("sidebar.grouping_updated"), move |_, cx| {
+                                let _ = updated_weak.update(cx, |this, cx| {
+                                    this.set_sidebar_grouping(SidebarGrouping::Updated, cx);
+                                });
+                            })
+                            .selected(grouping == SidebarGrouping::Updated),
+                            MenuItem::new(tr!("sidebar.grouping_status"), move |_, cx| {
+                                let _ = status_weak.update(cx, |this, cx| {
+                                    this.set_sidebar_grouping(SidebarGrouping::Status, cx);
+                                });
+                            })
+                            .selected(grouping == SidebarGrouping::Status),
+                        ]
+                    },
+                )];
+                // The status sections have a fixed order — what needs the user
+                // first — so that view offers no ordering control.
+                if grouping != SidebarGrouping::Status {
+                    items.push(MenuItem::submenu_with_value(
                         tr!("sidebar.ordering"),
                         sidebar_ordering_label(ordering),
                         move |_| {
@@ -663,8 +796,9 @@ impl Waku {
                                 .selected(ordering == SidebarOrdering::Oldest),
                             ]
                         },
-                    ),
-                ]
+                    ));
+                }
+                items
             },
         );
         let add_project = div()
@@ -1153,9 +1287,14 @@ impl Waku {
     /// started session and runs calendar math per session — far too much per
     /// tick for values that move at most once per stream commit. The
     /// fingerprint is an allocation-free scan of exactly what
-    /// [`Self::sidebar_rows`] reads: started sessions with their project and
-    /// recency, the presentation preferences, the collapsed-group set, and
-    /// today's date and the moving project-recency boundary.
+    /// [`Self::sidebar_rows`] reads: started sessions with their project,
+    /// recency, status and archive state, the presentation preferences, the
+    /// collapsed-group set, and today's date and the moving project-recency
+    /// boundary.
+    ///
+    /// A fact the rows are filtered or partitioned by has to be in here, or the
+    /// snapshot would outlive the rule that produced it — the archived-task
+    /// visibility toggle is one of those once it exists.
     fn sidebar_rows_cached(&self, today: NaiveDate, now: u64) -> Rc<Vec<SidebarRow>> {
         let mut fingerprint = mix(0x51de_ba5e_5eed_c0de, today.num_days_from_ce() as u64);
         fingerprint = mix(
@@ -1163,6 +1302,7 @@ impl Waku {
             match self.state.sidebar_grouping {
                 SidebarGrouping::Project => 1,
                 SidebarGrouping::Updated => 2,
+                SidebarGrouping::Status => 3,
             },
         );
         fingerprint = mix(
@@ -1176,9 +1316,7 @@ impl Waku {
             if !session.has_started() {
                 continue;
             }
-            fingerprint = mix_uuid(fingerprint, session.id);
-            fingerprint = mix_uuid(fingerprint, session.project_id);
-            fingerprint = mix(fingerprint, sidebar_session_timestamp(session));
+            fingerprint = mix_sidebar_session_facts(fingerprint, session);
             if self.state.sidebar_grouping == SidebarGrouping::Project {
                 fingerprint = mix(
                     fingerprint,
@@ -1217,15 +1355,24 @@ impl Waku {
             collapsed,
         );
         if self.sidebar_rows_fingerprint.get() != Some(fingerprint) {
-            *self.sidebar_rows_snapshot.borrow_mut() = Rc::new(self.sidebar_rows(today, now));
+            let (rows, status_section_counts) = self.sidebar_rows(today, now);
+            // Both halves come out of the same pass, so a header can never
+            // label itself with a count the rows do not back.
+            *self.sidebar_rows_snapshot.borrow_mut() = Rc::new(rows);
+            *self.sidebar_status_section_counts.borrow_mut() = status_section_counts;
             self.sidebar_rows_fingerprint.set(Some(fingerprint));
         }
         self.sidebar_rows_snapshot.borrow().clone()
     }
 
     /// Snapshot the session history as a flat list of lightweight rows under
-    /// the current grouping and ordering preferences.
-    fn sidebar_rows(&self, today: NaiveDate, now: u64) -> Vec<SidebarRow> {
+    /// the current grouping and ordering preferences, together with the
+    /// counts the status view's section headers label themselves with.
+    fn sidebar_rows(
+        &self,
+        today: NaiveDate,
+        now: u64,
+    ) -> (Vec<SidebarRow>, [usize; SidebarStatusSection::ALL.len()]) {
         let mut sorted_sessions = self
             .state
             .sessions
@@ -1234,8 +1381,26 @@ impl Waku {
             .collect::<Vec<_>>();
         sort_sidebar_sessions(&mut sorted_sessions, self.state.sidebar_ordering);
 
+        let mut status_section_counts = [0usize; SidebarStatusSection::ALL.len()];
         let mut rows = vec![SidebarRow::Search];
         match self.state.sidebar_grouping {
+            SidebarGrouping::Status => {
+                // Every section's tasks are already in render order, so the
+                // ordering preference does not reach this view.
+                let sections = status_sidebar_sections(&sorted_sessions);
+                for section in SidebarStatusSection::ALL {
+                    let group = section.group();
+                    let session_ids = &sections[section.index()];
+                    status_section_counts[section.index()] = session_ids.len();
+                    append_sidebar_group_rows(
+                        &mut rows,
+                        group,
+                        session_ids,
+                        self.sidebar_collapsed_groups.contains(&group),
+                        false,
+                    );
+                }
+            }
             SidebarGrouping::Updated => {
                 let mut grouped_sessions: [Vec<Uuid>; 6] = std::array::from_fn(|_| Vec::new());
                 for session in sorted_sessions {
@@ -1301,6 +1466,7 @@ impl Waku {
         if rows.len() == 1 {
             // Keep the header actions visible while there is no history.
             let group = match self.state.sidebar_grouping {
+                SidebarGrouping::Status => SidebarGroup::NeedsYou,
                 SidebarGrouping::Updated => SidebarGroup::Updated(SessionDateGroup::Today),
                 SidebarGrouping::Project => {
                     let projectless_root = crate::projectless::workspace_root();
@@ -1326,7 +1492,7 @@ impl Waku {
             };
             rows.push(SidebarRow::Header(group));
         }
-        rows
+        (rows, status_section_counts)
     }
 
     /// Keep the virtualized list in sync with the current row snapshot.
@@ -1406,6 +1572,9 @@ impl Waku {
         };
         let label = match group {
             SidebarGroup::Updated(group) => group.label(),
+            SidebarGroup::NeedsYou => tr!("sidebar.section_needs_you"),
+            SidebarGroup::Running => tr!("sidebar.section_running"),
+            SidebarGroup::Recent => tr!("sidebar.section_recent"),
             SidebarGroup::Project(project_id) => self
                 .state
                 .projects
@@ -1415,14 +1584,29 @@ impl Waku {
                 .unwrap_or_else(|| tr!("project.no_project_name")),
             SidebarGroup::Projectless => tr!("project.no_project_name"),
         };
-        let updated_chevron = matches!(group, SidebarGroup::Updated(_)).then(|| {
-            icon("icons/chevron-down.svg", 14.0, theme.text_secondary)
-                .when(collapsed, |icon| {
-                    icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.75)))
-                })
-                .invisible()
-                .group_hover(group_name.clone(), |icon| icon.visible())
-        });
+        // A status section is labeled with how many tasks it holds, and hints
+        // at its collapse control on hover. The other views' groups carry a
+        // date or a folder instead, and the lone placeholder header that keeps
+        // the sidebar actions reachable while there is no history carries
+        // neither. The count comes from the pass that built the row snapshot;
+        // a header must not count while it renders.
+        let status_section = SidebarStatusSection::ALL
+            .into_iter()
+            .find(|section| section.group() == group);
+        let count = status_section
+            .map(|section| self.sidebar_status_section_counts.borrow()[section.index()])
+            .filter(|count| *count > 0);
+        let collapse_hint = (matches!(group, SidebarGroup::Updated(_)) || status_section.is_some())
+            .then(|| {
+                icon("icons/chevron-down.svg", 14.0, theme.text_secondary)
+                    .when(collapsed, |icon| {
+                        icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(
+                            0.75,
+                        )))
+                    })
+                    .invisible()
+                    .group_hover(group_name.clone(), |icon| icon.visible())
+            });
         let compose = show_folder_icon.then(|| {
             let compose_focus = self
                 .sidebar_group_compose_focuses
@@ -1513,10 +1697,21 @@ impl Waku {
                             .items_center()
                             .gap(px(2.0))
                             .child(div().min_w_0().truncate().child(label))
-                            .when_some(updated_chevron, |element, chevron| element.child(chevron)),
+                            .when_some(collapse_hint, |element, chevron| element.child(chevron)),
                     )
                     .child(div().flex_1()),
             )
+            .when_some(count, |element, count| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .pl(px(6.0))
+                        .text_size(sp(12.5))
+                        .line_height(sp(0.0))
+                        .text_color(theme.text_ghost)
+                        .child(SharedString::from(count.to_string())),
+                )
+            })
             .when_some(compose, |element, compose| element.child(compose))
             .when(first, |element| {
                 element.child(self.render_sidebar_header_actions(cx))
@@ -1558,7 +1753,12 @@ impl Waku {
         match group {
             SidebarGroup::Project(project_id) => self.select_project(project_id, cx),
             SidebarGroup::Projectless => self.create_projectless_session(cx),
-            SidebarGroup::Updated(_) => return,
+            // Only a project section can start a task, so neither the status
+            // sections nor a date heading offer the action.
+            SidebarGroup::Updated(_)
+            | SidebarGroup::NeedsYou
+            | SidebarGroup::Running
+            | SidebarGroup::Recent => return,
         }
         let focus = self.composer_focus(cx);
         window.focus(&focus, cx);
@@ -2671,5 +2871,233 @@ mod tests {
             - offset.offset_in_item;
         assert_eq!(visible_height, px(400.0));
         assert_eq!(sidebar_session_row_index(&rows, Uuid::from_u128(41)), None);
+    }
+
+    fn status_test_session(status: SessionStatus) -> AgentSession {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.set_status(status);
+        session
+    }
+
+    /// The fingerprint `sidebar_rows_cached` folds over the session list, so a
+    /// test can ask whether a change would rebuild the row snapshot at all.
+    fn test_snapshot_fingerprint(sessions: &[&AgentSession]) -> u64 {
+        sessions.iter().fold(0u64, |fingerprint, session| {
+            mix_sidebar_session_facts(fingerprint, session)
+        })
+    }
+
+    fn status_section_ids(sessions: &[&AgentSession], section: SidebarStatusSection) -> Vec<Uuid> {
+        status_sidebar_sections(sessions)[section.index()].clone()
+    }
+
+    #[test]
+    fn status_view_lists_each_task_in_the_section_its_status_implies() {
+        let waiting = status_test_session(SessionStatus::Waiting);
+        let failed = status_test_session(SessionStatus::Failed);
+        let connecting = status_test_session(SessionStatus::Connecting);
+        let working = status_test_session(SessionStatus::Working);
+        let background = status_test_session(SessionStatus::Background);
+        let idle = status_test_session(SessionStatus::Idle);
+
+        let sessions = [
+            &idle as &AgentSession,
+            &background,
+            &failed,
+            &working,
+            &connecting,
+            &waiting,
+        ];
+        let sections = status_sidebar_sections(&sessions);
+
+        let needs_you = sections[SidebarStatusSection::NeedsYou.index()].clone();
+        let running = sections[SidebarStatusSection::Running.index()].clone();
+        let recent = sections[SidebarStatusSection::Recent.index()].clone();
+        assert_eq!(needs_you.len(), 2);
+        assert!(needs_you.contains(&waiting.id));
+        assert!(needs_you.contains(&failed.id));
+        assert_eq!(running.len(), 3);
+        assert!(running.contains(&connecting.id));
+        assert!(running.contains(&working.id));
+        assert!(running.contains(&background.id));
+        assert_eq!(recent, vec![idle.id]);
+        assert_eq!(sections.concat().len(), sessions.len());
+    }
+
+    #[test]
+    fn an_archived_task_belongs_to_no_active_status_section() {
+        let mut archived_waiting = status_test_session(SessionStatus::Waiting);
+        archived_waiting.archived_at = Some(1_700_000_000);
+
+        assert!(
+            status_section_ids(&[&archived_waiting], SidebarStatusSection::NeedsYou).is_empty()
+        );
+        assert!(
+            status_sidebar_sections(&[&archived_waiting])
+                .iter()
+                .all(Vec::is_empty)
+        );
+
+        archived_waiting.archived_at = None;
+        assert_eq!(
+            status_section_ids(&[&archived_waiting], SidebarStatusSection::NeedsYou),
+            vec![archived_waiting.id]
+        );
+    }
+
+    #[test]
+    fn the_longest_blockage_leads_the_needs_you_section() {
+        let now = 1_700_000_000u64;
+        let mut waiting_four_minutes = status_test_session(SessionStatus::Waiting);
+        waiting_four_minutes.blocked_since = Some(now - 4 * 60);
+        let mut waiting_forty_minutes = status_test_session(SessionStatus::Waiting);
+        waiting_forty_minutes.blocked_since = Some(now - 40 * 60);
+
+        assert_eq!(
+            status_section_ids(
+                &[&waiting_four_minutes, &waiting_forty_minutes],
+                SidebarStatusSection::NeedsYou
+            ),
+            vec![waiting_forty_minutes.id, waiting_four_minutes.id]
+        );
+    }
+
+    #[test]
+    fn a_blockage_recorded_before_the_stamp_existed_orders_by_its_newest_activity() {
+        let mut silent = status_test_session(SessionStatus::Failed);
+        silent.blocked_since = None;
+        silent.created_at = 100;
+        let mut stamped = status_test_session(SessionStatus::Failed);
+        stamped.blocked_since = Some(500);
+        let mut unstamped = status_test_session(SessionStatus::Failed);
+        unstamped.blocked_since = None;
+        unstamped.last_reply_at = Some(900);
+
+        assert_eq!(
+            status_section_ids(
+                &[&unstamped, &stamped, &silent],
+                SidebarStatusSection::NeedsYou
+            ),
+            vec![silent.id, stamped.id, unstamped.id]
+        );
+    }
+
+    #[test]
+    fn running_and_recent_sections_lead_with_the_newest_reply() {
+        let mut working_older = status_test_session(SessionStatus::Working);
+        working_older.last_reply_at = Some(10);
+        let mut working_newer = status_test_session(SessionStatus::Working);
+        working_newer.last_reply_at = Some(20);
+        let mut idle_older = status_test_session(SessionStatus::Idle);
+        idle_older.last_reply_at = Some(30);
+        let mut idle_newer = status_test_session(SessionStatus::Idle);
+        idle_newer.last_reply_at = Some(40);
+
+        assert_eq!(
+            status_section_ids(
+                &[&working_older, &working_newer],
+                SidebarStatusSection::Running
+            ),
+            vec![working_newer.id, working_older.id]
+        );
+        assert_eq!(
+            status_section_ids(&[&idle_older, &idle_newer], SidebarStatusSection::Recent),
+            vec![idle_newer.id, idle_older.id]
+        );
+    }
+
+    #[test]
+    fn status_section_order_comes_from_the_record_not_the_collection_order() {
+        let mut first = status_test_session(SessionStatus::Waiting);
+        first.blocked_since = Some(1_000);
+        first.last_reply_at = Some(1_000);
+        let mut second = status_test_session(SessionStatus::Failed);
+        second.blocked_since = Some(2_000);
+        second.last_reply_at = Some(2_000);
+        let mut third = status_test_session(SessionStatus::Idle);
+        third.last_reply_at = Some(3_000);
+
+        let collected = status_sidebar_sections(&[&first, &second, &third]);
+        let reversed = status_sidebar_sections(&[&third, &second, &first]);
+
+        assert_eq!(collected, reversed, "a restart keeps the order it stored");
+    }
+
+    #[test]
+    fn flipping_a_task_to_running_re_sections_the_row_snapshot() {
+        let mut task = status_test_session(SessionStatus::Idle);
+        task.last_reply_at = Some(50);
+
+        assert_eq!(
+            status_section_ids(&[&task], SidebarStatusSection::Recent),
+            vec![task.id]
+        );
+        let before = test_snapshot_fingerprint(&[&task]);
+
+        task.set_status(SessionStatus::Working);
+
+        assert_eq!(
+            status_section_ids(&[&task], SidebarStatusSection::Running),
+            vec![task.id]
+        );
+        assert_ne!(
+            test_snapshot_fingerprint(&[&task]),
+            before,
+            "the snapshot has to rebuild or the row keeps its old section"
+        );
+    }
+
+    #[test]
+    fn archiving_a_task_moves_the_row_snapshot() {
+        let mut task = status_test_session(SessionStatus::Idle);
+        let before = test_snapshot_fingerprint(&[&task]);
+
+        task.archived_at = Some(1_700_000_000);
+
+        assert_ne!(test_snapshot_fingerprint(&[&task]), before);
+    }
+
+    #[test]
+    fn a_rename_does_not_move_the_row_but_a_submitted_turn_does() {
+        let mut task = status_test_session(SessionStatus::Idle);
+        task.last_reply_at = Some(50);
+        let before = test_snapshot_fingerprint(&[&task]);
+
+        task.set_title("a name the user typed");
+        task.updated_at = 9_999;
+
+        assert_eq!(
+            test_snapshot_fingerprint(&[&task]),
+            before,
+            "a metadata edit does not move a row"
+        );
+
+        task.last_reply_at = Some(60);
+
+        assert_ne!(
+            test_snapshot_fingerprint(&[&task]),
+            before,
+            "a submitted turn does"
+        );
+    }
+
+    #[test]
+    fn status_sections_keep_their_own_collapse_identity() {
+        let keys = SidebarStatusSection::ALL
+            .iter()
+            .map(|section| section.group().element_key().to_string())
+            .chain([
+                SidebarGroup::Updated(SessionDateGroup::Today)
+                    .element_key()
+                    .to_string(),
+                SidebarGroup::Projectless.element_key().to_string(),
+            ])
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            keys.len(),
+            SidebarStatusSection::ALL.len() + 2,
+            "a section shares no identity with another section or view"
+        );
     }
 }
