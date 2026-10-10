@@ -527,7 +527,15 @@ impl Backend for WakuBackend {
                     .find(|session| session.id == session_id)
                 {
                     self.task_store.hydrate(session)?;
-                    Some(session.clone())
+                    // A client renders the objective and never ranks it
+                    // against a goal, so the hand-off carries the resolved
+                    // value. The session keeps the stored pair: its `objective`
+                    // is the generated value a cleared goal falls back to, and
+                    // a client saving this copy back must not overwrite it.
+                    let mut session = session.clone();
+                    let resolved = session.resolved_objective().map(str::to_owned);
+                    session.objective = resolved;
+                    Some(session)
                 } else {
                     None
                 };
@@ -1952,6 +1960,17 @@ mod tests {
     use super::*;
     use waku_protocol::event_from_wire;
 
+    /// A goal the way a provider reports one.
+    fn thread_goal(objective: &str) -> crate::model::ThreadGoal {
+        crate::model::ThreadGoal {
+            objective: objective.to_owned(),
+            status: crate::model::ThreadGoalStatus::Active,
+            token_budget: None,
+            tokens_used: 0,
+            time_used_seconds: 0,
+        }
+    }
+
     #[test]
     fn stale_runtime_projection_keeps_newer_transcript_cursor() {
         let runtime_id = Uuid::new_v4();
@@ -2012,7 +2031,7 @@ mod tests {
     }
 
     #[test]
-    fn a_client_projection_cannot_clear_daemon_owned_triage_state() {
+    fn a_client_projection_neither_sets_nor_clears_daemon_owned_triage_state() {
         let mut existing = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
         existing.objective = Some("Sidebar schedules tasks by state".into());
         existing.turn_count = Some(12);
@@ -2039,6 +2058,42 @@ mod tests {
         assert_eq!(incoming.archived_at, existing.archived_at);
         assert_eq!(incoming.blocked_since, existing.blocked_since);
         assert_eq!(incoming.blocked_reason, existing.blocked_reason);
+
+        // A client reads the list projection, so its copy of the objective is
+        // the resolved one. Saving that must not overwrite the generated
+        // value: clearing the goal has to fall back to the generated text, not
+        // to the goal the clear removed.
+        existing.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+        let mut resolved = existing.clone();
+        resolved.objective = existing.resolved_objective().map(str::to_owned);
+
+        preserve_daemon_triage(&existing, &mut resolved);
+
+        assert_eq!(
+            resolved.objective.as_deref(),
+            Some("Sidebar schedules tasks by state")
+        );
+        assert_eq!(
+            resolved.resolved_objective(),
+            Some("The sidebar groups tasks by what they need")
+        );
+        assert_eq!(
+            existing.objective.as_deref(),
+            Some("Sidebar schedules tasks by state")
+        );
+
+        // The provider reports the goal cleared. The client's copy still shows
+        // the goal text; the daemon resolves the save to the stored value.
+        let mut cleared = existing.clone();
+        cleared.thread_goal = None;
+        cleared.objective = Some("The sidebar groups tasks by what they need".into());
+
+        preserve_daemon_triage(&existing, &mut cleared);
+
+        assert_eq!(
+            cleared.resolved_objective(),
+            Some("Sidebar schedules tasks by state")
+        );
     }
 
     #[test]
