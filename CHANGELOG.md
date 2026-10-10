@@ -16,6 +16,8 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+- A long streamed reply grows with the dissolve instead of jumping a line at a time, and the dissolve now rebuilds only the part of the text on screen, so a long transcript keeps its frame pacing at 120 fps
+
 ## [26.10.8-rc.3]
 
 - Streamed replies dissolve in as a paced character wave instead of arriving a commit at a time; Settings → General chooses 30, 60, or 120 fps

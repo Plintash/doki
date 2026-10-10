@@ -1766,10 +1766,10 @@ fn begin_body<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<BodyPass<'a>>
     // tail, whose elements must be built even when the viewport is elsewhere.
     view.volatile_from
         .set(block_ordinal_base(view.parser.display_tail_start()));
+    // Sized before any block is built, so every `MeasuredBlock` knows its own
+    // slot; `resize` truncates too, which is what a shrunk body needs.
     let heights = view.heights.clone();
-    if heights.borrow().len() != blocks.len() {
-        heights.borrow_mut().resize(blocks.len(), (0..0, None));
-    }
+    heights.borrow_mut().resize(blocks.len(), (0..0, None));
     Some(BodyPass {
         blocks,
         ctx: ctx.with_cache(view),
@@ -2196,9 +2196,7 @@ impl Element for MeasuredBlock {
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
-        if let Some(slot) = self.heights.borrow_mut().get_mut(self.index) {
-            *slot = (self.range.clone(), Some(bounds.size.height));
-        }
+        self.heights.borrow_mut()[self.index] = (self.range.clone(), Some(bounds.size.height));
         self.inner.prepaint(window, cx);
     }
 

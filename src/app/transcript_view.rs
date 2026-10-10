@@ -266,9 +266,7 @@ impl Waku {
             self.transcript_is_scrolled.get(),
             self.transcript_anchor_following.get(),
             transcript_scrollable,
-            viewport_bottom,
-            tail_bottom,
-            anchor_end_space,
+            tail_rest,
         )
         .unwrap_or_else(|| self.transcript_scroll_to_bottom_visible.get());
         self.transcript_scroll_to_bottom_visible

@@ -719,7 +719,10 @@ pub(super) fn transcript_anchor_end_space(
 /// `is_scrolled` set after a collapse removes all overflow. The final row's
 /// bounds then distinguish the tail position for both list alignments:
 /// `ListScrollEvent::is_scrolled` alone stays true at the bottom of the
-/// top-aligned list used while a turn is anchored.
+/// top-aligned list used while a turn is anchored. `tail_rest` is the caller's
+/// [`transcript_rests_at_tail`] answer for this frame, which it reads anyway to
+/// pace the streaming reveal: taking it in keeps one answer per frame instead
+/// of asking the same question twice.
 ///
 /// The caller holds the previous answer through `None` rather than resolving
 /// it. Every stream commit remeasures the tail rows, so the frame after each
@@ -730,19 +733,13 @@ pub(super) fn should_show_scroll_to_bottom(
     is_scrolled: bool,
     anchor_following: bool,
     transcript_scrollable: bool,
-    viewport_bottom: Pixels,
-    tail_bottom: Option<Pixels>,
-    end_space: Pixels,
+    tail_rest: Option<bool>,
 ) -> Option<bool> {
     if !is_scrolled || anchor_following || !transcript_scrollable {
         return Some(false);
     }
 
-    Some(!transcript_rests_at_tail(
-        viewport_bottom,
-        tail_bottom,
-        end_space,
-    )?)
+    Some(!tail_rest?)
 }
 
 /// Whether the transcript currently sits at the end of its content, or `None`
