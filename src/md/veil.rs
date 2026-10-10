@@ -113,6 +113,8 @@ fn common_prefix(a: &str, b: &str) -> usize {
 }
 
 fn is_grapheme_boundary(text: &str, index: usize) -> bool {
+    // An index inside a character is trivially not a cluster boundary, and the
+    // cursor panics on one rather than answering.
     if !text.is_char_boundary(index) {
         return false;
     }
@@ -126,14 +128,11 @@ fn is_grapheme_boundary(text: &str, index: usize) -> bool {
 /// cluster the shaper wants whole.
 fn grapheme_prefix(previous: &str, text: &str) -> usize {
     let mut prefix = common_prefix(previous, text);
+    // Stepping back one byte at a time can land inside a multi-byte character,
+    // which `is_grapheme_boundary` rejects, so the loop never asks the cursor
+    // about a mid-character index.
     while prefix > 0 && !is_grapheme_boundary(text, prefix) {
-        // Step to the previous *character* boundary. A one-byte step can land
-        // inside a multi-byte character, and asking whether that index is a
-        // grapheme boundary is a slicing panic rather than a `false`.
         prefix -= 1;
-        while prefix > 0 && !text.is_char_boundary(prefix) {
-            prefix -= 1;
-        }
     }
     prefix
 }

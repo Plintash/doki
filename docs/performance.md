@@ -144,18 +144,19 @@ moment any scrollbar became visible.
   takes the streaming frame from ~2.65 ms to ~0.21 ms in the debug build
   (`cargo test --locked -p waku --lib bench_markdown_frame -- --ignored
   --nocapture`).
-- The live response **is revealed at the dissolve's pace, not the provider's**
-  (`MarkdownView::set_revealing_text`, [src/md/render.rs](../src/md/render.rs)).
-  Handing a whole commit's text to layout grows the row in one step, and the
-  tail pin then moves every row above it by that step — a vertical hitch even
-  when the grapheme fade is smooth. The view keeps a byte cursor into the
-  arrived body and parses only the revealed prefix, advanced toward the
-  arrival over `REVEAL_DRAIN_MS` and capped at `REVEAL_MAX_BYTES_PER_SECOND`,
-  so layout grows a few graphemes at a time and the scroll moves
-  continuously. The commits stay at ~8.3 Hz; the reveal, now a frame client,
-  supplies the motion between them. Settling, a rewrite, a body that shrank,
-  or a frame after the row was scrolled out of view reveals everything at
-  once, so nothing ever stays hidden.
+- The live response body **reports a leading container height**
+  (`MarkdownView::advance_clip`, [src/md/render.rs](../src/md/render.rs)). Text
+  layout grows the row in whole-line steps, and the row's height is what the
+  tail pin follows, so pinning the measured height makes every wrap a vertical
+  jolt however smooth the grapheme fade is. The row instead reports a height
+  that leads the measured body through a critically damped spring fed by the
+  body's smoothed growth rate, so a layout step changes acceleration rather
+  than position. The veil reveals a wrapped row only once the clip has passed
+  its bottom, so a clip that lags the body sits on text that is not painted
+  yet: the gap under the text is the only artefact, bounded by the rate lead
+  (`CLIP_RUNWAY_MAX`). Settling, a rewrite, a reflow, and a metric change all
+  release the clip, because a height kept across any of them would cut a body
+  that has since grown past it.
 - `MarkdownView::set_text` derives the mended display tail only when content
   or the streaming flag changed — the derivation re-parses the final block and
   runs for every visible row every frame.
@@ -193,9 +194,8 @@ original LaTeX byte ranges. The manual measurement is
 `docs/fixtures/streaming-stress.md` is the long mixed-Markdown payload used to
 exercise the streaming path by eye: roughly 200 top-level blocks, tall code
 blocks, tables and nested lists, no images or formulas so the windowed body
-stays on the windowed path. Replay it into the streaming playground when one
-exists, or open it in the transcript to check the dissolve and the container
-height against a worst case.
+stays on the windowed path. Open it in the transcript to check the dissolve and
+the container height against a worst case.
 
 Sampling alone misled this investigation for hours; counters cracked it in one
 run. In order of usefulness:

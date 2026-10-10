@@ -33,7 +33,6 @@ use gpui::{
     img, point, prelude::*, px, quad, relative, size,
 };
 use regex::Regex;
-use unicode_segmentation::UnicodeSegmentation;
 
 use super::highlight::{self, Lang, TokenClass};
 use super::mend::PENDING_LINK_URL;
@@ -41,7 +40,7 @@ use super::parser::{Block, IncrementalParser, InlineRun, ListItem, TableAlign, T
 use super::selection::{
     RegisteredText, Selection, SelectionRegistry, SelectionState, TextKey, line_range, word_range,
 };
-use super::veil::{RowVeil, apply_veil, veil_opacity};
+use super::veil::{RowVeil, apply_veil};
 use crate::theme::Theme;
 use crate::ui::menu::{ContextMenuHandle, context_menu};
 use crate::ui::tooltip::Tooltip;
@@ -499,14 +498,6 @@ pub fn flatten_plain(
 /// height, and the ceiling on that speed.
 const CLIP_RUNWAY_MAX: f32 = 44.0;
 
-/// Motion law for the leading container height.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ClipPhysics {
-    Linear,
-    Spring,
-    Bezier,
-}
-
 /// Where one text element sits in the clipped body, and where each wrapped
 /// row ends, recorded while painting. The clip uses it to reveal whole rows:
 /// a row is only faded in once the clip has passed its bottom, so the clip
@@ -559,66 +550,6 @@ fn reveal_rows(layout: &TextLayout) -> Vec<(f32, usize)> {
     rows
 }
 
-/// A provider burst is revealed over roughly this long once it has arrived, so
-/// a stream commit lands as motion rather than a jump of however many lines it
-/// carried.
-const REVEAL_DRAIN_MS: f32 = 240.0;
-/// Ceiling on the reveal rate. A pasted block still slides in instead of
-/// arriving in one frame; this is per second so the cadence setting cannot
-/// change how fast the text appears.
-const REVEAL_MAX_BYTES_PER_SECOND: f32 = 9_000.0;
-
-/// Pacing for [`MarkdownView::set_revealing_text`].
-///
-/// The defaults are what the transcript uses. They are a knob rather than a
-/// constant so the temporary streaming playground can tune the feel against a
-/// real render before a value is fixed.
-#[derive(Clone, Copy, PartialEq)]
-pub struct RevealTuning {
-    /// Aim the reveal to trail the arrival by about this long. Zero reveals
-    /// everything the moment it arrives.
-    pub drain_ms: f32,
-    /// Ceiling on the reveal rate, in bytes per second.
-    pub max_bytes_per_second: f32,
-    /// Advance on word boundaries instead of graphemes.
-    pub words: bool,
-}
-
-impl Default for RevealTuning {
-    fn default() -> Self {
-        Self {
-            drain_ms: REVEAL_DRAIN_MS,
-            max_bytes_per_second: REVEAL_MAX_BYTES_PER_SECOND,
-            words: false,
-        }
-    }
-}
-
-/// Advance `budget` bytes through `text`, stopping on a grapheme boundary
-/// (or, in word mode, the next whitespace) and always taking at least one
-/// cluster so a sparse drip never stalls.
-fn reveal_advance(text: &str, from: usize, budget: usize, words: bool) -> usize {
-    let mut cursor = from;
-    let mut used = 0usize;
-    for grapheme in text[from..].graphemes(true) {
-        used += grapheme.len();
-        cursor += grapheme.len();
-        if used >= budget {
-            break;
-        }
-    }
-    if words {
-        while cursor < text.len() {
-            let character = text[cursor..].chars().next().unwrap_or(' ');
-            cursor += character.len_utf8();
-            if character.is_whitespace() {
-                break;
-            }
-        }
-    }
-    cursor
-}
-
 /// Everything the renderer keeps between frames for one markdown body.
 ///
 /// The flatten cache is keyed by element ordinal and pruned only back to the
@@ -663,29 +594,14 @@ pub struct MarkdownView {
     /// without being rebuilt; the window planner refuses to stand in for
     /// blocks it cannot re-measure.
     async_blocks: Cell<bool>,
-    /// Block count the async scan last ran at. A paced reveal changes the
-    /// source every frame, and re-walking the whole document per frame would
-    /// put back the O(document) cost the pacing exists to avoid; only a block
-    /// boundary can move a block out of the volatile region the scan cares
-    /// about.
+    /// Block count the async scan last ran at. Re-walking the whole document
+    /// on every commit would put back the O(document) cost the window exists
+    /// to avoid, and only a block boundary can move a block out of the
+    /// volatile region the scan cares about.
     async_blocks_at: Cell<usize>,
-    /// Bytes of the streaming source handed to the parser and renderer. A
-    /// provider burst covers several lines, and giving the whole burst to
-    /// layout at once makes the transcript jump by that much and drags every
-    /// row above it up in one step; only the revealed prefix is parsed, so the
-    /// body grows with the dissolve instead of ahead of it.
-    revealed: Cell<usize>,
-    /// Whether the first streaming text has adopted its baseline. Attaching
-    /// to a body already in flight shows its history at once; later appends
-    /// are paced.
-    reveal_attached: Cell<bool>,
-    /// When the reveal cursor last moved, for the pacing step.
-    reveal_at: Cell<Instant>,
-    /// Pacing knobs for [`Self::set_revealing_text`].
-    reveal_tuning: Cell<RevealTuning>,
     /// Height the streaming body is clipped to while it grows. `None` shows
     /// the whole body; the controller keeps it continuous so the row never
-    /// jumps by a line, and never lets it fall behind the revealed text.
+    /// jumps by a line, and never lets it fall behind the measured body.
     clip: Cell<Option<Pixels>>,
     /// Natural height of the full arrived body, measured at paint.
     body_height: Rc<Cell<Option<Pixels>>>,
@@ -695,11 +611,8 @@ pub struct MarkdownView {
     /// container height.
     clip_last_height: Cell<Option<Pixels>>,
     clip_rate: Cell<f32>,
-    /// Motion law and its state: velocity for the spring, tween start for the
-    /// bezier.
-    clip_physics: Cell<ClipPhysics>,
+    /// Spring velocity of the leading container height.
     clip_velocity: Cell<f32>,
-    clip_tween: Cell<Option<(Instant, Pixels, Pixels)>>,
     /// Row geometry the clip gates the veil with.
     tracker: Rc<RevealTracker>,
 }
@@ -725,18 +638,12 @@ impl MarkdownView {
             streaming: Cell::new(false),
             async_blocks: Cell::new(false),
             async_blocks_at: Cell::new(0),
-            revealed: Cell::new(0),
-            reveal_attached: Cell::new(false),
-            reveal_at: Cell::new(Instant::now()),
-            reveal_tuning: Cell::new(RevealTuning::default()),
             clip: Cell::new(None),
             body_height: Rc::new(Cell::new(None)),
             clip_at: Cell::new(Instant::now()),
             clip_last_height: Cell::new(None),
             clip_rate: Cell::new(0.0),
-            clip_physics: Cell::new(ClipPhysics::Spring),
             clip_velocity: Cell::new(0.0),
-            clip_tween: Cell::new(None),
             tracker: Rc::new(RevealTracker::default()),
         }
     }
@@ -764,73 +671,7 @@ impl MarkdownView {
     }
 
     pub fn set_text(&mut self, text: &str, mend: bool) {
-        // A direct write is not a dissolve: show the whole body at once.
-        self.revealed.set(text.len());
-        self.reveal_attached.set(false);
-        self.reveal_at.set(Instant::now());
         self.apply_text(text, mend);
-    }
-
-    /// Show a streaming body at the pace of the dissolve rather than the
-    /// provider's bursts.
-    ///
-    /// A stream commit can deliver several lines at once, and handing all of
-    /// them to layout makes the row grow in one step — the tail pin then yanks
-    /// every row above it up by that step, which reads as a hitch however
-    /// smooth the grapheme fade is. This hands the renderer only a prefix of
-    /// `text`, advanced toward the arrival (see [`REVEAL_DRAIN_MS`] and
-    /// [`REVEAL_MAX_BYTES_PER_SECOND`]) on every frame it is drawn, so the
-    /// body grows a few graphemes at a time and the fade stays level with it.
-    pub fn set_revealing_text(&mut self, text: &str, mend: bool) {
-        let now = Instant::now();
-        let len = text.len();
-        let tuning = self.reveal_tuning.get();
-        if !self.reveal_attached.replace(true) {
-            // Attaching to a body already in flight: its history is not new
-            // text, so it is shown at once and only what arrives next fades.
-            self.revealed.set(len);
-        }
-        if !mend || !text.starts_with(self.parser.text()) {
-            // Settling or a rewrite must show everything at once: a hidden
-            // tail once the turn is over, or during a replacement, is a bug
-            // rather than a dissolve.
-            self.revealed.set(len);
-        } else {
-            let backlog = len - self.revealed.get();
-            if backlog > 0 {
-                let elapsed_ms = now
-                    .saturating_duration_since(self.reveal_at.get())
-                    .as_secs_f32()
-                    * 1_000.0;
-                let budget = if tuning.drain_ms <= 0.0 {
-                    backlog
-                } else {
-                    (backlog as f32 * elapsed_ms / tuning.drain_ms)
-                        .min(elapsed_ms * tuning.max_bytes_per_second / 1_000.0)
-                        .max(1.0) as usize
-                };
-                self.revealed.set(reveal_advance(
-                    text,
-                    self.revealed.get(),
-                    budget.min(backlog),
-                    tuning.words,
-                ));
-            }
-        }
-        self.reveal_at.set(now);
-        let revealed = self.revealed.get().min(len);
-        self.apply_text(&text[..revealed], mend);
-    }
-
-    /// Bytes of a streaming body the reveal cursor has handed to layout.
-    pub fn revealed_len(&self) -> usize {
-        self.revealed.get()
-    }
-
-    /// Override the reveal pacing. The streaming playground tunes against a
-    /// live render; production keeps the default.
-    pub fn set_reveal_tuning(&self, tuning: RevealTuning) {
-        self.reveal_tuning.set(tuning);
     }
 
     /// Advance the clipped height toward the body's real height.
@@ -856,7 +697,6 @@ impl MarkdownView {
             self.clip_last_height.set(Some(height));
             self.clip_rate.set(0.0);
             self.clip_velocity.set(0.0);
-            self.clip_tween.set(None);
             return;
         }
         // The container paves the road *ahead* of the body: it grows at the
@@ -881,59 +721,28 @@ impl MarkdownView {
         // Feed-forward: chase a target a short slice of growth ahead, so the
         // spring absorbs steps instead of lagging the arrival.
         let target = (height + px(rate * 0.10)).min(height + px(CLIP_RUNWAY_MAX));
-        match self.clip_physics.get() {
-            ClipPhysics::Linear => {
-                let lead = (current + px(rate.max(90.0) * dt)).max(height);
-                self.clip.set(Some(lead.min(height + px(CLIP_RUNWAY_MAX))));
-                self.clip_velocity.set(0.0);
-            }
-            ClipPhysics::Spring => {
-                // Critically damped spring on (position, velocity). A body
-                // step changes only the acceleration, so the row's motion
-                // stays smooth through it.
-                let stiffness = 220.0_f32;
-                let damping = 2.0 * (stiffness).sqrt();
-                let mut velocity = self.clip_velocity.get();
-                let accel = stiffness * f32::from(target - current) - damping * velocity;
-                velocity = (velocity + accel * dt).max(0.0);
-                self.clip_velocity.set(velocity);
-                let next = (current + px(velocity * dt)).max(height);
-                self.clip.set(Some(next.min(height + px(CLIP_RUNWAY_MAX))));
-            }
-            ClipPhysics::Bezier => {
-                let tween = match self.clip_tween.get() {
-                    Some((started, from, to)) if to == height && from <= current => {
-                        Some((started, from, to))
-                    }
-                    _ => None,
-                };
-                let (started, from, to) = tween.unwrap_or((now, current, height));
-                self.clip_tween.set(Some((started, from, to)));
-                let progress =
-                    (now.saturating_duration_since(started).as_secs_f32() / 0.18).clamp(0.0, 1.0);
-                let eased = veil_opacity(progress);
-                let next = (from + px(f32::from(to - from) * eased)).max(height);
-                self.clip.set(Some(next.min(height + px(CLIP_RUNWAY_MAX))));
-                if progress >= 1.0 {
-                    self.clip_tween.set(None);
-                }
-            }
-        }
+        // Critically damped spring on (position, velocity). A body step
+        // changes only the acceleration, so the row's motion stays smooth
+        // through it.
+        let stiffness = 220.0_f32;
+        let damping = 2.0 * (stiffness).sqrt();
+        let mut velocity = self.clip_velocity.get();
+        let accel = stiffness * f32::from(target - current) - damping * velocity;
+        velocity = (velocity + accel * dt).max(0.0);
+        self.clip_velocity.set(velocity);
+        let next = (current + px(velocity * dt)).max(height);
+        self.clip.set(Some(next.min(height + px(CLIP_RUNWAY_MAX))));
     }
 
-    /// Choose the motion law for the leading container height.
-    pub fn set_clip_physics(&self, physics: ClipPhysics) {
-        self.clip_physics.set(physics);
-    }
-
-    /// TEMPORARY: the smoothed height rate, for the diagnostics.
-    pub fn clip_rate(&self) -> f32 {
-        self.clip_rate.get()
-    }
-
-    /// Natural height of the full arrived body, when it has been measured.
-    pub fn body_height(&self) -> Option<Pixels> {
-        self.body_height.get()
+    /// Drop the leading container height. `None` reports the whole body, which
+    /// is what anything that invalidates the measured height needs: a retained
+    /// clip is a height the body has since grown past, and the row would cut
+    /// off the text below it.
+    fn release_clip(&self) {
+        self.clip.set(None);
+        self.clip_last_height.set(None);
+        self.clip_rate.set(0.0);
+        self.clip_velocity.set(0.0);
     }
 
     /// The container height the row should report, when the controller holds
@@ -966,13 +775,14 @@ impl MarkdownView {
         Some(limit)
     }
 
-    /// Parse and point the caches at `text`, which is the whole body for
-    /// [`Self::set_text`] and the revealed prefix for
-    /// [`Self::set_revealing_text`].
+    /// Parse and point the caches at `text`, the body in full.
     fn apply_text(&mut self, text: &str, mend: bool) {
         let was_streaming = self.streaming.replace(mend);
         if !mend && was_streaming {
+            // Settling drops the veil, so there is no invisible text left for
+            // a cut to land on; the row reports the body's real height again.
             *self.veil.borrow_mut() = RowVeil::default();
+            self.release_clip();
         } else if mend && !was_streaming && !self.parser.text().is_empty() {
             // A completed body that starts streaming again already has a
             // rendered baseline. Do not make that history dissolve again.
@@ -986,7 +796,7 @@ impl MarkdownView {
                 // A rewrite (edit, rewind, replacement) can change every
                 // block, so the measured heights no longer describe the body.
                 self.heights.borrow_mut().clear();
-                self.clip.set(None);
+                self.release_clip();
             }
         }
         // The mended display tail depends only on the source and the
@@ -1052,6 +862,9 @@ impl MarkdownView {
     pub fn set_render_width(&self, width: f32) {
         if self.heights_width.replace(Some(width)) != Some(width) {
             self.heights.borrow_mut().clear();
+            // The clip is a height at the old wrapping, so it is no more valid
+            // than the heights are: keeping it would cut the re-wrapped body.
+            self.release_clip();
         }
     }
 
@@ -1064,6 +877,7 @@ impl MarkdownView {
             // A metrics change moves every block's height, so the spacer
             // ledger has to be rebuilt at the new scale too.
             self.heights.borrow_mut().clear();
+            self.release_clip();
         }
     }
 
@@ -2011,6 +1825,53 @@ pub fn markdown_tail<'a>(
 /// a scroll between frames never exposes a block that was left unbuilt.
 pub const MARKDOWN_WINDOW_MARGIN: f32 = 600.0;
 
+/// The prologue every body pass shares: the document's top-level blocks, the
+/// flatten cache scoped to this view, the height ledger, and the veil frame a
+/// streaming body opens.
+struct BodyPass<'a> {
+    blocks: Vec<&'a TopBlock>,
+    ctx: Ctx<'a>,
+    heights: Rc<RefCell<Vec<(Range<usize>, Option<Pixels>)>>>,
+    /// Whether this body is streaming with the dissolve animating.
+    animate: bool,
+}
+
+/// Collect what a body pass needs before it builds a block. `None` when the
+/// body has no content — the veil frame is closed first, so a caller returns
+/// straight through.
+fn begin_body<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<BodyPass<'a>> {
+    let blocks = view.top_blocks().collect::<Vec<_>>();
+    if blocks.is_empty() {
+        if ctx.animate_streaming && view.streaming.get() {
+            let mut veil = view.veil.borrow_mut();
+            veil.begin_frame();
+            veil.finish_frame();
+        }
+        return None;
+    }
+
+    view.sync_style(ctx.palette, &ctx.metrics);
+    let animate = ctx.animate_streaming && view.streaming.get();
+    if animate {
+        view.veil.borrow_mut().begin_frame();
+    }
+    // Everything before the final block is settled, so its flattened elements
+    // stay cacheable across appends; the volatile region is the mended display
+    // tail, whose elements must be built even when the viewport is elsewhere.
+    view.volatile_from
+        .set(block_ordinal_base(view.parser.display_tail_start()));
+    let heights = view.heights.clone();
+    if heights.borrow().len() != blocks.len() {
+        heights.borrow_mut().resize(blocks.len(), (0..0, None));
+    }
+    Some(BodyPass {
+        blocks,
+        ctx: ctx.with_cache(view),
+        heights,
+        animate,
+    })
+}
+
 /// Render only the part of a long streaming body that a frame can show.
 ///
 /// A streaming response row is one virtualized list item: the moment any part
@@ -2031,48 +1892,24 @@ pub fn markdown_windowed<'a>(
     if view.has_async_blocks() {
         return markdown_capped(view, ctx, usize::MAX);
     }
-    let blocks = view.top_blocks().collect::<Vec<_>>();
-    if blocks.is_empty() {
-        if ctx.animate_streaming && view.streaming.get() {
-            let mut veil = view.veil.borrow_mut();
-            veil.begin_frame();
-            veil.finish_frame();
-        }
-        return None;
-    }
-
-    view.sync_style(ctx.palette, &ctx.metrics);
-    let ctx = ctx.with_cache(view);
-    let animate = ctx.animate_streaming && view.streaming.get();
-    if animate {
-        view.veil.borrow_mut().begin_frame();
-    }
-
-    let ranges = blocks
-        .iter()
-        .map(|top| top.range.clone())
-        .collect::<Vec<_>>();
-    let heights = view.heights.clone();
-    if heights.borrow().len() != blocks.len() {
-        heights.borrow_mut().resize(blocks.len(), (0..0, None));
-    }
-    // Everything before the final block is settled, so its flattened elements
-    // stay cacheable across appends; the volatile region is the mended display
-    // tail, whose elements must be built even when the viewport is elsewhere.
-    view.volatile_from
-        .set(block_ordinal_base(view.parser.display_tail_start()));
+    let BodyPass {
+        blocks,
+        ctx,
+        heights,
+        animate,
+    } = begin_body(view, ctx)?;
 
     let gap = px(ctx.metrics.block_gap);
     let plan = window_plan(
         &heights,
-        &ranges,
+        &blocks,
         gap,
         visible_top,
         visible_height,
         view.parser.display_tail_start().min(blocks.len()),
     );
 
-    let mut children = Vec::with_capacity(blocks.len().min(64));
+    let mut children = Vec::with_capacity(plan.child_count());
     for (group_ix, group) in plan.groups.iter().enumerate() {
         push_spacer(&plan.spacers[group_ix], &mut children);
         children.extend(render_block_range(&blocks, &ctx, group.clone(), &heights));
@@ -2096,28 +1933,36 @@ struct WindowPlan {
     spacers: Vec<Pixels>,
 }
 
+impl WindowPlan {
+    /// Elements one frame of this plan builds: every block of every group,
+    /// plus the spacers standing in for the blocks it dropped.
+    fn child_count(&self) -> usize {
+        self.spacers.len() + self.groups.iter().map(Range::len).sum::<usize>()
+    }
+}
+
 /// Choose the block window for a viewport at `visible_top` in the body's own
 /// coordinates. Blocks whose height is not yet known make the spacer
 /// arithmetic a guess, so the plan falls back to the whole body and lets that
 /// pass measure it.
 fn window_plan(
     heights: &Rc<RefCell<Vec<(Range<usize>, Option<Pixels>)>>>,
-    ranges: &[Range<usize>],
+    blocks: &[&TopBlock],
     gap: Pixels,
     visible_top: f32,
     visible_height: f32,
     volatile_start: usize,
 ) -> WindowPlan {
     let heights = heights.borrow();
-    let count = ranges.len();
+    let count = blocks.len();
     // A height counts only when it was measured for the block that currently
     // owns this index; a re-partition makes the stored range disagree, and the
     // plan then measures afresh instead of using another block's height.
-    let measured: Option<Vec<Pixels>> = ranges
+    let measured: Option<Vec<Pixels>> = blocks
         .iter()
         .enumerate()
-        .map(|(index, range)| match heights.get(index) {
-            Some((stored, height)) if stored == range => *height,
+        .map(|(index, top)| match heights.get(index) {
+            Some((stored, height)) if stored == &top.range => *height,
             // The volatile region is always built, so its heights never size
             // a spacer — and mending rewrites its range every frame. Only a
             // mismatch before it means the ledger itself is misaligned.
@@ -2206,31 +2051,14 @@ fn markdown_capped<'a>(
     ctx: &Ctx<'a>,
     max_blocks: usize,
 ) -> Option<AnyElement> {
-    let blocks = view.top_blocks().collect::<Vec<_>>();
-    if blocks.is_empty() {
-        if ctx.animate_streaming && view.streaming.get() {
-            let mut veil = view.veil.borrow_mut();
-            veil.begin_frame();
-            veil.finish_frame();
-        }
-        return None;
-    }
+    let BodyPass {
+        blocks,
+        ctx,
+        heights,
+        animate,
+    } = begin_body(view, ctx)?;
 
-    view.sync_style(ctx.palette, &ctx.metrics);
-    let ctx = ctx.with_cache(view);
-    let animate = ctx.animate_streaming && view.streaming.get();
-    if animate {
-        view.veil.borrow_mut().begin_frame();
-    }
     let first = blocks.len().saturating_sub(max_blocks);
-    // Everything before the final block is settled, so its flattened elements
-    // stay cacheable across appends.
-    view.volatile_from
-        .set(block_ordinal_base(view.parser.display_tail_start()));
-    let heights = view.heights.clone();
-    if heights.borrow().len() != blocks.len() {
-        heights.borrow_mut().resize(blocks.len(), (0..0, None));
-    }
     let children = render_block_range(&blocks, &ctx, first..blocks.len(), &heights);
     if animate {
         // Every element visible on the attach pass has synchronously adopted
@@ -3579,6 +3407,18 @@ mod tests {
         height
     }
 
+    /// The planner reads nothing but each block's source range, so a test
+    /// hands it ranges dressed as blocks.
+    fn ranged_blocks(ranges: &[Range<usize>]) -> Vec<TopBlock> {
+        ranges
+            .iter()
+            .map(|range| TopBlock {
+                range: range.clone(),
+                block: Block::Rule,
+            })
+            .collect()
+    }
+
     /// The spacers stand in for hidden blocks, so a windowed body has to
     /// measure exactly what the full body would — and it must build every
     /// block the viewport can reach.
@@ -3601,6 +3441,8 @@ mod tests {
             .iter()
             .map(|(range, _)| range.clone())
             .collect::<Vec<_>>();
+        let body = ranged_blocks(&ranges);
+        let blocks = body.iter().collect::<Vec<_>>();
         let full = measured.iter().copied().sum::<Pixels>() + gap * (measured.len() - 1) as f32;
         let heights = Rc::new(RefCell::new(heights));
 
@@ -3611,7 +3453,7 @@ mod tests {
             (1_000_000.0, 200.0),
         ] {
             // The volatile tail is the last two blocks; it is always built.
-            let plan = window_plan(&heights, &ranges, gap, top, height, measured.len() - 2);
+            let plan = window_plan(&heights, &blocks, gap, top, height, measured.len() - 2);
             assert!(
                 f32::from(plan_height(&plan, &measured, gap) - full).abs() < 0.01,
                 "top={top} groups={:?}",
@@ -3636,7 +3478,7 @@ mod tests {
         // An unknown height makes the spacer arithmetic a guess, so the plan
         // renders the whole body and lets that pass measure it.
         heights.borrow_mut()[7].1 = None;
-        let plan = window_plan(&heights, &ranges, gap, 400.0, 200.0, measured.len() - 2);
+        let plan = window_plan(&heights, &blocks, gap, 400.0, 200.0, measured.len() - 2);
         assert_eq!(plan.groups, vec![0..measured.len()]);
         assert_eq!(plan.spacers, vec![Pixels::ZERO, Pixels::ZERO]);
     }
@@ -3708,69 +3550,6 @@ mod tests {
         assert!(!code.has_async_blocks(), "math in code stays literal");
     }
 
-    /// A streaming body is handed to layout a step at a time: attaching shows
-    /// what already arrived, later frames advance toward the arrival, and
-    /// settling or a rewrite shows everything at once.
-    #[test]
-    fn a_streaming_body_reveals_toward_its_arrival() {
-        let mut view = MarkdownView::new();
-        let history = "First paragraph.";
-        view.set_revealing_text(history, true);
-        assert_eq!(view.source_len(), history.len(), "attach shows history");
-
-        let full = "First paragraph. Second paragraph grows here and keeps going.";
-        view.set_revealing_text(full, true);
-        let after_one = view.source_len();
-        assert!(after_one > history.len(), "an append reveals something");
-        assert!(
-            after_one < full.len(),
-            "a burst does not land in one frame: {after_one}"
-        );
-
-        for _ in 0..400 {
-            view.set_revealing_text(full, true);
-        }
-        assert_eq!(view.source_len(), full.len(), "the backlog drains");
-
-        // The parser only ever saw the revealed prefix, so the whole parse is
-        // of a real prefix of the source.
-        assert!(full.starts_with(view.parser.text()));
-
-        // Settling can never leave a hidden tail.
-        let mut settled = MarkdownView::new();
-        settled.set_revealing_text("one two three", true);
-        settled.set_revealing_text("one two three four five", false);
-        assert_eq!(settled.source_len(), "one two three four five".len());
-    }
-
-    /// A replacement is not an append: it must not page in over frames.
-    #[test]
-    fn a_rewritten_body_reveals_at_once() {
-        let mut view = MarkdownView::new();
-        view.set_revealing_text("alpha beta gamma", true);
-        view.set_revealing_text("alpha beta gamma delta", true);
-        assert!(view.source_len() < "alpha beta gamma delta".len());
-
-        view.set_revealing_text("REPLACED", true);
-        assert_eq!(view.source_len(), "REPLACED".len());
-    }
-
-    /// Reveal steps must not split a grapheme cluster, or the shaper would see
-    /// half an emoji or a combining mark with nothing to combine with.
-    #[test]
-    fn reveal_steps_land_on_grapheme_boundaries() {
-        let text = "a\u{0301}\u{0301}👩‍👩‍👧‍👦界b";
-        let mut cursor = 0;
-        for _ in 0..20 {
-            cursor = reveal_advance(text, cursor, 1, false);
-            assert!(text.is_char_boundary(cursor), "split at {cursor}");
-            assert!(cursor <= text.len());
-        }
-        assert_eq!(cursor, text.len());
-        // A budget larger than the whole string stops at the end.
-        assert_eq!(reveal_advance(text, 0, 10_000, false), text.len());
-    }
-
     /// The container height leads the streaming body: it grows at the body's
     /// smoothed rate so the row never reports a line step, and it never dips
     /// below the body.
@@ -3793,6 +3572,30 @@ mod tests {
         assert_eq!(view.reveal_until(0), None, "a leading height gates nothing");
     }
 
+    /// The clip is a height at one wrapping, and a retained one cuts a body
+    /// that has since grown past it. Settling and a reflow both drop it.
+    #[test]
+    fn settling_and_refowing_release_the_container_height() {
+        let mut view = MarkdownView::new();
+        view.set_render_width(600.0);
+        view.set_text("hello", true);
+        view.body_height.set(Some(px(100.0)));
+        view.advance_clip(true, Instant::now());
+        assert_eq!(view.clip_height(), Some(px(100.0)), "streaming clips");
+
+        // Settling drops the veil, so the row reports the body's real height
+        // instead of a clip the tail may have grown past.
+        view.set_text("hello", false);
+        assert_eq!(view.clip_height(), None, "settling releases the clip");
+
+        view.set_text("hello", true);
+        view.body_height.set(Some(px(100.0)));
+        view.advance_clip(true, Instant::now());
+        assert_eq!(view.clip_height(), Some(px(100.0)), "streaming clips");
+        view.set_render_width(500.0);
+        assert_eq!(view.clip_height(), None, "a reflow releases the clip");
+    }
+
     /// Mending re-partitions the tail as it settles. A height measured for
     /// the block that used to own an index must never size the block that
     /// owns it now, or the spacer arithmetic drifts by whole blocks.
@@ -3804,8 +3607,9 @@ mod tests {
             (10..20, Some(px(50.0))),
         ]));
         // The same indices now describe different source ranges.
-        let ranges = vec![0..5, 5..20];
-        let plan = window_plan(&heights, &ranges, gap, 0.0, 100.0, 1);
+        let body = ranged_blocks(&[0..5, 5..20]);
+        let blocks = body.iter().collect::<Vec<_>>();
+        let plan = window_plan(&heights, &blocks, gap, 0.0, 100.0, 1);
         assert_eq!(
             plan.groups,
             vec![0..2],
@@ -3814,8 +3618,9 @@ mod tests {
 
         // The volatile region's range changes every frame; that alone must
         // not drop the window, or a stream would re-measure everything.
-        let volatile_ranges = vec![0..10, 10..99];
-        let plan = window_plan(&heights, &volatile_ranges, gap, 0.0, 100.0, 1);
+        let volatile = ranged_blocks(&[0..10, 10..99]);
+        let volatile_blocks = volatile.iter().collect::<Vec<_>>();
+        let plan = window_plan(&heights, &volatile_blocks, gap, 0.0, 100.0, 1);
         assert_eq!(plan.groups, vec![0..2], "still one range to build");
     }
 

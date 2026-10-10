@@ -2564,14 +2564,6 @@ impl Waku {
                     let view = matches!(message.role, MessageRole::User | MessageRole::Assistant)
                         .then(|| {
                             let view = markdown.entry(message.id).or_default();
-                            // Reveal pacing changes the row's height every
-                            // frame; while the reader has left the tail, the
-                            // list is preserving their anchor, and a row that
-                            // keeps growing underneath that fight reads as a
-                            // tremor. Only a viewport resting on the tail
-                            // paces the reveal; from scrollback the whole body
-                            // is shown at once, where the new text is off
-                            // screen anyway.
                             view.set_text(message.visible_content(), message.streaming);
                             // The clipped height is what the row reports; it
                             // only animates while the reader rests on the
