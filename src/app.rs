@@ -963,7 +963,8 @@ struct SessionRuntime {
     /// The turn that exists only because the user submitted Pi's `/compact`.
     /// The command answers without a model turn, so its activity row is the
     /// whole record and its settlement must not add the answerless-turn
-    /// fallback line. Cleared when the next settlement consumes it.
+    /// fallback line. Consumed by the next settlement, which uses it to tell
+    /// its own turn from a stale one.
     compaction_turn: Option<Uuid>,
 }
 

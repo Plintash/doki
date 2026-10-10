@@ -51,8 +51,8 @@ shows none of the compaction Pi performs on its own.
   invocation shared by the daemon and the client.
 - `crates/waku-core/src/composer_complete.rs`: the Pi command catalogue.
 - `crates/waku-core/src/driver/pi.rs`: prompt routing, the `compact` RPC
-  write, compaction stream events, and the RPC answer that arrives after
-  them.
+  write, and the compaction stream events that drive its row, meter and
+  settlement.
 - `src/app/runtime.rs`, `src/app/streaming.rs`, `src/app.rs`: the settling
   turn is recorded and marked so it does not gain a synthetic reply.
 - `locales/*.yml`, `docs/providers.md`: new copy and the provider notes.

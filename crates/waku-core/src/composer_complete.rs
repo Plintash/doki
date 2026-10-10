@@ -267,8 +267,7 @@ fn assemble_slash_commands(
             // driver turns the submitted prompt into the RPC compaction
             // command — so it is offered beside them. Built-in scope keeps a
             // project, user or skill command of the same name in charge; an
-            // extension command of that name is shadowed, which is exactly
-            // what Pi's own dispatch does with its built-ins.
+            // extension command of that name is shadowed by it.
             commands.push(SlashCommand {
                 name: "compact".to_owned(),
                 description: crate::i18n::translate("commands.compact_description"),

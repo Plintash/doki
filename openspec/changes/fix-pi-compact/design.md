@@ -51,7 +51,9 @@ app already renders, reusing the existing copy:
   with the summary kept as the row's output; a failure becomes
   `activity.compaction_failed` with the provider's `errorMessage` as its
   detail; an aborted compaction just completes the row, because the stop path
-  already said what happened.
+  already said what happened. An end with no start completes nothing — a row
+  is only ever the one its start opened — while its token estimate and its
+  settlement still count.
 - `estimatedTokensAfter` refreshes `DriverEvent::UsageUpdated`; a missing
   window keeps the current one, which is how every other partial update reads.
 

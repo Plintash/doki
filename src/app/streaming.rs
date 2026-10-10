@@ -835,6 +835,21 @@ impl Waku {
                 summary,
                 interrupted,
             } => {
+                // A manual compaction's settlement carries no turn id, so the
+                // recorded compaction turn is what identifies it. When that
+                // turn is no longer the active one, the app already ended it
+                // (a stop) and this event belongs to that ended turn; settling
+                // the current one with it would end a turn that never ended.
+                let active_turn = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .and_then(AgentSession::active_turn_id);
+                let compaction_turn = runtime.compaction_turn.take();
+                if compaction_turn.is_some() && compaction_turn != active_turn {
+                    return true;
+                }
                 // A prompt the provider refused before accepting it settles as
                 // the delivery failure of the message that asked for the run:
                 // that message stays, marked undelivered with the reason, and
@@ -862,14 +877,7 @@ impl Waku {
                 {
                     self.plan_usage_stale.insert(provider);
                 }
-                if self
-                    .state
-                    .sessions
-                    .iter()
-                    .find(|session| session.id == session_id)
-                    .and_then(AgentSession::active_turn_id)
-                    .is_none()
-                {
+                if active_turn.is_none() {
                     return true;
                 }
                 let task_notification = cx.active_window().is_none().then(|| {
@@ -899,15 +907,8 @@ impl Waku {
                 // turn (Pi's `/compact`) settles with its activity row as the
                 // whole record; the answerless-turn fallback would add a
                 // synthetic reply under it. Only that recorded turn skips it.
-                let compaction_turn = self
-                    .state
-                    .sessions
-                    .iter()
-                    .find(|session| session.id == session_id)
-                    .and_then(AgentSession::active_turn_id)
-                    .is_some_and(|turn_id| runtime.compaction_turn.take() == Some(turn_id));
                 let needs_fallback =
-                    !self.turn_has_assistant_message(session_id) && !compaction_turn;
+                    !self.turn_has_assistant_message(session_id) && compaction_turn.is_none();
                 if let Some(session) = self.state.session_mut(session_id) {
                     // A provider-side user stop — the Stop button, or a denied
                     // permission the provider aborted on — settles like the

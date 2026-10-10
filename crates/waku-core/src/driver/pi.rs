@@ -1846,59 +1846,59 @@ fn handle_pi_message(
                 .get("errorMessage")
                 .and_then(Value::as_str)
                 .filter(|error| !error.trim().is_empty());
-            let id = state
-                .open_compaction
-                .take()
-                .unwrap_or_else(|| format!("pi-compaction-{}", state.compaction_sequence));
-            let mut compaction_tokens = None;
-            let item = if aborted {
-                // The stop that aborted it already said what happened; the
-                // row only has to stop being live.
-                activity::tool_activity(
-                    Some(id),
-                    ActivityKind::Tool,
-                    tr!("activity.compacting_context"),
-                    None,
-                    None,
-                    None,
-                    false,
-                    true,
-                )
-            } else if let Some(result) = result {
-                // The post-compaction estimate is what the context now holds;
-                // the window is unchanged and stays the one the meter has.
-                if let Some(tokens) = result.get("estimatedTokensAfter").and_then(Value::as_u64) {
-                    compaction_tokens = Some(tokens);
-                }
-                activity::tool_activity(
-                    Some(id),
-                    ActivityKind::Tool,
-                    tr!("activity.compacted_context"),
-                    None,
-                    result.get("summary"),
-                    None,
-                    false,
-                    true,
-                )
-            } else {
-                let message = error.map(str::to_owned).unwrap_or_else(|| {
-                    tr!(
-                        "errors.provider_reported_error",
-                        provider = flavor.display_name()
+            let compaction_tokens = result
+                .and_then(|result| result.get("estimatedTokensAfter"))
+                .and_then(Value::as_u64);
+            // The row belongs to the start that opened it. An end without one
+            // is not a compaction this session watched, so it completes
+            // nothing rather than fabricating a finished row.
+            if let Some(id) = state.open_compaction.take() {
+                let item = if aborted {
+                    // The stop that aborted it already said what happened; the
+                    // row only has to stop being live.
+                    activity::tool_activity(
+                        Some(id),
+                        ActivityKind::Tool,
+                        tr!("activity.compacting_context"),
+                        None,
+                        None,
+                        None,
+                        false,
+                        true,
                     )
-                });
-                activity::tool_activity(
-                    Some(id),
-                    ActivityKind::Tool,
-                    tr!("activity.compaction_failed"),
-                    None,
-                    Some(&Value::String(message)),
-                    None,
-                    true,
-                    true,
-                )
-            };
-            let _ = events.send(DriverEvent::RichActivity(item));
+                } else if let Some(result) = result {
+                    // The summary is the compaction's own text; the row keeps
+                    // it for the detail view.
+                    activity::tool_activity(
+                        Some(id),
+                        ActivityKind::Tool,
+                        tr!("activity.compacted_context"),
+                        None,
+                        result.get("summary"),
+                        None,
+                        false,
+                        true,
+                    )
+                } else {
+                    let message = error.map(str::to_owned).unwrap_or_else(|| {
+                        tr!(
+                            "errors.provider_reported_error",
+                            provider = flavor.display_name()
+                        )
+                    });
+                    activity::tool_activity(
+                        Some(id),
+                        ActivityKind::Tool,
+                        tr!("activity.compaction_failed"),
+                        None,
+                        Some(&Value::String(message)),
+                        None,
+                        true,
+                        true,
+                    )
+                };
+                let _ = events.send(DriverEvent::RichActivity(item));
+            }
             if let Some(tokens) = compaction_tokens {
                 report_context_tokens(events, tokens);
             }
@@ -5238,6 +5238,46 @@ mod tests {
             }
         ));
         assert!(event_rx.try_recv().is_err(), "no turn is settled for it");
+    }
+
+    #[test]
+    fn a_compaction_end_without_its_start_completes_no_row() {
+        // The row belongs to a start this session saw. An end on its own is
+        // not a compaction anyone watched, so it reports no row — only the
+        // meter it can still refresh and the settlement it owns.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "compaction_end",
+                "reason": "manual",
+                "result": {"summary": "Summary", "estimatedTokensAfter": 32000},
+                "aborted": false,
+                "willRetry": false,
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::UsageUpdated {
+                context_tokens: Some(32_000),
+                ..
+            }
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished {
+                success: true,
+                interrupted: false,
+                ..
+            }
+        ));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]

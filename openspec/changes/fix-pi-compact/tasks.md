@@ -11,7 +11,7 @@
 
 ## 3. The driver runs it instead of the model
 
-- [x] 3.1 Route a `CommandMessage::Prompt` through one function in `crates/waku-core/src/driver/pi.rs`: a Pi-flavour compact invocation with no live run writes `{"type":"compact","customInstructions"?…}` with an id whose answer is awaited by the reader, and any other prompt is sent as before; verified by a wire test for the bare and focused forms and a same-wire test that Oh My Pi still prompts
+- [x] 3.1 Route a `CommandMessage::Prompt` through one function in `crates/waku-core/src/driver/pi.rs`: a Pi-flavour compact invocation with no live run writes `{"type":"compact","customInstructions"?…}` with no id to await, and any other prompt is sent as before; verified by a wire test for the bare and focused forms and a same-wire test that Oh My Pi still prompts
 - [x] 3.2 Refuse a compact prompt that arrives while a run is live: no compact RPC is written and the submission settles as undelivered with a reason, because Pi's `session.compact()` would abort the run; verified by a driver test that opens the run liveness first
 - [x] 3.3 Write the request without an id and await nothing, like `abort` and `clear_queue`: every outcome the supported RPC reports arrives as an event, so no parallel answer path is added; verified by the wire test asserting the write carries no id and registers no pending response
 - [x] 3.4 Add `errors.compact_turn_running` to the three locale catalogs; verified by the parity test
