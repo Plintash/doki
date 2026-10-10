@@ -1724,20 +1724,28 @@ fn search_text(
 }
 
 /// Render a markdown body. Returns `None` when it has no content.
+///
+/// This is the pass a windowless frame of the streamed response takes, and the
+/// one [`markdown_windowed`] falls back to, so it fills the height ledger while
+/// the body streams.
 pub fn markdown<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<AnyElement> {
-    markdown_capped(view, ctx, usize::MAX)
+    markdown_capped(view, ctx, usize::MAX, true)
 }
 
 /// Like [`markdown`], but builds only the trailing `max_blocks` top-level
 /// blocks. The live reasoning peek shows a tail-pinned viewport while a
 /// thought streams, and building the whole growing document every pulse tick
 /// made a long think O(document) per frame; the cap makes it O(window).
+///
+/// A tail is never a body a window reads, so it keeps no height ledger: the
+/// peek would otherwise pay one measured wrapper per rendered block per pulse
+/// tick for heights nothing reads.
 pub fn markdown_tail<'a>(
     view: &'a MarkdownView,
     ctx: &Ctx<'a>,
     max_blocks: usize,
 ) -> Option<AnyElement> {
-    markdown_capped(view, ctx, max_blocks)
+    markdown_capped(view, ctx, max_blocks, false)
 }
 
 /// Extra pixels above and below the viewport that a windowed body renders.
@@ -1752,18 +1760,24 @@ pub const MARKDOWN_WINDOW_MARGIN: f32 = 600.0;
 struct BodyPass<'a> {
     blocks: Vec<&'a TopBlock>,
     ctx: Ctx<'a>,
-    /// Measured height of every top-level block, filled only while the body
-    /// streams: a window is the ledger's one reader, and only a streaming
-    /// body is windowed.
+    /// Measured height of every top-level block, filled only on the pass of a
+    /// body a window can read and only while that body streams: a window is
+    /// the ledger's one reader, and only a streaming body is windowed.
     heights: Option<BlockHeights>,
     /// Whether this body is streaming with the dissolve animating.
     animate: bool,
 }
 
-/// Collect what a body pass needs before it builds a block. `None` when the
-/// body has no content — the veil frame is closed first, so a caller returns
-/// straight through.
-fn begin_body<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<BodyPass<'a>> {
+/// Collect what a body pass needs before it builds a block. `keeps_heights`
+/// marks the passes whose body a window can read — [`markdown`] and
+/// [`markdown_windowed`], never [`markdown_tail`], whose live reasoning peek no
+/// window reads. `None` when the body has no content — the veil frame is closed
+/// first, so a caller returns straight through.
+fn begin_body<'a>(
+    view: &'a MarkdownView,
+    ctx: &Ctx<'a>,
+    keeps_heights: bool,
+) -> Option<BodyPass<'a>> {
     let blocks = view.top_blocks().collect::<Vec<_>>();
     let animate = ctx.animate_streaming && view.streaming.get();
     if blocks.is_empty() {
@@ -1786,13 +1800,12 @@ fn begin_body<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<BodyPass<'a>>
         .set(block_ordinal_base(view.parser.display_tail_start()));
     // Sized before any block is built, so every `Measured` wrapper knows its
     // own slot; `resize` truncates too, which is what a shrunk body needs.
-    // Only a streaming body keeps the ledger: a window is the only reader, and
-    // a streaming body fills it on every frame, including the ones its window
-    // falls back to a plain walk — those measure the blocks the windowed
-    // frames then size their spacers from. Every other body would pay one
-    // wrapper element per top-level block per frame for a ledger nothing
-    // reads.
-    let heights = view.streaming.get().then(|| {
+    // Only a streaming body a window can read keeps the ledger, and it fills on
+    // every frame of that body, including the ones its window falls back to a
+    // plain walk — those measure the blocks the windowed frames then size their
+    // spacers from. Every other pass would pay one wrapper element per
+    // top-level block per frame for a ledger nothing reads.
+    let heights = (keeps_heights && view.streaming.get()).then(|| {
         let heights = view.heights.clone();
         heights.borrow_mut().resize(blocks.len(), (0..0, None));
         heights
@@ -1840,14 +1853,14 @@ pub fn markdown_windowed<'a>(
     // fill, and a body holding an image or a formula can resize a block after
     // its first frame.
     if view.has_async_blocks() || ctx.has_search() || ctx.has_annotations() || ctx.has_selection() {
-        return markdown_capped(view, ctx, usize::MAX);
+        return markdown(view, ctx);
     }
     let BodyPass {
         blocks,
         ctx,
         heights,
         animate,
-    } = begin_body(view, ctx)?;
+    } = begin_body(view, ctx, true)?;
     // A window is only ever built for a streaming body, which is the same
     // condition the ledger is kept under.
     let heights = heights.expect("a windowed body always keeps its height ledger");
@@ -1928,8 +1941,9 @@ fn window_plan(
         .enumerate()
         .map(|(index, top)| match heights.get(index) {
             Some((stored, height)) if stored == &top.range => *height,
-            // The volatile region is always built, so its heights never size
-            // a spacer — and mending rewrites its range every frame. Only a
+            // The volatile region is always built — the merge below starts
+            // every group at its first block — so its heights never size a
+            // spacer, and mending rewrites its range every frame. Only a
             // mismatch before it means the ledger itself is misaligned.
             _ if index >= volatile_start => Some(Pixels::ZERO),
             _ => None,
@@ -1972,7 +1986,15 @@ fn window_plan(
     let volatile = volatile_start..count;
     if volatile.start < volatile.end {
         match groups.last_mut() {
-            Some(last) if volatile.start <= last.end => last.end = last.end.max(volatile.end),
+            // No height of the volatile region is ever measured, so none of it
+            // may be dropped: a viewport whose own window starts inside the
+            // region still has to build it from its first block, or the blocks
+            // between the two starts disappear and no spacer stands in for
+            // them.
+            Some(last) if volatile.start <= last.end => {
+                last.start = last.start.min(volatile.start);
+                last.end = last.end.max(volatile.end);
+            }
             _ => groups.push(volatile),
         }
     }
@@ -2006,13 +2028,14 @@ fn markdown_capped<'a>(
     view: &'a MarkdownView,
     ctx: &Ctx<'a>,
     max_blocks: usize,
+    keeps_heights: bool,
 ) -> Option<AnyElement> {
     let BodyPass {
         blocks,
         ctx,
         heights,
         animate,
-    } = begin_body(view, ctx)?;
+    } = begin_body(view, ctx, keeps_heights)?;
 
     let first = blocks.len().saturating_sub(max_blocks);
     let children = render_block_range(&blocks, &ctx, first..blocks.len(), heights.as_ref());
@@ -3450,6 +3473,37 @@ mod tests {
         assert_eq!(plan_height(&plan, &measured, gap), full);
     }
 
+    /// The volatile region's heights are never measured, so a window may start
+    /// only at its first block: a viewport whose own window starts inside the
+    /// region would otherwise drop the blocks between them with no height to
+    /// stand in for them.
+    #[test]
+    fn a_window_starting_inside_the_volatile_region_builds_all_of_it() {
+        let gap = px(10.0);
+        // Blocks 3-5 are the volatile tail: sized, but unmeasured — the state
+        // `begin_body` leaves them in.
+        let heights = Rc::new(RefCell::new(vec![
+            (0..1, Some(px(100.0))),
+            (1..2, Some(px(100.0))),
+            (2..3, Some(px(100.0))),
+            (0..0, None),
+            (0..0, None),
+            (0..0, None),
+        ]));
+        let body = ranged_blocks(&[0..1, 1..2, 2..3, 3..4, 4..5, 5..6]);
+        let blocks = body.iter().collect::<Vec<_>>();
+
+        // The margin puts the viewport's own window start at block 4, inside
+        // the volatile region.
+        let plan = window_plan(&heights, &blocks, gap, 935.0, 10.0, 3);
+        assert_eq!(plan.groups, vec![3..6], "{:?}", plan.groups);
+        assert_eq!(
+            plan.spacers,
+            vec![Some(px(320.0))],
+            "the spacer still stands in for the three hidden blocks"
+        );
+    }
+
     /// The height ledger is what makes the spacers exact: appends keep it,
     /// and anything that re-wraps or rewrites the body drops it.
     #[test]
@@ -3492,13 +3546,13 @@ mod tests {
         );
     }
 
-    /// The ledger costs one wrapper element per top-level block per frame,
-    /// and a window is its only reader, so a settled body must not carry one —
-    /// including on the frames a streaming body's window falls back to a
-    /// plain walk, which are the frames that measure what a window later
-    /// sizes its spacers from.
+    /// The ledger costs one wrapper element per top-level block per frame, and
+    /// a window is its only reader, so only a streaming body a window can read
+    /// carries one — including on the frames that body's window falls back to a
+    /// plain walk, which are the frames that measure what a window later sizes
+    /// its spacers from.
     #[test]
-    fn only_a_streaming_body_keeps_the_height_ledger() {
+    fn the_height_ledger_is_kept_only_where_a_window_reads_it() {
         let palette = Palette::from_theme(&Theme::dark());
         let mut view = MarkdownView::new();
         view.set_text("one\n\ntwo", true);
@@ -3508,16 +3562,24 @@ mod tests {
             Metrics::BODY,
             TranscriptSelection::default(),
         );
-        assert!(begin_body(&view, &ctx).unwrap().heights.is_some());
+        assert!(begin_body(&view, &ctx, true).unwrap().heights.is_some());
         assert_eq!(
             view.heights.borrow().len(),
             2,
             "the ledger is sized before any block is built"
         );
 
+        // The live reasoning peek streams, but through `markdown_tail`: no
+        // window ever reads it, so its pass keeps nothing.
         view.heights.borrow_mut().clear();
+        assert!(begin_body(&view, &ctx, false).unwrap().heights.is_none());
+        assert!(
+            view.heights.borrow().is_empty(),
+            "a pass no window reads sizes nothing"
+        );
+
         view.set_text("one\n\ntwo", false);
-        assert!(begin_body(&view, &ctx).unwrap().heights.is_none());
+        assert!(begin_body(&view, &ctx, true).unwrap().heights.is_none());
         assert!(
             view.heights.borrow().is_empty(),
             "a settled pass sizes nothing"

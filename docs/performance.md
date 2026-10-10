@@ -146,9 +146,11 @@ moment any scrollbar became visible.
   height, so that commit's frame builds the whole body once and measures it
   (a pure text append stays windowed, and the next frame windows again). A
   wrap-width, metric, or rewrite change drops the ledger, and the next frame's
-  full pass re-measures. Only a streaming body keeps and fills it, on every
-  frame including the ones its window falls back to a plain walk; a settled
-  body skips the per-block measuring wrapper entirely. Planning itself still
+  full pass re-measures. Only a pass a window can read keeps and fills it — the
+  streaming response body, on every frame including the ones its window falls
+  back to a plain walk; a settled body and the live reasoning tail, which
+  streams through `markdown_tail`, skip the per-block measuring wrapper
+  entirely. Planning itself still
   walks the whole ledger — two vectors and two scans a frame — so it stays
   proportional to the document, and the build is proportional to the viewport
   **per top-level block**: the planner selects whole blocks, so a body that is
@@ -170,7 +172,7 @@ moment any scrollbar became visible.
   body whenever a selection exists anywhere in the
   transcript: its spans and drag anchor live in the same registry a shift-click
   resolves against, so a hidden block could not be extended into.
-  On a 400-block reply this takes the streaming frame from ~2.65 ms to ~0.21
+  On a 400-block reply this takes the streaming frame from ~2.7 ms to ~0.36
   ms in the debug build
   (`cargo test --locked -p waku --lib bench_markdown_frame -- --ignored
   --nocapture`).
