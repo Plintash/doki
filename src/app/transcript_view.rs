@@ -2431,7 +2431,6 @@ impl Waku {
             MessageBodyWindow {
                 visible_top: f32::from(viewport.top() - bounds.top()),
                 visible_height: f32::from(viewport.size.height),
-                width: f32::from(self.transcript_layout_width.get()),
             },
         ))
     }
@@ -2560,6 +2559,15 @@ impl Waku {
                         .then(|| {
                             let view = markdown.entry(message.id).or_default();
                             view.set_text(message.visible_content(), message.streaming);
+                            // The ledger and the clip are geometry at one wrap
+                            // width, and every frame that lays this body out
+                            // records it — not only a windowed one. A stream
+                            // commit remeasures the tail rows, so the frame
+                            // after each one has no bounds to window with, and
+                            // a narrow drag keeps landing there: without this a
+                            // clip measured at the wider wrap would cut the
+                            // lines the new wrap pushed below it.
+                            view.set_render_width(f32::from(self.transcript_layout_width.get()));
                             // The clipped height is what the row reports; it
                             // only animates while the reader rests on the
                             // tail, because a row that keeps growing under a

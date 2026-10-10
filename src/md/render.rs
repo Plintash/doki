@@ -551,7 +551,7 @@ pub struct MarkdownView {
     clip: Cell<Option<Pixels>>,
     /// Natural height of the full arrived body, measured at paint.
     body_height: Rc<Cell<Option<Pixels>>>,
-    /// When the clip height last moved.
+    /// When `advance_clip` last ran.
     clip_at: Cell<Instant>,
     /// Last measured body height and smoothed growth rate, for the leading
     /// container height.
@@ -756,11 +756,14 @@ impl MarkdownView {
         self.clip.set(Some(next.min(height + px(CLIP_RUNWAY_MAX))));
     }
 
-    /// Forget the geometry measured for the old body: the block heights and
-    /// the clip that was sized from them. They are one answer, and dropping
-    /// either alone would cut a body that has since grown past it.
+    /// Forget the geometry measured for the old body: the block heights, the
+    /// body height, and the clip sized from them. They are one answer at one
+    /// wrapping, and the clip alone is not enough to drop: `advance_clip`
+    /// reads the body height back and would pin the stale height on the very
+    /// frame that has since re-wrapped.
     fn forget_measured_geometry(&self) {
         self.heights.borrow_mut().clear();
+        self.body_height.set(None);
         self.release_clip();
     }
 
@@ -795,6 +798,10 @@ impl MarkdownView {
     /// Point the height ledger at the width the next pass lays out at. A
     /// changed width drops every recorded height: a block re-wraps, so the
     /// spacer arithmetic would otherwise carry the old reflow into the row.
+    /// The transcript row records the width before every body render, because
+    /// its own frame is the only place that knows one: a windowed frame is not
+    /// guaranteed, and a pass that wraps the body at a new width has to drop
+    /// the geometry measured at the old one either way.
     pub fn set_render_width(&self, width: f32) {
         if self.heights_width.replace(Some(width)) != Some(width) {
             // The clip is a height at the old wrapping, so it is no more valid
@@ -1832,7 +1839,6 @@ fn begin_body<'a>(
 pub struct MessageBodyWindow {
     pub visible_top: f32,
     pub visible_height: f32,
-    pub width: f32,
 }
 
 /// Render only the part of a long streaming body that a frame can show.
@@ -1849,7 +1855,6 @@ pub fn markdown_windowed<'a>(
     ctx: &Ctx<'a>,
     window: MessageBodyWindow,
 ) -> Option<AnyElement> {
-    view.set_render_width(window.width);
     // A window stands in for the blocks it drops, which is only sound while
     // the frame has no other use for them: a search mark, an annotation mark,
     // and a selection are read back from the registry the built elements
@@ -3257,7 +3262,6 @@ mod tests {
                         MessageBodyWindow {
                             visible_top: top,
                             visible_height: height,
-                            width: 700.0,
                         },
                     ),
                     None => markdown(&data.view, &ctx),
@@ -3310,6 +3314,9 @@ mod tests {
             {
                 let mut data = data.borrow_mut();
                 data.view.set_text(&source, true);
+                // The row records the wrap width before every body render; the
+                // body below lays out at the same 700 px.
+                data.view.set_render_width(700.0);
                 data.window = None;
             }
             // Two frames so the ledger is filled before it is timed.
@@ -3713,17 +3720,69 @@ mod tests {
     fn the_container_height_leads_the_body() {
         let mut view = MarkdownView::new();
         view.set_text("hello", true);
-        view.body_height.set(Some(px(100.0)));
         let start = Instant::now();
-        view.advance_clip(true, start);
-        assert!(view.clip_height().unwrap() >= px(100.0));
+        let frame = Duration::from_millis(8);
+        // One laid-out line of the body, and the cadence the stream lays one
+        // out at: the height the body measures steps, the reported height is
+        // the one that has to stay smooth.
+        let line = 13.0_f32;
+        let mut measured = px(100.0);
+        let mut now = start;
+        view.body_height.set(Some(measured));
+        view.advance_clip(true, now);
+        assert_eq!(
+            view.clip_height(),
+            Some(measured),
+            "the first frame reports the body it measured"
+        );
 
-        view.body_height.set(Some(px(200.0)));
-        view.advance_clip(true, start + Duration::from_millis(10));
-        let lead = view.clip_height().expect("a container height");
-        assert!(lead > px(100.0) && lead <= px(244.0), "{lead:?}");
+        let mut samples = Vec::new();
+        for frame_ix in 0..(15 * 12) {
+            if frame_ix > 0 && frame_ix % 15 == 0 {
+                measured += px(line);
+            }
+            view.body_height.set(Some(measured));
+            now += frame;
+            view.advance_clip(true, now);
+            let clip = view.clip_height().expect("a container height");
+            assert!(clip >= measured, "the clip fell behind the body: {clip:?}");
+            assert!(
+                clip <= measured + px(CLIP_RUNWAY_MAX),
+                "the clip ran past its runway: {clip:?}"
+            );
+            samples.push((measured, clip));
+        }
 
-        view.advance_clip(false, start + Duration::from_millis(20));
+        // The row glides: it never gives back height it has already reported
+        // and never takes the body's whole line step, which is what a
+        // controller pinned to the measured height reports exactly.
+        let steps = samples
+            .windows(2)
+            .map(|pair| f32::from(pair[1].1 - pair[0].1))
+            .collect::<Vec<_>>();
+        assert!(
+            steps.iter().all(|step| *step >= 0.0),
+            "the reported height dipped: {steps:?}"
+        );
+        // The one frame that does take the whole step is the first: the
+        // smoothed rate is zero until the body has grown once, so only after
+        // that can the container bank the lead the next line lands in.
+        assert!(
+            steps[15..].iter().all(|step| *step < line),
+            "a settled frame repeated the body's line step: {:?}",
+            &steps[15..]
+        );
+        // Banked ahead of the body, not level with it: the last line steps
+        // still report the body's own height as already covered.
+        assert!(
+            samples[samples.len() - 15..]
+                .iter()
+                .all(|(measured, clip)| clip > measured),
+            "the container stopped leading the body: {:?}",
+            &samples[samples.len() - 15..]
+        );
+
+        view.advance_clip(false, now + frame);
         assert_eq!(
             view.clip_height(),
             None,
@@ -3830,7 +3889,10 @@ mod tests {
     }
 
     /// The clip is a height at one wrapping, and a retained one cuts a body
-    /// that has since grown past it. Settling and a reflow both drop it.
+    /// that has since grown past it. Settling and a reflow both drop it, and
+    /// the reflow takes the measurement with it: the controller reads that
+    /// height back, so a clip released while it stands is pinned right back on
+    /// the frame that has already re-wrapped.
     #[test]
     fn settling_and_reflowing_release_the_container_height() {
         let mut view = MarkdownView::new();
@@ -3855,6 +3917,12 @@ mod tests {
         assert_eq!(view.clip_height(), Some(px(100.0)), "streaming clips");
         view.set_render_width(500.0);
         assert_eq!(view.clip_height(), None, "a reflow releases the clip");
+        view.advance_clip(true, Instant::now());
+        assert_eq!(
+            view.clip_height(),
+            None,
+            "the height measured at the old wrap is forgotten, so the clip stays released"
+        );
     }
 
     /// Re-attaching to a body that streamed while its row was off screen
@@ -3934,7 +4002,6 @@ mod tests {
                         MessageBodyWindow {
                             visible_top: top,
                             visible_height: height,
-                            width: 700.0,
                         },
                     ),
                     None => markdown(&self.view, &ctx),

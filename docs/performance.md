@@ -146,9 +146,14 @@ moment any scrollbar became visible.
   height, so that commit's frame builds the whole body once and measures it
   (a pure text append stays windowed, and the next frame windows again). A
   wrap-width, metric, or rewrite change drops the ledger, and the next frame's
-  full pass re-measures. Only a pass a window can read keeps and fills it — the
-  streaming response body, on every frame including the ones its window falls
-  back to a plain walk; a settled body, the live reasoning tail, which streams
+  full pass re-measures. The row records the width it is about to lay a body
+  out at before every body render — a windowed frame is not guaranteed, since a
+  stream commit remeasures the tail rows — so a reflow drops the ledger, the
+  measured body height, and the clip on the frame the body actually re-wraps,
+  whether or not that frame had bounds to window with. Only a pass a window can
+  read keeps and fills it — the streaming response body, on every frame
+  including the ones its window falls back to a plain walk; a settled body, the
+  live reasoning tail, which streams
   through `markdown_tail`, and a body holding an image or a formula, which no
   window is built for, skip the per-block measuring wrapper
   entirely. Planning itself still
