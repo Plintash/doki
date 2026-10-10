@@ -1,7 +1,7 @@
 <!--
-Read CONTRIBUTING.md before submitting. Write all responses yourself:
-PR descriptions and comments must not be LLM generated. PRs with obviously
-LLM-generated text will be closed immediately without review.
+Write all responses yourself: PR descriptions and comments must not be LLM
+generated. PRs with obviously LLM-generated text will be closed immediately
+without review.
 -->
 
 ## Problem and solution
@@ -10,8 +10,8 @@ LLM-generated text will be closed immediately without review.
 
 ## Checks
 
-<!-- List the checks you ran and their results. See CONTRIBUTING.md for the
-required checks. For visible changes, describe how you verified the app. -->
+<!-- List the checks you ran and their results. For visible changes, describe
+how you verified the app. -->
 
 ## Limitations and follow-up
 
