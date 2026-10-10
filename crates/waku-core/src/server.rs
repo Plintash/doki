@@ -391,6 +391,14 @@ impl Hub {
     ) {
         let mut state = self.state.lock();
         let mut changed = false;
+        // The entry's objective is the *resolved* display value, which the
+        // daemon derives rather than the saving client authoring: a client that
+        // just set or cleared a task's goal sends the goal, the goal lives in
+        // the hydrated detail, and the daemon resolves it into this entry. So
+        // the subscriber that caused the change is the one subscriber that
+        // cannot already be holding it — the source is skipped for their own
+        // change to be told about, not to be kept from it.
+        let mut resolution_changed = false;
         for project in projects {
             let next = ProjectCatalogEntry::from(project);
             changed |= state
@@ -400,13 +408,21 @@ impl Hub {
         }
         for session in sessions {
             let next = SessionCatalogEntry::from(session);
-            changed |= state
-                .catalog_sessions
-                .insert(session.id, next.clone())
-                .is_none_or(|previous| previous != next);
+            let previous = state.catalog_sessions.insert(session.id, next.clone());
+            if let Some(previous) = previous {
+                changed |= previous != next;
+                resolution_changed |= previous.objective != next.objective;
+            } else {
+                changed = true;
+            }
         }
         if changed {
-            Self::broadcast_task_state_changed(&mut state, source_subscriber_id);
+            let skip = if resolution_changed {
+                u64::MAX
+            } else {
+                source_subscriber_id
+            };
+            Self::broadcast_task_state_changed(&mut state, skip);
         }
     }
 
@@ -1299,6 +1315,37 @@ mod tests {
             observer_rx
                 .recv_timeout(Duration::from_millis(100))
                 .is_err()
+        );
+    }
+
+    /// The client that sets a goal is the one client a revision would
+    /// otherwise skip, and it is the one client that cannot already hold the
+    /// result: the daemon resolves the goal into the list entry, so the goal
+    /// text reaches a client that only knows the objective it replaced.
+    #[test]
+    fn a_goal_change_reaches_the_client_that_made_it() {
+        let hub = Hub::default();
+        let (source_tx, source_rx) = unbounded();
+        let source_id = hub.subscribe(&[], Subscriber::new(source_tx).0);
+
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.objective = Some("Sidebar schedules tasks by state".into());
+        hub.task_state_saved(source_id, &[], std::slice::from_ref(&session));
+        assert!(
+            source_rx.try_recv().is_err(),
+            "a client's own save is not news to the client that made it"
+        );
+
+        // The same client sets a goal. Nothing it authored changed — the
+        // daemon resolves the goal into the entry — so it has to be told.
+        session.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+        hub.task_state_saved(source_id, &[], std::slice::from_ref(&session));
+        assert!(
+            matches!(
+                source_rx.recv_timeout(Duration::from_secs(1)),
+                Ok(ServerMessage::TaskStateChanged { .. })
+            ),
+            "the setter has to hear that its task's objective was resolved"
         );
     }
 

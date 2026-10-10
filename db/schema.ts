@@ -64,6 +64,13 @@ export const sessions = sqliteTable(
      * it, so a task-state save can never set or clear it.
      */
     archivedAt: integer("archived_at"),
+    /**
+     * The provider's goal for this task, as JSON. The goal also lives in the
+     * hydrated detail, but the list resolves the objective out of it, so a
+     * restart that reads only the narrow row would lose the goal and fall back
+     * to the generated objective it replaced.
+     */
+    threadGoal: text("thread_goal"),
   },
   (table) => [
     index("sessions_by_project").on(table.projectId, table.updatedAt),

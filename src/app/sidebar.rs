@@ -356,7 +356,12 @@ fn mix_sidebar_session_facts(fingerprint: u64, session: &AgentSession) -> u64 {
     let fingerprint = mix_uuid(fingerprint, session.project_id);
     let fingerprint = mix(fingerprint, sidebar_session_timestamp(session));
     let fingerprint = mix(fingerprint, status);
-    mix(fingerprint, u64::from(session.archived_at.is_some()))
+    let fingerprint = mix(fingerprint, u64::from(session.archived_at.is_some()));
+    // "Needs you" orders by how long the task has been blocked, and a
+    // re-stamped blockage moves a row without moving its status or its
+    // recency — the field that decided the new order has to be folded in here
+    // or the snapshot keeps the order the old stamp produced.
+    mix(fingerprint, session.blocked_since.unwrap_or(0))
 }
 
 /// The active status section a task belongs to, or none while the task is
@@ -440,29 +445,40 @@ fn mix_sidebar_archived_visibility(
 
 /// Lift the started tasks that were put away out of the sections a view would
 /// otherwise file them in, keeping the order that view sorted them into, and
-/// say whether their trailing section stands.
+/// give the ids the trailing section lists and whether that section stands.
 ///
-/// An archived task is removed here whatever its status — waiting, running or
-/// idle — so a view's sections can never disagree with the trailing one about
-/// where a task belongs. The trailing section stands when the user asked to
-/// see what was put away, and also when the task the window is showing is one
-/// of them, which is what keeps the open task from becoming a gap in the list
-/// that is showing it.
+/// An archived task is removed from the view's own sections here whatever its
+/// status — waiting, running or idle — so a view's sections can never disagree
+/// with the trailing one about where a task belongs.
+///
+/// The trailing section stands when the user asked to see what was put away,
+/// and also when the task the window is showing is one of them, which is what
+/// keeps the open task from becoming a gap in the list that is showing it. It
+/// stands for that task *alone* while the reveal is off: listing every archived
+/// task under it would put the whole archive back on screen through the one
+/// section that has to stay.
 fn split_archived_sessions<'a>(
     sessions: Vec<&'a AgentSession>,
     show_archived: bool,
-    active_task_archived: bool,
+    active_task: Option<Uuid>,
 ) -> (Vec<&'a AgentSession>, Vec<Uuid>, bool) {
+    let active_archived = active_task.filter(|active| {
+        sessions
+            .iter()
+            .any(|session| session.id == *active && session.archived_at.is_some())
+    });
     let mut listed = Vec::with_capacity(sessions.len());
     let mut archived = Vec::new();
     for session in sessions {
         if session.archived_at.is_some() {
-            archived.push(session.id);
+            if show_archived || Some(session.id) == active_archived {
+                archived.push(session.id);
+            }
         } else {
             listed.push(session);
         }
     }
-    (listed, archived, show_archived || active_task_archived)
+    (listed, archived, show_archived || active_archived.is_some())
 }
 
 /// Apply one archive action to a client-held task the way the daemon applies
@@ -732,18 +748,41 @@ struct SidebarTaskCard {
     recency: SharedString,
 }
 
-/// The card for one task, resolved from values the client already holds.
+/// The values a row captures for its card the frame it is drawn.
 ///
-/// A row reports a busy task's objective only when the provider has no step for
-/// it; the card is what the task *is*, so it gives the objective its own line
-/// and lets the reason or the step say where the task stands.
-fn sidebar_task_card(
+/// The card is only ever revealed by the pointer or by keyboard focus, so the
+/// row holds the values and the card is assembled when one of those surfaces
+/// asks for it. Wording the recency and building the card both allocate, and
+/// this runs for every visible row on every frame.
+///
+/// Every field is a value the client already holds — the task's list entry, its
+/// row facts, its project, and the branch the client knows it is on — and the
+/// field types are the guarantee that revealing the card cannot fetch anything:
+/// there is no daemon client, store, or path handle in here to fetch one with,
+/// so a hover can never issue a request, retry, or spawn work.
+#[derive(Clone)]
+struct SidebarTaskCardSource {
+    session_id: Uuid,
+    title: SharedString,
+    objective: Option<SharedString>,
+    state: Option<SidebarRowDetail>,
+    project: SharedString,
+    branch: Option<SharedString>,
+    turns: Option<u32>,
+    changed_files: Option<u32>,
+    /// Unix seconds the task last moved at. The card words it in the same
+    /// terms as the row's trailing label when it is drawn.
+    recency_at: u64,
+}
+
+/// The values one task's card is built from: the row's list values, its cached
+/// row facts, and the project the client knows it belongs to.
+fn sidebar_task_card_source(
     session: &AgentSession,
     facts: &SidebarSessionFacts,
     project: Option<&Project>,
-    now: u64,
-) -> SidebarTaskCard {
-    SidebarTaskCard {
+) -> SidebarTaskCardSource {
+    SidebarTaskCardSource {
         session_id: session.id,
         title: SharedString::from(localized_session_title(session)),
         objective: facts.objective.clone(),
@@ -753,9 +792,35 @@ fn sidebar_task_card(
         branch: persisted_sidebar_branch_label(&session.workspace).map(SharedString::from),
         turns: facts.turn_count,
         changed_files: facts.changed_files,
-        recency: SharedString::from(format_time_ago(
-            now.saturating_sub(sidebar_session_timestamp(session)),
-        )),
+        recency_at: sidebar_session_timestamp(session),
+    }
+}
+
+impl SidebarTaskCardSource {
+    /// The card as a surface reveals it. Both routes to a card — the pointer's
+    /// tooltip and the row's focus card — run this when they open, so the
+    /// assembly happens once per reveal rather than once per row per frame.
+    fn resolve(&self) -> SidebarTaskCard {
+        sidebar_task_card(self, unix_time())
+    }
+}
+
+/// The card for one task, resolved from values the client already holds.
+///
+/// A row reports a busy task's objective only when the provider has no step for
+/// it; the card is what the task *is*, so it gives the objective its own line
+/// and lets the reason or the step say where the task stands.
+fn sidebar_task_card(source: &SidebarTaskCardSource, now: u64) -> SidebarTaskCard {
+    SidebarTaskCard {
+        session_id: source.session_id,
+        title: source.title.clone(),
+        objective: source.objective.clone(),
+        state: source.state.clone(),
+        project: source.project.clone(),
+        branch: source.branch.clone(),
+        turns: source.turns,
+        changed_files: source.changed_files,
+        recency: SharedString::from(format_time_ago(now.saturating_sub(source.recency_at))),
     }
 }
 
@@ -810,6 +875,47 @@ impl Render for SidebarTaskCard {
     }
 }
 
+/// What every line of one card shares: the surface the lines sit on, the
+/// card's id, and whether the system asked for reduced motion.
+///
+/// A card's lines differ in their text, their icon, their color and their
+/// trailing element, and agree on everything else. Holding the agreement here
+/// is what lets a line read as data — `lines.line("project", …)` — instead of
+/// repeating one seven-argument call five times and rebuilding the element id
+/// at each of them.
+struct SidebarCardLines {
+    session_id: Uuid,
+    surface: Hsla,
+    reduce_motion: bool,
+}
+
+impl SidebarCardLines {
+    /// One line of the card, named by its own suffix. gpui tracks an animation
+    /// by element id, so each line needs an id of its own: a shared one would
+    /// hand the next line the previous line's finished animation.
+    fn line(
+        &self,
+        suffix: &str,
+        icon_path: Option<&'static str>,
+        text: SharedString,
+        color: Hsla,
+        trailing: Option<AnyElement>,
+    ) -> Div {
+        sidebar_card_line(
+            ElementId::Name(SharedString::from(format!(
+                "card-{}-{suffix}",
+                self.session_id
+            ))),
+            icon_path,
+            text,
+            color,
+            self.surface,
+            trailing,
+            self.reduce_motion,
+        )
+    }
+}
+
 /// The card's one compact stack, drawn: no dividers and no columns, every line
 /// one line tall. The facts are the shortest line, so they take the right edge
 /// of the block that carries them rather than a row of their own.
@@ -818,7 +924,11 @@ fn sidebar_task_card_view(
     cx: &mut Context<SidebarTaskCard>,
 ) -> impl IntoElement {
     let theme = Theme::current(cx);
-    let reduce_motion = cx.reduce_motion();
+    let lines = SidebarCardLines {
+        session_id: card.session_id,
+        surface: theme.raised,
+        reduce_motion: cx.reduce_motion(),
+    };
     let facts = sidebar_card_facts_line(card.turns, card.changed_files, &card.recency);
     let facts_element = |color: Hsla, facts: SharedString| {
         div()
@@ -850,73 +960,49 @@ fn sidebar_task_card_view(
         .text_size(sp(12.5))
         .line_height(sp(16.0))
         .child(
-            sidebar_card_line(
-                ElementId::Name(SharedString::from(format!(
-                    "card-{}-title",
-                    card.session_id
-                ))),
-                None,
-                card.title.clone(),
-                theme.text,
-                theme.raised,
-                facts_ride_the_title.then(|| facts_element(theme.text_ghost, facts.clone())),
-                reduce_motion,
-            )
-            .text_size(sp(13.5))
-            .font_weight(FontWeight::MEDIUM),
+            lines
+                .line(
+                    "title",
+                    None,
+                    card.title.clone(),
+                    theme.text,
+                    facts_ride_the_title.then(|| facts_element(theme.text_ghost, facts.clone())),
+                )
+                .text_size(sp(13.5))
+                .font_weight(FontWeight::MEDIUM),
         )
         .when_some(objective, |element, objective| {
-            element.child(sidebar_card_line(
-                ElementId::Name(SharedString::from(format!(
-                    "card-{}-objective",
-                    card.session_id
-                ))),
+            element.child(lines.line(
+                "objective",
                 Some("icons/target.svg"),
                 objective,
                 theme.text_secondary,
-                theme.raised,
                 (!facts_ride_the_title).then(|| facts_element(theme.text_ghost, facts.clone())),
-                reduce_motion,
             ))
         })
         .when_some(card.state.as_ref(), |element, state| {
-            element.child(sidebar_card_line(
-                ElementId::Name(SharedString::from(format!(
-                    "card-{}-state",
-                    card.session_id
-                ))),
+            element.child(lines.line(
+                "state",
                 Some(state.icon()),
                 state.text().clone(),
                 theme.text_secondary,
-                theme.raised,
                 None,
-                reduce_motion,
             ))
         })
-        .child(sidebar_card_line(
-            ElementId::Name(SharedString::from(format!(
-                "card-{}-project",
-                card.session_id
-            ))),
+        .child(lines.line(
+            "project",
             Some("icons/folder.svg"),
             card.project.clone(),
             theme.text_tertiary,
-            theme.raised,
             None,
-            reduce_motion,
         ))
         .when_some(card.branch.clone(), |element, branch| {
-            element.child(sidebar_card_line(
-                ElementId::Name(SharedString::from(format!(
-                    "card-{}-branch",
-                    card.session_id
-                ))),
+            element.child(lines.line(
+                "branch",
                 Some("icons/git-branch.svg"),
                 branch,
                 theme.text_tertiary,
-                theme.raised,
                 None,
-                reduce_motion,
             ))
         })
 }
@@ -938,7 +1024,9 @@ const SIDEBAR_CARD_MARQUEE: Duration = Duration::from_millis(1_400);
 /// `ease_out_quint`, which is what makes it arrive at the end instead of
 /// hitting it - and it is skipped entirely when the system asks for reduced
 /// motion, which leaves the fade as the whole treatment.
-#[allow(clippy::too_many_arguments)]
+///
+/// Callers go through [`SidebarCardLines::line`], which holds what every line
+/// of one card agrees on.
 fn sidebar_card_line(
     id: ElementId,
     icon_path: Option<&'static str>,
@@ -1018,14 +1106,18 @@ fn sidebar_card_line_fade(surface: Hsla) -> impl IntoElement {
 /// row keeps the first handle for its context menu, so opening one surface
 /// never opens the other.
 ///
-/// Both routes draw the card the caller already resolved; revealing it is a
-/// paint, so neither can ask the daemon for anything.
+/// The row hands over the values rather than the card, and each surface
+/// resolves them when it opens. Revealing the card is a paint either way, so
+/// neither can ask the daemon for anything.
 fn with_sidebar_task_card(
     row: Stateful<Div>,
-    card: SidebarTaskCard,
+    source: SidebarTaskCardSource,
     card_handle: &ContextMenuHandle,
 ) -> Div {
-    let hover = card.clone();
+    // Both closures build the card when their surface opens, from the source
+    // the row captured while it was drawn, so no visible row assembles one on
+    // a frame that is not revealing it.
+    let hover = source.clone();
     // While the card stands for this row's keyboard focus the tooltip stays
     // off, so the pointer never draws a second copy of it.
     //
@@ -1033,10 +1125,10 @@ fn with_sidebar_task_card(
     // second, so the pointer has to be able to come to rest on the card and read
     // it. A plain tooltip vanishes the moment the pointer leaves the row.
     let row = row.when(!card_handle.is_open(), |row| {
-        row.hoverable_tooltip(move |_window, cx| hover.clone().into_view(cx))
+        row.hoverable_tooltip(move |_window, cx| hover.resolve().into_view(cx))
     });
     anchor_popover(row, card_handle, MenuAlign::BelowLeft, move |_, _, cx| {
-        card.clone().into_view(cx).into_any_element()
+        source.resolve().into_view(cx).into_any_element()
     })
 }
 
@@ -2082,18 +2174,6 @@ impl Waku {
         self.sidebar_rows_snapshot.borrow().clone()
     }
 
-    /// Whether the open task is one that was put away. The task the window is
-    /// showing is never a gap in the list showing it, so this is the second
-    /// half of the trailing archived section's gate.
-    fn active_task_is_archived(&self) -> bool {
-        self.state.selected_session.is_some_and(|selected| {
-            self.state
-                .sessions
-                .iter()
-                .any(|session| session.id == selected && session.archived_at.is_some())
-        })
-    }
-
     /// Snapshot the session history as a flat list of lightweight rows under
     /// the current grouping and ordering preferences, together with the counts
     /// the section headers label themselves with: one per active status
@@ -2122,7 +2202,7 @@ impl Waku {
         let (sorted_sessions, archived_ids, archived_section_stands) = split_archived_sessions(
             sorted_sessions,
             self.state.sidebar_show_archived,
-            self.active_task_is_archived(),
+            self.state.selected_session,
         );
 
         let mut status_section_counts = [0usize; SidebarStatusSection::ALL.len()];
@@ -2291,7 +2371,7 @@ impl Waku {
         match *row {
             SidebarRow::Search => self.render_sidebar_search(cx).into_any_element(),
             SidebarRow::Header(group) => self
-                .render_sidebar_group_header(group, index == 1, cx)
+                .render_sidebar_group_header(group, index == 1, window, cx)
                 .into_any_element(),
             SidebarRow::Session(session_id) => self
                 .render_sidebar_session_item(session_id, window, cx)
@@ -2310,6 +2390,7 @@ impl Waku {
         &self,
         group: SidebarGroup,
         first: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = Theme::current(cx);
@@ -2322,6 +2403,11 @@ impl Waku {
             .entry(group)
             .or_insert_with(|| cx.focus_handle())
             .clone();
+        // The header is the control the chevron hints at, and it is reachable
+        // by Tab. The hint is revealed on hover and on that keyboard focus
+        // alike, so the one thing the section reveals is never hover-only —
+        // focus changes redraw, so reading the focus here is enough.
+        let header_focused = header_focus.is_focused(window) && window.last_input_was_keyboard();
         let show_folder_icon =
             matches!(group, SidebarGroup::Project(_) | SidebarGroup::Projectless);
         let folder_icon = if collapsed {
@@ -2366,7 +2452,7 @@ impl Waku {
                 .when(collapsed, |icon| {
                     icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.75)))
                 })
-                .invisible()
+                .when(!header_focused, |icon| icon.invisible())
                 .group_hover(group_name.clone(), |icon| icon.visible())
         });
         let compose = show_folder_icon.then(|| {
@@ -2811,10 +2897,10 @@ impl Waku {
             .cloned()
             .unwrap_or_default();
         let detail = sidebar_row_detail(session, &facts);
-        // What the card answers with, resolved once here from the values the
-        // client already holds: the hover tooltip and the focus-revealed card
-        // render the same content.
-        let card = sidebar_task_card(session, &facts, project, unix_time());
+        // What the card answers with, captured here from the values the client
+        // already holds: the hover tooltip and the focus-revealed card render
+        // the same content, assembled when one of them opens.
+        let card = sidebar_task_card_source(session, &facts, project);
         let menu = self.menu_handle(format!("session-{session_id}"), cx);
         let row_focus = sidebar_row_focus(&menu);
         let card_handle = sidebar_task_card_handle(session_id, &row_focus, window, cx);
@@ -3936,6 +4022,35 @@ mod tests {
         assert_ne!(test_snapshot_fingerprint(&[&task]), before);
     }
 
+    /// A blockage reported again with a newer clock moves a row's place in
+    /// "needs you" without moving its status, its recency or its identity. The
+    /// fingerprint has to carry the stamp that decided the new order.
+    #[test]
+    fn re_stamping_a_blockage_re_sections_the_row_snapshot() {
+        let mut first = status_test_session(SessionStatus::Waiting);
+        first.blocked_since = Some(1_000);
+        let mut second = status_test_session(SessionStatus::Waiting);
+        second.blocked_since = Some(2_000);
+        assert_eq!(
+            status_section_ids(&[&first, &second], SidebarStatusSection::NeedsYou),
+            vec![first.id, second.id]
+        );
+        let before = test_snapshot_fingerprint(&[&first, &second]);
+
+        second.blocked_since = Some(500);
+
+        assert_eq!(
+            status_section_ids(&[&first, &second], SidebarStatusSection::NeedsYou),
+            vec![second.id, first.id],
+            "the re-stamped blockage leads the section"
+        );
+        assert_ne!(
+            test_snapshot_fingerprint(&[&first, &second]),
+            before,
+            "the snapshot has to rebuild or the row keeps the old stamp's order"
+        );
+    }
+
     /// The archived-visibility inputs `sidebar_rows_cached` folds over and
     /// above the session list: turning the reveal preference on, or the open
     /// task becoming one of the archived ones, has to re-section the rows.
@@ -3967,7 +4082,7 @@ mod tests {
         let (listed, archived, stands) = split_archived_sessions(
             vec![&archived_waiting as &AgentSession, &running, &idle],
             false,
-            false,
+            None,
         );
 
         assert_eq!(
@@ -3975,11 +4090,11 @@ mod tests {
             vec![running.id, idle.id],
             "an archived task joins no active section, whatever its status"
         );
-        assert_eq!(archived, vec![archived_waiting.id]);
         assert!(
-            !stands,
+            archived.is_empty(),
             "what was put away stays hidden until the user asks for it"
         );
+        assert!(!stands);
     }
 
     #[test]
@@ -3987,16 +4102,55 @@ mod tests {
         let mut archived = status_test_session(SessionStatus::Idle);
         archived.archived_at = Some(1_700_000_000);
 
-        let (_, _, hidden) = split_archived_sessions(vec![&archived], false, false);
-        assert!(!hidden, "the default is not to reveal what was put away");
-
-        let (_, _, revealed) = split_archived_sessions(vec![&archived], true, false);
-        assert!(revealed, "the toggle reveals the trailing archived section");
-
-        let (_, _, open_task) = split_archived_sessions(vec![&archived], false, true);
+        let (_, hidden, hidden_stands) = split_archived_sessions(vec![&archived], false, None);
         assert!(
+            hidden.is_empty(),
+            "the default is not to reveal what was put away"
+        );
+        assert!(!hidden_stands);
+
+        let (_, revealed, revealed_stands) = split_archived_sessions(vec![&archived], true, None);
+        assert_eq!(revealed, vec![archived.id]);
+        assert!(
+            revealed_stands,
+            "the toggle reveals the trailing archived section"
+        );
+
+        let (_, open_task, open_stands) =
+            split_archived_sessions(vec![&archived], false, Some(archived.id));
+        assert_eq!(
             open_task,
+            vec![archived.id],
             "the open task is never a gap, so its section stands whatever the toggle says"
+        );
+        assert!(open_stands);
+    }
+
+    /// With the reveal off the section stands only for the open task, and it
+    /// has to stand for that one *alone*: appending every archived id would
+    /// put the whole archive back on screen through the section that exists to
+    /// keep the open task from becoming a gap.
+    #[test]
+    fn the_archived_section_lists_one_task_while_the_reveal_is_off() {
+        let mut open = status_test_session(SessionStatus::Idle);
+        open.archived_at = Some(1_700_000_000);
+        let mut other = status_test_session(SessionStatus::Waiting);
+        other.archived_at = Some(1_700_000_100);
+
+        let sessions = vec![&open as &AgentSession, &other];
+        let (_, listed, stands) = split_archived_sessions(sessions.clone(), false, Some(open.id));
+        assert_eq!(
+            listed,
+            vec![open.id],
+            "only the open task is on screen, not the archive behind it"
+        );
+        assert!(stands);
+
+        let (_, revealed, _) = split_archived_sessions(sessions, true, Some(open.id));
+        assert_eq!(
+            revealed,
+            vec![open.id, other.id],
+            "the toggle reveals every task that was put away"
         );
     }
 
@@ -4277,6 +4431,18 @@ mod tests {
         }
     }
 
+    /// One row's card, assembled the way a reveal assembles it: the source a
+    /// row captures, resolved at a known instant so the recency is a fixed
+    /// word to assert on.
+    fn test_card(
+        session: &AgentSession,
+        facts: &SidebarSessionFacts,
+        project: Option<&Project>,
+        now: u64,
+    ) -> SidebarTaskCard {
+        sidebar_task_card(&sidebar_task_card_source(session, facts, project), now)
+    }
+
     #[test]
     fn a_task_card_carries_everything_the_client_holds() {
         let mut task = task_with_a_live_plan_step("Move the row's second line");
@@ -4292,7 +4458,7 @@ mod tests {
         let project = card_test_project(task.project_id, "doki");
 
         let facts = sidebar_session_facts(&task);
-        let card = sidebar_task_card(&task, &facts, Some(&project), 1_300);
+        let card = test_card(&task, &facts, Some(&project), 1_300);
 
         assert_eq!(card.title, SharedString::from("Fix the sidebar row"));
         assert_eq!(
@@ -4329,7 +4495,7 @@ mod tests {
         let mut stepped = task_with_a_live_plan_step("Refresh the cache");
         stepped.objective = Some("The sidebar row says where the task stands".to_owned());
         let facts = sidebar_session_facts(&stepped);
-        let card = sidebar_task_card(&stepped, &facts, None, 0);
+        let card = test_card(&stepped, &facts, None, 0);
 
         assert_eq!(
             card.state,
@@ -4345,7 +4511,7 @@ mod tests {
         let mut unstepped = task_without_a_live_plan_step();
         unstepped.objective = Some("The sidebar row says where the task stands".to_owned());
         let facts = sidebar_session_facts(&unstepped);
-        let card = sidebar_task_card(&unstepped, &facts, None, 0);
+        let card = test_card(&unstepped, &facts, None, 0);
 
         assert_eq!(card.state, None);
         assert_eq!(
@@ -4363,7 +4529,7 @@ mod tests {
         task.set_blocked_reason("Approve the network request");
 
         let facts = sidebar_session_facts(&task);
-        let card = sidebar_task_card(&task, &facts, None, 0);
+        let card = test_card(&task, &facts, None, 0);
 
         assert_eq!(
             card.state,
@@ -4405,11 +4571,10 @@ mod tests {
                             .tab_index(0)
                             .w(px(120.0))
                             .h(px(32.0)),
-                        sidebar_task_card(
+                        sidebar_task_card_source(
                             &AgentSession::new(Uuid::new_v4(), ProviderKind::Claude),
                             &SidebarSessionFacts::default(),
                             None,
-                            0,
                         ),
                         &handle,
                     ),
@@ -4630,7 +4795,10 @@ mod tests {
     fn the_row_card_asks_for_nothing() {
         let source = include_str!("sidebar.rs");
         for anchor in [
+            "\nfn sidebar_task_card_source(",
             "\nfn sidebar_task_card(",
+            "\n    fn resolve(&self) -> SidebarTaskCard {",
+            "\n    fn line(",
             "\nfn sidebar_card_facts_line(",
             "\nfn sidebar_task_card_view(",
             "\nfn sidebar_card_line(",
@@ -4671,6 +4839,27 @@ mod tests {
                 "a `{forbidden}` in `{signature}` would let the card fetch what it draws"
             );
         }
+    }
+
+    /// A section header hints at its collapse control with a chevron, revealed
+    /// on hover. The header itself is the control and is reachable by Tab, so
+    /// the hint is revealed on that focus too: a reader who never uses the
+    /// pointer still gets the one thing the section reveals. This reads the
+    /// source because a hover-only regression is invisible to a keyboard walk
+    /// that happens not to look at a header.
+    #[test]
+    fn a_section_chevron_is_revealed_by_keyboard_focus_too() {
+        let source = include_str!("sidebar.rs");
+        let body = source_body(source, "\n    fn render_sidebar_group_header(");
+        assert!(
+            body.contains("header_focus.is_focused(window)"),
+            "the header's own focus is what the hint follows"
+        );
+        assert!(
+            body.contains(".when(!header_focused, |icon| icon.invisible())"),
+            "the chevron hides only when the header is neither hovered nor focused"
+        );
+        assert!(body.contains(".group_hover("), "the pointer reveals it too");
     }
 
     #[test]

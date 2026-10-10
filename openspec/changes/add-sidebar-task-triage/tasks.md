@@ -129,6 +129,12 @@
 - [ ] 6.3 AGENTS.md 无障碍走查：只按键盘完成"切换视图 → 定位一条需要处理的任务 → 看到卡片 →
       归档它"，确认焦点始终可见、`enter`/`space`/方向键可用、reduced-motion 下 spinner 静止。
 - [ ] 6.4 `openspec validate add-sidebar-task-triage --strict` 保持通过。
+- [ ] 6.5 6.1–6.3 是**操作者的手动走查**：实时走查（6.1）与 200 条列表的帧预算测量
+      （6.2）在 `waku-sidebar-nav` worktree 的 dev watcher 所托管的 demo 实例里由操作者完成，
+      不在本 worktree 重复，以免两个 watcher 互相接管同一个 app。命令行侧的证据已经在手：
+      `crates/waku-core/src/driver/pi.rs` 的 live `pi` digest 测试对着真实 provider 证明
+      "触发 → 无第二个进程 → 无新会话 → transcript 与上下文占用不变 → 结果经会话事件流回来"，
+      本节的其余部分（6.4）由 `openspec validate` 覆盖。
 
 ## Workflow follow-up
 

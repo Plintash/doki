@@ -4,8 +4,8 @@
 
 ### Requirement: Archiving hides a task without destroying it
 
-Archiving SHALL record that a task is put away and remove it from the task
-lists. Archiving MUST NOT delete the task's messages, its stored transcript
+Archiving SHALL record that a task is put away and remove it from the desktop
+task lists. Archiving MUST NOT delete the task's messages, its stored transcript
 detail, its checkpoints, its worktree, or its provider session. The archive
 state SHALL persist, and a store written before the field existed SHALL load
 with every task unarchived.
@@ -19,6 +19,11 @@ with every task unarchived.
 
 - **WHEN** a task is archived
 - **THEN** its messages, transcript detail, checkpoints, and worktree still exist on disk and in the store
+
+#### Scenario: The other clients keep the field
+
+- **WHEN** a task is archived and listed by `apps/web` or `apps/mobile`
+- **THEN** those lists still include the task and its archive field, which they pass through rather than drop or clear
 
 #### Scenario: An older store loads unarchived
 
@@ -46,7 +51,8 @@ does not know the field MUST NOT clear it.
 
 The sidebar SHALL provide a persisted way to reveal archived tasks. Unarchiving
 SHALL return a task to the active sections immediately. A task's row context menu
-SHALL offer the action for that task and the inverse for an archived one, and the
+SHALL offer the action for that task and the inverse for an archived one, the
+command palette SHALL offer the same action for the task it is showing, and the
 placement of revealed tasks is defined by the sidebar's archived section.
 
 #### Scenario: Unarchive returns the task
@@ -58,6 +64,11 @@ placement of revealed tasks is defined by the sidebar's archived section.
 
 - **WHEN** the user opens a task's row context menu
 - **THEN** it offers archiving, and offers unarchiving for a task that is already archived
+
+#### Scenario: The action is reachable from the palette
+
+- **WHEN** the user opens the command palette while a task is showing
+- **THEN** it offers archiving that task, and offers unarchiving it when it is already archived
 
 #### Scenario: The reveal choice survives a restart
 
