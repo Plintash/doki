@@ -147,6 +147,18 @@ fn sidebar_grouping_label(grouping: SidebarGrouping) -> String {
     }
 }
 
+/// The glyph the view switch shows for each grouping. It is paired with the
+/// view's own label, so the three views stay tellable apart without opening the
+/// menu: a folder is the projects, a clock is the recency headings, a list is
+/// the sections a task's state puts it in.
+fn sidebar_grouping_glyph(grouping: SidebarGrouping) -> &'static str {
+    match grouping {
+        SidebarGrouping::Project => "icons/folder.svg",
+        SidebarGrouping::Updated => "icons/clock.svg",
+        SidebarGrouping::Status => "icons/list.svg",
+    }
+}
+
 fn sidebar_ordering_label(ordering: SidebarOrdering) -> String {
     match ordering {
         SidebarOrdering::Newest => tr!("sidebar.ordering_newest"),
@@ -1249,6 +1261,64 @@ impl Waku {
                 div().id("sidebar-titlebar-drag-region").h_full().flex_1(),
                 cx,
             ))
+            .child(self.render_sidebar_view_switch(cx))
+    }
+
+    /// The visible way to change what the sidebar groups by.
+    ///
+    /// The options menu still carries the same choice, but that is two clicks
+    /// deep and tells a reader nothing about the view they are in. This chip
+    /// names the current view, shows its glyph, and opens the three of them, so
+    /// the project and updated views stay one click away now that the status
+    /// view exists beside them. `popover` owns the trigger's focus and key
+    /// handling, so Tab reaches it and Enter or Space opens it.
+    fn render_sidebar_view_switch(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::current(cx);
+        let grouping = self.state.sidebar_grouping;
+        let menu = self.menu_handle("sidebar-view-switch", cx);
+        let open = menu.is_open();
+        let weak = cx.entity().downgrade();
+        let trigger = MenuChip::new("sidebar-view-switch")
+            .icon(
+                sidebar_grouping_glyph(grouping),
+                if open {
+                    theme.text
+                } else {
+                    theme.text_secondary
+                },
+            )
+            .label(sidebar_grouping_label(grouping))
+            .height(px(22.0))
+            .selected(open);
+
+        div()
+            .pr(px(10.0))
+            .flex_none()
+            .child(dropdown_menu(
+                trigger,
+                "sidebar-view-switch-menu",
+                &menu,
+                MenuAlign::BelowRight,
+                move |_| {
+                    [
+                        SidebarGrouping::Project,
+                        SidebarGrouping::Updated,
+                        SidebarGrouping::Status,
+                    ]
+                    .into_iter()
+                    .map(|candidate| {
+                        let item_weak = weak.clone();
+                        MenuItem::new(sidebar_grouping_label(candidate), move |_, cx| {
+                            let _ = item_weak.update(cx, |this, cx| {
+                                this.set_sidebar_grouping(candidate, cx);
+                            });
+                        })
+                        .selected(grouping == candidate)
+                    })
+                    .collect()
+                },
+            ))
+            .into_any_element()
     }
 
     fn render_sidebar_header_actions(&self, cx: &mut Context<Self>) -> Div {
@@ -3230,6 +3300,34 @@ fn sidebar_session_selected(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every view keeps a name and a glyph of its own: the switch is the only
+    /// place a reader learns which view they are in, and the three have to stay
+    /// tellable apart at a glance.
+    #[test]
+    fn every_view_has_its_own_label_and_glyph() {
+        let views = [
+            SidebarGrouping::Project,
+            SidebarGrouping::Updated,
+            SidebarGrouping::Status,
+        ];
+        let labels = views.map(|view| sidebar_grouping_label(view));
+        let glyphs = views.map(|view| sidebar_grouping_glyph(view));
+        assert!(
+            labels.iter().all(|label| !label.trim().is_empty()),
+            "a view without a name cannot be offered: {labels:?}"
+        );
+        assert!(
+            glyphs.iter().all(|glyph| glyph.starts_with("icons/")),
+            "each view needs an icon: {glyphs:?}"
+        );
+        for (index, glyph) in glyphs.iter().enumerate() {
+            assert!(
+                !glyphs[..index].contains(glyph),
+                "two views cannot share one glyph: {glyphs:?}"
+            );
+        }
+    }
 
     #[test]
     fn groups_sessions_by_calendar_period() {
