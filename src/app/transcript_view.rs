@@ -2572,16 +2572,16 @@ impl Waku {
                             // paces the reveal; from scrollback the whole body
                             // is shown at once, where the new text is off
                             // screen anyway.
-                            if animate_streaming
-                                && message.role == MessageRole::Assistant
-                                && rests_at_tail
-                            {
-                                view.set_revealing_text(
-                                    message.visible_content(),
-                                    message.streaming,
+                            view.set_text(message.visible_content(), message.streaming);
+                            // The clipped height is what the row reports; it
+                            // only animates while the reader rests on the
+                            // tail, because a row that keeps growing under a
+                            // preserved scrollback anchor reads as a tremor.
+                            if message.role == MessageRole::Assistant && message.streaming {
+                                view.advance_clip(
+                                    animate_streaming && rests_at_tail,
+                                    std::time::Instant::now(),
                                 );
-                            } else {
-                                view.set_text(message.visible_content(), message.streaming);
                             }
                             &*view
                         });

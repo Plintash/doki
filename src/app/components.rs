@@ -562,7 +562,7 @@ fn render_markdown_message_body<'a>(
     theme: &Theme,
     ctx: &MarkdownCtx<'a>,
 ) -> AnyElement {
-    markdown
+    let body = markdown
         .and_then(|markdown| match window {
             Some(window) if !ctx.has_search() && !ctx.has_annotations() => {
                 md::render::markdown_windowed(
@@ -584,7 +584,15 @@ fn render_markdown_message_body<'a>(
                 theme.text,
                 ctx,
             )
-        })
+        });
+    // The clip layer: report a continuous height to the row while the real
+    // body is taller, so the transcript pins to a height that glides instead
+    // of stepping a line at a time. Everything below the clip is unrevealed
+    // text, so nothing visible is ever cut.
+    let Some(markdown) = markdown else {
+        return body;
+    };
+    md::render::clip_body(markdown, body)
 }
 
 /// The compact annotation indicator under a sent user message: a count the

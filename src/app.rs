@@ -1585,6 +1585,7 @@ pub struct Waku {
     /// swapping in frozen page pixels while an overlay is open.
     scene_overlay_enabled: bool,
     settings_page: Option<SettingsPage>,
+
     /// The Skills page's library snapshot, scanned off-thread. Frames read
     /// only this; `None` means the first scan has not landed yet.
     skills_catalog: Option<Rc<crate::skills::SkillsCatalog>>,

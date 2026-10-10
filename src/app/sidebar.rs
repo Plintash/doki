@@ -2151,7 +2151,7 @@ impl Waku {
             .children(right_window_controls)
     }
 
-    // ── Empty states ───────────────────────────────────────────────────────
+    // ── Empty states ──────────────────────────────────────────────────────
 
     pub(super) fn render_empty_state(&self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
