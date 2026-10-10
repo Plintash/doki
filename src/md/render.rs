@@ -1962,9 +1962,9 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &Ctx) -> AnyElemen
         .w_full()
         .min_w_0()
         .rounded(px(8.0))
-        .border_1()
-        .border_color(ctx.palette.border)
-        .bg(ctx.palette.inset)
+        // The faint wash the tool activity detail blocks use, so a fenced
+        // block reads as part of the prose instead of a dark panel.
+        .bg(ctx.palette.overlay.opacity(0.7))
         .overflow_hidden()
         .child(
             div()

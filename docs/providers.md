@@ -268,7 +268,7 @@ visible.
 
 Oh My Pi is a fork of Pi that kept the RPC transport and renamed part of its
 surface, so one driver serves both. `PiFlavor`
-([pi.rs:52](../crates/waku-core/src/driver/pi.rs#L52)) carries every divergence,
+([pi.rs:59](../crates/waku-core/src/driver/pi.rs#L52)) carries every divergence,
 which is what keeps the two from drifting into near-copies:
 
 | | Pi | Oh My Pi |
@@ -288,7 +288,7 @@ Everything below is shared unless noted.
 
 **Launch** — `pi --mode rpc --approve` with `PI_SKIP_VERSION_CHECK=1`;
 `omp --mode rpc --yolo`
-([pi.rs:402](../crates/waku-core/src/driver/pi.rs#L402)). Oh My Pi negotiates
+([pi.rs:417](../crates/waku-core/src/driver/pi.rs#L402)). Oh My Pi negotiates
 protocol v2 first, before `get_state`, so a large first response arrives chunked
 rather than shrunk to an error frame. Its opening `ready` frame is what makes
 that worth doing — it reports `supportedProtocolVersions: [1, 2]` alongside a
@@ -305,7 +305,7 @@ strictness is why its catalog probe cannot borrow Pi's argument list.
 Waku stamps each request with a string id (`waku-<n>`) and Pi answers with
 `{"type": "response", "id", "success", "data"}`. Everything else on the stream
 is an unsolicited event. Requests are issued synchronously by the writer thread
-with a 10 s timeout ([pi.rs:1004](../crates/waku-core/src/driver/pi.rs#L1004));
+with a 10 s timeout ([pi.rs:1019](../crates/waku-core/src/driver/pi.rs#L1004));
 events keep flowing on the reader thread meanwhile. The handshake gets 30 s
 instead: the agent does not answer at all until it has finished loading its
 extensions, resources and — when model networking is on — its model catalog,
@@ -358,7 +358,7 @@ it, and a project, user or skill command named `compact` still wins it through
 the ordinary precedence. Oh My Pi's flavour is untouched: only Pi's RPC has
 been verified to take the command.
 
-**Inbound stream** ([pi.rs:1707](../crates/waku-core/src/driver/pi.rs#L1707)):
+**Inbound stream** ([pi.rs:1757](../crates/waku-core/src/driver/pi.rs#L1636)):
 
 | Event | Becomes |
 | --- | --- |
@@ -373,6 +373,7 @@ been verified to take the command.
 | `queue_update` | `ProviderQueue` — the provider's complete steering and follow-up queues, which are the client's pending list |
 | `extension_ui_request` → `select`, `confirm`, `input`, `editor` | `UserInputRequested`, answered through `respond_user_input` |
 | `extension_ui_request` → `notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text` | the app's notification, session-status, widget, window-title and composer surfaces |
+| `extension_ui_request` → `setWidget` on pi-subagents' `subagent-async` key | `BackgroundWork` (kind subagent) per run: live while it runs, its outcome when the snapshot reports one, and lost when it leaves a complete snapshot without one. The snapshot is a level signal read as changes, and it is not also forwarded as widget text |
 | `extension_ui_request`, any other method | answered with a cancellation at once, so an unknown dialog does not block the extension until its timeout |
 
 **Extension surfaces** — Pi's extension UI subprotocol reaches the app instead
@@ -394,20 +395,21 @@ client does not know is cancelled at once, because the extension is blocking on
 it and no surface can present it. What Pi's RPC mode cannot carry at all
 (`ctx.ui.custom()`, `onTerminalInput`, `setToolsExpanded`) is a no-op on the
 provider's side, so there is nothing to receive. pi-subagents is the reference
-user: its async status widget, its fleet strip, its `subagent-notify` and
-`subagent-incremental-child-notify` messages, and the questions its inspector
-asks all arrive through these records.
+user: the runs its `subagent-async` widget reports (live ones included, on the
+detached-work surface rather than as raw JSON), its fleet strip, its
+`subagent-notify` and `subagent-incremental-child-notify` messages, and the
+questions its inspector asks all arrive through these records.
 
 **Access modes** — Full access only, enforced at driver start rather than
 degraded silently: any other selection fails with "currently supports Full
-access only" ([pi.rs:365](../crates/waku-core/src/driver/pi.rs#L365)).
+access only" ([pi.rs:380](../crates/waku-core/src/driver/pi.rs#L365)).
 Pi has no permission system at all, so `--approve` is the whole story. Oh My Pi
 *does* have one, which Waku's `--yolo` then bypasses — the restriction is Waku's
 here, not the CLI's, and lifting it is a matter of wiring Oh My Pi's permission
 requests to a `Permission` event.
 
 **Cancel** — `clear_queue` first, then `abort`
-([pi.rs:1248](../crates/waku-core/src/driver/pi.rs#L1248)). That order is Pi's own
+([pi.rs:1290](../crates/waku-core/src/driver/pi.rs#L1248)). That order is Pi's own
 Esc recipe, and it is the reason to keep it: a message the user stopped is taken
 out of the session instead of waiting there to be carried into whatever runs
 next. The abort carries no request id and is not awaited — Pi answers it only
@@ -420,17 +422,20 @@ held retracts it — the driver clears the queue and reports the text — rather
 than leaving it parked.
 
 **Steer** — `{"type": "steer", "message": …}`, and only into a run that is
-still live ([pi.rs:1183](../crates/waku-core/src/driver/pi.rs#L1183)). Pi queues
+still live ([pi.rs:1225](../crates/waku-core/src/driver/pi.rs#L1183)). Pi queues
 a steer whether or not a run is open, and splices what it parks there into the
 next turn's boundary, so a steer arriving after its run settled is written as a
 prompt instead. Its `disposition: "queued"` means the message was accepted into
 the live turn, which is what `SteerAccepted` reports — not that it was
-delivered.
+delivered. A refusal of that converted prompt — the provider refuses while it
+is compacting — travels back as the same steer's `SteerRejected`, carrying the
+text the write already acknowledged, so the app can mark the transcript row
+undelivered instead of submitting the text a second time.
 
 **Rewind and branch** — both go through `get_fork_messages` → `fork {entryId}`
 (`get_branch_messages` → `branch` on Oh My Pi), or `clone` when nothing is
 removed, then `get_state`
-([pi.rs:1460](../crates/waku-core/src/driver/pi.rs#L1460)). Rewind adopts the fork
+([pi.rs:1502](../crates/waku-core/src/driver/pi.rs#L1460)). Rewind adopts the fork
 as the session's new cursor. Branch additionally `switch_session`es back to the
 source file and verifies it landed on the right session; if that restore fails
 the runtime is dropped, because the RPC process may still be sitting on the fork
@@ -439,7 +444,7 @@ the runtime is dropped, because the RPC process may still be sitting on the fork
 **Copying a whole session differs.** Removing no turns is a plain copy, which Pi
 performs in place. Oh My Pi only copies at launch, so Waku shells out to a
 throwaway `omp --mode rpc --yolo --fork <session file>` and reads the new cursor
-off it ([pi.rs:1572](../crates/waku-core/src/driver/pi.rs#L1572)). That is the
+off it ([pi.rs:1614](../crates/waku-core/src/driver/pi.rs#L1572)). That is the
 better shape anyway: the out-of-process copy never moves the live session, so
 unlike the in-place path it needs no restore afterwards and cannot strand the
 RPC process on the fork.
@@ -987,7 +992,7 @@ What the long-lived session buys, and what Waku pays for not having it:
 | Interactive approvals | Every provider: Claude via the SDK's `canUseTool` (including `AskUserQuestion` and `ExitPlanMode`), Cursor/Grok via ACP `session/request_permission`, Codex via `*requestApproval*` | Every provider except Amp and Pi, neither of which exposes a request to answer |
 | Interrupt | `session/cancel`, `query.interrupt()` (plus `stopTask()` for runaway subagents) | Protocol interrupt everywhere except Amp, which has none and is stopped outright |
 | Change model mid-session | `capabilities.sessionModelSwitch: "in-session"` → `session/set_model`, `query.setModel()` | Every transport keeps the session except Amp, whose mode is a launch argument |
-| Mid-turn prompt | Queued into the live agent loop as a **steer**, same turn | Steered into the live turn on every provider (`⌘↩`); plain `Enter` queues a visible, editable follow-up instead |
+| Mid-turn prompt | Queued into the live agent loop as a **steer**, same turn | Steered into the live turn on every provider; `Enter` follows the client's follow-up behavior (steer by default) and `⌘↩` does the opposite, with a visible, editable queue as the fallback |
 | Native rollback | `rollbackThread` on the adapter contract | Codex/Pi natively; the rest emulated out-of-band by the `*_session.rs` helpers |
 | Idle cleanup | `ProviderSessionReaper` stops sessions idle 30 min, swept every 5 min, skipping threads with an active turn | same, on the same thresholds |
 

@@ -947,10 +947,14 @@ pub(super) fn folded_transcript_row_kinds(
             rows.push(row);
         }
     }
-    // A busy session with a live turn closes with the working indicator. The
-    // busy check matters on its own: a driver error can fail the session while
-    // its turn is still marked running, and "Working" over a failure misleads.
-    if session.status.is_busy() && session.active_turn_id().is_some() {
+    // A busy session closes with the working indicator: the live turn while
+    // it runs, and a Pi turn that ended while the detached work it started
+    // still runs, which has no turn left to hold but is not finished either.
+    // The busy check matters on its own: a driver error can fail the session
+    // while its turn is still marked running, and "Working" over a failure
+    // misleads.
+    let waits_for_detached_work = session.status == SessionStatus::Background;
+    if session.status.is_busy() && (session.active_turn_id().is_some() || waits_for_detached_work) {
         rows.push(TranscriptRowKind::WorkingIndicator);
     }
 

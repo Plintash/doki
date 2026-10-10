@@ -6,7 +6,7 @@
 //! once protocol v2 is negotiated. [`PiFlavor`] carries those differences so
 //! both providers share one transport instead of two near-copies.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -46,6 +46,13 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Oh My Pi refuses to reassemble beyond this, so neither should Waku.
 const MAX_REASSEMBLED_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// The widget key pi-subagents publishes its machine-readable async status
+/// under in RPC mode, and the prefix of the one line it carries. The body is
+/// a JSON snapshot of the runs the extension still holds, which is what makes
+/// the widget a level signal a client can read instead of prose.
+const PI_ASYNC_STATUS_WIDGET_KEY: &str = "subagent-async";
+const PI_ASYNC_STATUS_PREFIX: &str = "PI_SUBAGENT_ASYNC_JSON:";
 
 /// Which dialect of the Pi RPC protocol a session speaks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,7 +189,15 @@ enum CommandMessage {
 
 enum PendingResponse {
     Request(Sender<Result<Value, String>>),
-    Prompt,
+    /// A prompt whose answer may arrive long after the write — Pi holds it
+    /// until compaction or another built-in finishes. `converted_steer`
+    /// carries the transport text when this prompt was a steer the run could
+    /// no longer take: its acceptance was already reported at write time, so
+    /// a refusal travels back as that steer's rejection instead of as a
+    /// settlement for a run that does not exist.
+    Prompt {
+        converted_steer: Option<String>,
+    },
 }
 
 type PendingResponses = Arc<Mutex<HashMap<String, PendingResponse>>>;
@@ -1047,13 +1062,40 @@ fn send_prompt(
     next_request_id: &mut u64,
     prompt: &str,
 ) -> Result<(), String> {
+    write_prompt(stdin, pending, next_request_id, prompt, false)
+}
+
+/// Sends a prompt for a steer whose run had already settled. The write is
+/// still acknowledged as an accepted steer; the difference is what a refusal
+/// of the prompt means, which is why the prompt carries its origin.
+fn send_converted_steer_prompt(
+    stdin: &mut impl Write,
+    pending: &PendingResponses,
+    next_request_id: &mut u64,
+    prompt: &str,
+) -> Result<(), String> {
+    write_prompt(stdin, pending, next_request_id, prompt, true)
+}
+
+fn write_prompt(
+    stdin: &mut impl Write,
+    pending: &PendingResponses,
+    next_request_id: &mut u64,
+    prompt: &str,
+    converted_steer: bool,
+) -> Result<(), String> {
     *next_request_id += 1;
     let id = format!("waku-{}", next_request_id);
     {
         let mut pending = pending.lock();
         // A response from an older prompt cannot settle the next turn.
         pending.retain(|_, response| matches!(response, PendingResponse::Request(_)));
-        pending.insert(id.clone(), PendingResponse::Prompt);
+        pending.insert(
+            id.clone(),
+            PendingResponse::Prompt {
+                converted_steer: converted_steer.then(|| prompt.to_owned()),
+            },
+        );
     }
     // OMP built-ins can hold the prompt response until compaction or another
     // command finishes. Do not apply the short control-RPC timeout or block
@@ -1205,7 +1247,7 @@ fn send_steer(
         )
         .map(|_| ())
     } else {
-        send_prompt(stdin, pending, next_request_id, &prompt)
+        send_converted_steer_prompt(stdin, pending, next_request_id, &prompt)
     };
     match delivered {
         Ok(_) => {
@@ -1678,6 +1720,11 @@ struct PiStreamState {
     /// completes the same row. Pi names no compaction, so Waku counts them.
     open_compaction: Option<String>,
     compaction_sequence: u64,
+    /// The detached pi-subagents runs the extension's own status widget last
+    /// reported, by run id. The widget is a level signal — a run that left it
+    /// is settled or gone — so keeping the last report is what turns its
+    /// snapshots into the changes the app hears.
+    async_runs: HashMap<String, PiAsyncRun>,
 }
 
 impl PiStreamState {
@@ -1688,17 +1735,20 @@ impl PiStreamState {
     /// matched against every row this session already has, so a second
     /// compaction must not reuse the first one's id even in a later turn, and
     /// a compaction that outlives the settlement still completes the row its
-    /// start opened.
+    /// start opened. The extension's detached runs outlive the turn that
+    /// started them, so their last report survives too.
     fn reset(&mut self) {
         let run = self.run.clone();
         let dialogs = self.dialogs.clone();
         let compaction_sequence = self.compaction_sequence;
         let open_compaction = self.open_compaction.take();
+        let async_runs = std::mem::take(&mut self.async_runs);
         *self = Self {
             run,
             dialogs,
             compaction_sequence,
             open_compaction,
+            async_runs,
             ..Self::default()
         };
     }
@@ -1720,8 +1770,11 @@ fn handle_pi_message(
         let Some(id) = value.get("id").and_then(Value::as_str) else {
             return;
         };
-        let prompt_response = matches!(pending.lock().get(id), Some(PendingResponse::Prompt));
-        if prompt_response {
+        let prompt_response = match pending.lock().get(id) {
+            Some(PendingResponse::Prompt { converted_steer }) => Some(converted_steer.clone()),
+            _ => None,
+        };
+        if let Some(converted_steer) = prompt_response {
             let success = value.get("success").and_then(Value::as_bool) == Some(true);
             // Pi answers a prompt with what became of it: `started` and
             // `queued` mean the work is on its way and the run settles the
@@ -1750,11 +1803,12 @@ fn handle_pi_message(
             //
             // A refusal is the delivery failure of the message that asked for
             // the run: it never reached the conversation, so the provider's
-            // own reason travels as the settlement's summary, which is what
-            // marks the message undelivered. Sending it as a transport error
-            // instead would have the client store it as an answer to a
-            // message the agent never saw.
-            let summary = (!success).then(|| {
+            // own reason travels with it — as the settlement's summary for an
+            // ordinary prompt, as the steer's rejection for a converted one —
+            // and that is what marks the message undelivered. Sending it as a
+            // transport error instead would have the client store it as an
+            // answer to a message the agent never saw.
+            let refusal_reason = || {
                 value
                     .get("error")
                     .and_then(Value::as_str)
@@ -1765,12 +1819,26 @@ fn handle_pi_message(
                             provider = flavor.display_name()
                         )
                     })
-            });
-            let _ = events.send(DriverEvent::TurnFinished {
-                interrupted: false,
-                success,
-                summary,
-            });
+            };
+            if let Some(message) = converted_steer {
+                // The steer was already reported accepted when its prompt was
+                // written, so only a refusal is news: it says the provider
+                // never added the message to the conversation, and the app
+                // needs to hear it as that steer's rejection rather than as a
+                // settlement of a run the steer never joined.
+                if !success {
+                    let _ = events.send(DriverEvent::SteerRejected {
+                        message,
+                        reason: refusal_reason(),
+                    });
+                }
+            } else {
+                let _ = events.send(DriverEvent::TurnFinished {
+                    interrupted: false,
+                    success,
+                    summary: (!success).then(refusal_reason),
+                });
+            }
             // No run stands behind this answer — a refusal, or an extension
             // command that consumed the prompt — so nothing is live until the
             // provider announces a run of its own.
@@ -2123,19 +2191,32 @@ fn handle_pi_message(
                 }
                 Some("setWidget") => {
                     if let Some(key) = value.get("widgetKey").and_then(Value::as_str) {
-                        let _ = events.send(DriverEvent::ExtensionWidget {
-                            key: key.to_owned(),
-                            // Pi sends the lines themselves in RPC mode, and
-                            // their absence is the extension's own clear.
-                            lines: value.get("widgetLines").and_then(Value::as_array).map(
-                                |lines| {
+                        // Pi sends the lines themselves in RPC mode, and
+                        // their absence is the extension's own clear.
+                        let lines =
+                            value
+                                .get("widgetLines")
+                                .and_then(Value::as_array)
+                                .map(|lines| {
                                     lines
                                         .iter()
                                         .filter_map(Value::as_str)
                                         .map(str::to_owned)
-                                        .collect()
-                                },
-                            ),
+                                        .collect::<Vec<_>>()
+                                });
+                        // pi-subagents' async status is its own encoding of
+                        // the runs it holds, not text a user can read: it
+                        // becomes the detached-work surface instead of a
+                        // widget line of raw JSON.
+                        if key == PI_ASYNC_STATUS_WIDGET_KEY
+                            && let Some(snapshot) = pi_async_status_snapshot(lines.as_deref())
+                        {
+                            publish_pi_async_runs(snapshot, events, state);
+                            return;
+                        }
+                        let _ = events.send(DriverEvent::ExtensionWidget {
+                            key: key.to_owned(),
+                            lines,
                             placement: match value.get("widgetPlacement").and_then(Value::as_str) {
                                 Some("belowEditor") => ExtensionWidgetPlacement::BelowEditor,
                                 _ => ExtensionWidgetPlacement::AboveEditor,
@@ -2260,6 +2341,146 @@ fn pi_custom_message_text(content: Option<&Value>) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// One detached run as pi-subagents' own status snapshot reports it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PiAsyncRun {
+    label: String,
+    status: BackgroundWorkStatus,
+}
+
+/// The runs one async-status widget carries.
+///
+/// `complete` is false when the snapshot itself left runs out — `omitted.runs`
+/// is the extension's own count — because a run this report does not name is
+/// then not necessarily one that left, and only a complete list can say so.
+struct PiAsyncSnapshot {
+    runs: Vec<(String, PiAsyncRun)>,
+    complete: bool,
+}
+
+/// The runs a `subagent-async` widget reports, or `None` when its lines are
+/// not that snapshot and the widget should reach the client as an ordinary
+/// one.
+///
+/// The extension takes the widget down when it holds no run worth showing, so
+/// missing lines are its own clear: an empty, complete snapshot rather than a
+/// state the client has to guess at.
+fn pi_async_status_snapshot(lines: Option<&[String]>) -> Option<PiAsyncSnapshot> {
+    let Some(line) = lines.and_then(<[String]>::first) else {
+        return Some(PiAsyncSnapshot {
+            runs: Vec::new(),
+            complete: true,
+        });
+    };
+    let snapshot: Value = serde_json::from_str(line.strip_prefix(PI_ASYNC_STATUS_PREFIX)?).ok()?;
+    let runs = snapshot.get("runs")?.as_array()?;
+    let complete = snapshot
+        .pointer("/omitted/runs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        == 0;
+    let runs = runs
+        .iter()
+        .filter_map(|run| {
+            let id = run
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())?;
+            let label = run
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .unwrap_or(id);
+            Some((
+                id.to_owned(),
+                PiAsyncRun {
+                    label: label.to_owned(),
+                    status: pi_async_run_status(run.get("state").and_then(Value::as_str)),
+                },
+            ))
+        })
+        .collect();
+    Some(PiAsyncSnapshot { runs, complete })
+}
+
+/// The status a snapshot state carries onto the detached-work surface. The two
+/// the extension words as still going stay live; the ones with no outcome of
+/// their own — a partial or paused run — read as stopped rather than as a
+/// success or a failure, and anything a later version words differently keeps
+/// the run live, the way an unknown child outcome does.
+fn pi_async_run_status(state: Option<&str>) -> BackgroundWorkStatus {
+    match state {
+        Some("queued") => BackgroundWorkStatus::Starting,
+        Some("running") => BackgroundWorkStatus::Running,
+        Some("complete") => BackgroundWorkStatus::Completed,
+        Some("failed" | "rejected") => BackgroundWorkStatus::Failed,
+        Some("partial" | "paused" | "stopped") => BackgroundWorkStatus::Stopped,
+        _ => BackgroundWorkStatus::Running,
+    }
+}
+
+/// Moves a status snapshot onto the detached-work surface.
+///
+/// The app cannot read the extension's encoding, and a line of JSON is not
+/// text a user can use, so each run becomes an item where its children's
+/// completions land: live while it runs, its outcome when the snapshot has
+/// one, and lost when it leaves a complete snapshot without any. Only changes
+/// are published — the widget republishes every second or so — and a run's own
+/// id is the item's authority, so a completion notification for a child of the
+/// same run adds its detail instead of rewriting this state.
+fn publish_pi_async_runs(
+    snapshot: PiAsyncSnapshot,
+    events: &impl DriverEventSink,
+    state: &mut PiStreamState,
+) {
+    let PiAsyncSnapshot { runs, complete } = snapshot;
+    if complete {
+        let present = runs
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<HashSet<_>>();
+        let vanished = state
+            .async_runs
+            .iter()
+            .filter(|(id, run)| run.status.is_live() && !present.contains(id.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in vanished {
+            let Some(run) = state.async_runs.remove(&id) else {
+                continue;
+            };
+            let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
+                pi_async_run_item(&id, &run.label, BackgroundWorkStatus::Lost),
+            )));
+        }
+    }
+    for (id, run) in runs {
+        if state.async_runs.get(&id) == Some(&run) {
+            continue;
+        }
+        let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
+            pi_async_run_item(&id, &run.label, run.status),
+        )));
+        state.async_runs.insert(id, run);
+    }
+}
+
+fn pi_async_run_item(id: &str, label: &str, status: BackgroundWorkStatus) -> BackgroundWorkItem {
+    let mut item = BackgroundWorkItem::new(
+        BackgroundWorkKind::Subagent,
+        id.to_owned(),
+        label.to_owned(),
+        status,
+    );
+    // The run outlives the turn that started it: the app treats an item with
+    // this flag as work the session is still waiting on, which is what keeps
+    // the session busy and what a stop must not sweep away.
+    item.background = true;
+    item
 }
 
 /// pi-subagents' child and background notifications as detached work.
@@ -2950,6 +3171,78 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_converted_steer_is_reported_as_that_steers_rejection() {
+        // The steer missed the run, so it went out as a prompt — and the
+        // provider refused that prompt before accepting it. The write was
+        // already acknowledged as an accepted steer, so the refusal has to
+        // travel as that steer's rejection: a TurnFinished here would settle a
+        // run the steer never joined and leave the app believing the message
+        // was delivered.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { .. }
+        ));
+
+        let mut wire = Vec::new();
+        let mut next_request_id = 0;
+        send_steer(
+            &mut wire,
+            &pending,
+            &mut next_request_id,
+            &events,
+            &state.run,
+            PiFlavor::Pi,
+            "stop doing that".to_owned(),
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerAccepted { message } if message == "stop doing that"
+        ));
+
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "response",
+                "id": "waku-1",
+                "success": false,
+                "error": "Compaction is in progress.",
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::SteerRejected { message, reason }
+                if message == "stop doing that" && reason == "Compaction is in progress."
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a converted steer's refusal is not a settlement of the run it missed"
+        );
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
     fn a_steer_into_the_live_run_is_written_as_a_steer() {
         let (pending, commands, _command_rx, mut state) = harness();
         let (events, event_rx) = unbounded();
@@ -3511,8 +3804,9 @@ mod tests {
 
     /// The acceptance path this change exists for: `npm:pi-subagents` runs one
     /// background workflow, and the child's completion wakes the session — the
-    /// completion lands where detached work is shown, the wake opens a turn with
-    /// no Waku prompt, and the reply it produced streams into the transcript.
+    /// run is on the detached-work surface while it runs, its completion lands
+    /// where that work is shown, the wake opens a turn with no Waku prompt, and
+    /// the reply it produced streams into the transcript.
     ///
     /// Ignored because it needs Pi 1.0 authenticated with `npm:pi-subagents`
     /// installed, and because the extension registers nothing in a process that
@@ -3536,6 +3830,7 @@ mod tests {
         driver.prompt("/waku-subagents-wake".to_owned());
 
         let mut command_settled = false;
+        let mut live_run = None;
         let mut completion = false;
         let mut child = None;
         let mut woke = false;
@@ -3547,9 +3842,24 @@ mod tests {
                 LIVE_WORKFLOW_TIMEOUT,
             ) {
                 DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) => {
-                    completion = true;
-                    if item.key.kind == BackgroundWorkKind::Subagent {
-                        child = Some(item);
+                    if item.status.is_live() {
+                        // The run itself, published while it runs: this is what
+                        // keeps the session busy after its own turn settled.
+                        assert!(
+                            !completion,
+                            "a run cannot still be live after its completion"
+                        );
+                        live_run = Some(item);
+                    } else {
+                        completion = true;
+                        if item.key.kind == BackgroundWorkKind::Subagent
+                            && item
+                                .detail
+                                .as_deref()
+                                .is_some_and(|detail| detail.contains("Background task completed"))
+                        {
+                            child = Some(item);
+                        }
                     }
                 }
                 DriverEvent::TurnStarted => {
@@ -3582,6 +3892,17 @@ mod tests {
         assert!(
             command_settled,
             "the command that launched the workflow settles"
+        );
+        let live_run =
+            live_run.expect("the run must reach the detached-work surface while it runs");
+        assert_eq!(live_run.key.kind, BackgroundWorkKind::Subagent);
+        assert!(
+            !live_run.key.provider_id.is_empty(),
+            "the run is named by the provider's own run id"
+        );
+        assert!(
+            live_run.background,
+            "a run outlives the turn that launched it"
         );
         let child = child.expect("the child's completion must land on the detached-work surface");
         assert_eq!(child.status, BackgroundWorkStatus::Completed);
@@ -3705,6 +4026,76 @@ mod tests {
             text.contains("QUEUED-OK"),
             "the queued message must be delivered into the turn: {text:?}"
         );
+    }
+
+    /// A steer reaches a run that is still streaming: the provider folds it
+    /// into the same turn, and what it answers with lands in that turn's
+    /// stream. The write's acknowledgement is what the app's transcript row is
+    /// built on, so it has to arrive whether the run takes the steer or the
+    /// driver has to convert it into the next prompt.
+    #[test]
+    fn pi_steers_into_a_streaming_turn_against_the_real_rpc() {
+        const STEER: &str = "Reply with exactly STEERED-OK and nothing else. Do not use any tools.";
+
+        let Some((driver, event_rx)) = real_pi_session(None) else {
+            return;
+        };
+        driver.prompt(
+            "Write a 200-word description of a lighthouse keeper's morning. Plain prose, one \
+             paragraph, no tools, do not shorten it."
+                .to_owned(),
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let mut sent = false;
+        let mut accepted = false;
+        let mut text = String::new();
+        let mut settled_after_steer = false;
+        loop {
+            // The steered generation can arrive at the live run's boundary or,
+            // if the run settled first, as the next prompt, so the token — not
+            // the first settlement — is what says the steer landed.
+            if text.contains("STEERED-OK") && settled_after_steer {
+                break;
+            }
+            let budget = deadline.saturating_duration_since(std::time::Instant::now());
+            if budget.is_zero() {
+                break;
+            }
+            let Ok(event) = event_rx.recv_timeout(budget) else {
+                break;
+            };
+            match event {
+                DriverEvent::TextDelta(delta) => {
+                    if !sent {
+                        // The steer has to race a turn that is streaming.
+                        sent = true;
+                        driver.steer(STEER.to_owned());
+                    }
+                    text.push_str(&delta);
+                }
+                DriverEvent::SteerAccepted { message } => {
+                    if message == STEER {
+                        accepted = true;
+                    }
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished { .. } => {
+                    if text.contains("STEERED-OK") {
+                        settled_after_steer = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(sent, "the turn must stream text before the steer goes out");
+        assert!(accepted, "the provider must acknowledge the steer");
+        assert!(
+            text.contains("STEERED-OK"),
+            "the steered message must land in the provider's conversation: {text:?}"
+        );
+        assert!(settled_after_steer, "the turn the steer joined must settle");
     }
 
     /// A stop takes the message the user had queued out of the provider's queue
@@ -4712,6 +5103,221 @@ mod tests {
             events.as_slice(),
             [DriverEvent::ExtensionWidget { key, lines, .. }]
                 if key == "subagent-fleet" && lines.is_none()
+        ));
+    }
+
+    /// One async-status widget update through the reader's own path, with the
+    /// reader state shared across updates the way a session's is. `None` is
+    /// the extension taking its widget down.
+    fn async_status_update(
+        pending: &PendingResponses,
+        commands: &Sender<CommandMessage>,
+        state: &mut PiStreamState,
+        lines: Option<Vec<Value>>,
+    ) -> Vec<DriverEvent> {
+        let (events, event_rx) = unbounded();
+        let mut request = json!({
+            "type": "extension_ui_request",
+            "id": "uuid-async",
+            "method": "setWidget",
+            "widgetKey": PI_ASYNC_STATUS_WIDGET_KEY,
+        });
+        if let Some(lines) = lines {
+            request["widgetLines"] = Value::Array(lines);
+        }
+        handle_pi_message(PiFlavor::Pi, request, pending, commands, &events, state);
+        event_rx.try_iter().collect()
+    }
+
+    /// One line of the snapshot pi-subagents encodes its async status in.
+    fn async_snapshot(runs: Value, omitted: u64) -> Vec<Value> {
+        vec![Value::String(format!(
+            "{PI_ASYNC_STATUS_PREFIX}{}",
+            json!({
+                "kind": "pi-subagents.async-status-snapshot",
+                "version": 1,
+                "generatedAt": 1,
+                "omitted": { "runs": omitted, "children": 0, "byteLimitExceeded": false },
+                "runs": runs,
+            })
+        ))]
+    }
+
+    #[test]
+    fn a_pi_subagents_run_is_detached_work_while_it_runs() {
+        // The extension's async status is a level signal a client reads, not a
+        // line for a user: each run belongs on the surface the child's
+        // completion lands on, live while it runs, and the raw snapshot must
+        // not also become a widget of JSON.
+        let (pending, commands, _command_rx, mut state) = harness();
+
+        let first = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot(
+                json!([
+                    {"id": "run-1", "kind": "workflow", "label": "scout, reviewer", "state": "running"},
+                    {"id": "run-2", "kind": "subagent", "label": "oracle", "state": "queued"},
+                ]),
+                0,
+            )),
+        );
+        let [
+            DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(running)),
+            DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(queued)),
+        ] = first.as_slice()
+        else {
+            panic!("each run must land on the detached-work surface: {first:?}")
+        };
+        assert_eq!(running.key.kind, BackgroundWorkKind::Subagent);
+        assert_eq!(running.key.provider_id, "run-1");
+        assert_eq!(running.title, "scout, reviewer");
+        assert_eq!(running.status, BackgroundWorkStatus::Running);
+        assert!(
+            running.background,
+            "a run outlives the turn that started it"
+        );
+        assert_eq!(queued.title, "oracle");
+        assert_eq!(queued.status, BackgroundWorkStatus::Starting);
+
+        // The same state republished is not news: the widget refreshes every
+        // second or so while it holds a run.
+        let repeated = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot(
+                json!([
+                    {"id": "run-1", "kind": "workflow", "label": "scout, reviewer", "state": "running"},
+                    {"id": "run-2", "kind": "subagent", "label": "oracle", "state": "queued"},
+                ]),
+                0,
+            )),
+        );
+        assert!(
+            repeated.is_empty(),
+            "an unchanged level signal publishes nothing: {repeated:?}"
+        );
+
+        // A settled run takes its outcome with it, and the run that is still
+        // live stays live.
+        let settled = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot(
+                json!([
+                    {"id": "run-1", "kind": "workflow", "label": "scout, reviewer", "state": "complete"},
+                    {"id": "run-2", "kind": "subagent", "label": "oracle", "state": "running"},
+                ]),
+                0,
+            )),
+        );
+        let [
+            DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(completed)),
+            DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(running)),
+        ] = settled.as_slice()
+        else {
+            panic!("the outcome and the state change are the news: {settled:?}")
+        };
+        assert_eq!(completed.key.provider_id, "run-1");
+        assert_eq!(completed.status, BackgroundWorkStatus::Completed);
+        assert_eq!(running.key.provider_id, "run-2");
+        assert_eq!(running.status, BackgroundWorkStatus::Running);
+
+        // The extension takes the widget down when it holds nothing more to
+        // show; a run it still called live is then lost, while the settled one
+        // keeps the outcome it reported.
+        let cleared = async_status_update(&pending, &commands, &mut state, None);
+        let [DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(lost))] = cleared.as_slice()
+        else {
+            panic!("the clear must settle what it can no longer speak for: {cleared:?}")
+        };
+        assert_eq!(lost.key.provider_id, "run-2");
+        assert_eq!(lost.status, BackgroundWorkStatus::Lost);
+        assert!(
+            !first
+                .iter()
+                .chain(&settled)
+                .chain(&cleared)
+                .any(|event| matches!(event, DriverEvent::ExtensionWidget { .. })),
+            "the snapshot is the app's data, not a widget line"
+        );
+    }
+
+    #[test]
+    fn an_async_status_snapshot_that_omits_runs_keeps_them_live() {
+        // The extension caps how many runs one snapshot carries. A run the
+        // report left out is not a run that left.
+        let (pending, commands, _command_rx, mut state) = harness();
+        async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot(
+                json!([
+                    {"id": "run-1", "kind": "subagent", "label": "scout", "state": "running"},
+                    {"id": "run-2", "kind": "subagent", "label": "oracle", "state": "running"},
+                ]),
+                0,
+            )),
+        );
+
+        let truncated = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot(
+                json!([
+                    {"id": "run-1", "kind": "subagent", "label": "scout", "state": "running"},
+                ]),
+                1,
+            )),
+        );
+        assert!(
+            truncated.is_empty(),
+            "a report that omitted a run cannot say it is lost: {truncated:?}"
+        );
+
+        // Once the report is whole again and the run is really gone, it is.
+        let complete = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot(
+                json!([
+                    {"id": "run-1", "kind": "subagent", "label": "scout", "state": "running"},
+                ]),
+                0,
+            )),
+        );
+        let [DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(lost))] = complete.as_slice()
+        else {
+            panic!("a run missing from a complete report is lost: {complete:?}")
+        };
+        assert_eq!(lost.key.provider_id, "run-2");
+        assert_eq!(lost.status, BackgroundWorkStatus::Lost);
+    }
+
+    #[test]
+    fn an_async_status_widget_that_is_not_the_snapshot_still_reaches_the_client() {
+        // A version of the extension that words its widget differently must
+        // still reach the client as the text surface it was, rather than being
+        // swallowed by the key it happens to share.
+        let events = extension_ui_events(json!({
+            "type": "extension_ui_request",
+            "id": "uuid-async",
+            "method": "setWidget",
+            "widgetKey": PI_ASYNC_STATUS_WIDGET_KEY,
+            "widgetLines": ["subagent-async: 2 running"]
+        }));
+
+        assert!(matches!(
+            events.as_slice(),
+            [DriverEvent::ExtensionWidget { key, lines, .. }]
+                if key == PI_ASYNC_STATUS_WIDGET_KEY
+                    && lines.as_deref() == Some(["subagent-async: 2 running".to_owned()].as_slice())
         ));
     }
 

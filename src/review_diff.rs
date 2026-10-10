@@ -348,6 +348,28 @@ pub fn wire_source(source: Source) -> waku_client::workspace::ReviewDiffSource {
     }
 }
 
+/// The desktop source a persisted or wire [`ReviewDiffSource`] describes. A
+/// `LastTurn` source keeps its turn reference; the surface re-resolves it
+/// against the session and falls back should the turn be gone.
+pub fn source_from_wire(source: waku_client::workspace::ReviewDiffSource) -> Source {
+    match source {
+        waku_client::workspace::ReviewDiffSource::LastTurn {
+            session_id,
+            turn_id,
+            turn_count,
+        } => Source::LastTurn {
+            session_id,
+            turn_id,
+            turn_count,
+        },
+        waku_client::workspace::ReviewDiffSource::Uncommitted => Source::Uncommitted,
+        waku_client::workspace::ReviewDiffSource::Unstaged => Source::Unstaged,
+        waku_client::workspace::ReviewDiffSource::Staged => Source::Staged,
+        waku_client::workspace::ReviewDiffSource::Committed => Source::Committed,
+        waku_client::workspace::ReviewDiffSource::Branch => Source::Branch,
+    }
+}
+
 fn parse(source: Source, numstat: &str, patch: &str, complete_context: bool) -> Snapshot {
     let mut files = parse_numstat(numstat);
     let mut path_indexes = files

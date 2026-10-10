@@ -214,7 +214,6 @@ const SIDEBAR_GROUP_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_GROUP_HEADER_BOTTOM_GAP: f32 = 2.0;
 const SIDEBAR_SHOW_MORE_ROW_HEIGHT: f32 = 30.0;
 const SIDEBAR_GROUP_SPACER_HEIGHT: f32 = 10.0;
-const SIDEBAR_GROUP_GUIDE_X: f32 = 15.0;
 const SIDEBAR_GROUP_CHILD_PADDING: f32 = 28.0;
 const SIDEBAR_PROJECT_RECENT_WINDOW_SECONDS: u64 = 3 * 24 * 60 * 60;
 const SIDEBAR_PROJECT_REVEAL_BATCH: usize = 30;
@@ -1366,13 +1365,9 @@ impl Waku {
         };
         match *row {
             SidebarRow::Search => self.render_sidebar_search(cx).into_any_element(),
-            SidebarRow::Header(group) => {
-                let has_expanded_children = rows.get(index + 1).is_some_and(|row| {
-                    matches!(row, SidebarRow::Session(_) | SidebarRow::ShowMore(_))
-                });
-                self.render_sidebar_group_header(group, index == 1, has_expanded_children, cx)
-                    .into_any_element()
-            }
+            SidebarRow::Header(group) => self
+                .render_sidebar_group_header(group, index == 1, cx)
+                .into_any_element(),
             SidebarRow::Session(session_id) => self
                 .render_sidebar_session_item(session_id, cx)
                 .into_any_element(),
@@ -1390,7 +1385,6 @@ impl Waku {
         &self,
         group: SidebarGroup,
         first: bool,
-        has_expanded_children: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = Theme::current(cx);
@@ -1495,7 +1489,6 @@ impl Waku {
             .tab_group()
             .tab_stop(true)
             .group(group_name)
-            .relative()
             .w_full()
             .rounded(px(6.0))
             .cursor_default()
@@ -1527,17 +1520,6 @@ impl Waku {
             .when_some(compose, |element, compose| element.child(compose))
             .when(first, |element| {
                 element.child(self.render_sidebar_header_actions(cx))
-            })
-            .when(show_folder_icon && has_expanded_children, |element| {
-                element.child(
-                    div()
-                        .absolute()
-                        .left(px(SIDEBAR_GROUP_GUIDE_X))
-                        .top(px(19.0))
-                        .bottom(px(-2.0))
-                        .w(px(1.0))
-                        .bg(theme.border),
-                )
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_sidebar_group(group, cx);
@@ -1614,27 +1596,12 @@ impl Waku {
             }));
 
         div()
-            .relative()
             .w_full()
             .h(px(SIDEBAR_SHOW_MORE_ROW_HEIGHT))
             .pl(px(SIDEBAR_GROUP_CHILD_PADDING))
             .flex()
             .items_center()
             .child(button)
-            .child(
-                div()
-                    .absolute()
-                    .left(px(SIDEBAR_GROUP_GUIDE_X))
-                    .top_0()
-                    .w(px(SIDEBAR_GROUP_CHILD_PADDING
-                        - SIDEBAR_GROUP_GUIDE_X
-                        - 4.0))
-                    .h(px(15.0))
-                    .border_l_1()
-                    .border_b_1()
-                    .rounded_bl(px(4.0))
-                    .border_color(theme.border),
-            )
     }
 
     fn show_more_project_sessions(&mut self, group: SidebarGroup, cx: &mut Context<Self>) {
@@ -1692,6 +1659,10 @@ impl Waku {
             return;
         }
         self.state.sidebar_grouping = grouping;
+        // A grouping that actually changed is the user's pick, not a default:
+        // the marker is what keeps a future change of default from rewriting
+        // it on the next launch.
+        self.state.sidebar_grouping_chosen = true;
         self.sidebar_rows_fingerprint.set(None);
         self.sidebar_branch_scan_fingerprint.set(None);
         self.sidebar_branch_scan_generation
@@ -1700,7 +1671,7 @@ impl Waku {
             item_ix: 0,
             offset_in_item: Pixels::ZERO,
         });
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1714,7 +1685,7 @@ impl Waku {
             item_ix: 0,
             offset_in_item: Pixels::ZERO,
         });
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1767,7 +1738,7 @@ impl Waku {
                 .session_mut(session_id)
                 .is_some_and(|session| session.set_title(&title))
         {
-            self.save();
+            self.save(cx);
         }
         cx.notify();
     }
@@ -2026,21 +1997,9 @@ impl Waku {
         };
 
         div()
-            .relative()
             .w_full()
             .pb(px(SIDEBAR_SESSION_ROW_GAP))
             .child(row)
-            .when(grouped_by_project, |element| {
-                element.child(
-                    div()
-                        .absolute()
-                        .left(px(SIDEBAR_GROUP_GUIDE_X))
-                        .top_0()
-                        .bottom_0()
-                        .w(px(1.0))
-                        .bg(theme.border),
-                )
-            })
             .into_any_element()
     }
 
@@ -2170,6 +2129,29 @@ impl Waku {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text_secondary)
                                 .child(icon("icons/bot.svg", 10.5, theme.text_tertiary))
+                                .child(div().min_w_0().truncate().child(SharedString::from(label)))
+                        }))
+                        // Several debug builds can run side by side, each on its
+                        // own checkout's database; the badge says which is
+                        // which. Release builds have one app and no badge.
+                        .children(crate::instance::debug_label().map(|label| {
+                            div()
+                                .id("debug-instance")
+                                .h(px(22.0))
+                                .max_w(px(240.0))
+                                .px(px(6.0))
+                                .rounded(px(6.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .bg(theme.overlay)
+                                .text_size(sp(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text_ghost)
+                                .tooltip(Tooltip::text(format!(
+                                    "debug build · database {}",
+                                    crate::instance::database_path()
+                                )))
                                 .child(div().min_w_0().truncate().child(SharedString::from(label)))
                         })),
                     cx,

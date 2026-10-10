@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -55,8 +55,10 @@ use crate::ui::tooltip::Tooltip;
 
 use crate::browser::BrowserView;
 use crate::persistence::{
-    ComposerDraftStore, ComposerDrafts, DEFAULT_RIGHT_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH,
-    PersistedState, PersistedWindowState, SidebarGrouping, SidebarOrdering, StateStore,
+    AppSettings, ComposerDraftStore, ComposerDrafts, DEFAULT_RIGHT_PANEL_WIDTH,
+    DEFAULT_SIDEBAR_WIDTH, FollowUpBehavior, PersistedState, PersistedWindowState,
+    RightPanelSurfaceDescriptor, RightPanelTaskDescriptor, SidebarGrouping, SidebarOrdering,
+    StateStore,
 };
 use crate::query::{Query, QueryCache};
 use crate::review_diff::{Snapshot as ReviewDiffSnapshot, Source as ReviewDiffSource};
@@ -73,8 +75,8 @@ use crate::{
     FocusPrev, NavigateBack, NavigateForward, NewProject, NewSession, OpenFind, OpenFindReplace,
     OpenResumePicker, OpenSettings, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask,
     SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette, ToggleFindCaseSensitive,
-    ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel,
-    ToggleSidebar, ToggleUsagePanel,
+    ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter, ToggleFullScreen, ToggleModelPicker,
+    ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]
@@ -940,6 +942,12 @@ struct SessionRuntime {
     /// Presentation metadata for steering messages awaiting the provider's
     /// accepted/rejected acknowledgement, in transport order.
     pending_steers: VecDeque<ComposerSubmission>,
+    /// Transcript rows a provider already accepted as steers, keyed by the
+    /// transport text it echoed. A late refusal — a steer the run could not
+    /// take, converted to a prompt, then refused — needs the row's id to mark
+    /// it undelivered instead of submitting the same text a second time.
+    /// Cleared by the settlement that ends the run those steers joined.
+    delivered_steers: VecDeque<(String, Uuid)>,
     stream_phase: Option<StreamPhase>,
     /// The parked-turn notification has fired for the turn in flight, so a
     /// wake that parks again does not repeat it. Cleared when the turn ends.
@@ -1151,9 +1159,11 @@ impl Default for ActivityScrollViewport {
 }
 
 pub struct Waku {
-    /// Owns the headless provider process for exactly as long as the desktop
-    /// app entity. Debug builds can replace it independently after a rebuild;
-    /// all live driver handles below are lightweight RPC proxies.
+    /// A clone of the application-scope daemon supervisor, not its owner: the
+    /// app keeps the daemon alive, so closing this window leaves the process
+    /// running and a rebuilt window reattaches to it. Debug builds can replace
+    /// it independently after a rebuild; all live driver handles below are
+    /// lightweight RPC proxies.
     daemon: waku_client::DaemonSupervisor,
     /// Cached once at construction for the Daemon settings connection URL;
     /// rendering must not query account or network configuration.
@@ -1517,6 +1527,12 @@ pub struct Waku {
     right_panel_rendered_width: f32,
     fps_counter_visible: bool,
     panel_resize_drag: Option<PanelResizeDrag>,
+    /// The confirmation an unsaved file editor raises in front of a close.
+    unsaved_edits_guard: UnsavedEditsGuard,
+    /// The confirmation's two choices, so both answer the keyboard as well as
+    /// the pointer.
+    window_close_discard_focus: FocusHandle,
+    window_close_cancel_focus: FocusHandle,
     /// Window-relative PiP position, independent of incoming preview frames.
     computer_use_preview_position: Option<gpui::Point<Pixels>>,
     right_panel_session_states: HashMap<Uuid, RightPanelSessionState>,
@@ -1574,6 +1590,10 @@ pub struct Waku {
     workspace_queries_stale: bool,
     right_panel_terminals: HashMap<Uuid, Entity<TerminalView>>,
     right_panel_browsers: HashMap<Uuid, Entity<BrowserView>>,
+    /// URLs a restored browser tab must navigate to on its first render, keyed
+    /// by surface id. The surface id is the tab's identity; the URL is held
+    /// here until the render builds the webview host it needs.
+    right_panel_pending_browser_urls: HashMap<Uuid, String>,
     /// A Browser surface was just opened; the next right panel render moves
     /// focus into its address bar.
     right_panel_pending_browser_focus: Option<Uuid>,
@@ -1808,7 +1828,8 @@ mod transcript_search;
 mod transcript_view;
 mod usage_meter;
 mod usage_page;
-mod window_chrome;
+pub(crate) mod window_chrome;
+mod window_close;
 
 pub use autocomplete::init as init_composer_autocomplete;
 use background_work::{
@@ -1826,6 +1847,8 @@ pub use skills_page::init as init_skills_keys;
 use streaming::*;
 use transcript::*;
 use transcript_view::ConversationNavigationRail;
+use window_close::UnsavedEditsGuard;
+pub use window_close::init as init_window_close_keys;
 
 /// Collapse provider- or page-supplied text into a label that cannot contain
 /// hard line breaks. GPUI's `truncate()` prevents wrapping, but explicit
@@ -2114,9 +2137,13 @@ impl Waku {
         window: &mut Window,
         cx: &mut App,
         daemon: waku_client::DaemonSupervisor,
+        preferences: AppSettings,
     ) -> Entity<Self> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let store = StateStore::remote(daemon.clone());
+        // The window read these once before its first frame; hydrating from the
+        // same snapshot is what keeps the workspace from switching the theme,
+        // language, or font size under the skeleton that is already on screen.
+        let store = StateStore::remote_with_settings(daemon.clone(), preferences);
         let daemon_hostname = crate::daemon::local_hostname().unwrap_or_else(|| "this-mac".into());
         let composer_draft_store = ComposerDraftStore::remote(daemon.clone());
         let composer_drafts = composer_draft_store.load().unwrap_or_default();
@@ -2559,7 +2586,7 @@ impl Waku {
                             this.submit_composer_submission(submission, cx);
                         }
                     }
-                    ComposerEvent::SubmitSteer(prompt) => {
+                    ComposerEvent::SubmitOpposite(prompt) => {
                         if let Some(session_id) = this.selected_session().and_then(|session| {
                             this.response_fork_preparations
                                 .contains_key(&session.id)
@@ -2569,7 +2596,7 @@ impl Waku {
                         } else if let Some(submission) =
                             this.submission_with_attachments(prompt, cx)
                         {
-                            this.steer_composer_submission(submission, cx);
+                            this.submit_opposite_composer_submission(submission, cx);
                         }
                     }
                     ComposerEvent::SteerQueued => {
@@ -2656,8 +2683,8 @@ impl Waku {
 
             // Window-frame changes are only mirrored in memory; the quit save
             // is what lands the final position and size on disk.
-            cx.on_app_quit(|this, _| {
-                this.save();
+            cx.on_app_quit(|this, cx| {
+                this.save(cx);
                 async {}
             })
             .detach();
@@ -3072,6 +3099,9 @@ impl Waku {
                 },
                 fps_counter_visible: false,
                 panel_resize_drag: None,
+                unsaved_edits_guard: UnsavedEditsGuard::default(),
+                window_close_discard_focus: cx.focus_handle(),
+                window_close_cancel_focus: cx.focus_handle(),
                 computer_use_preview_position: None,
                 right_panel_session_states: HashMap::new(),
                 right_panel_surfaces: Vec::new(),
@@ -3113,6 +3143,7 @@ impl Waku {
                 workspace_queries_stale: false,
                 right_panel_terminals: HashMap::new(),
                 right_panel_browsers: HashMap::new(),
+                right_panel_pending_browser_urls: HashMap::new(),
                 right_panel_pending_browser_focus: None,
                 scene_overlay_enabled,
                 settings_page: None,
@@ -3221,6 +3252,7 @@ impl Waku {
         // first frame.
         entity.update(cx, |this, cx| {
             this.restart_task_state_sync();
+            this.restore_persisted_right_panels(cx);
             for session_id in startup_live_session_ids {
                 this.start_runtime_attachment(session_id, cx);
             }

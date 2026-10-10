@@ -95,7 +95,7 @@ impl Waku {
         div()
             .key_context("Waku")
             .track_focus(&self.settings_focus)
-            .on_action(|_: &CloseWindow, window, _| crate::platform::hide_window(window))
+            .on_action(cx.listener(Self::close_window_action))
             .on_action(cx.listener(Self::new_session_action))
             .on_action(cx.listener(Self::new_project_action))
             .on_action(cx.listener(Self::open_settings_action))
@@ -428,6 +428,60 @@ impl Waku {
         let updater_available = cx
             .try_global::<crate::updater::UpdaterState>()
             .is_some_and(|updater| updater.0.is_some());
+        let selected_dissolve_fps = self.state.dissolve_fps;
+        let weak = cx.entity().downgrade();
+        let dissolve_fps_handle = self.menu_handle("dissolve-fps-selector", cx);
+        let dissolve_fps_selector = dropdown_menu(
+            MenuChip::new("dissolve-fps-selector")
+                .label(dissolve_fps_label(selected_dissolve_fps))
+                .outlined()
+                .selected(dissolve_fps_handle.is_open())
+                .w(px(116.0))
+                .justify_between(),
+            "dissolve-fps-selector-menu",
+            &dissolve_fps_handle,
+            MenuAlign::BelowRight,
+            move |_| {
+                waku_client::persistence::DISSOLVE_FPS_CHOICES
+                    .into_iter()
+                    .map(|fps| {
+                        let weak = weak.clone();
+                        MenuItem::new(dissolve_fps_label(fps), move |_window, cx| {
+                            let _ = weak.update(cx, |this, cx| this.set_dissolve_fps(fps, cx));
+                        })
+                        .selected(fps == selected_dissolve_fps)
+                    })
+                    .collect()
+            },
+        );
+        let selected_follow_up = self.state.follow_up_behavior;
+        let weak = cx.entity().downgrade();
+        let follow_up_handle = self.menu_handle("follow-up-behavior-selector", cx);
+        let follow_up_selector = dropdown_menu(
+            MenuChip::new("follow-up-behavior-selector")
+                .label(follow_up_behavior_label(selected_follow_up))
+                .outlined()
+                .selected(follow_up_handle.is_open())
+                .w(px(116.0))
+                .justify_between(),
+            "follow-up-behavior-selector-menu",
+            &follow_up_handle,
+            MenuAlign::BelowRight,
+            move |_| {
+                FollowUpBehavior::ALL
+                    .into_iter()
+                    .map(|behavior| {
+                        let weak = weak.clone();
+                        MenuItem::new(follow_up_behavior_label(behavior), move |_, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.set_follow_up_behavior(behavior, cx);
+                            });
+                        })
+                        .selected(behavior == selected_follow_up)
+                    })
+                    .collect()
+            },
+        );
         div()
             .child(
                 div()
@@ -496,6 +550,78 @@ impl Waku {
                             move |this, _, cx| this.set_render_math(!enabled, cx)
                         },
                     )),
+            )
+            .child(
+                div()
+                    .mt(px(15.0))
+                    .w_full()
+                    .min_h(px(60.0))
+                    .px(px(20.0))
+                    .py(px(12.0))
+                    .rounded(px(13.0))
+                    .bg(theme.raised)
+                    .flex()
+                    .items_center()
+                    .gap(px(24.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(sp(13.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(tr!("settings.stream_dissolve")),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(5.0))
+                                    .text_size(sp(12.5))
+                                    .line_height(sp(18.0))
+                                    .text_color(theme.text_secondary)
+                                    .child(tr!("settings.stream_dissolve_description")),
+                            ),
+                    )
+                    .child(dissolve_fps_selector),
+            )
+            .child(
+                div()
+                    .mt(px(15.0))
+                    .w_full()
+                    .min_h(px(60.0))
+                    .px(px(20.0))
+                    .py(px(12.0))
+                    .rounded(px(13.0))
+                    .bg(theme.raised)
+                    .flex()
+                    .items_center()
+                    .gap(px(24.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(sp(13.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(tr!("settings.follow_up_behavior")),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(5.0))
+                                    .text_size(sp(12.5))
+                                    .line_height(sp(18.0))
+                                    .text_color(theme.text_secondary)
+                                    .child(tr!(
+                                        "settings.follow_up_behavior_description",
+                                        shortcut =
+                                            crate::platform::primary_shortcut("⌘↩", "Ctrl+Enter")
+                                    )),
+                            ),
+                    )
+                    .child(follow_up_selector),
             )
             .when(updater_available, |column| {
                 let enabled = self.automatic_updates_enabled;
@@ -1196,7 +1322,7 @@ impl Waku {
         let needs_restart = self.state.daemon_exposure.enabled || settings.enabled;
         if !needs_restart {
             self.state.daemon_exposure = settings;
-            self.save();
+            self.save(cx);
             cx.notify();
             return;
         }
@@ -1221,7 +1347,7 @@ impl Waku {
                         this.daemon_origins_input.update(cx, |input, cx| {
                             input.set_content(applied.allowed_origins_text(), cx)
                         });
-                        this.save();
+                        this.save(cx);
                         this.show_success_toast(tr!("daemon.settings_applied"));
                     }
                     Err(error) => {
@@ -1497,7 +1623,26 @@ impl Waku {
         }
         self.state.render_math = enabled;
         self.remeasure_font_sized_surfaces();
-        self.save();
+        self.save(cx);
+        cx.notify();
+    }
+
+    fn set_dissolve_fps(&mut self, fps: u32, cx: &mut Context<Self>) {
+        let fps = waku_client::persistence::sanitized_dissolve_fps(fps);
+        if self.state.dissolve_fps == fps {
+            return;
+        }
+        self.state.dissolve_fps = fps;
+        self.save(cx);
+        cx.notify();
+    }
+
+    fn set_follow_up_behavior(&mut self, behavior: FollowUpBehavior, cx: &mut Context<Self>) {
+        if self.state.follow_up_behavior == behavior {
+            return;
+        }
+        self.state.follow_up_behavior = behavior;
+        self.save(cx);
         cx.notify();
     }
 
@@ -1510,7 +1655,7 @@ impl Waku {
         // Chrome is authored in `sp` rems; the rem size is the setting.
         window.set_rem_size(px(size));
         self.remeasure_font_sized_surfaces();
-        self.save();
+        self.save(cx);
         window.refresh();
         cx.notify();
     }
@@ -1522,7 +1667,7 @@ impl Waku {
         }
         self.state.code_font_size = size;
         self.remeasure_font_sized_surfaces();
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1950,7 +2095,7 @@ impl Waku {
         } else {
             self.state.provider_binary_overrides.insert(provider, text);
         }
-        self.save();
+        self.save(cx);
         self.refresh_provider_detection(Some(provider));
         self.refresh_composer_sources(cx);
         cx.notify();
@@ -2004,7 +2149,7 @@ impl Waku {
                 }
             }
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -2256,7 +2401,7 @@ impl Waku {
 
     fn set_computer_use_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.state.computer_use_enabled = enabled;
-        self.save();
+        self.save(cx);
         if enabled {
             self.request_computer_permissions(true, cx);
         }
@@ -2300,7 +2445,7 @@ impl Waku {
         self.state
             .computer_use_allowed_apps
             .retain(|grant| grant.key() != key);
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -2394,7 +2539,7 @@ impl Waku {
         }
         self.state.theme = preference;
         crate::theme::apply_theme_preference(preference, window, cx);
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -2455,7 +2600,7 @@ impl Waku {
             .and_then(|updater| updater.0.as_ref())
             .is_some();
         crate::set_app_menus(cx, updater_available);
-        self.save();
+        self.save(cx);
         window.refresh();
         cx.notify();
     }
@@ -2471,6 +2616,18 @@ fn font_size_label(size: f32) -> String {
         format!("{size:.0} px")
     } else {
         format!("{size} px")
+    }
+}
+
+/// "60 fps" reads the same in every locale; the unit is not translated.
+fn dissolve_fps_label(fps: u32) -> String {
+    format!("{fps} fps")
+}
+
+fn follow_up_behavior_label(behavior: FollowUpBehavior) -> String {
+    match behavior {
+        FollowUpBehavior::Queue => tr!("settings.follow_up_behavior_queue"),
+        FollowUpBehavior::Steer => tr!("settings.follow_up_behavior_steer"),
     }
 }
 

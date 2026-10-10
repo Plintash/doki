@@ -80,9 +80,9 @@ layout to read a row from, so a stale row can never cost more than the line.
 
 | Chord | Does |
 | --- | --- |
-| `enter` | submits; while a turn is running, queues a follow-up |
+| `enter` | submits; while a turn is running, applies the client's follow-up behavior (steer by default) |
 | `shift-enter`, `ctrl-enter`, `alt-enter` | insert a line break (`insertLineBreak:` / `insertNewlineIgnoringFieldEditor:`) |
-| `cmd-enter` | steers with the draft, or injects the oldest queued follow-up |
+| `cmd-enter` | applies the opposite follow-up behavior with the draft, or injects the oldest queued follow-up when the composer is empty |
 | `cmd-z` / `cmd-shift-z` | undo / redo |
 | `cmd-c` / `cmd-x` / `cmd-v` | copy / cut / paste |
 | `escape` | clears fields that opt in via `clear_on_escape` (the search fields); otherwise propagates. The composer does not opt in: its clear also drops undo history, so Escape stops the turn or dismisses a popup instead |

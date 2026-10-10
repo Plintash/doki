@@ -19,7 +19,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -178,6 +178,15 @@ pub enum Command {
     SaveTaskState {
         projects: Vec<Project>,
         live_session_ids: Vec<Uuid>,
+        /// Sessions in `sessions` whose transcript detail was never loaded.
+        ///
+        /// [`AgentSession::detail_loaded`] is process-local and does not
+        /// survive the wire, so a list projection would otherwise arrive as a
+        /// fully loaded but empty session. The daemon restores the marker on
+        /// these ids before merging, or it overwrites the stored transcript
+        /// with the empty shell and deletes the task's rows.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skeleton_session_ids: Vec<Uuid>,
         sessions: Vec<AgentSession>,
     },
     /// Explicitly remove one daemon-owned task. Ordinary state saves are
@@ -251,11 +260,25 @@ pub enum Command {
     Workspace {
         operation: WorkspaceOperation,
     },
+    /// Open a terminal in the daemon, owned by the task it works for.
+    ///
+    /// The owning task is what task removal disposes: a client is free to
+    /// close its own surface, but only the task going away ends the shell
+    /// without an explicit close.
     OpenTerminal {
+        task_id: Uuid,
         #[ts(type = "string")]
         cwd: PathBuf,
         cols: u16,
         rows: u16,
+    },
+    /// Recover a terminal this client was not attached for.
+    ///
+    /// The response carries the retained output and the terminal's current
+    /// size; live output then continues through the runtime event stream, so a
+    /// client subscribes before attaching to avoid a gap.
+    AttachTerminal {
+        task_id: Uuid,
     },
     WriteTerminal {
         #[serde(with = "base64_bytes")]
@@ -462,6 +485,32 @@ pub enum ResponsePayload {
     Workspace {
         result: WorkspaceResult,
     },
+    /// Retained terminal output and current size, returned by
+    /// [`Command::AttachTerminal`].
+    TerminalSnapshot(TerminalSnapshot),
+    /// The daemon holds no terminal under the attached id. Distinct from an
+    /// error so a client can tell "nothing is running here, open one" from a
+    /// transport or RPC failure, which must not be answered by replacing a
+    /// live terminal. Returned only by [`Command::AttachTerminal`].
+    TerminalAbsent,
+}
+
+/// Retained terminal output and current size, replayed on attach.
+///
+/// `data` is base64 on the wire. `sequence` is the cumulative number of output
+/// bytes the terminal had produced when the snapshot was taken, counting bytes
+/// the bounded ring already dropped; a client drops live `terminalOutput`
+/// batches whose own end sequence is at or below it, which makes the
+/// snapshot/live boundary exact.
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSnapshot {
+    #[serde(with = "base64_bytes")]
+    #[ts(type = "string")]
+    pub data: Vec<u8>,
+    pub sequence: u64,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -529,13 +578,67 @@ mod tests {
     }
 
     #[test]
+    fn terminal_commands_name_the_task_that_owns_the_terminal() {
+        let task_id = Uuid::from_u128(7);
+
+        let command = serde_json::to_value(Command::AttachTerminal { task_id }).unwrap();
+        assert_eq!(command["type"], "attachTerminal");
+        assert_eq!(command["taskId"], task_id.to_string());
+
+        let opened = serde_json::to_value(Command::OpenTerminal {
+            task_id,
+            cwd: PathBuf::from("/workspace"),
+            cols: 100,
+            rows: 30,
+        })
+        .unwrap();
+        assert_eq!(opened["type"], "openTerminal");
+        assert_eq!(opened["taskId"], task_id.to_string());
+    }
+
+    #[test]
+    fn terminal_attach_returns_a_base64_snapshot_with_size() {
+        let payload = ResponsePayload::TerminalSnapshot(TerminalSnapshot {
+            data: vec![0, 1, 2, 255],
+            sequence: 4096,
+            cols: 120,
+            rows: 40,
+        });
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["type"], "terminalSnapshot");
+        assert_eq!(json["data"], "AAEC/w==");
+        assert_eq!(json["sequence"], 4096);
+        assert_eq!(json["cols"], 120);
+        assert_eq!(json["rows"], 40);
+
+        let ResponsePayload::TerminalSnapshot(snapshot) = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected payload variant");
+        };
+        assert_eq!(snapshot.data, vec![0, 1, 2, 255]);
+        assert_eq!(snapshot.sequence, 4096);
+        assert_eq!((snapshot.cols, snapshot.rows), (120, 40));
+    }
+
+    #[test]
+    fn terminal_absence_is_its_own_response_not_an_error() {
+        let json = serde_json::to_value(ResponsePayload::TerminalAbsent).unwrap();
+
+        assert_eq!(json["type"], "terminalAbsent");
+        assert!(matches!(
+            serde_json::from_value(json).unwrap(),
+            ResponsePayload::TerminalAbsent
+        ));
+    }
+
+    #[test]
     fn response_fork_command_uses_stable_camel_case_fields() {
         let json =
             serde_json::to_value(Command::ForkSessionFromResponse { turn_count: 7 }).unwrap();
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 
     #[test]
@@ -544,7 +647,32 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 12);
+    }
+
+    #[test]
+    fn task_state_save_names_the_sessions_that_are_list_projections() {
+        let skeleton_id = Uuid::from_u128(1);
+        let command = Command::SaveTaskState {
+            projects: Vec::new(),
+            live_session_ids: vec![skeleton_id],
+            skeleton_session_ids: vec![skeleton_id],
+            sessions: Vec::new(),
+        };
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(json["type"], "saveTaskState");
+        assert_eq!(json["skeletonSessionIds"][0], skeleton_id.to_string());
+
+        // A save with no projections keeps the older shape, so a payload that
+        // never mentions skeletons stays compatible.
+        let command = Command::SaveTaskState {
+            projects: Vec::new(),
+            live_session_ids: Vec::new(),
+            skeleton_session_ids: Vec::new(),
+            sessions: Vec::new(),
+        };
+        let json = serde_json::to_value(&command).unwrap();
+        assert!(json.get("skeletonSessionIds").is_none());
     }
 
     #[test]

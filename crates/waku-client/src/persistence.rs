@@ -23,6 +23,7 @@ use waku_protocol::model::{
     ProviderSessionHistory, ProviderSessionSummary, RuntimeMode,
 };
 use waku_protocol::theme::ThemePreference;
+use waku_protocol::workspace::ReviewDiffSource;
 
 pub use waku_protocol::persistence::{
     ComposerDraft, ComposerDraftAttachment, ComposerDraftChange, ComposerDraftKey,
@@ -36,11 +37,16 @@ pub const DEFAULT_SIDEBAR_WIDTH: f32 = 252.0;
 pub const DEFAULT_RIGHT_PANEL_WIDTH: f32 = 460.0;
 
 /// How the desktop groups task history in the sidebar.
+///
+/// Project-first by default: a day's work is spread across every project it
+/// touched, so date headings pile unrelated tasks on top of each other, while
+/// the tasks sharing a project are the ones a user resumes together. Date
+/// headings stay one click away in the sidebar's options menu.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarGrouping {
-    Project,
     #[default]
+    Project,
     Updated,
 }
 
@@ -51,6 +57,30 @@ pub enum SidebarOrdering {
     #[default]
     Newest,
     Oldest,
+}
+
+/// What the composer's primary send action does while the agent is working:
+/// steer the running turn, or queue the message as a follow-up. The
+/// primary-modifier chord applies the other action to one message.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FollowUpBehavior {
+    Queue,
+    #[default]
+    Steer,
+}
+
+impl FollowUpBehavior {
+    pub const ALL: [Self; 2] = [Self::Queue, Self::Steer];
+
+    /// The other behavior, which the primary-modifier chord applies to one
+    /// message.
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Queue => Self::Steer,
+            Self::Steer => Self::Queue,
+        }
+    }
 }
 
 fn default_sidebar_visibility() -> bool {
@@ -75,6 +105,24 @@ fn default_code_font_size() -> f32 {
 
 fn default_render_math() -> bool {
     true
+}
+
+/// Frame cadences offered for the streaming dissolve ([`AppSettings::dissolve_fps`]).
+/// The dissolve's gradient travels on every frame, so a slower cadence shows
+/// visible steps on a fast panel; 120 is the ProMotion choice.
+pub const DISSOLVE_FPS_CHOICES: [u32; 3] = [30, 60, 120];
+pub const DEFAULT_DISSOLVE_FPS: u32 = 120;
+
+fn default_dissolve_fps() -> u32 {
+    DEFAULT_DISSOLVE_FPS
+}
+
+/// Bounds a possibly hand-edited cadence to one of the offered choices.
+pub fn sanitized_dissolve_fps(fps: u32) -> u32 {
+    DISSOLVE_FPS_CHOICES
+        .into_iter()
+        .min_by_key(|choice| choice.abs_diff(fps))
+        .unwrap_or(DEFAULT_DISSOLVE_FPS)
 }
 
 fn default_provider() -> ProviderKind {
@@ -237,6 +285,42 @@ pub struct PersistedWindowState {
     pub display: Option<Uuid>,
 }
 
+/// One right-panel surface reduced to the identity a rebuilt window can
+/// restore: a daemon terminal id, a browser tab's last observed URL, a
+/// workspace-relative file path, or a diff source. View state — scroll
+/// position, selection, editor buffers, file-tree expansion, and a browser
+/// page's in-page state — is deliberately absent; a rebuilt window restores
+/// identities, not page or caret state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RightPanelSurfaceDescriptor {
+    Terminal {
+        terminal_id: Uuid,
+    },
+    /// A browser tab. `url` is the last URL the page committed, or `None` for
+    /// a tab whose page was never observed, which a rebuilt window restores
+    /// blank.
+    Browser {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    File {
+        path: String,
+    },
+    Diff {
+        source: ReviewDiffSource,
+    },
+}
+
+/// One task's persisted right panel: its restorable surfaces and which of them
+/// was active. An empty `surfaces` means the task had nothing durable open.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct RightPanelTaskDescriptor {
+    pub surfaces: Vec<RightPanelSurfaceDescriptor>,
+    pub active: Option<usize>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -252,6 +336,12 @@ pub struct AppSettings {
     /// applied.
     pub code_font_size: f32,
     pub render_math: bool,
+    /// Frame budget for the streaming text dissolve: 30, 60, or 120. See
+    /// [`DISSOLVE_FPS_CHOICES`].
+    pub dissolve_fps: u32,
+    /// What the composer's primary send action does while the agent is
+    /// working; the primary-modifier chord does the opposite.
+    pub follow_up_behavior: FollowUpBehavior,
     pub daemon_exposure: DaemonExposureSettings,
     /// Preferred target of the header's "open project in app" control, by
     /// catalog id. `None` — and an id no longer installed — fall back to the
@@ -268,6 +358,8 @@ impl Default for AppSettings {
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             code_font_size: DEFAULT_CODE_FONT_SIZE,
             render_math: true,
+            dissolve_fps: DEFAULT_DISSOLVE_FPS,
+            follow_up_behavior: FollowUpBehavior::Steer,
             daemon_exposure: DaemonExposureSettings::default(),
             open_in_app: None,
         }
@@ -323,6 +415,11 @@ struct AppState {
     sidebar_width: f32,
     #[serde(default)]
     sidebar_grouping: SidebarGrouping,
+    /// Whether the stored grouping is the user's own pick. Documents written
+    /// before project-first grouping was the default carry a grouping nobody
+    /// chose, and that one has to yield to the current default.
+    #[serde(default)]
+    sidebar_grouping_chosen: bool,
     #[serde(default)]
     sidebar_ordering: SidebarOrdering,
     #[serde(default = "default_right_panel_width")]
@@ -333,6 +430,10 @@ struct AppState {
     markdown_preview: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_state: Option<PersistedWindowState>,
+    /// Per-task right-panel descriptors, keyed by task id. Written only by the
+    /// desktop; a document that predates the field reads back empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    right_panel: BTreeMap<Uuid, RightPanelTaskDescriptor>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -367,6 +468,10 @@ pub struct PersistedState {
     pub code_font_size: f32,
     #[serde(default = "default_render_math")]
     pub render_math: bool,
+    #[serde(default = "default_dissolve_fps")]
+    pub dissolve_fps: u32,
+    #[serde(default)]
+    pub follow_up_behavior: FollowUpBehavior,
     #[serde(default)]
     pub daemon_exposure: DaemonExposureSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -379,6 +484,9 @@ pub struct PersistedState {
     pub sidebar_width: f32,
     #[serde(default)]
     pub sidebar_grouping: SidebarGrouping,
+    /// Set once the user picks a grouping, never by the default: it is what
+    /// keeps a later change of default from rewriting that choice.
+    pub sidebar_grouping_chosen: bool,
     #[serde(default)]
     pub sidebar_ordering: SidebarOrdering,
     #[serde(default = "default_right_panel_width")]
@@ -389,6 +497,11 @@ pub struct PersistedState {
     pub markdown_preview: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_state: Option<PersistedWindowState>,
+    /// Per-task right-panel descriptors. Desktop-only: the daemon's task store
+    /// never sees them, so they are skipped in [`PersistedState`]'s own
+    /// serialization and travel to disk through `state.json`'s `AppState`.
+    #[serde(skip)]
+    pub right_panel_descriptors: BTreeMap<Uuid, RightPanelTaskDescriptor>,
     #[serde(default = "default_computer_use_enabled")]
     pub computer_use_enabled: bool,
     #[serde(default)]
@@ -439,16 +552,20 @@ impl PersistedState {
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             code_font_size: DEFAULT_CODE_FONT_SIZE,
             render_math: true,
+            dissolve_fps: DEFAULT_DISSOLVE_FPS,
+            follow_up_behavior: FollowUpBehavior::Steer,
             daemon_exposure: DaemonExposureSettings::default(),
             open_in_app: None,
             sidebar_visible: true,
             right_panel_visible: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
-            sidebar_grouping: SidebarGrouping::Updated,
+            sidebar_grouping: SidebarGrouping::default(),
+            sidebar_grouping_chosen: false,
             sidebar_ordering: SidebarOrdering::Newest,
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             markdown_preview: false,
             window_state: None,
+            right_panel_descriptors: BTreeMap::new(),
             computer_use_enabled: false,
             computer_use_allowed_apps: Vec::new(),
             disabled_providers: Vec::new(),
@@ -566,6 +683,8 @@ impl PersistedState {
             ui_font_size: self.ui_font_size,
             code_font_size: self.code_font_size,
             render_math: self.render_math,
+            dissolve_fps: self.dissolve_fps,
+            follow_up_behavior: self.follow_up_behavior,
             daemon_exposure: self.daemon_exposure.clone(),
             open_in_app: self.open_in_app.clone(),
         }
@@ -587,10 +706,12 @@ impl PersistedState {
             right_panel_visible: self.right_panel_visible,
             sidebar_width: self.sidebar_width,
             sidebar_grouping: self.sidebar_grouping,
+            sidebar_grouping_chosen: self.sidebar_grouping_chosen,
             sidebar_ordering: self.sidebar_ordering,
             right_panel_width: self.right_panel_width,
             markdown_preview: self.markdown_preview,
             window_state: self.window_state,
+            right_panel: self.right_panel_descriptors.clone(),
         }
     }
 
@@ -601,6 +722,8 @@ impl PersistedState {
         self.ui_font_size = sanitized_ui_font_size(settings.ui_font_size);
         self.code_font_size = sanitized_code_font_size(settings.code_font_size);
         self.render_math = settings.render_math;
+        self.dissolve_fps = sanitized_dissolve_fps(settings.dissolve_fps);
+        self.follow_up_behavior = settings.follow_up_behavior;
         self.daemon_exposure = settings.daemon_exposure;
         self.open_in_app = settings.open_in_app;
     }
@@ -618,11 +741,16 @@ impl PersistedState {
         self.sidebar_visible = app_state.sidebar_visible;
         self.right_panel_visible = app_state.right_panel_visible;
         self.sidebar_width = app_state.sidebar_width;
-        self.sidebar_grouping = app_state.sidebar_grouping;
+        self.sidebar_grouping = sidebar_grouping_for(
+            app_state.sidebar_grouping_chosen,
+            app_state.sidebar_grouping,
+        );
+        self.sidebar_grouping_chosen = app_state.sidebar_grouping_chosen;
         self.sidebar_ordering = app_state.sidebar_ordering;
         self.right_panel_width = app_state.right_panel_width;
         self.markdown_preview = app_state.markdown_preview;
         self.window_state = app_state.window_state;
+        self.right_panel_descriptors = app_state.right_panel;
     }
 
     fn persistable_selected_session(&self) -> Option<Uuid> {
@@ -702,6 +830,19 @@ impl PersistedState {
         if self.last_context_window.is_none() {
             self.last_context_window = session.context_window;
         }
+    }
+}
+
+/// The grouping a stored document opens with.
+///
+/// An unchosen grouping is whatever the default was in the build that wrote
+/// the document, so this build's default replaces it; a chosen one is the
+/// user's and survives every launch, including a switch back to date headings.
+fn sidebar_grouping_for(chosen: bool, stored: SidebarGrouping) -> SidebarGrouping {
+    if chosen {
+        stored
+    } else {
+        SidebarGrouping::default()
     }
 }
 
@@ -792,6 +933,23 @@ pub fn load_or_create_app_settings() -> io::Result<AppSettings> {
     Ok(settings)
 }
 
+/// The app preferences hydration applies.
+///
+/// A window reads the persisted settings once before its first frame and hands
+/// that snapshot to the store; when it does, hydration uses the snapshot rather
+/// than reading the file a second time, which is what keeps the skeleton and
+/// the workspace from disagreeing about theme, language, or font size. A store
+/// with no snapshot still reads the file.
+fn hydration_app_settings(
+    preloaded: Option<&AppSettings>,
+    read_from_disk: impl FnOnce() -> io::Result<Option<AppSettings>>,
+) -> io::Result<Option<AppSettings>> {
+    match preloaded {
+        Some(settings) => Ok(Some(settings.clone())),
+        None => read_from_disk(),
+    }
+}
+
 /// Desktop state store: app files stay local, task data crosses RPC.
 pub struct StateStore {
     path: PathBuf,
@@ -800,6 +958,11 @@ pub struct StateStore {
     legacy_settings_paths: Vec<PathBuf>,
     daemon: DaemonSupervisor,
     remote_default_cwd: Mutex<Option<PathBuf>>,
+    /// The app preferences a window already read before its first frame. When
+    /// present, hydration applies them instead of reading the file again, so
+    /// the skeleton and the workspace cannot disagree about theme, language,
+    /// or font size.
+    preloaded_app_settings: Option<AppSettings>,
     /// A task snapshot may only be written after this client has successfully
     /// loaded the daemon's authoritative state. Falling back to an empty UI
     /// after a transient RPC failure must never turn the next ordinary save
@@ -832,7 +995,20 @@ impl StateStore {
             path: Self::default_path(),
             daemon,
             remote_default_cwd: Mutex::new(None),
+            preloaded_app_settings: None,
             task_state_loaded: AtomicBool::new(false),
+        }
+    }
+
+    /// A store that hydrates the app preferences a window already read.
+    ///
+    /// The window reads the persisted settings once, before its first frame,
+    /// and passes the same snapshot here so hydration applies exactly what the
+    /// skeleton painted rather than risking a second, different read.
+    pub fn remote_with_settings(daemon: DaemonSupervisor, app_settings: AppSettings) -> Self {
+        Self {
+            preloaded_app_settings: Some(app_settings),
+            ..Self::remote(daemon)
         }
     }
 
@@ -962,7 +1138,10 @@ impl StateStore {
         state.projects = projects;
         state.sessions = sessions;
         let app_settings_missing = !self.app_settings_path.is_file();
-        if let Some(settings) = self.read_app_settings()? {
+        let settings = hydration_app_settings(self.preloaded_app_settings.as_ref(), || {
+            self.read_app_settings()
+        })?;
+        if let Some(settings) = settings {
             state.apply_app_settings(settings);
         }
         let app_state = read_app_state_file(&self.app_state_path);
@@ -1011,6 +1190,15 @@ impl StateStore {
             .iter()
             .filter(|session| dirty_ids.contains(&session.id))
             .cloned()
+            .collect::<Vec<AgentSession>>();
+        // `detail_loaded` is process-local and does not cross the wire, so a
+        // skeleton arrives at the daemon looking like a fully loaded but empty
+        // session. Name the projections here; the daemon restores the marker
+        // before it merges and saves them.
+        let skeleton_session_ids = sessions
+            .iter()
+            .filter(|session| !session.detail_loaded)
+            .map(|session| session.id)
             .collect();
         let live_session_ids = state.sessions.iter().map(|session| session.id).collect();
         self.daemon
@@ -1021,6 +1209,7 @@ impl StateStore {
                 Command::SaveTaskState {
                     projects: state.projects.clone(),
                     live_session_ids,
+                    skeleton_session_ids,
                     sessions,
                 },
             )
@@ -1139,6 +1328,43 @@ mod tests {
     }
 
     #[test]
+    fn dissolve_fps_defaults_to_the_fastest_choice_and_snaps_hand_edits() {
+        let defaults: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.dissolve_fps, DEFAULT_DISSOLVE_FPS);
+        assert_eq!(PersistedState::empty().dissolve_fps, DEFAULT_DISSOLVE_FPS);
+        assert_eq!(sanitized_dissolve_fps(0), 30);
+        assert_eq!(sanitized_dissolve_fps(59), 60);
+        assert_eq!(sanitized_dissolve_fps(144), 120);
+        let mut state = PersistedState::empty();
+        state.dissolve_fps = 60;
+        let settings = serde_json::to_value(state.app_settings()).unwrap();
+        assert_eq!(settings["dissolve_fps"], 60);
+        let mut restored = PersistedState::empty();
+        restored.apply_app_settings(serde_json::from_value(settings).unwrap());
+        assert_eq!(restored.dissolve_fps, 60);
+    }
+
+    #[test]
+    fn follow_up_behavior_defaults_to_steer_and_persists_as_an_app_preference() {
+        let defaults: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.follow_up_behavior, FollowUpBehavior::Steer);
+        let mut state = PersistedState::empty();
+        assert_eq!(state.follow_up_behavior, FollowUpBehavior::Steer);
+        state.follow_up_behavior = FollowUpBehavior::Queue;
+        let settings = serde_json::to_value(state.app_settings()).unwrap();
+        assert_eq!(settings["follow_up_behavior"], "queue");
+        assert!(
+            serde_json::to_value(state.app_state())
+                .unwrap()
+                .get("follow_up_behavior")
+                .is_none()
+        );
+        let mut restored = PersistedState::empty();
+        restored.apply_app_settings(serde_json::from_value(settings).unwrap());
+        assert_eq!(restored.follow_up_behavior, FollowUpBehavior::Queue);
+    }
+
+    #[test]
     fn desktop_settings_paths_are_build_specific() {
         let app_settings_path = default_app_settings_path();
         let legacy_settings_paths = default_legacy_settings_paths();
@@ -1167,12 +1393,51 @@ mod tests {
     }
 
     #[test]
+    fn a_window_snapshot_replaces_the_settings_read_during_hydration() {
+        let snapshot = AppSettings {
+            theme: ThemePreference::Dark,
+            ..AppSettings::default()
+        };
+        let mut reads = 0;
+        let applied = hydration_app_settings(Some(&snapshot), || {
+            reads += 1;
+            Ok(Some(AppSettings::default()))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(reads, 0, "a window snapshot skips the file read");
+        assert_eq!(applied.theme, ThemePreference::Dark);
+
+        let applied = hydration_app_settings(None, || {
+            reads += 1;
+            Ok(Some(AppSettings::default()))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(reads, 1, "a store without a snapshot reads the file");
+        assert_eq!(applied.theme, ThemePreference::System);
+    }
+
+    #[test]
     fn legacy_app_state_defaults_sidebar_presentation() {
         let state: AppState = serde_json::from_str(r#"{"app_state_version":1}"#).unwrap();
 
-        assert_eq!(state.sidebar_grouping, SidebarGrouping::Updated);
+        assert_eq!(state.sidebar_grouping, SidebarGrouping::Project);
         assert_eq!(state.sidebar_ordering, SidebarOrdering::Newest);
         assert_eq!(state.last_runtime_mode, RuntimeMode::FullAccess);
+    }
+
+    #[test]
+    fn date_grouping_stored_before_the_default_changed_adopts_project_grouping() {
+        assert_eq!(
+            sidebar_grouping_for(false, SidebarGrouping::Updated),
+            SidebarGrouping::Project
+        );
+        assert_eq!(
+            sidebar_grouping_for(true, SidebarGrouping::Updated),
+            SidebarGrouping::Updated,
+            "a switch back to date headings survives the next launch"
+        );
     }
 
     #[test]
@@ -1184,6 +1449,136 @@ mod tests {
 
         assert_eq!(session.runtime_mode, RuntimeMode::Ask);
         assert_eq!(state.app_state().last_runtime_mode, RuntimeMode::Ask);
+    }
+
+    /// A composer pick — model, thinking level, service tier, context window —
+    /// mutates the selected session through [`PersistedState::session_mut`],
+    /// the accessor every picker handler uses. That is what queues the choice
+    /// for the next daemon save, so a pick made and then abandoned (no
+    /// following turn) still reaches the daemon and the rebuilt window's
+    /// task-list load.
+    #[test]
+    fn a_composer_pick_is_queued_for_the_next_daemon_save() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/pick"));
+        let session_id = state.sessions[0].id;
+        state.dirty_sessions.clear();
+
+        let session = state
+            .session_mut(session_id)
+            .expect("the selected session exists");
+        session.model = Some("gpt-5".into());
+        session.reasoning_effort = Some("high".into());
+        session.service_tier = Some("fast".into());
+        session.context_window = Some("1m".into());
+
+        assert!(
+            state.dirty_sessions.contains(&session_id),
+            "the pick is queued even though no turn follows it"
+        );
+    }
+
+    #[test]
+    fn right_panel_descriptors_round_trip_through_app_state() {
+        let task = Uuid::new_v4();
+        let terminal_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let mut state = PersistedState::empty();
+        state.right_panel_descriptors.insert(
+            task,
+            RightPanelTaskDescriptor {
+                surfaces: vec![
+                    RightPanelSurfaceDescriptor::Terminal { terminal_id },
+                    RightPanelSurfaceDescriptor::Browser {
+                        url: Some("https://example.com/docs".into()),
+                    },
+                    RightPanelSurfaceDescriptor::Browser { url: None },
+                    RightPanelSurfaceDescriptor::File {
+                        path: "src/main.rs".into(),
+                    },
+                    RightPanelSurfaceDescriptor::Diff {
+                        source: ReviewDiffSource::LastTurn {
+                            session_id: task,
+                            turn_id,
+                            turn_count: 2,
+                        },
+                    },
+                ],
+                active: Some(4),
+            },
+        );
+
+        let encoded = serde_json::to_value(state.app_state()).unwrap();
+        let mut restored = PersistedState::empty();
+        restored.apply_app_state(serde_json::from_value(encoded).unwrap());
+
+        assert_eq!(
+            restored.right_panel_descriptors,
+            state.right_panel_descriptors
+        );
+    }
+
+    #[test]
+    fn a_browser_descriptor_without_a_url_reads_back_blank() {
+        // A tab whose page was never observed persists without a `url` field;
+        // reading it back must yield the blank tab, not an error.
+        let descriptor: RightPanelSurfaceDescriptor =
+            serde_json::from_str(r#"{"kind":"browser"}"#).unwrap();
+        assert_eq!(
+            descriptor,
+            RightPanelSurfaceDescriptor::Browser { url: None }
+        );
+
+        let encoded =
+            serde_json::to_value(RightPanelSurfaceDescriptor::Browser { url: None }).unwrap();
+        assert!(encoded.get("url").is_none());
+    }
+
+    /// The window snapshot a rebuilt window reads back carries the selected
+    /// task and the layout: the task, the sidebar and right panel's visibility
+    /// and widths.
+    #[test]
+    fn the_window_snapshot_restores_the_selected_task_and_layout() {
+        let project = Project::from_path(PathBuf::from("/workspace"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.begin_turn("restored turn");
+        let mut state = PersistedState::empty();
+        state.projects = vec![project.clone()];
+        state.selected_project = Some(project.id);
+        state.selected_session = Some(session.id);
+        state.sessions = vec![session];
+        state.sidebar_visible = false;
+        state.sidebar_width = 248.0;
+        state.right_panel_visible = true;
+        state.right_panel_width = 420.0;
+
+        let encoded = serde_json::to_value(state.app_state()).unwrap();
+        let mut restored = PersistedState::empty();
+        restored.apply_app_state(serde_json::from_value(encoded).unwrap());
+
+        assert_eq!(restored.selected_project, state.selected_project);
+        assert_eq!(restored.selected_session, state.selected_session);
+        assert!(!restored.sidebar_visible);
+        assert_eq!(restored.sidebar_width, 248.0);
+        assert!(restored.right_panel_visible);
+        assert_eq!(restored.right_panel_width, 420.0);
+    }
+
+    #[test]
+    fn app_state_written_before_panel_descriptors_restores_them_empty() {
+        // An older `state.json` has no `right_panel` key at all; reading it
+        // must not fail, and the panel simply has nothing to restore.
+        let state: AppState = serde_json::from_str(r#"{"app_state_version":1}"#).unwrap();
+        assert!(state.right_panel.is_empty());
+
+        let mut persisted = PersistedState::empty();
+        persisted.apply_app_state(state);
+        assert!(persisted.right_panel_descriptors.is_empty());
+    }
+
+    #[test]
+    fn app_state_skips_the_right_panel_key_when_nothing_is_open() {
+        let encoded = serde_json::to_value(PersistedState::empty().app_state()).unwrap();
+        assert!(encoded.get("right_panel").is_none());
     }
 
     #[test]

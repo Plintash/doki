@@ -2,7 +2,7 @@
 
 import { lstat, readdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, basename, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 const projectRoot = resolve(import.meta.dir, "..");
@@ -10,8 +10,14 @@ const userHome = homedir();
 const library = join(userHome, "Library");
 const debugBundleIdentifiers = ["sh.doki.dev", "sh.waku.dev", "codes.waku.dev"];
 // The debug app was called "Waku Debug" before the Doki rename; both names are
-// cleaned so a stale bundle from before the rename cannot linger.
-const debugAppNames = ["Doki Debug", "Waku Debug"];
+// cleaned so a stale bundle from before the rename cannot linger. Each
+// checkout names its own build after itself, so the current name is listed
+// first.
+const debugAppNames = [
+  `Doki Debug (${basename(projectRoot)})`,
+  "Doki Debug",
+  "Waku Debug",
+];
 
 type Target = {
   path: string;

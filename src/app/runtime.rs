@@ -114,6 +114,18 @@ pub(super) fn session_has_active_provider_turn(session: &AgentSession) -> bool {
             .is_some_and(|turn| turn.status == TurnStatus::Running && turn.provider_turn_started)
 }
 
+/// Whether a submission waits behind the session's live turn instead of
+/// becoming its next prompt.
+///
+/// A session can be busy without a turn: Pi settles a turn as soon as the
+/// agent's reply ends, and the detached work that reply left running keeps the
+/// session's own status busy until the provider wakes it (see
+/// `sync_background_wait_status`). A message then is the next prompt, not a
+/// follow-up for a turn that will never take it.
+pub(super) fn submission_waits_for_a_turn(status: SessionStatus, provider_turn_live: bool) -> bool {
+    status.is_busy() && !(status == SessionStatus::Background && !provider_turn_live)
+}
+
 /// Merge the daemon's list-only session projection into the desktop catalog.
 ///
 /// Existing rows may already contain a hydrated transcript, so only list
@@ -1213,7 +1225,7 @@ impl Waku {
             self.reset_visible_state();
             self.reset_transcript_rows(self.transcript_row_count());
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1561,8 +1573,11 @@ impl Waku {
             .unwrap_or(&[])
     }
 
-    pub(super) fn save(&mut self) {
+    pub(super) fn save(&mut self, cx: &App) {
         self.last_stream_save = Instant::now();
+        // Every write of `state.json` carries the right panel's current
+        // identities, so a window rebuilt later restores them.
+        self.state.right_panel_descriptors = self.persisted_right_panel_descriptors(cx);
         let daemon_error = self
             .daemon
             .update_settings(self.state.daemon_settings())
@@ -1749,7 +1764,7 @@ impl Waku {
                         // turn's final stream save can disappear on relaunch.
                         cx.spawn(async move |waku, cx| {
                             cx.background_executor().timer(STREAM_FRAME_INTERVAL).await;
-                            let _ = waku.update(cx, |waku, _| waku.save());
+                            let _ = waku.update(cx, |waku, cx| waku.save(cx));
                         })
                         .detach();
                     }
@@ -2035,8 +2050,8 @@ impl Waku {
                     this.submit_message_edit_prompt(prompt.clone(), cx)
                 }
                 // An edited past message resubmits from that point; there is
-                // no running turn for it to steer.
-                ComposerEvent::SubmitSteer(prompt) => {
+                // no running turn for it to steer or queue behind.
+                ComposerEvent::SubmitOpposite(prompt) => {
                     this.submit_message_edit_prompt(prompt.clone(), cx)
                 }
                 ComposerEvent::SteerQueued => {}
@@ -2901,7 +2916,7 @@ impl Waku {
                 return;
             }
         }
-        self.save();
+        self.save(cx);
         self.drain_queued_message(session_id, cx);
         cx.notify();
     }
@@ -2920,6 +2935,7 @@ impl Waku {
                 events: prepared.events,
                 pending_events: VecDeque::new(),
                 pending_steers: VecDeque::new(),
+                delivered_steers: VecDeque::new(),
                 stream_phase: None,
                 park_announced: false,
                 stream_remeasure_pending: false,
@@ -2961,18 +2977,60 @@ impl Waku {
         }
         if session.status == SessionStatus::Background {
             // The turn is parked on detached work and the provider is idle,
-            // so the message goes straight in as a steer: queued, it would
-            // wait for a settle that only the message itself could hasten.
-            self.steer_composer_submission(submission, cx);
+            // so the message goes straight in: queued, it would wait for a
+            // settle that only the message itself could hasten. A parked turn
+            // that is still open takes it as a steer; a provider that settled
+            // its turn before the detached work landed (Pi) has nothing to
+            // steer, and the message is simply that session's next prompt.
+            if session_has_active_provider_turn(session) {
+                self.steer_composer_submission(submission, cx);
+            } else {
+                self.submit_submission_for_session(session.id, submission, cx);
+            }
             return;
         }
         if session.is_busy() {
-            // While the agent is working, Enter queues a follow-up instead of
-            // refusing the message. The queue drains once the turn settles.
-            self.enqueue_follow_up_submission(session.id, submission, cx);
+            // While the agent is working, Enter follows the configured
+            // follow-up behavior instead of refusing the message. A steer the
+            // provider cannot take falls back to the queue, which drains once
+            // the turn settles.
+            let session_id = session.id;
+            match self.state.follow_up_behavior {
+                FollowUpBehavior::Steer => self.steer_composer_submission(submission, cx),
+                FollowUpBehavior::Queue => {
+                    self.enqueue_follow_up_submission(session_id, submission, cx)
+                }
+            }
             return;
         }
         self.submit_submission_for_session(session.id, submission, cx);
+    }
+
+    /// The opposite of the configured follow-up behavior, for the
+    /// primary-modifier chord. An idle session has nothing to steer or queue
+    /// behind, so the message is sent normally.
+    pub(super) fn submit_opposite_composer_submission(
+        &mut self,
+        submission: ComposerSubmission,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        if self.response_fork_preparations.contains_key(&session.id) {
+            return;
+        }
+        if !session.is_busy() || session.status == SessionStatus::Background {
+            self.submit_composer_submission(submission, cx);
+            return;
+        }
+        let session_id = session.id;
+        match self.state.follow_up_behavior.opposite() {
+            FollowUpBehavior::Steer => self.steer_composer_submission(submission, cx),
+            FollowUpBehavior::Queue => {
+                self.enqueue_follow_up_submission(session_id, submission, cx)
+            }
+        }
     }
 
     /// Deliver a steering message into the running turn. Providers without a
@@ -3048,7 +3106,7 @@ impl Waku {
                 .push(submission.into_queued_message());
             session.updated_at = unix_time();
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -3063,7 +3121,7 @@ impl Waku {
                 .queued_messages
                 .retain(|message| message.id != message_id);
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -3088,7 +3146,7 @@ impl Waku {
         self.restore_composer_submission(ComposerSubmission::from_queued_message(message), cx);
         let focus_handle = self.composer_focus(cx);
         window.focus(&focus_handle, cx);
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -3111,7 +3169,7 @@ impl Waku {
         }) else {
             return;
         };
-        self.save();
+        self.save(cx);
         self.steer_composer_submission(ComposerSubmission::from_queued_message(message), cx);
     }
 
@@ -3198,7 +3256,11 @@ impl Waku {
             self.defer_queue_drain(session_id);
             return;
         }
-        if session.status.is_busy() {
+        // A session whose turn ended while detached work still runs stays
+        // busy for as long as that work does (see
+        // `sync_background_wait_status`), but there is no turn for a message
+        // to wait behind: it is the session's next prompt.
+        if submission_waits_for_a_turn(session.status, session_has_active_provider_turn(session)) {
             self.enqueue_follow_up_submission(session_id, submission, cx);
             return;
         }
@@ -3416,6 +3478,7 @@ impl Waku {
                 .pending_events
                 .retain(|event| matches!(event, DriverEvent::BackgroundWork(_)));
             runtime.pending_steers.clear();
+            runtime.delivered_steers.clear();
             runtime.stream_remeasure_pending = false;
             runtime.stream_phase = None;
             runtime.pending_permission = None;
@@ -3491,7 +3554,7 @@ impl Waku {
         // hold the final preparation frame motionless.
         cx.spawn(async move |waku, cx| {
             cx.background_executor().timer(STREAM_FRAME_INTERVAL).await;
-            let _ = waku.update(cx, |waku, _| waku.save());
+            let _ = waku.update(cx, |waku, cx| waku.save(cx));
         })
         .detach();
     }
@@ -3673,7 +3736,7 @@ impl Waku {
         if self.stream_state_dirty
             && (force_save || self.last_stream_save.elapsed() >= STREAM_SAVE_INTERVAL)
         {
-            self.save();
+            self.save(cx);
         }
         changed || selected_changed
     }
