@@ -1671,11 +1671,17 @@ pub struct Waku {
     /// Fingerprint + snapshot pair backing `sidebar_rows_cached`.
     sidebar_rows_fingerprint: Cell<Option<u64>>,
     sidebar_rows_snapshot: RefCell<Rc<Vec<SidebarRow>>>,
-    /// Branch labels for ordinary local project paths, resolved together on a
-    /// background executor so sidebar rows only read memory.
-    sidebar_branch_labels: RefCell<HashMap<PathBuf, SharedString>>,
-    sidebar_branch_scan_fingerprint: Cell<Option<u64>>,
-    sidebar_branch_scan_generation: Cell<u64>,
+    /// How many started tasks each status section holds, from the pass that
+    /// built `sidebar_rows_snapshot`, so a section header labels itself without
+    /// counting the session list while it renders.
+    sidebar_status_section_counts: RefCell<[usize; SidebarStatusSection::ALL.len()]>,
+    /// How many tasks the trailing archived section held in that same pass.
+    sidebar_archived_count: Cell<usize>,
+    /// What the sidebar's second line reports about each started task, keyed by
+    /// session id and refreshed where the session's data changes. The plan step
+    /// lives in the transcript, so it is resolved into this cache there rather
+    /// than by a row builder on the frame path.
+    sidebar_session_facts: RefCell<HashMap<Uuid, SidebarSessionFacts>>,
     transcript_row_kinds: RefCell<Vec<TranscriptRowKind>>,
     /// Fingerprint of the transcript inputs `transcript_row_kinds` was folded
     /// from, so an unchanged transcript costs nothing on a frame. `None` until
@@ -1842,7 +1848,7 @@ pub use goal_dialog::init as init_goal_dialog_keys;
 pub use image_preview::init as init_image_preview_keys;
 pub use settings::init as init_settings_keys;
 pub use sidebar::init as init_sidebar_keys;
-use sidebar::{SidebarGroup, SidebarRow};
+use sidebar::{SidebarGroup, SidebarRow, SidebarSessionFacts, SidebarStatusSection};
 pub use skills_page::init as init_skills_keys;
 use streaming::*;
 use transcript::*;
@@ -2298,7 +2304,7 @@ impl Waku {
                 continue;
             }
             if session.status != SessionStatus::Idle {
-                session.status = SessionStatus::Idle;
+                session.set_status(SessionStatus::Idle);
             }
             let interrupted_turn = if let Some(turn) = session
                 .turns
@@ -3191,9 +3197,9 @@ impl Waku {
                 sidebar_row_cache: RefCell::new(Vec::new()),
                 sidebar_rows_fingerprint: Cell::new(None),
                 sidebar_rows_snapshot: RefCell::new(Rc::new(Vec::new())),
-                sidebar_branch_labels: RefCell::new(HashMap::new()),
-                sidebar_branch_scan_fingerprint: Cell::new(None),
-                sidebar_branch_scan_generation: Cell::new(0),
+                sidebar_status_section_counts: RefCell::new([0; SidebarStatusSection::ALL.len()]),
+                sidebar_archived_count: Cell::new(0),
+                sidebar_session_facts: RefCell::new(HashMap::new()),
                 transcript_row_kinds: RefCell::new(Vec::new()),
                 transcript_row_kinds_fingerprint: Cell::new(None),
                 transcript_navigation_turns: RefCell::new(Rc::new(Vec::new())),

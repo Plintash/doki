@@ -994,6 +994,34 @@ pub struct AgentSession {
     /// then refreshed when the turn settles, whatever its outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reply_at: Option<u64>,
+    /// What will be true when this task is done, as one sentence. Waku owns
+    /// this field: a goal the user set outranks a generated objective, and the
+    /// title is never rewritten from it (see `docs/titles.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    /// When the task entered `Waiting` or `Failed`, unix seconds. The task list
+    /// orders blocked tasks by it, so it has to outlive the runtime that
+    /// noticed the transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_since: Option<u64>,
+    /// Why the task is blocked — the permission or question it is waiting on,
+    /// or the failure that ended its turn. Kept on the task because neither the
+    /// pending request nor the driver error survives a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    /// Settled turns so far, kept as a narrow counter because the list
+    /// projection leaves `turns` empty. `None` is "not known yet", which is not
+    /// the same as a task that has settled no turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u32>,
+    /// Files the task's checkpoints touched, as of the newest settled turn.
+    /// Narrow for the same reason as [`Self::turn_count`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_files: Option<u32>,
+    /// When the task was put away, unix seconds. Only the archive action sets
+    /// it: an ordinary task-state save never sets or clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<u64>,
     #[serde(default)]
     pub provider_cursor: Option<ProviderResumeCursor>,
     /// Slash commands the provider reported for this session's live process,
@@ -1053,6 +1081,12 @@ fn detail_loaded_default() -> bool {
     true
 }
 
+/// Whether a status is one a task waits in, and therefore whether the blocked
+/// record applies to it.
+fn is_blocking(status: SessionStatus) -> bool {
+    matches!(status, SessionStatus::Waiting | SessionStatus::Failed)
+}
+
 impl AgentSession {
     pub const DEFAULT_TITLE: &'static str = "New task";
 
@@ -1075,6 +1109,12 @@ impl AgentSession {
             created_at: now,
             updated_at: now,
             last_reply_at: None,
+            objective: None,
+            blocked_since: None,
+            blocked_reason: None,
+            turn_count: None,
+            changed_files: None,
+            archived_at: None,
             detail_loaded: true,
             provider_cursor: None,
             available_commands: Vec::new(),
@@ -1102,6 +1142,8 @@ impl AgentSession {
     /// columns, not transcript detail: the composer renders each of them
     /// straight from this projection until hydration lands, so they travel with
     /// the list or the chips jump when it does.
+    ///
+    /// The objective travels resolved, see [`Self::resolved_objective`].
     pub fn list_projection(&self) -> Self {
         Self {
             id: self.id,
@@ -1120,6 +1162,12 @@ impl AgentSession {
             created_at: self.created_at,
             updated_at: self.updated_at,
             last_reply_at: self.last_reply_at,
+            objective: self.resolved_objective().map(str::to_owned),
+            blocked_since: self.blocked_since,
+            blocked_reason: self.blocked_reason.clone(),
+            turn_count: self.turn_count,
+            changed_files: self.changed_files,
+            archived_at: self.archived_at,
             provider_cursor: None,
             available_commands: Vec::new(),
             thread_goal: None,
@@ -1135,6 +1183,20 @@ impl AgentSession {
             queued_messages: Vec::new(),
             detail_loaded: false,
         }
+    }
+
+    /// The objective a client displays: a goal the user or the provider owns
+    /// when the task has one, otherwise the generated objective Waku stores.
+    ///
+    /// [`Self::objective`] holds only the generated value, so resolving the
+    /// goal into it would let a goal edit rewrite the fallback a cleared goal
+    /// returns to. Every client renders this one value instead of ranking the
+    /// two itself, so two clients cannot disagree about the same task.
+    pub fn resolved_objective(&self) -> Option<&str> {
+        self.thread_goal
+            .as_ref()
+            .map(|goal| goal.objective.as_str())
+            .or(self.objective.as_deref())
     }
 
     pub fn is_busy(&self) -> bool {
@@ -1228,6 +1290,43 @@ impl AgentSession {
                 title = format!("{}…", title.chars().take(53).collect::<String>());
             }
             self.auto_title = Some(title);
+        }
+    }
+
+    /// Sets the status and keeps the blocked record in step with it.
+    ///
+    /// Entering `Waiting` or `Failed` stamps when the task became blocked —
+    /// once, so a repeated report of the same blockage does not restart the
+    /// clock the task list orders by — and every other status clears the
+    /// record, because a task that is running again is not blocked. Moving
+    /// between the two blocking statuses keeps the clock and drops the reason,
+    /// which described the blockage that just changed. The reason itself is set
+    /// separately: the transition and the request that caused it are not always
+    /// observed in the same place.
+    pub fn set_status(&mut self, status: SessionStatus) {
+        let previous = self.status;
+        let changed = previous != status;
+        self.status = status;
+        if is_blocking(status) {
+            if !is_blocking(previous) {
+                self.blocked_since = Some(unix_time());
+            }
+            if changed {
+                // A different blockage is a different reason; the clock stays,
+                // because the user has been ignoring this task the whole time.
+                self.blocked_reason = None;
+            }
+        } else {
+            self.blocked_since = None;
+            self.blocked_reason = None;
+        }
+    }
+
+    /// Records why the task is blocked, keeping the stamp [`Self::set_status`]
+    /// already set. Ignored when the task is not blocked.
+    pub fn set_blocked_reason(&mut self, reason: impl Into<String>) {
+        if is_blocking(self.status) {
+            self.blocked_reason = Some(reason.into());
         }
     }
 
@@ -1466,7 +1565,7 @@ impl AgentSession {
         let mut prompt = Message::new_for_turn(MessageRole::User, message, turn_id);
         prompt.id = message_id;
         self.messages.push(prompt);
-        self.status = SessionStatus::Connecting;
+        self.set_status(SessionStatus::Connecting);
         self.last_reply_at = Some(now);
         self.updated_at = now;
         true
@@ -1613,7 +1712,7 @@ impl AgentSession {
                 .is_some_and(|last| !last.provider_turn_started)
         {
             self.unwind_unstarted_turn(turn);
-            self.status = SessionStatus::Idle;
+            self.set_status(SessionStatus::Idle);
         }
         self.updated_at = unix_time();
         taken
@@ -1652,7 +1751,7 @@ impl AgentSession {
             return false;
         }
         self.turns.pop();
-        self.status = SessionStatus::Idle;
+        self.set_status(SessionStatus::Idle);
         self.updated_at = unix_time();
         true
     }
@@ -1815,7 +1914,7 @@ impl AgentSession {
         fork.id = fork_id;
         fork.title = Self::DEFAULT_TITLE.to_owned();
         fork.auto_title = Some(fork_title.to_owned());
-        fork.status = SessionStatus::Idle;
+        fork.set_status(SessionStatus::Idle);
         fork.created_at = now;
         fork.updated_at = now;
         fork.provider_cursor = Some(provider_cursor);
@@ -5536,6 +5635,202 @@ mod tests {
         // The transcript is still detail the list never carries.
         assert!(projection.messages.is_empty());
         assert!(projection.turns.is_empty());
+    }
+
+    #[test]
+    fn the_list_projection_keeps_what_the_sidebar_renders() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Pi);
+        session.objective = Some("Sidebar schedules tasks by state".into());
+        session.blocked_since = Some(1_700_000_000);
+        session.blocked_reason = Some("Waiting for the npm test decision".into());
+        session.turn_count = Some(12);
+        session.changed_files = Some(6);
+        session.archived_at = Some(1_700_000_500);
+
+        let projection = session.list_projection();
+
+        assert_eq!(
+            projection.objective.as_deref(),
+            session.objective.as_deref()
+        );
+        assert_eq!(projection.blocked_since, session.blocked_since);
+        assert_eq!(
+            projection.blocked_reason.as_deref(),
+            session.blocked_reason.as_deref()
+        );
+        assert_eq!(projection.turn_count, Some(12));
+        assert_eq!(projection.changed_files, Some(6));
+        assert_eq!(projection.archived_at, session.archived_at);
+    }
+
+    /// A test goal the way a provider reports one.
+    fn thread_goal(objective: &str) -> ThreadGoal {
+        ThreadGoal {
+            objective: objective.to_owned(),
+            status: ThreadGoalStatus::Active,
+            token_budget: None,
+            tokens_used: 0,
+            time_used_seconds: 0,
+        }
+    }
+
+    /// A goal the user or the provider owns is the objective, and the list
+    /// entry carries it. Resolving here is what keeps two clients from ranking
+    /// the goal against the generated value differently.
+    #[test]
+    fn a_goal_outranks_the_stored_objective_in_the_list_projection() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.objective = Some("Sidebar schedules tasks by state".into());
+        session.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+
+        assert_eq!(
+            session.resolved_objective(),
+            Some("The sidebar groups tasks by what they need")
+        );
+
+        let projection = session.list_projection();
+
+        assert_eq!(
+            projection.objective.as_deref(),
+            Some("The sidebar groups tasks by what they need")
+        );
+        assert!(projection.thread_goal.is_none());
+        // Resolving the hand-off leaves the stored pair alone: the generated
+        // objective is what a cleared goal returns to.
+        assert_eq!(
+            session.objective.as_deref(),
+            Some("Sidebar schedules tasks by state")
+        );
+    }
+
+    /// Clearing the goal releases the field: the stored generated objective is
+    /// the objective again, and a task that has none falls back to none.
+    #[test]
+    fn clearing_the_goal_releases_the_objective() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.objective = Some("Sidebar schedules tasks by state".into());
+        session.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+
+        session.thread_goal = None;
+
+        assert_eq!(
+            session.resolved_objective(),
+            Some("Sidebar schedules tasks by state")
+        );
+        assert_eq!(
+            session.list_projection().objective.as_deref(),
+            Some("Sidebar schedules tasks by state")
+        );
+
+        let mut never_generated = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        never_generated.thread_goal =
+            Some(thread_goal("The sidebar groups tasks by what they need"));
+        never_generated.thread_goal = None;
+
+        assert_eq!(never_generated.resolved_objective(), None);
+        assert_eq!(never_generated.list_projection().objective, None);
+    }
+
+    /// The projection carries the resolved objective for a task whose
+    /// transcript was never loaded, so no client hydrates to render a row.
+    #[test]
+    fn the_list_projection_resolves_the_objective_without_the_transcript() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+        session.begin_turn("A prompt the list never reads");
+        session.push_message(MessageRole::Assistant, "An answer the list never reads");
+
+        let projection = session.list_projection();
+
+        assert_eq!(
+            projection.objective.as_deref(),
+            Some("The sidebar groups tasks by what they need")
+        );
+        assert!(!projection.detail_loaded);
+        assert!(projection.messages.is_empty());
+        assert!(projection.turns.is_empty());
+        assert!(projection.thread_goal.is_none());
+    }
+
+    #[test]
+    fn blocking_status_stamps_once_and_non_blocking_status_clears_it() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+
+        session.set_status(SessionStatus::Waiting);
+        let stamped = session
+            .blocked_since
+            .expect("entering Waiting stamps the time");
+        session.set_blocked_reason("Waiting for the npm test decision");
+        assert_eq!(
+            session.blocked_reason.as_deref(),
+            Some("Waiting for the npm test decision")
+        );
+
+        // The same blockage reported again does not restart the clock the list
+        // orders by, and it keeps the reason it already had.
+        session.set_status(SessionStatus::Waiting);
+        assert_eq!(session.blocked_since, Some(stamped));
+        assert_eq!(
+            session.blocked_reason.as_deref(),
+            Some("Waiting for the npm test decision")
+        );
+
+        // A failure is a new blockage, so it takes a fresh stamp and no longer
+        // claims the old reason.
+        session.set_status(SessionStatus::Failed);
+        assert!(session.blocked_reason.is_none());
+        session.set_blocked_reason("the provider refused the turn");
+        assert!(session.blocked_since.is_some());
+
+        session.set_status(SessionStatus::Working);
+        assert!(
+            session.blocked_since.is_none(),
+            "running again is not blocked"
+        );
+        assert!(session.blocked_reason.is_none());
+
+        // A reason arriving late, after the task left the blocked status, is
+        // ignored rather than stored against a task that is working.
+        session.set_blocked_reason("stale");
+        assert!(session.blocked_reason.is_none());
+    }
+
+    #[test]
+    fn a_task_record_without_the_triage_fields_decodes_to_their_defaults() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Pi);
+        session.objective = Some("Ship the new view".into());
+        session.blocked_since = Some(1_700_000_000);
+        session.blocked_reason = Some("Waiting for review".into());
+        session.turn_count = Some(4);
+        session.changed_files = Some(2);
+        session.archived_at = Some(1_700_000_500);
+
+        // A store written before these fields existed is this record with the
+        // keys gone.
+        let mut stored = serde_json::to_value(&session).unwrap();
+        let fields = stored.as_object_mut().unwrap();
+        for key in [
+            "objective",
+            "blocked_since",
+            "blocked_reason",
+            "turn_count",
+            "changed_files",
+            "archived_at",
+        ] {
+            fields.remove(key);
+        }
+
+        let decoded: AgentSession = serde_json::from_value(stored).unwrap();
+
+        assert!(decoded.objective.is_none());
+        assert!(decoded.blocked_since.is_none());
+        assert!(decoded.blocked_reason.is_none());
+        assert!(decoded.turn_count.is_none());
+        assert!(decoded.changed_files.is_none());
+        assert!(decoded.archived_at.is_none());
+        assert_eq!(decoded.display_title(), session.display_title());
     }
 
     #[test]

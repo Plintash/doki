@@ -161,6 +161,7 @@ enum PaletteAction {
     ToggleRightPanel,
     OpenSettings(SettingsPage),
     SelectTask(Uuid),
+    SetTaskArchived { session_id: Uuid, archived: bool },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -401,6 +402,100 @@ impl CommandPaletteUi {
     pub(super) fn is_open(&self) -> bool {
         self.open
     }
+}
+
+/// The archive action for the task the palette is showing, or nothing when no
+/// task is selected.
+///
+/// The palette is not only a finder — it already offers commands that act on
+/// the selected task — so putting a task away is one of them rather than a
+/// second surface reaching into the palette's rows. The wording is the row
+/// menu's, so both surfaces promise the same thing: the task is put away, and
+/// nothing claims space was freed.
+fn palette_archive_command(
+    session: Option<&AgentSession>,
+    order: usize,
+) -> Option<CommandPaletteItem> {
+    let session = session?;
+    let archived = session.archived_at.is_some();
+    Some(CommandPaletteItem::command(
+        PaletteSection::Commands,
+        tr!(if archived {
+            "sidebar.bring_back"
+        } else {
+            "sidebar.put_away"
+        }),
+        "icons/package.svg",
+        None,
+        PaletteAction::SetTaskArchived {
+            session_id: session.id,
+            archived: !archived,
+        },
+        "archive unarchive put away restore bring back hide task away",
+        order,
+    ))
+}
+
+/// The tasks the palette can offer, in the client's own order.
+///
+/// Every started task is a candidate, including the ones the sidebar has put
+/// away. Hiding is a rendering concern: the catalog this reads keeps every
+/// task, so search still finds what the list is not showing, and selecting an
+/// archived result opens it like any other.
+fn palette_task_candidates(
+    sessions: &[AgentSession],
+    projects: &HashMap<Uuid, (String, String)>,
+    selected_session: Option<Uuid>,
+    message_matches: &HashMap<Uuid, crate::persistence::SessionMessageMatch>,
+) -> Vec<CommandPaletteItem> {
+    sessions
+        .iter()
+        .filter(|session| session.has_started())
+        .enumerate()
+        .map(|(order, session)| {
+            let (project, project_path) = projects
+                .get(&session.project_id)
+                .cloned()
+                .unwrap_or_else(|| (tr!("project.no_project_name"), String::new()));
+            let (workspace_path, branch) = match &session.workspace {
+                SessionWorkspace::Local => (String::new(), None),
+                SessionWorkspace::NewWorktree { base_branch } => {
+                    (String::new(), base_branch.as_deref())
+                }
+                SessionWorkspace::Worktree { path, branch } => {
+                    (path.to_string_lossy().into_owned(), Some(branch.as_str()))
+                }
+            };
+            let mut details = vec![project.clone()];
+            if let Some(branch) = branch {
+                details.push(format!("#{branch}"));
+            }
+            if Some(session.id) == selected_session {
+                details.push(tr!("command_palette.current"));
+            }
+            let detail = details.join(" · ");
+            let label = session.display_title().to_owned();
+            let content_match = message_matches.get(&session.id).cloned();
+            CommandPaletteItem {
+                section: PaletteSection::Tasks,
+                search_text: format!(
+                    "{label} {project} {project_path} {workspace_path} {} {} {} {} task session chat conversation",
+                    branch.unwrap_or_default(),
+                    session.provider.short_name(),
+                    session.provider.display_name(),
+                    session.model.as_deref().unwrap_or_default(),
+                ),
+                label,
+                detail: Some(detail),
+                icon: PaletteIcon::Provider(session.provider),
+                shortcut: None,
+                action: PaletteAction::SelectTask(session.id),
+                content_match,
+                order,
+                recency: session.updated_at,
+            }
+        })
+        .collect()
 }
 
 impl Waku {
@@ -759,6 +854,9 @@ impl Waku {
                 ));
             }
         }
+        if let Some(archive) = palette_archive_command(self.selected_session(), next()) {
+            commands.push(archive);
+        }
         if self.usage_meter_available() {
             commands.push(CommandPaletteItem::command(
                 PaletteSection::Commands,
@@ -884,59 +982,12 @@ impl Waku {
                 )
             })
             .collect::<HashMap<_, _>>();
-        self.state
-            .sessions
-            .iter()
-            .filter(|session| session.has_started())
-            .enumerate()
-            .map(|(order, session)| {
-                let (project, project_path) = projects
-                    .get(&session.project_id)
-                    .cloned()
-                    .unwrap_or_else(|| (tr!("project.no_project_name"), String::new()));
-                let (workspace_path, branch) = match &session.workspace {
-                    SessionWorkspace::Local => (String::new(), None),
-                    SessionWorkspace::NewWorktree { base_branch } => {
-                        (String::new(), base_branch.as_deref())
-                    }
-                    SessionWorkspace::Worktree { path, branch } => {
-                        (path.to_string_lossy().into_owned(), Some(branch.as_str()))
-                    }
-                };
-                let mut details = vec![project.clone()];
-                if let Some(branch) = branch {
-                    details.push(format!("#{branch}"));
-                }
-                if Some(session.id) == self.state.selected_session {
-                    details.push(tr!("command_palette.current"));
-                }
-                let detail = details.join(" · ");
-                let label = session.display_title().to_owned();
-                let content_match = self
-                    .command_palette
-                    .message_matches
-                    .get(&session.id)
-                    .cloned();
-                CommandPaletteItem {
-                    section: PaletteSection::Tasks,
-                    search_text: format!(
-                        "{label} {project} {project_path} {workspace_path} {} {} {} {} task session chat conversation",
-                        branch.unwrap_or_default(),
-                        session.provider.short_name(),
-                        session.provider.display_name(),
-                        session.model.as_deref().unwrap_or_default(),
-                    ),
-                    label,
-                    detail: Some(detail),
-                    icon: PaletteIcon::Provider(session.provider),
-                    shortcut: None,
-                    action: PaletteAction::SelectTask(session.id),
-                    content_match,
-                    order,
-                    recency: session.updated_at,
-                }
-            })
-            .collect()
+        palette_task_candidates(
+            &self.state.sessions,
+            &projects,
+            self.state.selected_session,
+            &self.command_palette.message_matches,
+        )
     }
 
     fn command_palette_resume_candidates(&self) -> Vec<CommandPaletteItem> {
@@ -1595,6 +1646,10 @@ impl Waku {
                 let focus = self.composer_focus(cx);
                 window.focus(&focus, cx);
             }
+            PaletteAction::SetTaskArchived {
+                session_id,
+                archived,
+            } => self.set_session_archived(session_id, archived, cx),
             PaletteAction::ChooseModel | PaletteAction::ToggleUsage => {
                 // These popovers are rendered by the composer. If the command
                 // came from Settings, reveal one normal app frame first so its
@@ -2070,6 +2125,70 @@ mod tests {
         let mut matcher = crate::composer_complete::matcher();
         let mut buf = Vec::new();
         pattern.score(Utf32Str::new(candidate, &mut buf), &mut matcher)
+    }
+
+    /// The archive action is reachable from the palette as well as from the
+    /// row menu, and it is the action for the task the palette is showing — the
+    /// shape the identifier commands already have. An archived task is offered
+    /// the way back.
+    #[test]
+    fn the_palette_offers_the_archive_action_for_the_task_it_shows() {
+        let mut task = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let put_away = palette_archive_command(Some(&task), 0).expect("the selected task's action");
+        assert_eq!(
+            put_away.action,
+            PaletteAction::SetTaskArchived {
+                session_id: task.id,
+                archived: true,
+            }
+        );
+        assert_eq!(put_away.label, tr!("sidebar.put_away"));
+
+        task.archived_at = Some(1_700_000_000);
+        let bring_back =
+            palette_archive_command(Some(&task), 0).expect("the archived task's action");
+        assert_eq!(
+            bring_back.action,
+            PaletteAction::SetTaskArchived {
+                session_id: task.id,
+                archived: false,
+            }
+        );
+        assert_eq!(bring_back.label, tr!("sidebar.bring_back"));
+
+        assert!(
+            palette_archive_command(None, 0).is_none(),
+            "no task is selected, so there is nothing to put away"
+        );
+    }
+
+    /// Search is the way back to a task that was put away: the sidebar hides
+    /// it, the catalog keeps it, and the palette offers it like any other
+    /// task — found by a word from its title and opened by selecting it.
+    #[test]
+    fn an_archived_task_is_still_a_search_result() {
+        let mut archived = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        archived.set_title("Fix the sidebar row");
+        archived.begin_turn("Ask");
+        archived.archived_at = Some(1_700_000_000);
+        let draft = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+
+        let items = palette_task_candidates(
+            &[archived.clone(), draft],
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            items.iter().map(|item| &item.action).collect::<Vec<_>>(),
+            vec![&PaletteAction::SelectTask(archived.id)],
+            "the archived task is offered, and the draft that never started is not"
+        );
+        assert!(
+            items[0].search_text.contains("Fix the sidebar row"),
+            "a word from the title finds it"
+        );
     }
 
     #[test]

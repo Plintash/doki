@@ -164,7 +164,7 @@ if [ ! -d "$sparkle_framework_source" ]; then
 fi
 
 rm -rf "$bundle"
-mkdir -p "$contents/MacOS" "$contents/Resources/computer-use" "$contents/Resources/skills/waku-computer-use" "$contents/Helpers"
+mkdir -p "$contents/MacOS" "$contents/Resources/computer-use" "$contents/Resources/pi-extensions" "$contents/Resources/skills/waku-computer-use" "$contents/Helpers"
 cp "$cargo_target_dir/$profile/waku" "$contents/MacOS/$app_name"
 cp "$cargo_target_dir/$profile/waku_js_repl" "$repl_executable"
 chmod 755 "$repl_executable"
@@ -175,6 +175,7 @@ fi
 cp resources/Info.plist "$contents/Info.plist"
 cp "resources/$icon_file" "$contents/Resources/AppIcon.icns"
 cp resources/computer-use/pi-extension.ts "$contents/Resources/computer-use/pi-extension.ts"
+cp resources/pi-extensions/task-digest.ts "$contents/Resources/pi-extensions/task-digest.ts"
 bun scripts/cua-api.ts "$cached_helper_bundle/Contents/MacOS/$helper_name" "$contents/Resources/skills/waku-computer-use/SKILL.md"
 frameworks_directory="$contents/Frameworks"
 sparkle_framework="$frameworks_directory/Sparkle.framework"

@@ -240,6 +240,13 @@ impl Waku {
         }
         self.refresh_composer_sources(cx);
         self.reset_transcript_rows(self.transcript_row_count());
+        // Reveal once the selection has moved, not only when it was requested.
+        // The row snapshot depends on which task is open — the archived section
+        // stands for the open task — so an archived task opened from search has
+        // no row to scroll to until this point, and the earlier reveal, which
+        // acknowledges the click against the snapshot the old selection gave,
+        // cannot find it.
+        self.reveal_sidebar_session(session_id);
         self.save(cx);
         if self
             .selected_session()
@@ -264,9 +271,6 @@ impl Waku {
             return;
         };
         self.branch_snapshots.invalidate(&workspace_path);
-        self.sidebar_branch_scan_fingerprint.set(None);
-        self.sidebar_branch_scan_generation
-            .set(self.sidebar_branch_scan_generation.get().wrapping_add(1));
         self.refresh_workspace_surfaces(cx);
         self.invalidate_composer_sources(cx);
     }
@@ -1265,7 +1269,7 @@ impl Waku {
         if has_active_turn {
             let needs_fallback = !self.turn_has_assistant_message(session_id);
             if let Some(session) = self.state.session_mut(session_id) {
-                session.status = SessionStatus::Idle;
+                session.set_status(SessionStatus::Idle);
                 if needs_fallback {
                     session.push_message(MessageRole::Assistant, tr!("session.stopped"));
                 }
@@ -1314,7 +1318,7 @@ impl Waku {
             runtime.permission_note_open = false;
         }
         if let Some(session) = self.selected_session_mut() {
-            session.status = SessionStatus::Working;
+            session.set_status(SessionStatus::Working);
         }
         cx.notify();
     }
@@ -1560,7 +1564,7 @@ impl Waku {
         if let Some(session) = self.state.session_mut(session_id)
             && session.active_turn_id().is_some()
         {
-            session.status = SessionStatus::Working;
+            session.set_status(SessionStatus::Working);
         }
         self.user_input_answer
             .update(cx, |input, cx| input.clear(cx));
@@ -1627,7 +1631,7 @@ impl Waku {
             runtime.driver.run_computer_tool(pending.request);
         }
         if let Some(session) = self.state.session_mut(session_id) {
-            session.status = SessionStatus::Working;
+            session.set_status(SessionStatus::Working);
         }
         self.runtimes.insert(session_id, runtime);
         cx.notify();

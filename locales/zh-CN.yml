@@ -217,6 +217,9 @@ providers.checked_minutes_ago: "%{count} 分钟前检查过"
 providers.checked_hours_ago: "%{count} 小时前检查过"
 computer_use.allow_apps: 允许 Doki 操作其他应用
 computer_use.availability: Codex、OpenCode、OpenCode、Grok 和 Pi 支持电脑操作功能
+computer_use.desktop_access: 桌面访问
+computer_use.windows_access_description: 控制当前 Windows 桌面会话中的应用。Windows 可能限制对提权应用和安全桌面的访问。
+computer_use.linux_access_description: 控制当前 Linux 桌面会话中的应用。屏幕捕获与输入支持取决于你的合成器和无障碍服务。
 computer_use.macos_access: macOS 权限
 computer_use.helper_access: 请向 Doki 的独立控制助手 %{helper} 授予权限
 computer_use.screen_recording: 屏幕录制
@@ -240,6 +243,15 @@ sidebar.options: 侧边栏选项
 sidebar.grouping: 分组
 sidebar.grouping_project: 项目
 sidebar.grouping_updated: 更新时间
+sidebar.grouping_status: 状态
+sidebar.view_switch: 切换分组
+sidebar.section_needs_you: 需要你
+sidebar.section_running: 进行中
+sidebar.section_recent: 最近
+sidebar.section_archived: 已归档
+sidebar.show_archived: 显示已归档任务
+sidebar.put_away: 收起
+sidebar.bring_back: 取回
 sidebar.ordering: 排序
 sidebar.ordering_newest: 最新优先
 sidebar.ordering_oldest: 最旧优先
@@ -265,6 +277,10 @@ sidebar.status_working: 正在工作
 sidebar.status_waiting: 正在等待
 sidebar.status_background: 等待后台任务
 sidebar.status_failed: 失败
+sidebar.card_turn_one: "%{count} 轮"
+sidebar.card_turn_many: "%{count} 轮"
+sidebar.card_file_one: "%{count} 个文件"
+sidebar.card_file_many: "%{count} 个文件"
 project.new_project: 新建项目…
 project.no_project: 不使用项目
 project.no_project_name: 无项目
@@ -398,6 +414,11 @@ activity.plan_update_failed: 更新计划失败
 activity.activity: 操作
 activity.tool: 工具
 activity.plan_updated: 计划已更新
+activity.compacting_context: 正在压缩上下文
+activity.compacted_context: 已压缩上下文
+activity.compaction_failed: 上下文压缩失败
+activity.provider_retrying: 正在重试请求
+activity.background_shell: 后台 Shell
 activity.output_truncated: "\n\n… 输出已截断"
 activity.thought: 思考
 activity.thoughts: 思考
@@ -691,6 +712,7 @@ errors.read_provider_exit_status: "无法读取 %{provider} 的退出状态：%{
 errors.initialize_provider: "无法初始化 %{provider}：%{error}"
 errors.provider_no_session_id: "%{provider} 未返回会话 ID"
 errors.provider_rejected_prompt_detail: "%{provider} 拒绝了消息：%{error}"
+errors.provider_catalogue_unavailable: "%{provider} 无法读取其 %{catalogue} 模型目录：%{error}"
 errors.stop_provider: "无法停止 %{provider}：%{error}"
 errors.switch_provider_model: "无法切换 %{provider} 模型：%{error}"
 errors.change_provider_thinking: "无法更改 %{provider} 的思考强度：%{error}"

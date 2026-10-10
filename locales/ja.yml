@@ -225,6 +225,9 @@ providers.checked_hours_ago: "%{count} 時間前に確認済み"
 
 computer_use.allow_apps: Doki にアプリの操作を許可
 computer_use.availability: コンピュータ操作は Codex、OpenCode、OpenCode、Grok、Pi で利用できます
+computer_use.desktop_access: デスクトップへのアクセス
+computer_use.windows_access_description: 現在の Windows デスクトップセッションのアプリを操作します。Windows は昇格したアプリやセキュアデスクトップへのアクセスを制限することがあります。
+computer_use.linux_access_description: 現在の Linux デスクトップセッションのアプリを操作します。キャプチャと入力の対応は使用中のコンポジタとアクセシビリティサービスに依存します。
 computer_use.macos_access: macOS のアクセス権
 computer_use.helper_access: Doki の分離された操作ヘルパー %{helper} にアクセスを許可してください
 computer_use.screen_recording: 画面収録
@@ -251,6 +254,15 @@ sidebar.options: サイドバーオプション
 sidebar.grouping: グループ化
 sidebar.grouping_project: プロジェクト
 sidebar.grouping_updated: 更新日
+sidebar.grouping_status: ステータス
+sidebar.view_switch: グループを切り替える
+sidebar.section_needs_you: あなたの対応待ち
+sidebar.section_running: 実行中
+sidebar.section_recent: 最近
+sidebar.section_archived: アーカイブ済み
+sidebar.show_archived: アーカイブ済みのタスクを表示
+sidebar.put_away: 片づける
+sidebar.bring_back: 戻す
 sidebar.ordering: 並び順
 sidebar.ordering_newest: 新しい順
 sidebar.ordering_oldest: 古い順
@@ -276,6 +288,10 @@ sidebar.status_working: 作業中
 sidebar.status_waiting: 待機中
 sidebar.status_background: バックグラウンドタスク待ち
 sidebar.status_failed: 失敗
+sidebar.card_turn_one: "%{count} ターン"
+sidebar.card_turn_many: "%{count} ターン"
+sidebar.card_file_one: "%{count} ファイル"
+sidebar.card_file_many: "%{count} ファイル"
 
 project.new_project: 新規プロジェクト…
 project.no_project: プロジェクトを使用しない
@@ -415,6 +431,11 @@ activity.plan_update_failed: プランの更新に失敗しました
 activity.activity: アクティビティ
 activity.tool: ツール
 activity.plan_updated: プランを更新しました
+activity.compacting_context: コンテキストを圧縮しています
+activity.compacted_context: コンテキストを圧縮しました
+activity.compaction_failed: コンテキストの圧縮に失敗しました
+activity.provider_retrying: リクエストを再試行しています
+activity.background_shell: バックグラウンドシェル
 activity.output_truncated: "\n\n… 出力は省略されました"
 activity.thought: 思考
 activity.thoughts: 思考
@@ -725,6 +746,7 @@ errors.read_provider_exit_status: "%{provider} の終了ステータスを読み
 errors.initialize_provider: "%{provider} を初期化できませんでした：%{error}"
 errors.provider_no_session_id: "%{provider} からセッション ID が返されませんでした"
 errors.provider_rejected_prompt_detail: "%{provider} がプロンプトを拒否しました：%{error}"
+errors.provider_catalogue_unavailable: "%{provider} は %{catalogue} カタログを読み取れませんでした：%{error}"
 errors.stop_provider: "%{provider} を停止できませんでした：%{error}"
 errors.switch_provider_model: "%{provider} のモデルを切り替えられませんでした：%{error}"
 errors.change_provider_thinking: "%{provider} の思考レベルを変更できませんでした：%{error}"

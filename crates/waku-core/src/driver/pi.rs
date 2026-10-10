@@ -165,6 +165,9 @@ impl PiFlavor {
 
 enum CommandMessage {
     Prompt(String),
+    /// The daemon's trigger for one generated objective, carrying the dispatch
+    /// it expects the result back with.
+    TaskDigest(String),
     Steer(String),
     Cancel,
     /// Take back whatever the provider's queue still holds without waiting for
@@ -190,14 +193,30 @@ enum CommandMessage {
 enum PendingResponse {
     Request(Sender<Result<Value, String>>),
     /// A prompt whose answer may arrive long after the write — Pi holds it
-    /// until compaction or another built-in finishes. `converted_steer`
-    /// carries the transport text when this prompt was a steer the run could
-    /// no longer take: its acceptance was already reported at write time, so
-    /// a refusal travels back as that steer's rejection instead of as a
-    /// settlement for a run that does not exist.
+    /// until compaction or another built-in finishes. `origin` decides what
+    /// that answer means, and `converted_steer` carries the transport text
+    /// when this prompt was a steer the run could no longer take: its
+    /// acceptance was already reported at write time, so a refusal travels
+    /// back as that steer's rejection instead of as a settlement for a run
+    /// that does not exist.
     Prompt {
-        converted_steer: Option<String>,
+        origin: PromptOrigin,
     },
+}
+
+/// Why a prompt was written.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PromptOrigin {
+    /// A message the user submitted. `converted_steer` carries the transport
+    /// text when this prompt is a steer the run could no longer take: its
+    /// acceptance was already reported at write time, so a refusal travels back
+    /// as that steer's rejection rather than as a settlement for a run that
+    /// does not exist.
+    Submitted { converted_steer: Option<String> },
+    /// The daemon's trigger for a generated objective. The task's own
+    /// conversation never sees it and no turn stands behind it, so its answer
+    /// settles nothing: the result arrives as the entry the extension appends.
+    TaskDigest,
 }
 
 type PendingResponses = Arc<Mutex<HashMap<String, PendingResponse>>>;
@@ -206,6 +225,12 @@ pub struct PiDriver {
     flavor: PiFlavor,
     commands: Sender<CommandMessage>,
     computer_use: Option<computer_use_runtime::ComputerUseRuntime>,
+    /// Whether this session's provider reported Waku's task-digest command. A
+    /// trigger is sent only when it did: an extension command is handled
+    /// without a run, while the same text would be an ordinary prompt — a
+    /// real turn in the task's conversation — on a session that never loaded
+    /// the extension.
+    digest_commands: Arc<AtomicBool>,
     /// The dialogs still waiting for the user, keyed by the provider's request
     /// id, shared with the reader thread that opened them. The stored method is
     /// what tells the answer which `extension_ui_response` shape it must take.
@@ -413,9 +438,20 @@ impl PiDriver {
             .as_ref()
             .map(|_| crate::computer_use::pi_extension_path())
             .transpose()?;
+        // Waku's task-digest extension ships with the app and rides the same
+        // `--extension` argument. A build that lost it still runs sessions:
+        // the driver asks the provider what commands it has (see
+        // [`Self::digest_commands`]) and never sends a trigger the provider did
+        // not register, so the only thing missing is the objective.
+        let digest_extension = (flavor == PiFlavor::Pi)
+            .then(crate::task_digest::pi_extension_path)
+            .and_then(Result::ok);
         let mut command = crate::command_env::command(&binary);
         command.args(["--mode", "rpc", flavor.full_access_arg()]);
         for extension in extensions {
+            command.arg("--extension").arg(extension);
+        }
+        if let Some(extension) = digest_extension.as_deref() {
             command.arg("--extension").arg(extension);
         }
         if flavor.skips_version_check_by_env() {
@@ -455,6 +491,8 @@ impl PiDriver {
         let reader_pending = pending.clone();
         let reader_commands = commands.clone();
         let reader_events = events.clone();
+        let digest_commands = Arc::new(AtomicBool::new(false));
+        let writer_digest_commands = digest_commands.clone();
         let dialogs: PiDialogs = Arc::new(Mutex::new(HashMap::new()));
         let reader_dialogs = dialogs.clone();
         let reader_thread =
@@ -677,10 +715,14 @@ impl PiDriver {
                         json!({"type": "get_commands"}),
                     )
                 {
-                    publish_commands(
-                        crate::slash_command_catalog::parse_pi_commands(&catalog),
-                        &writer_events,
+                    let commands = crate::slash_command_catalog::parse_pi_commands(&catalog);
+                    writer_digest_commands.store(
+                        commands
+                            .iter()
+                            .any(|command| command.name == crate::task_digest::DIGEST_SURFACE),
+                        Ordering::Relaxed,
                     );
+                    publish_commands(commands, &writer_events);
                 }
 
                 // Both flavors expose setters for these, so changing either is
@@ -698,6 +740,18 @@ impl PiDriver {
                                 &run,
                                 flavor,
                                 prompt,
+                            );
+                        }
+                        CommandMessage::TaskDigest(prompt) => {
+                            // A trigger that never reached the provider is a
+                            // generation that did not happen: the daemon stops
+                            // expecting its result, the task keeps its
+                            // objective, and nothing is reported to anyone.
+                            let _ = send_task_digest_prompt(
+                                &mut stdin,
+                                &writer_pending,
+                                &mut next_request_id,
+                                &prompt,
                             );
                         }
                         CommandMessage::Steer(prompt) => {
@@ -895,6 +949,7 @@ impl PiDriver {
             flavor,
             commands,
             computer_use,
+            digest_commands,
             dialogs,
         })
     }
@@ -902,6 +957,22 @@ impl PiDriver {
 
 impl DriverControl for PiDriver {
     fn prompt(&self, prompt: String) {
+        // One method carries both the user's messages and the daemon's
+        // trigger, because Pi dispatches extension commands on the same pipe
+        // that carries prompts. What separates them is the payload: a trigger
+        // is the digest surface with the dispatch its result must name, which
+        // nothing else writes — see [`crate::task_digest::trigger_dispatch`].
+        if crate::task_digest::trigger_dispatch(&prompt).is_some() {
+            // The extension has to be loaded for the provider to handle the
+            // command, and the provider says so by listing it. Sending the
+            // trigger to a session that never loaded the extension would make
+            // it an ordinary prompt, and the task would gain a real turn —
+            // the one thing generating an objective must never do.
+            if self.digest_commands.load(Ordering::Relaxed) {
+                let _ = self.commands.send(CommandMessage::TaskDigest(prompt));
+            }
+            return;
+        }
         let _ = self.commands.send(CommandMessage::Prompt(prompt));
     }
 
@@ -1062,7 +1133,15 @@ fn send_prompt(
     next_request_id: &mut u64,
     prompt: &str,
 ) -> Result<(), String> {
-    write_prompt(stdin, pending, next_request_id, prompt, false)
+    write_prompt(
+        stdin,
+        pending,
+        next_request_id,
+        prompt,
+        PromptOrigin::Submitted {
+            converted_steer: None,
+        },
+    )
 }
 
 /// Sends a prompt for a steer whose run had already settled. The write is
@@ -1074,7 +1153,39 @@ fn send_converted_steer_prompt(
     next_request_id: &mut u64,
     prompt: &str,
 ) -> Result<(), String> {
-    write_prompt(stdin, pending, next_request_id, prompt, true)
+    write_prompt(
+        stdin,
+        pending,
+        next_request_id,
+        prompt,
+        PromptOrigin::Submitted {
+            converted_steer: Some(prompt.to_owned()),
+        },
+    )
+}
+
+/// Sends the daemon's trigger for one generated objective.
+///
+/// It travels the prompt command because that is the pipe Pi dispatches
+/// extension commands on, and Pi handles a command without starting a run. It
+/// carries no `streamingBehavior` on purpose: a trigger that arrives while the
+/// task's turn is still streaming is either dispatched at once — which is what
+/// the answer's `handled` disposition reports — or refused. Asking Pi to queue
+/// it as a follow-up would park Waku's internal trigger text in the task's own
+/// conversation, to be delivered as a user message later.
+fn send_task_digest_prompt(
+    stdin: &mut impl Write,
+    pending: &PendingResponses,
+    next_request_id: &mut u64,
+    prompt: &str,
+) -> Result<(), String> {
+    write_prompt(
+        stdin,
+        pending,
+        next_request_id,
+        prompt,
+        PromptOrigin::TaskDigest,
+    )
 }
 
 fn write_prompt(
@@ -1082,21 +1193,22 @@ fn write_prompt(
     pending: &PendingResponses,
     next_request_id: &mut u64,
     prompt: &str,
-    converted_steer: bool,
+    origin: PromptOrigin,
 ) -> Result<(), String> {
     *next_request_id += 1;
     let id = format!("waku-{}", next_request_id);
+    let submitted = matches!(origin, PromptOrigin::Submitted { .. });
     {
         let mut pending = pending.lock();
-        // A response from an older prompt cannot settle the next turn.
-        pending.retain(|_, response| matches!(response, PendingResponse::Request(_)));
-        pending.insert(
-            id.clone(),
-            PendingResponse::Prompt {
-                converted_steer: converted_steer.then(|| prompt.to_owned()),
-            },
-        );
+        // A response from an older prompt cannot settle the next turn. The
+        // trigger is exempt: it belongs to no turn, and a message the user just
+        // submitted has an answer of its own still on the way.
+        if submitted {
+            pending.retain(|_, response| matches!(response, PendingResponse::Request(_)));
+        }
+        pending.insert(id.clone(), PendingResponse::Prompt { origin });
     }
+    let mut request = json!({"id": id, "type": "prompt", "message": prompt});
     // OMP built-ins can hold the prompt response until compaction or another
     // command finishes. Do not apply the short control-RPC timeout or block
     // the writer from sending abort while waiting for that response.
@@ -1111,15 +1223,15 @@ fn write_prompt(
     // the previous turn is queued and delivered — inside that run when it
     // reaches a boundary, as its own run when an abort ended the first —
     // rather than failed into the transcript.
-    if let Err(error) = write_json_line(
-        stdin,
-        &json!({
-            "id": id,
-            "type": "prompt",
-            "message": prompt,
-            "streamingBehavior": "followUp",
-        }),
-    ) {
+    //
+    // The trigger asks for no such thing. Pi dispatches an extension command
+    // immediately whether or not a run is streaming, and a trigger that is
+    // queued instead would eventually be delivered as a user message in the
+    // task's own conversation — the one place Waku's own text must never land.
+    if submitted {
+        request["streamingBehavior"] = Value::String("followUp".to_owned());
+    }
+    if let Err(error) = write_json_line(stdin, &request) {
         pending.lock().remove(&id);
         return Err(format!("transport write failed: {error}"));
     }
@@ -1712,6 +1824,10 @@ struct PiStreamState {
     message_saw_text: bool,
     message_saw_reasoning: bool,
     failed: bool,
+    /// A trigger the provider answered with something other than the `handled`
+    /// report it owes an extension command. A result that arrives while this is
+    /// set is refused: the answer was read, and it did not verify.
+    digest_trigger_unhandled: bool,
     tools: HashMap<String, (ActivityKind, String)>,
     /// The messages the provider's last queue report still held, in the order
     /// it reported them. Empty on a provider that reports no queue.
@@ -1771,10 +1887,10 @@ fn handle_pi_message(
             return;
         };
         let prompt_response = match pending.lock().get(id) {
-            Some(PendingResponse::Prompt { converted_steer }) => Some(converted_steer.clone()),
+            Some(PendingResponse::Prompt { origin }) => Some(origin.clone()),
             _ => None,
         };
-        if let Some(converted_steer) = prompt_response {
+        if let Some(origin) = prompt_response {
             let success = value.get("success").and_then(Value::as_bool) == Some(true);
             // Pi answers a prompt with what became of it: `started` and
             // `queued` mean the work is on its way and the run settles the
@@ -1787,6 +1903,25 @@ fn handle_pi_message(
             let handled_locally = value.pointer("/data/disposition").and_then(Value::as_str)
                 == Some("handled")
                 || value.pointer("/data/agentInvoked").and_then(Value::as_bool) == Some(false);
+            if origin == PromptOrigin::TaskDigest {
+                // The trigger is an exchange between Waku and its own
+                // extension. `handled` is what says the command ran and its
+                // result is on its way; anything else means no generation
+                // happened — the daemon stops expecting one and the task keeps
+                // the objective it had. Neither answer is a settlement: the
+                // task's own conversation never saw the trigger, so it gains no
+                // turn, no entry, and no error from it.
+                //
+                // The spec promises this report is verified before a result is
+                // accepted, and this is the only place the report is readable.
+                // A report of anything but `handled` says the trigger did not
+                // stay an exchange — so a result arriving behind it is refused
+                // rather than stored as the objective of a generation that
+                // never ran.
+                state.digest_trigger_unhandled = !handled_locally;
+                pending.lock().remove(id);
+                return;
+            }
             // A command that starts a run of its own — the shape an extension
             // uses to wake the session — has already announced that run by the
             // time this answer arrives, and the run settles its own turn.
@@ -1819,6 +1954,11 @@ fn handle_pi_message(
                             provider = flavor.display_name()
                         )
                     })
+            };
+            let converted_steer = match origin {
+                PromptOrigin::Submitted { converted_steer } => converted_steer,
+                // A trigger never reaches this point; its answer returns above.
+                PromptOrigin::TaskDigest => None,
             };
             if let Some(message) = converted_steer {
                 // The steer was already reported accepted when its prompt was
@@ -1928,6 +2068,11 @@ fn handle_pi_message(
     }
 
     match event_type {
+        "entry_appended" => {
+            if let Some(entry) = value.get("entry") {
+                emit_digest_entry(entry, state.digest_trigger_unhandled, events);
+            }
+        }
         "queue_update" => {
             // Each report is the provider's complete queue, so the client's
             // pending list is the provider's own rather than a guess.
@@ -2286,8 +2431,17 @@ fn publish_commands(
     commands: Vec<waku_protocol::composer::SlashCommand>,
     events: &impl DriverEventSink,
 ) {
+    // Waku's own extension commands are the daemon's internal surface, not the
+    // user's: offering `/waku:digest` in the composer would invite a person to
+    // dispatch Waku's own work by hand. They stay out of the catalog the
+    // client renders — the same list is where the driver looks the trigger up.
     let commands = commands
         .into_iter()
+        .filter(|command| {
+            !command
+                .name
+                .starts_with(crate::task_digest::COMMAND_NAMESPACE)
+        })
         .map(|command| ReportedCommand {
             name: command.name,
             description: command.description,
@@ -2324,6 +2478,41 @@ fn emit_extension_message(message: &Value, events: &impl DriverEventSink) {
         custom_type: custom_type.to_owned(),
         text,
         display,
+    });
+}
+
+/// The result of a generation, as the entry Waku's own extension appended.
+///
+/// `pi.appendEntry` writes an entry the model never sees and Pi reports as
+/// `entry_appended`, which is how a result comes back without joining the
+/// conversation: the daemon stores it as the task's objective, and clients
+/// render that from the task list rather than from their transcript. The entry
+/// is not a message, so it travels as a hidden extension message and its data
+/// as the JSON text the daemon parses — the version, the dispatch, and the
+/// sentence are all decided there, never here.
+///
+/// Every other custom entry belongs to the extension that wrote it: Pi stores
+/// its own router state this way, and none of it is Waku's to interpret.
+fn emit_digest_entry(entry: &Value, trigger_unhandled: bool, events: &impl DriverEventSink) {
+    if entry.get("type").and_then(Value::as_str) != Some("custom") {
+        return;
+    }
+    if entry.get("customType").and_then(Value::as_str) != Some(crate::task_digest::DIGEST_SURFACE) {
+        return;
+    }
+    // The provider's answer to the trigger is the gate the spec names: a
+    // command it reported as started rather than handled reached the task's
+    // own conversation, and its entry is not a generation Waku accepts.
+    if trigger_unhandled {
+        return;
+    }
+    let Some(data) = entry.get("data") else {
+        return;
+    };
+    let _ = events.send(DriverEvent::ExtensionMessage {
+        custom_type: crate::task_digest::DIGEST_SURFACE.to_owned(),
+        text: serde_json::to_string(data).unwrap_or_default(),
+        display: false,
     });
 }
 
@@ -2609,6 +2798,7 @@ fn tool_title(name: &str) -> String {
 mod tests {
     use super::*;
     use crossbeam_channel::TryRecvError;
+    use uuid::Uuid;
 
     #[test]
     fn live_command_updates_reach_the_composer_and_clear_removed_commands() {
@@ -2737,6 +2927,374 @@ mod tests {
             "a handled prompt opens no turn of its own"
         );
         assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn the_digest_trigger_is_an_exchange_that_settles_nothing() {
+        // The trigger is the daemon's own question to its extension, written on
+        // the pipe Pi dispatches commands on. `handled` says the command ran,
+        // and no run stands behind it — but the task's conversation never saw
+        // the trigger, so this answer must not settle a turn the whole app
+        // would read as the user's work finishing.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let prompt = crate::task_digest::trigger_prompt(Uuid::new_v4());
+        let mut wire = Vec::new();
+        send_task_digest_prompt(&mut wire, &pending, &mut 0, &prompt).unwrap();
+
+        let request: Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(request["type"], "prompt");
+        assert_eq!(request["message"], prompt);
+        assert!(
+            request.get("streamingBehavior").is_none(),
+            "a trigger is never queued as steering or as a follow-up"
+        );
+
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "handled"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a handled trigger settles nothing and reports nothing"
+        );
+        assert!(pending.lock().is_empty());
+        assert!(!state.run.is_live());
+    }
+
+    #[test]
+    fn a_trigger_answered_while_a_run_streams_leaves_that_run_alone() {
+        // The quiet period can expire while the next turn is already
+        // streaming. The trigger is dispatched immediately — it is a command —
+        // and the turn it interrupts still owns its own start and settle.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "run the tests").unwrap();
+        for frame in [
+            json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "started"}}),
+            json!({"type": "agent_start"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+
+        let trigger = crate::task_digest::trigger_prompt(Uuid::new_v4());
+        send_task_digest_prompt(&mut Vec::new(), &pending, &mut 1, &trigger).unwrap();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-2", "command": "prompt", "success": true, "data": {"disposition": "handled"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "an answered trigger neither settles nor interrupts the run"
+        );
+        assert!(
+            state.run.is_live(),
+            "the run the trigger interrupted is live"
+        );
+
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "agent_settled"}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(event_rx.try_recv().is_err(), "one turn, one settlement");
+    }
+
+    #[test]
+    fn a_trigger_does_not_forget_a_prompt_the_user_just_submitted() {
+        // Writing a prompt drops the pending entries of older prompts, because
+        // an old answer must not settle the next turn. The trigger is not a
+        // submission: a message the user submitted a moment ago still has its
+        // own answer on the way, and losing it would strand that turn.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "run the tests").unwrap();
+        send_task_digest_prompt(
+            &mut Vec::new(),
+            &pending,
+            &mut 1,
+            &crate::task_digest::trigger_prompt(Uuid::new_v4()),
+        )
+        .unwrap();
+
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-2", "command": "prompt", "success": true, "data": {"disposition": "handled"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "started"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the submission started a run, so its answer settles nothing yet"
+        );
+        // The submission's own answer was the run's, and the run still owns its
+        // turn: it settles when the provider says so, not because a trigger
+        // came and went.
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "agent_start"}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "agent_settled"}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(pending.lock().is_empty(), "the submission's turn settled");
+    }
+
+    #[test]
+    fn the_generation_result_travels_as_a_hidden_extension_message() {
+        // The result is a session entry Pi does not send to the model, so it
+        // reaches the daemon as an event. It is not a message for the
+        // transcript: the objective belongs to the task list.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let dispatch = Uuid::new_v4();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({
+                "type": "entry_appended",
+                "entry": {
+                    "type": "custom",
+                    "id": "e1",
+                    "customType": "waku:digest",
+                    "data": {"v": 1, "dispatch": dispatch, "objective": "The list says why"},
+                },
+            }),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        let DriverEvent::ExtensionMessage {
+            custom_type,
+            text,
+            display,
+        } = event_rx.recv().unwrap()
+        else {
+            panic!("the published result must reach the daemon")
+        };
+        assert_eq!(custom_type, crate::task_digest::DIGEST_SURFACE);
+        assert!(!display, "an objective is not a transcript row");
+        assert_eq!(
+            crate::task_digest::parse_result(&text),
+            Some(crate::task_digest::DigestResult {
+                dispatch,
+                objective: "The list says why".to_owned(),
+            })
+        );
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    /// The spec promises the trigger's report is verified before a result is
+    /// accepted. The report is the prompt answer, and `handled` is what says
+    /// the command stayed an exchange instead of opening a run; a trigger the
+    /// provider answered any other way reached the task's own conversation, so
+    /// a result arriving behind it is refused rather than stored.
+    #[test]
+    fn a_result_is_refused_when_the_trigger_was_not_reported_handled() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let dispatch = Uuid::new_v4();
+        send_task_digest_prompt(
+            &mut Vec::new(),
+            &pending,
+            &mut 0,
+            &crate::task_digest::trigger_prompt(dispatch),
+        )
+        .unwrap();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "started"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        let entry = |dispatch: Uuid| {
+            json!({
+                "type": "entry_appended",
+                "entry": {
+                    "type": "custom",
+                    "id": "e1",
+                    "customType": "waku:digest",
+                    "data": {"v": 1, "dispatch": dispatch, "objective": "The list says why"},
+                },
+            })
+        };
+        handle_pi_message(
+            PiFlavor::Pi,
+            entry(dispatch),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the trigger started a run, so no generation ran to publish a result"
+        );
+
+        // A trigger the provider does report as handled verifies, and its
+        // result travels as it always did.
+        let dispatch = Uuid::new_v4();
+        send_task_digest_prompt(
+            &mut Vec::new(),
+            &pending,
+            &mut 1,
+            &crate::task_digest::trigger_prompt(dispatch),
+        )
+        .unwrap();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-2", "command": "prompt", "success": true, "data": {"disposition": "handled"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        handle_pi_message(
+            PiFlavor::Pi,
+            entry(dispatch),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::ExtensionMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn only_the_digest_entry_is_read_from_the_session_tree() {
+        // Pi stores its own state and other extensions store theirs the same
+        // way. Those entries are not Waku's to interpret, and a message that
+        // merely shares the name is not a result.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for entry in [
+            json!({"type": "custom", "customType": "pi.virtual-model-state", "data": {}}),
+            json!({"type": "custom", "customType": "subagent-notify", "data": {"text": "hi"}}),
+            json!({"type": "custom_message", "customType": "waku:digest", "content": "hi"}),
+            json!({"type": "custom", "customType": "waku:digest"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                json!({"type": "entry_appended", "entry": entry}),
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(
+            event_rx.try_recv().is_err(),
+            "only the digest's own entry carries a result"
+        );
+    }
+
+    #[test]
+    fn a_trigger_is_sent_only_where_the_provider_reported_the_command() {
+        // Sending the trigger to a session that never loaded the extension
+        // would make it an ordinary prompt: the task would gain a real turn,
+        // which is the one thing generating an objective must never do.
+        let unsupported = driver_handle(false).0;
+        unsupported.prompt(crate::task_digest::trigger_prompt(Uuid::new_v4()));
+
+        let (driver, command_rx) = driver_handle(true);
+        let prompt = crate::task_digest::trigger_prompt(Uuid::new_v4());
+        driver.prompt(prompt.clone());
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            CommandMessage::TaskDigest(text) if text == prompt
+        ));
+
+        // A submission travels the prompt path unchanged, including one that
+        // names the command without the dispatch only the daemon writes.
+        for submitted in ["run the tests".to_owned(), "/waku:digest".to_owned()] {
+            driver.prompt(submitted.clone());
+            assert!(matches!(
+                command_rx.try_recv().unwrap(),
+                CommandMessage::Prompt(text) if text == submitted
+            ));
+        }
+    }
+
+    #[test]
+    fn the_composer_never_offers_waku_own_commands() {
+        let (events, event_rx) = unbounded();
+        publish_commands(
+            ["waku:digest", "compact", "waku:internal"]
+                .into_iter()
+                .map(|name| waku_protocol::composer::SlashCommand {
+                    name: name.to_owned(),
+                    description: String::new(),
+                    scope: waku_protocol::composer::CommandScope::Builtin,
+                    argument_hint: None,
+                    template: None,
+                })
+                .collect(),
+            &events,
+        );
+        let DriverEvent::AvailableCommands(commands) = event_rx.recv().unwrap() else {
+            panic!("the provider's catalog must reach the composer")
+        };
+        assert_eq!(
+            commands
+                .into_iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["compact"]
+        );
     }
 
     #[test]
@@ -3436,6 +3994,25 @@ mod tests {
         )
     }
 
+    /// A driver handle and the command channel it writes to. `digest_commands`
+    /// is what the provider reported about Waku's digest extension, which is
+    /// what decides whether a trigger is sent at all.
+    fn driver_handle(
+        digest_commands: bool,
+    ) -> (PiDriver, crossbeam_channel::Receiver<CommandMessage>) {
+        let (commands, receiver) = unbounded();
+        (
+            PiDriver {
+                flavor: PiFlavor::Pi,
+                commands,
+                computer_use: None,
+                digest_commands: Arc::new(AtomicBool::new(digest_commands)),
+                dialogs: PiDialogs::default(),
+            },
+            receiver,
+        )
+    }
+
     /// A driver handle and the reader state that share one dialog store, so a
     /// dialog the reader opens is the one the handle answers, and the reply
     /// travels the transport's own command channel.
@@ -3458,6 +4035,7 @@ mod tests {
                 flavor: PiFlavor::Pi,
                 commands: commands.clone(),
                 computer_use: None,
+                digest_commands: Arc::new(AtomicBool::new(false)),
                 dialogs: dialogs.clone(),
             };
             Self {
@@ -3549,6 +4127,22 @@ mod tests {
     /// compiled.
     fn live_probe_extension(name: &str) -> PathBuf {
         live_fixture(name, include_str!("fixtures/pi_live_probe.js"))
+    }
+
+    /// Waku's digest fixture: it registers the command the daemon triggers and
+    /// answers with the entry the bundled extension publishes, without a model
+    /// call.
+    fn live_digest_extension() -> PathBuf {
+        live_fixture("digest-probe", include_str!("fixtures/pi_digest_probe.js"))
+    }
+
+    /// The extension Waku ships, loaded from the source tree. A test binary has
+    /// no app bundle beside it, so this is the file `scripts/bundle.sh` copies
+    /// into one.
+    fn bundled_digest_extension() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../resources")
+            .join(crate::task_digest::EXTENSION_RESOURCE)
     }
 
     /// A fixture extension, written where Pi can load it.
@@ -3682,6 +4276,142 @@ mod tests {
         );
     }
 
+    /// The daemon's trigger reaches the provider's extension surface and comes
+    /// back as a session entry, with no run, no turn, and nothing added to the
+    /// task's own conversation.
+    ///
+    /// Only the real provider can prove this: Pi decides the prompt is a
+    /// command (and answers `handled`), Pi reports the command on `get_commands`
+    /// — which is what allows the trigger to be sent at all — and Pi's session
+    /// tree is what carries the result back. The fixture stands in for Waku's
+    /// bundled extension so the test needs no credentials; the entry it
+    /// publishes is the one the extension publishes.
+    #[test]
+    fn pi_answers_the_digest_trigger_without_a_run_against_the_real_rpc() {
+        let Some((driver, event_rx)) = real_pi_session(Some(live_digest_extension())) else {
+            return;
+        };
+        // The handshake reports the context the session starts from. Anything
+        // the trigger does to that number would arrive after it.
+        drain_events(&event_rx, Duration::from_millis(200));
+
+        let dispatch = Uuid::new_v4();
+        driver.prompt(crate::task_digest::trigger_prompt(dispatch));
+
+        let result = loop {
+            match next_live_step(&event_rx, "the trigger's result") {
+                DriverEvent::ExtensionMessage {
+                    custom_type,
+                    text,
+                    display,
+                } => {
+                    assert_eq!(custom_type, crate::task_digest::DIGEST_SURFACE);
+                    assert!(!display, "an objective is not a transcript row");
+                    break crate::task_digest::parse_result(&text)
+                        .expect("the provider's entry carries a result Waku can read");
+                }
+                DriverEvent::TurnStarted => panic!("the trigger must not open a turn"),
+                DriverEvent::TurnFinished { .. } => panic!("the trigger must not settle a turn"),
+                DriverEvent::TextDelta(delta) => {
+                    panic!("the trigger must not write to the transcript: {delta:?}")
+                }
+                DriverEvent::UsageUpdated { .. } => {
+                    panic!("the trigger must not grow the task's context")
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                _ => {}
+            }
+        };
+        assert_eq!(
+            result,
+            crate::task_digest::DigestResult {
+                dispatch,
+                objective: "The live probe answered the digest trigger".to_owned(),
+            },
+            "the result answers the dispatch the daemon asked about"
+        );
+
+        // A turn behind the trigger would arrive right after its answer, so
+        // the window after the result is where that has to be ruled out.
+        for event in drain_events(&event_rx, Duration::from_secs(2)) {
+            match event {
+                DriverEvent::TurnStarted => panic!("the trigger opened a turn"),
+                DriverEvent::TurnFinished { .. } => panic!("the trigger settled a turn"),
+                DriverEvent::TextDelta(delta) => {
+                    panic!("the trigger wrote to the transcript: {delta:?}")
+                }
+                DriverEvent::UsageUpdated { .. } => {
+                    panic!("the trigger grew the task's context")
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// Waku's own extension answers the trigger with a sentence generated
+    /// inside the task's own provider process: no second process, no new
+    /// session, and nothing added to the conversation the sentence describes.
+    ///
+    /// This is the whole mechanism against the real thing — Pi loads the
+    /// extension Waku ships, dispatches the command without a run, the nested
+    /// `ctx.modelRegistry.complete` reuses the running instance's credentials,
+    /// and the entry it appends comes back to the daemon as an event. It makes
+    /// one real model call, the way the other live Pi tests do; only the
+    /// sentence itself is unpredictable, so the assertion is that Waku's parser
+    /// accepts it, which is what the task list needs.
+    #[test]
+    fn pi_generates_an_objective_inside_the_running_session_against_the_real_rpc() {
+        let Some((driver, event_rx)) = real_pi_session(Some(bundled_digest_extension())) else {
+            return;
+        };
+        // The task needs a turn behind it: the extension describes the work,
+        // and a session with no conversation gives it nothing to read.
+        driver.prompt("Say in one sentence what a sidecar container is for.".to_owned());
+        let mut title = None;
+        loop {
+            match next_live_step(&event_rx, "the task's first turn to settle") {
+                DriverEvent::TurnFinished {
+                    success, summary, ..
+                } => {
+                    assert!(success, "the task's turn should settle: {summary:?}");
+                    break;
+                }
+                DriverEvent::AutoTitleUpdated(Some(provider_title)) => {
+                    title = Some(provider_title);
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                _ => {}
+            }
+        }
+
+        let dispatch = Uuid::new_v4();
+        driver.prompt(crate::task_digest::trigger_prompt(dispatch));
+        let result = loop {
+            match next_live_event(&event_rx, "the generated objective", LIVE_WORKFLOW_TIMEOUT) {
+                DriverEvent::ExtensionMessage {
+                    custom_type, text, ..
+                } => {
+                    assert_eq!(custom_type, crate::task_digest::DIGEST_SURFACE);
+                    break crate::task_digest::parse_result(&text)
+                        .expect("the extension publishes a result Waku can read");
+                }
+                DriverEvent::TurnStarted | DriverEvent::TurnFinished { .. } => {
+                    panic!("a trigger generates inside the task, it does not run in it")
+                }
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                _ => {}
+            }
+        };
+        assert_eq!(result.dispatch, dispatch);
+        let title = title.unwrap_or_else(|| crate::model::AgentSession::DEFAULT_TITLE.to_owned());
+        assert!(
+            crate::task_digest::accept(&result.objective, None, &title).is_ok(),
+            "the generated objective must be one Waku can store for {title:?}: {:?}",
+            result.objective
+        );
+    }
+
     /// The extension's own messages reach their surfaces — a subagent's child
     /// notification as detached work, anything else as an extension message,
     /// and one marked not for display as such — and the question it asks is
@@ -3800,6 +4530,22 @@ mod tests {
         awaited: &str,
     ) -> DriverEvent {
         next_live_event(event_rx, awaited, LIVE_STEP_TIMEOUT)
+    }
+
+    /// Everything the live provider sends within `window`, without demanding
+    /// that it sends anything at all.
+    fn drain_events(
+        event_rx: &crossbeam_channel::Receiver<DriverEvent>,
+        window: Duration,
+    ) -> Vec<DriverEvent> {
+        let deadline = std::time::Instant::now() + window;
+        let mut events = Vec::new();
+        while let Ok(event) =
+            event_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            events.push(event);
+        }
+        events
     }
 
     /// The acceptance path this change exists for: `npm:pi-subagents` runs one
@@ -4187,13 +4933,7 @@ mod tests {
 
     #[test]
     fn model_and_thinking_changes_reach_the_running_session_but_mode_changes_do_not() {
-        let (commands, command_rx) = unbounded();
-        let driver = PiDriver {
-            flavor: PiFlavor::Pi,
-            commands,
-            computer_use: None,
-            dialogs: PiDialogs::default(),
-        };
+        let (driver, command_rx) = driver_handle(false);
         let options = |mode| SessionOptions {
             mode,
             model: Some("anthropic/claude-opus-5".to_owned()),

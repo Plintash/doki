@@ -97,6 +97,21 @@ impl EventSink {
             .emit(self.session_id, self.runtime_id, event, false);
         Ok(())
     }
+
+    /// Publishes a daemon-owned change to this session's objective.
+    ///
+    /// The daemon writes a generated objective itself, with no client save
+    /// behind it, so there is no source subscriber to skip: every attached
+    /// client has to reload the task state to see it. The catalog entry keeps
+    /// the value the clients now render, or the next save would look like a
+    /// change the daemon had not published yet.
+    pub fn task_objective_published(&self, objective: String) {
+        let mut state = self.hub.state.lock();
+        if let Some(entry) = state.catalog_sessions.get_mut(&self.session_id) {
+            entry.objective = Some(objective);
+        }
+        Hub::broadcast_task_state_changed(&mut state, u64::MAX);
+    }
 }
 
 /// One connected client's delivery state.
@@ -156,6 +171,17 @@ struct SessionCatalogEntry {
     status: SessionStatus,
     created_at: u64,
     last_reply_at: Option<u64>,
+    // Triage state a client renders from the list row: a change to any of these
+    // has to move the revision, or a client that is already holding the task
+    // never learns about it. The objective is the resolved display value, the
+    // same one `AgentSession::list_projection` hands out, so a goal change is
+    // what this entry records as the task's objective changing.
+    objective: Option<String>,
+    blocked_since: Option<u64>,
+    blocked_reason: Option<String>,
+    turn_count: Option<u32>,
+    changed_files: Option<u32>,
+    archived_at: Option<u64>,
 }
 
 impl From<&AgentSession> for SessionCatalogEntry {
@@ -169,6 +195,12 @@ impl From<&AgentSession> for SessionCatalogEntry {
             status: session.status,
             created_at: session.created_at,
             last_reply_at: session.last_reply_at,
+            objective: session.resolved_objective().map(str::to_owned),
+            blocked_since: session.blocked_since,
+            blocked_reason: session.blocked_reason.clone(),
+            turn_count: session.turn_count,
+            changed_files: session.changed_files,
+            archived_at: session.archived_at,
         }
     }
 }
@@ -359,6 +391,14 @@ impl Hub {
     ) {
         let mut state = self.state.lock();
         let mut changed = false;
+        // The entry's objective is the *resolved* display value, which the
+        // daemon derives rather than the saving client authoring: a client that
+        // just set or cleared a task's goal sends the goal, the goal lives in
+        // the hydrated detail, and the daemon resolves it into this entry. So
+        // the subscriber that caused the change is the one subscriber that
+        // cannot already be holding it — the source is skipped for their own
+        // change to be told about, not to be kept from it.
+        let mut resolution_changed = false;
         for project in projects {
             let next = ProjectCatalogEntry::from(project);
             changed |= state
@@ -368,13 +408,21 @@ impl Hub {
         }
         for session in sessions {
             let next = SessionCatalogEntry::from(session);
-            changed |= state
-                .catalog_sessions
-                .insert(session.id, next.clone())
-                .is_none_or(|previous| previous != next);
+            let previous = state.catalog_sessions.insert(session.id, next.clone());
+            if let Some(previous) = previous {
+                changed |= previous != next;
+                resolution_changed |= previous.objective != next.objective;
+            } else {
+                changed = true;
+            }
         }
         if changed {
-            Self::broadcast_task_state_changed(&mut state, source_subscriber_id);
+            let skip = if resolution_changed {
+                u64::MAX
+            } else {
+                source_subscriber_id
+            };
+            Self::broadcast_task_state_changed(&mut state, skip);
         }
     }
 
@@ -800,6 +848,7 @@ fn command_targets_runtime(command: &Command) -> bool {
             | Command::CloseTerminal
             | Command::CloseSession
             | Command::RemoveSession
+            | Command::SetTaskArchived { .. }
     )
 }
 
@@ -1002,6 +1051,7 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
             projects: projects.clone(),
         },
         Command::RemoveSession
+        | Command::SetTaskArchived { .. }
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. } => TaskCatalogAction::Changed,
         _ => TaskCatalogAction::None,
@@ -1090,6 +1140,17 @@ mod tests {
     use std::path::PathBuf;
     use waku_client::{DaemonClient, DaemonSupervisor};
 
+    /// A goal the way a provider reports one.
+    fn thread_goal(objective: &str) -> crate::model::ThreadGoal {
+        crate::model::ThreadGoal {
+            objective: objective.to_owned(),
+            status: crate::model::ThreadGoalStatus::Active,
+            token_budget: None,
+            tokens_used: 0,
+            time_used_seconds: 0,
+        }
+    }
+
     #[derive(Default)]
     struct TestBackend {
         runtimes: Mutex<HashMap<Uuid, Uuid>>,
@@ -1176,6 +1237,143 @@ mod tests {
             observer_rx.recv_timeout(Duration::from_secs(1)),
             Ok(ServerMessage::TaskStateChanged { revision: 1 })
         ));
+    }
+
+    #[test]
+    fn a_daemon_generated_objective_reaches_every_client_and_stays_published() {
+        // The daemon writes a generated objective itself: no client's save is
+        // behind it, so no subscriber is the source and every one of them has
+        // to reload the task state. The catalog then records what the clients
+        // will find there — an objective the daemon has already published — so
+        // the next client save carrying it is not read as a change the daemon
+        // still owes them.
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let (author_tx, author_rx) = unbounded();
+        hub.subscribe(&[], Subscriber::new(author_tx).0);
+        let (observer_tx, observer_rx) = unbounded();
+        hub.subscribe(&[], Subscriber::new(observer_tx).0);
+
+        let mut session = AgentSession::new(session_id, ProviderKind::Pi);
+        session.objective = Some("The list says why each task exists".into());
+        hub.replace_task_catalog(&[], std::slice::from_ref(&session));
+        hub.event_sink(session_id, runtime_id)
+            .task_objective_published("The list says why each task exists".to_owned());
+
+        for subscriber in [&author_rx, &observer_rx] {
+            assert!(matches!(
+                subscriber.recv_timeout(Duration::from_secs(1)),
+                Ok(ServerMessage::TaskStateChanged { revision: 1 })
+            ));
+        }
+
+        // The catalog now holds the objective, so a client reporting the value
+        // it just loaded moves nothing.
+        hub.task_state_saved(u64::MAX, &[], std::slice::from_ref(&session));
+        for subscriber in [&author_rx, &observer_rx] {
+            assert!(
+                subscriber.recv_timeout(Duration::from_millis(50)).is_err(),
+                "a client's copy of a published objective is not a change"
+            );
+        }
+    }
+
+    /// A goal change has to move the task catalog revision. The entry records
+    /// the objective a client renders, so the same task saved again with only
+    /// a goal added is a change the clients holding it must hear about.
+    #[test]
+    fn a_goal_change_moves_the_task_catalog_revision() {
+        let hub = Hub::default();
+        let (observer_tx, observer_rx) = unbounded();
+        hub.subscribe(&[], Subscriber::new(observer_tx).0);
+
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.objective = Some("Sidebar schedules tasks by state".into());
+        hub.task_state_saved(u64::MAX, &[], std::slice::from_ref(&session));
+        assert!(matches!(
+            observer_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(ServerMessage::TaskStateChanged { revision: 1 })
+        ));
+
+        // The user sets a goal on the task and nothing else about it changes.
+        session.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+        hub.task_state_saved(u64::MAX, &[], std::slice::from_ref(&session));
+
+        assert!(
+            matches!(
+                observer_rx.recv_timeout(Duration::from_secs(1)),
+                Ok(ServerMessage::TaskStateChanged { revision: 2 })
+            ),
+            "a goal change has to reach a client that already holds the task"
+        );
+
+        // Saving the same task again changes nothing, so the catalog stays
+        // quiet and the row is not reloaded for every save.
+        hub.task_state_saved(u64::MAX, &[], std::slice::from_ref(&session));
+        assert!(
+            observer_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+    }
+
+    /// The client that sets a goal is the one client a revision would
+    /// otherwise skip, and it is the one client that cannot already hold the
+    /// result: the daemon resolves the goal into the list entry, so the goal
+    /// text reaches a client that only knows the objective it replaced.
+    #[test]
+    fn a_goal_change_reaches_the_client_that_made_it() {
+        let hub = Hub::default();
+        let (source_tx, source_rx) = unbounded();
+        let source_id = hub.subscribe(&[], Subscriber::new(source_tx).0);
+
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.objective = Some("Sidebar schedules tasks by state".into());
+        hub.task_state_saved(source_id, &[], std::slice::from_ref(&session));
+        assert!(
+            source_rx.try_recv().is_err(),
+            "a client's own save is not news to the client that made it"
+        );
+
+        // The same client sets a goal. Nothing it authored changed — the
+        // daemon resolves the goal into the entry — so it has to be told.
+        session.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+        hub.task_state_saved(source_id, &[], std::slice::from_ref(&session));
+        assert!(
+            matches!(
+                source_rx.recv_timeout(Duration::from_secs(1)),
+                Ok(ServerMessage::TaskStateChanged { .. })
+            ),
+            "the setter has to hear that its task's objective was resolved"
+        );
+    }
+
+    /// The catalog entry carries the resolved objective, not the goal: the
+    /// goal text is what moves the entry, and the stored generated value stays
+    /// where a cleared goal can return to it.
+    #[test]
+    fn the_catalog_entry_records_the_resolved_objective() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.objective = Some("Sidebar schedules tasks by state".into());
+        let generated = SessionCatalogEntry::from(&session);
+
+        session.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+        let with_goal = SessionCatalogEntry::from(&session);
+
+        assert_eq!(
+            generated.objective.as_deref(),
+            Some("Sidebar schedules tasks by state")
+        );
+        assert_eq!(
+            with_goal.objective.as_deref(),
+            Some("The sidebar groups tasks by what they need")
+        );
+        assert_ne!(generated, with_goal);
+        assert_eq!(
+            session.objective.as_deref(),
+            Some("Sidebar schedules tasks by state")
+        );
     }
 
     #[test]
@@ -1560,6 +1758,113 @@ mod tests {
         assert!(
             projection.messages.is_empty(),
             "the transcript stays detail the list never carries"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A goal is resolved once, on the way out, so no client ranks it against
+    /// the generated objective. The list entry and the hydrated hand-off carry
+    /// the goal as the objective, a plain save leaves the stored generated
+    /// value alone, and clearing the goal returns the task to that value.
+    #[cfg(unix)]
+    #[test]
+    fn a_goal_is_resolved_on_the_way_to_a_client_and_never_stored() {
+        let root = std::env::temp_dir().join(format!("waku-goal-objective-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("app.db");
+        let hub = Arc::new(Hub::default());
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(database.clone()),
+        )
+        .unwrap();
+        let sink = || hub.event_sink(Uuid::nil(), Uuid::nil());
+        let request = |command: Command| Request {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            runtime_id: Uuid::nil(),
+            command,
+        };
+
+        let project = Project::from_path(root.join("repo"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.objective = Some("Sidebar schedules tasks by state".into());
+        session.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+        session.begin_turn("ask once");
+        session.push_message(crate::model::MessageRole::Assistant, "answer");
+        let session_id = session.id;
+        let save = |session: AgentSession| {
+            backend
+                .handle(
+                    request(Command::SaveTaskState {
+                        projects: vec![project.clone()],
+                        live_session_ids: vec![session_id],
+                        skeleton_session_ids: Vec::new(),
+                        sessions: vec![session],
+                    }),
+                    sink(),
+                )
+                .unwrap()
+        };
+        let load = || {
+            let ResponsePayload::TaskState { mut sessions, .. } = backend
+                .handle(request(Command::LoadTaskState), sink())
+                .unwrap()
+            else {
+                panic!("expected daemon task state")
+            };
+            sessions.remove(0)
+        };
+        let hydrate = || {
+            let ResponsePayload::Session {
+                session: Some(session),
+            } = backend
+                .handle(request(Command::HydrateSession { session_id }), sink())
+                .unwrap()
+            else {
+                panic!("the stored task hydrates")
+            };
+            session
+        };
+        save(session);
+
+        // The row renders from the list entry: the goal is the objective, and
+        // the transcript never travelled.
+        let projection = load();
+        assert!(!projection.detail_loaded);
+        assert!(projection.turns.is_empty());
+        assert!(projection.thread_goal.is_none());
+        assert_eq!(
+            projection.objective.as_deref(),
+            Some("The sidebar groups tasks by what they need")
+        );
+
+        // Hydration carries the same objective, so a card built from the
+        // hydrated task cannot disagree with the row.
+        let hydrated = hydrate();
+        assert_eq!(
+            hydrated.objective.as_deref(),
+            Some("The sidebar groups tasks by what they need")
+        );
+
+        // A plain save of exactly what that client holds never stores the
+        // resolved value: the generated objective stays the fallback.
+        save(hydrated);
+        let store = StateStore::daemon(database.clone());
+        let stored = store.load().unwrap().sessions.remove(0);
+        assert_eq!(
+            stored.objective.as_deref(),
+            Some("Sidebar schedules tasks by state")
+        );
+
+        // Clearing the goal releases the field back to the stored value.
+        let mut cleared = hydrate();
+        cleared.thread_goal = None;
+        save(cleared);
+        assert_eq!(
+            load().objective.as_deref(),
+            Some("Sidebar schedules tasks by state")
         );
 
         std::fs::remove_dir_all(root).unwrap();

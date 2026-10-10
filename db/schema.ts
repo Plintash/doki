@@ -42,6 +42,35 @@ export const sessions = sqliteTable(
     updatedAt: integer("updated_at").notNull(),
     /** Completion of the most recent assistant turn, unix seconds. */
     lastReplyAt: integer("last_reply_at"),
+    /**
+     * When the task entered `Waiting` or `Failed`, unix seconds.
+     * The list orders blocked tasks by it, so it cannot be derived at render
+     * time from a runtime the client may not have.
+     */
+    blockedSince: integer("blocked_since"),
+    /** The permission, question, or failure the task is blocked on. */
+    blockedReason: text("blocked_reason"),
+    /**
+     * One sentence for what will be true when the task is done. Renderable
+     * from the list row alone, so the list never reads the transcript for it.
+     */
+    objective: text("objective"),
+    /** Settled turns so far; the list never loads `turns`. NULL means not known. */
+    turnCount: integer("turn_count"),
+    /** Files the newest checkpoint touched; the list never loads checkpoints. */
+    changedFiles: integer("changed_files"),
+    /**
+     * When the task was put away, unix seconds. Only the archive action writes
+     * it, so a task-state save can never set or clear it.
+     */
+    archivedAt: integer("archived_at"),
+    /**
+     * The provider's goal for this task, as JSON. The goal also lives in the
+     * hydrated detail, but the list resolves the objective out of it, so a
+     * restart that reads only the narrow row would lose the goal and fall back
+     * to the generated objective it replaced.
+     */
+    threadGoal: text("thread_goal"),
   },
   (table) => [
     index("sessions_by_project").on(table.projectId, table.updatedAt),

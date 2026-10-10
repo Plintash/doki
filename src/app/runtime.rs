@@ -157,9 +157,21 @@ pub(super) fn merge_remote_session_catalog(
             local.model = remote.model;
             local.created_at = remote.created_at;
             local.last_reply_at = remote.last_reply_at;
+            // The daemon generates the objective, counts settled work, and
+            // applies archive actions, so its copy is the newer one here. A
+            // client that has not learned the field yet simply has none, and
+            // the exchange above must not silently drop what the daemon holds.
+            local.objective = remote.objective;
+            local.turn_count = remote.turn_count;
+            local.changed_files = remote.changed_files;
+            local.archived_at = remote.archived_at;
             if !has_local_runtime(local.id) {
                 local.status = remote.status;
                 local.updated_at = remote.updated_at;
+                // Blocked state follows the status it belongs to, so it is only
+                // taken from the catalog when the catalog owns the status.
+                local.blocked_since = remote.blocked_since;
+                local.blocked_reason = remote.blocked_reason;
             }
         } else {
             local.push(remote);
@@ -1022,6 +1034,10 @@ impl Waku {
             self.task_switcher.remove(*session_id);
         }
         self.state.projects = snapshot.projects;
+        // The catalog owns which sessions exist and what their list columns
+        // hold, so one pass here refreshes every row's facts — including the
+        // tasks that arrived from another client and the ones that are gone.
+        self.rebuild_sidebar_row_facts();
 
         let attach = self
             .state
@@ -1123,6 +1139,9 @@ impl Waku {
                 };
                 if !self.runtimes.contains_key(&session_id) {
                     self.state.sessions[index] = session;
+                    // The hydrated session brought its transcript with it, so
+                    // this is where a busy task's plan step becomes known.
+                    self.refresh_sidebar_row_facts(session_id);
                     self.install_prepared_driver(session_id, prepared);
                     if self.state.selected_session == Some(session_id) {
                         self.reset_visible_state();
@@ -1177,7 +1196,7 @@ impl Waku {
             if !session.status.is_busy() {
                 return;
             }
-            session.status = SessionStatus::Idle;
+            session.set_status(SessionStatus::Idle);
             let interrupted_turn_count = session
                 .turns
                 .last_mut()
@@ -2351,7 +2370,7 @@ impl Waku {
             message.display_content = submission.display_content.clone();
             message.attachments = submission.attachments.clone();
             message.annotations = submission.annotations.clone();
-            session.status = SessionStatus::Connecting;
+            session.set_status(SessionStatus::Connecting);
             session.updated_at = unix_time();
             Some(original)
         });
@@ -2487,7 +2506,7 @@ impl Waku {
                 session.provider_cursor = Some(cursor);
             }
             session.truncate_after_turn(retained_turn_count);
-            session.status = SessionStatus::Idle;
+            session.set_status(SessionStatus::Idle);
         }
 
         if let Some(prepared) = prepared_driver.as_mut() {
@@ -3315,7 +3334,7 @@ impl Waku {
                 submission.attachments.clone(),
                 submission.annotations.clone(),
             );
-            session.status = SessionStatus::Connecting;
+            session.set_status(SessionStatus::Connecting);
             session.updated_at = unix_time();
             selected.then_some(TranscriptAnchor {
                 session_id,
@@ -3408,7 +3427,7 @@ impl Waku {
                     if let Some(turn_id) = session.active_turn_id() {
                         session.unwind_unstarted_turn(turn_id);
                     }
-                    session.status = SessionStatus::Idle;
+                    session.set_status(SessionStatus::Idle);
                 }
                 if selected {
                     if self
@@ -3534,7 +3553,8 @@ impl Waku {
                 failed_to_start = true;
                 let message = tr!("errors.start_agent", error = error);
                 if let Some(session) = self.state.session_mut(session_id) {
-                    session.status = SessionStatus::Failed;
+                    session.set_status(SessionStatus::Failed);
+                    session.set_blocked_reason(message.clone());
                     session.push_message(MessageRole::Assistant, message);
                 }
                 self.finish_active_turn(session_id, TurnStatus::Failed);
