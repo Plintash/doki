@@ -136,12 +136,15 @@ moment any scrollbar became visible.
   below, and the volatile tail) with spacers sized from the same ledger, so
   the row still measures exactly as tall as the full body. Appends keep the
   ledger; a wrap-width, metric, or rewrite change drops it, and the next
-  frame's full pass re-measures. Bodies containing an image or formula are
-  never windowed, because those blocks can change height after their first
-  frame and a spacer would freeze the old value, and a body with a search or
-  annotation mark keeps the full walk because a reveal reads its geometry
-  back from the frame's registry. On a 400-block reply this
-  takes the streaming frame from ~2.65 ms to ~0.21 ms in the debug build
+  frame's full pass re-measures. Planning itself still walks the whole ledger
+  — two vectors and two scans a frame — so it stays proportional to the
+  document, and only the build and layout are proportional to the viewport.
+  Bodies containing an image or formula are never windowed, because those
+  blocks can change height after their first frame and a spacer would freeze
+  the old value, and a body with a search or annotation mark keeps the full
+  walk because a reveal reads its geometry back from the frame's registry.
+  On a 400-block reply this takes the streaming frame from ~2.65 ms to ~0.21
+  ms in the debug build
   (`cargo test --locked -p waku --lib bench_markdown_frame -- --ignored
   --nocapture`).
 - The live response body **reports a leading container height**
@@ -151,12 +154,14 @@ moment any scrollbar became visible.
   jolt however smooth the grapheme fade is. The row instead reports a height
   that leads the measured body through a critically damped spring fed by the
   body's smoothed growth rate, so a layout step changes acceleration rather
-  than position. The veil reveals a wrapped row only once the clip has passed
-  its bottom, so a clip that lags the body sits on text that is not painted
-  yet: the gap under the text is the only artefact, bounded by the rate lead
-  (`CLIP_RUNWAY_MAX`). Settling, a rewrite, a reflow, and a metric change all
-  release the clip, because a height kept across any of them would cut a body
-  that has since grown past it.
+  than position. The clip stays at or above the height measured on the
+  previous frame, so a line laid out this frame lands in space that already
+  exists and only text appended since that measurement ever sits below the
+  clip edge — and the veil has not painted that yet, because a newly appended
+  grapheme is born at zero opacity. The gap under the text is the only
+  artefact, bounded by the rate lead (`CLIP_RUNWAY_MAX`). Settling, a rewrite,
+  a reflow, and a metric change all release the clip, because a height kept
+  across any of them would cut a body that has since grown past it.
 - `MarkdownView::set_text` derives the mended display tail only when content
   or the streaming flag changed — the derivation re-parses the final block and
   runs for every visible row every frame.

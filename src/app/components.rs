@@ -585,10 +585,11 @@ fn render_markdown_message_body<'a>(
                 ctx,
             )
         });
-    // The clip layer: report a continuous height to the row while the real
-    // body is taller, so the transcript pins to a height that glides instead
-    // of stepping a line at a time. Everything below the clip is unrevealed
-    // text, so nothing visible is ever cut.
+    // The clip layer: report a leading height to the row so the transcript
+    // pins to a height that glides instead of stepping a line at a time. The
+    // clip never falls below the height measured last frame, and text appended
+    // since that measurement is still unborn in the veil, so nothing painted is
+    // ever cut.
     let Some(markdown) = markdown else {
         return body;
     };

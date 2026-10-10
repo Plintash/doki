@@ -91,9 +91,6 @@ struct Unit {
 struct ElementVeil {
     previous: String,
     units: Vec<Unit>,
-    /// Byte limit already handed to the wave. The clip grows this on frame
-    /// boundaries rather than the text growing it on commits.
-    revealed: usize,
     /// Birth the next appended grapheme would take if the wave is running.
     next_birth: Option<Instant>,
     last_append: Option<Instant>,
@@ -142,7 +139,6 @@ impl ElementVeil {
         self.previous.clear();
         self.previous.push_str(text);
         self.units.clear();
-        self.revealed = text.len();
         self.next_birth = None;
         self.last_append = None;
     }
@@ -152,18 +148,18 @@ impl ElementVeil {
     /// spending seconds invisible: once the queue would run more than one
     /// commit gap plus one fade ahead, the rest is born at the cap and lands
     /// together.
-    fn append(&mut self, text: &str, prefix: usize, limit: usize, now: Instant) {
+    fn append(&mut self, text: &str, prefix: usize, now: Instant) {
         let gap_ms = self
             .last_append
             .map_or(VEIL_GAP_CLAMP_MS, |last| millis_between(last, now))
             .clamp(VEIL_GAP_MIN_MS, VEIL_GAP_CLAMP_MS);
-        let count = text[prefix..limit].graphemes(true).count().max(1) as f32;
+        let count = text[prefix..].graphemes(true).count().max(1) as f32;
         let pace = millis((gap_ms / count).clamp(VEIL_MIN_PACE_MS, VEIL_MAX_PACE_MS));
         let cap = now + millis(gap_ms + VEIL_FADE_MS);
 
         let mut chain = self.next_birth.unwrap_or(now);
         let mut offset = prefix;
-        for grapheme in text[prefix..limit].graphemes(true) {
+        for grapheme in text[prefix..].graphemes(true) {
             let birth = chain.max(now).min(cap);
             let end = offset + grapheme.len();
             self.units.push(Unit {
@@ -177,8 +173,7 @@ impl ElementVeil {
         self.last_append = Some(now);
     }
 
-    fn advance(&mut self, text: &str, now: Instant, reveal_until: Option<usize>) -> Vec<VeilSpan> {
-        let limit = reveal_until.unwrap_or(text.len()).min(text.len());
+    fn advance(&mut self, text: &str, now: Instant) -> Vec<VeilSpan> {
         if text != self.previous {
             // A streaming Markdown reparse can replace delimiter characters
             // with styled text. Preserve the common prefix and re-veil only
@@ -188,19 +183,11 @@ impl ElementVeil {
                 unit.range.end = unit.range.end.min(prefix);
                 unit.range.start < unit.range.end
             });
-            if self.revealed > prefix {
-                self.revealed = prefix;
+            if prefix < text.len() {
+                self.append(text, prefix, now);
             }
             self.previous.clear();
             self.previous.push_str(text);
-        }
-        if limit > self.revealed {
-            self.append(text, self.revealed, limit, now);
-            self.revealed = limit;
-        } else if limit < self.revealed {
-            // The clip can only give ground back when the body is rewritten.
-            self.units.retain(|unit| unit.range.start < limit);
-            self.revealed = limit;
         }
 
         // Units settle in birth order; drop the ones that already landed.
@@ -276,13 +263,7 @@ impl RowVeil {
         self.finish_seeding();
     }
 
-    pub fn advance(
-        &mut self,
-        element: usize,
-        text: &str,
-        now: Instant,
-        reveal_until: Option<usize>,
-    ) -> Vec<VeilSpan> {
+    pub fn advance(&mut self, element: usize, text: &str, now: Instant) -> Vec<VeilSpan> {
         self.seen_this_frame.insert(element);
         if self.seeding && !self.elements.contains_key(&element) {
             let mut veil = ElementVeil::default();
@@ -290,10 +271,7 @@ impl RowVeil {
             self.elements.insert(element, veil);
             return Vec::new();
         }
-        self.elements
-            .entry(element)
-            .or_default()
-            .advance(text, now, reveal_until)
+        self.elements.entry(element).or_default().advance(text, now)
     }
 
     pub fn is_fading(&self) -> bool {
@@ -372,7 +350,7 @@ mod tests {
     }
 
     fn advance(veil: &mut ElementVeil, text: &str, now: Instant) -> Vec<VeilSpan> {
-        veil.advance(text, now, None)
+        veil.advance(text, now)
     }
 
     #[test]
@@ -477,10 +455,10 @@ mod tests {
     fn seeded_rows_do_not_refade_existing_content() {
         let start = Instant::now();
         let mut veil = RowVeil::seeded();
-        assert!(veil.advance(0, "already here", start, None).is_empty());
+        assert!(veil.advance(0, "already here", start).is_empty());
         veil.finish_seeding();
         assert_eq!(
-            veil.advance(0, "already here plus", at(start, 100), None),
+            veil.advance(0, "already here plus", at(start, 100)),
             vec![(12..17, 0.0)]
         );
     }
