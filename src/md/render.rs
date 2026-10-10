@@ -498,6 +498,14 @@ pub fn flatten_plain(
 /// measured body; also caps the feed-forward lookahead on a fast stream.
 const CLIP_RUNWAY_MAX: f32 = 44.0;
 
+/// Measured height of every top-level block of one body, one entry per block
+/// index. An entry is keyed by the block's *source range*: mending
+/// re-partitions the tail as it settles, so a block's index is not a stable
+/// identity and an index-keyed ledger would hand one block's height to
+/// another. `None` means the block has never been laid out at the current
+/// width, which forces one full pass so the spacers cannot guess.
+type BlockHeights = Rc<RefCell<Vec<(Range<usize>, Option<Pixels>)>>>;
+
 /// Everything the renderer keeps between frames for one markdown body.
 ///
 /// The flatten cache is keyed by element ordinal and pruned only back to the
@@ -522,13 +530,8 @@ pub struct MarkdownView {
     /// Measured height of every top-level block, recorded as the renderer
     /// lays each one out. A long streaming body is rendered as the window of
     /// blocks near the viewport plus the volatile tail; the unrendered blocks
-    /// stand in as spacers sized from these heights. `None` means the block
-    /// has never been laid out at the current width, which forces one full
-    /// pass so the spacers cannot guess.
-    /// Each entry is keyed by the block's *source range*: mending re-partitions
-    /// the tail as it settles, so a block's index is not a stable identity and
-    /// an index-keyed ledger hands one block's height to another.
-    heights: Rc<RefCell<Vec<(Range<usize>, Option<Pixels>)>>>,
+    /// stand in as spacers sized from these heights.
+    heights: BlockHeights,
     /// Wrap width the recorded heights were measured at. A reflow invalidates
     /// every height, because a block's height is a function of its width.
     heights_width: Cell<Option<f32>>,
@@ -700,7 +703,7 @@ impl MarkdownView {
             .as_secs_f32();
         self.clip_at.set(now);
         let Some(height) = self.body_height.get() else {
-            self.clip.set(None);
+            self.release_clip();
             return;
         };
         if !animate {
@@ -1737,7 +1740,7 @@ pub const MARKDOWN_WINDOW_MARGIN: f32 = 600.0;
 struct BodyPass<'a> {
     blocks: Vec<&'a TopBlock>,
     ctx: Ctx<'a>,
-    heights: Rc<RefCell<Vec<(Range<usize>, Option<Pixels>)>>>,
+    heights: BlockHeights,
     /// Whether this body is streaming with the dissolve animating.
     animate: bool,
 }
@@ -1766,8 +1769,8 @@ fn begin_body<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<BodyPass<'a>>
     // tail, whose elements must be built even when the viewport is elsewhere.
     view.volatile_from
         .set(block_ordinal_base(view.parser.display_tail_start()));
-    // Sized before any block is built, so every `MeasuredBlock` knows its own
-    // slot; `resize` truncates too, which is what a shrunk body needs.
+    // Sized before any block is built, so every `Measured` wrapper knows its
+    // own slot; `resize` truncates too, which is what a shrunk body needs.
     let heights = view.heights.clone();
     heights.borrow_mut().resize(blocks.len(), (0..0, None));
     Some(BodyPass {
@@ -1868,7 +1871,7 @@ impl WindowPlan {
 /// arithmetic a guess, so the plan falls back to the whole body and lets that
 /// pass measure it.
 fn window_plan(
-    heights: &Rc<RefCell<Vec<(Range<usize>, Option<Pixels>)>>>,
+    heights: &BlockHeights,
     blocks: &[&TopBlock],
     gap: Pixels,
     visible_top: f32,
@@ -2034,7 +2037,7 @@ fn render_block_range(
     blocks: &[&TopBlock],
     ctx: &Ctx,
     range: Range<usize>,
-    heights: &Rc<RefCell<Vec<(Range<usize>, Option<Pixels>)>>>,
+    heights: &BlockHeights,
 ) -> Vec<AnyElement> {
     let mut children = Vec::with_capacity(range.len());
     for block_ix in range {
@@ -2045,11 +2048,13 @@ fn render_block_range(
             "a single block overflowed its ordinal stride"
         );
         children.push(
-            MeasuredBlock {
+            Measured {
                 inner: rendered,
-                heights: heights.clone(),
-                index: block_ix,
-                range: blocks[block_ix].range.clone(),
+                sink: MeasureSink::Block {
+                    heights: heights.clone(),
+                    index: block_ix,
+                    range: blocks[block_ix].range.clone(),
+                },
             }
             .into_any_element(),
         );
@@ -2079,20 +2084,34 @@ pub fn clip_body(view: &MarkdownView, body: AnyElement) -> AnyElement {
 
 /// Wrap a streaming body so the clip controller knows its real height.
 fn measure_body(view: &MarkdownView, inner: AnyElement) -> AnyElement {
-    MeasuredBody {
+    Measured {
         inner,
-        height: view.body_height.clone(),
+        sink: MeasureSink::Body(view.body_height.clone()),
     }
     .into_any_element()
 }
 
-/// The body wrapper behind [`measure_body`].
-struct MeasuredBody {
-    inner: AnyElement,
-    height: Rc<Cell<Option<Pixels>>>,
+/// Where a [`Measured`] wrapper records the height it laid out at.
+enum MeasureSink {
+    /// The streaming body's own height, for the clip controller.
+    Body(Rc<Cell<Option<Pixels>>>),
+    /// One block's slot in the height ledger, for the window planner.
+    Block {
+        heights: BlockHeights,
+        index: usize,
+        range: Range<usize>,
+    },
 }
 
-impl IntoElement for MeasuredBody {
+/// Wraps an element to record the height it laid out at, for whoever asked to
+/// measure it: the clip controller ([`clip_body`]) or the window planner
+/// ([`render_block_range`]).
+struct Measured {
+    inner: AnyElement,
+    sink: MeasureSink,
+}
+
+impl IntoElement for Measured {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -2100,7 +2119,7 @@ impl IntoElement for MeasuredBody {
     }
 }
 
-impl Element for MeasuredBody {
+impl Element for Measured {
     type RequestLayoutState = ();
     type PrepaintState = ();
 
@@ -2131,72 +2150,16 @@ impl Element for MeasuredBody {
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
-        self.height.set(Some(bounds.size.height));
-        self.inner.prepaint(window, cx);
-    }
-
-    fn paint(
-        &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        _: &mut (),
-        window: &mut Window,
-        cx: &mut gpui::App,
-    ) {
-        self.inner.paint(window, cx);
-    }
-}
-
-/// Records the height a block was laid out at, for the window planner.
-struct MeasuredBlock {
-    inner: AnyElement,
-    heights: Rc<RefCell<Vec<(Range<usize>, Option<Pixels>)>>>,
-    index: usize,
-    range: Range<usize>,
-}
-
-impl IntoElement for MeasuredBlock {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for MeasuredBlock {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<gpui::ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut gpui::App,
-    ) -> (gpui::LayoutId, ()) {
-        (self.inner.request_layout(window, cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut (),
-        window: &mut Window,
-        cx: &mut gpui::App,
-    ) {
-        self.heights.borrow_mut()[self.index] = (self.range.clone(), Some(bounds.size.height));
+        match &self.sink {
+            MeasureSink::Body(height) => height.set(Some(bounds.size.height)),
+            MeasureSink::Block {
+                heights,
+                index,
+                range,
+            } => {
+                heights.borrow_mut()[*index] = (range.clone(), Some(bounds.size.height));
+            }
+        }
         self.inner.prepaint(window, cx);
     }
 
@@ -3668,7 +3631,7 @@ mod tests {
             view: Rc<MarkdownView>,
             palette: Palette,
             window: Rc<Cell<Option<(f32, f32)>>>,
-            height: Rc<RefCell<Vec<(Range<usize>, Option<Pixels>)>>>,
+            height: BlockHeights,
         }
 
         impl gpui::Render for WindowedBody {
@@ -3693,11 +3656,13 @@ mod tests {
                 };
                 // The recorder reads the body column's own bounds: the window
                 // root otherwise stretches to the whole viewport.
-                let measured = MeasuredBlock {
+                let measured = Measured {
                     inner: body.unwrap_or_else(|| div().into_any_element()),
-                    heights: self.height.clone(),
-                    index: 0,
-                    range: 0..1,
+                    sink: MeasureSink::Block {
+                        heights: self.height.clone(),
+                        index: 0,
+                        range: 0..1,
+                    },
                 };
                 div().w(px(700.0)).flex().items_start().child(measured)
             }
@@ -3729,9 +3694,8 @@ mod tests {
                 cxt.draw(cx).clear(cx);
             });
         };
-        let body_height = |height: &Rc<RefCell<Vec<(Range<usize>, Option<Pixels>)>>>| {
-            height.borrow()[0].1.expect("the body was laid out")
-        };
+        let body_height =
+            |height: &BlockHeights| height.borrow()[0].1.expect("the body was laid out");
 
         draw(visual, &entity);
         let full = body_height(&height);

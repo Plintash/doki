@@ -2411,6 +2411,16 @@ impl Waku {
         viewport: Bounds<Pixels>,
     ) -> Option<(usize, MessageBodyWindow)> {
         let session = self.selected_session()?;
+        // Only a streaming reply has a windowed body, and this walk runs on
+        // every frame: a settled transcript has nothing to find, so the scan
+        // for a streaming assistant message pays for itself first.
+        if !session
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Assistant && message.streaming)
+        {
+            return None;
+        }
         let row_index = self
             .transcript_row_kinds
             .borrow()
