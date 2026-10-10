@@ -1111,6 +1111,8 @@ skills.disable_named:
 
 commands.fast_description:
   en: Toggle fast mode
+commands.compact_description:
+  en: Compact the context
 commands.fast_enabled:
   en: Fast mode enabled
 commands.fast_disabled:
@@ -1438,6 +1440,8 @@ errors.provider_initialize_session:
   en: "%{provider} could not initialize this session"
 errors.provider_rejected_prompt:
   en: "%{provider} rejected the prompt before it ran"
+errors.compact_turn_running:
+  en: Stop the running turn before compacting the context
 errors.provider_complete_turn:
   en: "%{provider} could not complete this turn"
 errors.provider_reported_error:

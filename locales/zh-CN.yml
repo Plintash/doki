@@ -535,6 +535,7 @@ skills.section_user_skills: 用户技能
 skills.enable_named: 启用%{name}
 skills.disable_named: 停用%{name}
 commands.fast_description: 切换快速模式
+commands.compact_description: 压缩上下文
 commands.fast_enabled: 已启用快速模式
 commands.fast_disabled: 已关闭快速模式
 commands.goal_description: 为此任务设定一个持续追求的目标
@@ -694,6 +695,7 @@ errors.provider_rejected_steer: "%{provider} 拒绝了补充指示：%{error}"
 errors.provider_stopped_receiving: "%{provider} 已停止接收消息"
 errors.provider_initialize_session: "%{provider} 未能初始化此任务"
 errors.provider_rejected_prompt: "%{provider} 在开始处理前拒绝了消息"
+errors.compact_turn_running: 请先停止正在执行的回合，再压缩上下文
 errors.provider_complete_turn: "%{provider} 未能完成本轮任务"
 errors.provider_reported_error: "%{provider} 报告了错误"
 session.response_unavailable: 该回复已不可用

@@ -2934,6 +2934,7 @@ impl Waku {
                 last_background_refresh_at: Instant::now()
                     .checked_sub(BACKGROUND_WORK_REFRESH_INTERVAL)
                     .unwrap_or_else(Instant::now),
+                compaction_turn: None,
             },
         );
         // Startup can emit before the background task hands this receiver to
@@ -3452,6 +3453,17 @@ impl Waku {
             .find(|session| session.id == session_id)
             .map(submitted_prompt_identity)
             .unwrap_or((None, None));
+        // A Pi `/compact` is a provider command the transport runs itself: it
+        // settles without a model turn, so the answerless-turn fallback must
+        // skip exactly this turn. Resolution above has already let a project,
+        // user or skill command of the same name expand or redirect, so a
+        // literal invocation here is the built-in.
+        if provider == ProviderKind::Pi
+            && waku_protocol::composer::parse_compact_invocation(&driver_prompt).is_some()
+            && let Some(runtime) = self.runtimes.get_mut(&session_id)
+        {
+            runtime.compaction_turn = turn_id;
+        }
         let mut failed_to_start = false;
         match driver {
             Ok(driver) => driver.prompt(driver_prompt, turn_id, message_id),

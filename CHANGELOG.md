@@ -20,6 +20,7 @@ the original feature bullet instead of adding separate entries for them.
 - Pi: stopping a turn takes its queued message back and returns the text to you instead of letting the message run afterwards
 - Pi: a background subagent's completion now wakes the task — the child's outcome appears with detached work, and the reply it produced lands in the transcript
 - Pi: an extension's notifications, status, widgets and questions reach the UI instead of being dropped or cancelled on your behalf
+- Pi: type `/compact` to run its context compaction — offered in the composer, never sent to the model, with its progress and the refreshed context meter visible
 
 ## [26.9.21]
 

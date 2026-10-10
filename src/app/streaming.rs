@@ -835,6 +835,23 @@ impl Waku {
                 summary,
                 interrupted,
             } => {
+                // A manual compaction's settlement carries no turn id. When the
+                // recorded compaction turn is no longer the active one, the app
+                // already ended it (the user stopped) and this event belongs to
+                // that ended turn: settling the current one with it would end a
+                // turn that never ended.
+                if let Some(recorded) = runtime.compaction_turn
+                    && self
+                        .state
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .and_then(AgentSession::active_turn_id)
+                        != Some(recorded)
+                {
+                    runtime.compaction_turn = None;
+                    return true;
+                }
                 // A prompt the provider refused before accepting it settles as
                 // the delivery failure of the message that asked for the run:
                 // that message stays, marked undelivered with the reason, and
@@ -842,6 +859,7 @@ impl Waku {
                 // — an answer row, a checkpoint, background work — would be
                 // reporting a turn that never happened.
                 if !success && self.record_refused_prompt(session_id, runtime, summary.as_deref()) {
+                    runtime.compaction_turn = None;
                     return true;
                 }
                 let (session_status, turn_status, background_status) =
@@ -895,7 +913,19 @@ impl Waku {
                 self.complete_turn_blocks(session_id);
                 runtime.stream_phase = None;
                 runtime.park_announced = false;
-                let needs_fallback = !self.turn_has_assistant_message(session_id);
+                // A provider command whose transport answers without a model
+                // turn (Pi's `/compact`) settles with its activity row as the
+                // whole record; the answerless-turn fallback would add a
+                // synthetic reply under it. Only that recorded turn skips it.
+                let compaction_turn = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .and_then(AgentSession::active_turn_id)
+                    .is_some_and(|turn_id| runtime.compaction_turn.take() == Some(turn_id));
+                let needs_fallback =
+                    !self.turn_has_assistant_message(session_id) && !compaction_turn;
                 if let Some(session) = self.state.session_mut(session_id) {
                     // A provider-side user stop — the Stop button, or a denied
                     // permission the provider aborted on — settles like the
@@ -987,6 +1017,7 @@ impl Waku {
             }
             DriverEvent::ProcessExited => {
                 self.mark_background_work_lost(session_id);
+                runtime.compaction_turn = None;
                 let previous_kinds = self.snapshot_selected_transcript_rows(session_id);
                 self.finish_streaming_assistant(session_id);
                 self.complete_turn_blocks(session_id);
