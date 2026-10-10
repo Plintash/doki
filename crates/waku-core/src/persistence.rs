@@ -1127,7 +1127,8 @@ impl StateStore {
         let mut sessions = connection
             .prepare(
                 "SELECT id, project_id, title, auto_title, provider, model, status,
-                        created_at, updated_at, last_reply_at
+                        created_at, updated_at, last_reply_at,
+                        blocked_since, blocked_reason, objective, turn_count, changed_files, archived_at
                  FROM sessions ORDER BY updated_at",
             )
             .map_err(to_io_error)?;
@@ -1145,6 +1146,12 @@ impl StateStore {
                     row.get::<_, i64>(7)?,
                     row.get::<_, i64>(8)?,
                     row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
                 ))
             })
             .map_err(to_io_error)?
@@ -1495,6 +1502,12 @@ type SessionColumns = (
     i64,
     i64,
     Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
 );
 
 /// Builds a list-only session from its columns. `messages`,
@@ -1514,6 +1527,12 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         created_at,
         updated_at,
         last_reply_at,
+        blocked_since,
+        blocked_reason,
+        objective,
+        turn_count,
+        changed_files,
+        archived_at,
     ) = row;
     Some(AgentSession {
         id: Uuid::parse_str(&id).ok()?,
@@ -1533,6 +1552,12 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         created_at: created_at as u64,
         updated_at: updated_at as u64,
         last_reply_at: last_reply_at.map(|at| at as u64),
+        objective,
+        blocked_since: blocked_since.map(|at| at as u64),
+        blocked_reason,
+        turn_count: turn_count.map(|count| count.max(0) as u32),
+        changed_files: changed_files.map(|count| count.max(0) as u32),
+        archived_at: archived_at.map(|at| at as u64),
         provider_cursor: None,
         available_commands: Vec::new(),
         thread_goal: None,
@@ -1807,8 +1832,10 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
 /// listing sessions never has to deserialize a transcript.
 const UPSERT_SESSION: &str = "INSERT INTO sessions(
          id, project_id, title, auto_title, provider, model, status,
-         created_at, updated_at, last_reply_at
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         created_at, updated_at, last_reply_at,
+         blocked_since, blocked_reason, objective,
+         turn_count, changed_files, archived_at
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
      ON CONFLICT(id) DO UPDATE SET
          project_id    = excluded.project_id,
          title         = excluded.title,
@@ -1818,7 +1845,13 @@ const UPSERT_SESSION: &str = "INSERT INTO sessions(
          status        = excluded.status,
          created_at    = excluded.created_at,
          updated_at    = excluded.updated_at,
-         last_reply_at = excluded.last_reply_at";
+         last_reply_at = excluded.last_reply_at,
+         blocked_since = excluded.blocked_since,
+         blocked_reason = excluded.blocked_reason,
+         objective     = excluded.objective,
+         turn_count    = excluded.turn_count,
+         changed_files = excluded.changed_files,
+         archived_at   = excluded.archived_at";
 
 const INSERT_PROJECT: &str = "INSERT INTO projects(id, name, path, position, created_at)
      VALUES(?1, ?2, ?3, ?4, ?5)
@@ -1856,6 +1889,26 @@ fn session_params(session: &AgentSession) -> Vec<rusqlite::types::Value> {
         Value::Integer(session.updated_at as i64),
         session
             .last_reply_at
+            .map_or(Value::Null, |at| Value::Integer(at as i64)),
+        session
+            .blocked_since
+            .map_or(Value::Null, |at| Value::Integer(at as i64)),
+        session
+            .blocked_reason
+            .clone()
+            .map_or(Value::Null, Value::Text),
+        session
+            .objective
+            .clone()
+            .map_or(Value::Null, Value::Text),
+        session
+            .turn_count
+            .map_or(Value::Null, |count| Value::Integer(count as i64)),
+        session
+            .changed_files
+            .map_or(Value::Null, |count| Value::Integer(count as i64)),
+        session
+            .archived_at
             .map_or(Value::Null, |at| Value::Integer(at as i64)),
     ]
 }
@@ -3382,12 +3435,14 @@ mod tests {
         // Rewind the file to the release before annotations: the column is gone
         // and the migration is no longer recorded, which is what an upgrade
         // from that build finds. Every other column and row stays in place.
-        let (annotation_migration, annotation_sql) =
-            *MIGRATIONS.last().expect("at least one migration");
+        let (annotation_migration, annotation_sql) = MIGRATIONS
+            .iter()
+            .find(|migration| migration.1.contains("annotations"))
+            .copied()
+            .expect("a migration adds the annotations column");
         assert!(
-            annotation_sql.contains("annotations"),
-            "this fixture rewinds the newest migration, which must be the one adding the \
-             annotations column: {annotation_sql}"
+            annotation_sql.contains("messages"),
+            "the located migration adds the annotations column to messages: {annotation_sql}"
         );
         let connection = Connection::open(directory.join("app.db")).unwrap();
         connection
@@ -3497,6 +3552,12 @@ mod tests {
         state.sessions[0].model = Some("gpt-5.6-luna".into());
         state.sessions[0].begin_turn("Go");
         state.sessions[0].finish_active_turn(crate::model::TurnStatus::Completed);
+        state.sessions[0].objective = Some("The parser survives malformed rows".into());
+        state.sessions[0].blocked_since = Some(1_700_000_100);
+        state.sessions[0].blocked_reason = Some("Waiting for the rerun decision".into());
+        state.sessions[0].turn_count = Some(7);
+        state.sessions[0].changed_files = Some(3);
+        state.sessions[0].archived_at = Some(1_700_000_200);
         let session = state.sessions[0].clone();
         store.save(&mut state).unwrap();
 
@@ -3504,7 +3565,9 @@ mod tests {
         let columns = connection
             .query_row(
                 "SELECT title, auto_title, provider, model, status,
-                        created_at, updated_at, last_reply_at
+                        created_at, updated_at, last_reply_at,
+                        objective, blocked_since, blocked_reason,
+                        turn_count, changed_files, archived_at
                  FROM sessions WHERE id = ?1",
                 params![session.id.to_string()],
                 |row| {
@@ -3517,11 +3580,32 @@ mod tests {
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
                         row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<i64>>(12)?,
+                        row.get::<_, Option<i64>>(13)?,
                     ))
                 },
             )
             .unwrap();
-        let (title, auto_title, provider, model, status, created, updated, last_reply) = columns;
+        let (
+            title,
+            auto_title,
+            provider,
+            model,
+            status,
+            created,
+            updated,
+            last_reply,
+            objective,
+            blocked_since,
+            blocked_reason,
+            turn_count,
+            changed_files,
+            archived_at,
+        ) = columns;
 
         assert_eq!(title, "Investigate the parser");
         assert_eq!(auto_title.as_deref(), Some("Provider fallback"));
@@ -3532,6 +3616,139 @@ mod tests {
         assert_eq!(updated as u64, session.updated_at);
         assert_eq!(last_reply.map(|at| at as u64), session.last_reply_at);
         assert!(last_reply.is_some(), "a submitted turn sets last_reply_at");
+        assert_eq!(objective.as_deref(), session.objective.as_deref());
+        assert_eq!(blocked_since.map(|at| at as u64), session.blocked_since);
+        assert_eq!(
+            blocked_reason.as_deref(),
+            session.blocked_reason.as_deref()
+        );
+        assert_eq!(turn_count.map(|count| count as u32), session.turn_count);
+        assert_eq!(changed_files.map(|count| count as u32), session.changed_files);
+        assert_eq!(archived_at.map(|at| at as u64), session.archived_at);
+
+        // And the columns come back through the list load, not just the JSON.
+        let restored = store.load().unwrap();
+        let loaded = restored
+            .sessions
+            .iter()
+            .find(|loaded| loaded.id == session.id)
+            .expect("the session loads");
+        assert_eq!(loaded.objective.as_deref(), session.objective.as_deref());
+        assert_eq!(loaded.blocked_since, session.blocked_since);
+        assert_eq!(
+            loaded.blocked_reason.as_deref(),
+            session.blocked_reason.as_deref()
+        );
+        assert_eq!(loaded.turn_count, session.turn_count);
+        assert_eq!(loaded.changed_files, session.changed_files);
+        assert_eq!(loaded.archived_at, session.archived_at);
+
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn the_sessions_table_carries_the_triage_columns() {
+        let connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&connection).unwrap();
+
+        let names: Vec<String> = connection
+            .prepare("PRAGMA table_info(sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+
+        for expected in [
+            "blocked_since",
+            "blocked_reason",
+            "turn_count",
+            "changed_files",
+            "archived_at",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "{expected} is missing from {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_row_without_triage_values_loads_unarchived_and_unblocked() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        state.sessions[0].begin_turn("Ask");
+        state.sessions[0].finish_active_turn(crate::model::TurnStatus::Completed);
+        let session_id = state.sessions[0].id;
+        store.save(&mut state).unwrap();
+
+        // A row written before the triage columns existed: the nullable ones are
+        // NULL and the counters hold their default.
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE sessions SET blocked_since = NULL, blocked_reason = NULL,
+                        turn_count = NULL, changed_files = NULL, archived_at = NULL
+                 WHERE id = ?1",
+                params![session_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let reloaded = store.load().unwrap();
+        let session = reloaded
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("the row survives the reload");
+
+        assert!(session.archived_at.is_none(), "an old store stays unarchived");
+        assert!(session.blocked_since.is_none());
+        assert!(session.blocked_reason.is_none());
+        assert!(session.turn_count.is_none());
+        assert!(session.changed_files.is_none());
+
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn archiving_a_task_round_trips_through_the_store() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        state.sessions[0].begin_turn("Ask");
+        state.sessions[0].finish_active_turn(crate::model::TurnStatus::Completed);
+        let session_id = state.sessions[0].id;
+        state.session_mut(session_id).expect("the session").archived_at = Some(1_700_000_000);
+        store.save(&mut state).unwrap();
+
+        let mut reloaded = load_hydrated(&store_in(&directory));
+        assert_eq!(
+            reloaded
+                .session_mut(session_id)
+                .expect("the session")
+                .archived_at,
+            Some(1_700_000_000)
+        );
+
+        // Unarchiving is the same field going back to none.
+        reloaded
+            .session_mut(session_id)
+            .expect("the session")
+            .archived_at = None;
+        store_in(&directory).save(&mut reloaded).unwrap();
+
+        let restored = load_hydrated(&store_in(&directory));
+        assert!(
+            restored
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .expect("the session")
+                .archived_at
+                .is_none()
+        );
 
         fs::remove_dir_all(directory).ok();
     }

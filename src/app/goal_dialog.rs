@@ -201,7 +201,7 @@ impl Waku {
             return;
         };
         let turn_id = session.begin_provider_turn();
-        session.status = SessionStatus::Connecting;
+        session.set_status(SessionStatus::Connecting);
         self.state.mark_session_dirty(session_id);
         cx.notify();
         // Continuation can legitimately never come — an inherited deferral,
@@ -246,7 +246,7 @@ impl Waku {
             session.unwind_unstarted_turn(turn_id);
         }
         if session.status.is_busy() {
-            session.status = SessionStatus::Idle;
+            session.set_status(SessionStatus::Idle);
         }
         self.state.mark_session_dirty(session_id);
     }

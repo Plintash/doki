@@ -2293,7 +2293,7 @@ impl Waku {
                 continue;
             }
             if session.status != SessionStatus::Idle {
-                session.status = SessionStatus::Idle;
+                session.set_status(SessionStatus::Idle);
             }
             let interrupted_turn = if let Some(turn) = session
                 .turns

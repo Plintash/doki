@@ -502,6 +502,13 @@ fn remote_task_catalog_adds_web_tasks_without_replacing_hydrated_detail() {
     local_projection.title = "Renamed elsewhere".into();
     local_projection.status = SessionStatus::Waiting;
     local_projection.updated_at += 10;
+    // What the daemon generated and the web client never saw.
+    local_projection.objective = Some("The remote catalog keeps the objective".into());
+    local_projection.turn_count = Some(9);
+    local_projection.changed_files = Some(4);
+    local_projection.archived_at = Some(1_700_000_000);
+    local_projection.blocked_since = Some(1_700_000_100);
+    local_projection.blocked_reason = Some("Waiting for the npm test decision".into());
 
     let mut web_task = AgentSession::new(project_id, ProviderKind::Claude).list_projection();
     web_task.title = "Created in Web".into();
@@ -521,6 +528,18 @@ fn remote_task_catalog_adds_web_tasks_without_replacing_hydrated_detail() {
     assert_eq!(merged_local.status, SessionStatus::Waiting);
     assert_eq!(merged_local.messages.len(), 1);
     assert_eq!(merged_local.messages[0].content, "keep this transcript");
+    assert_eq!(
+        merged_local.objective.as_deref(),
+        Some("The remote catalog keeps the objective")
+    );
+    assert_eq!(merged_local.turn_count, Some(9));
+    assert_eq!(merged_local.changed_files, Some(4));
+    assert_eq!(merged_local.archived_at, Some(1_700_000_000));
+    assert_eq!(merged_local.blocked_since, Some(1_700_000_100));
+    assert_eq!(
+        merged_local.blocked_reason.as_deref(),
+        Some("Waiting for the npm test decision")
+    );
     assert!(catalog.iter().any(|session| session.id == web_task_id));
 }
 

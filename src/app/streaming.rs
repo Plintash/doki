@@ -492,7 +492,7 @@ impl Waku {
                     }
                     session.provider_cursor = provider_cursor;
                     if session.status == SessionStatus::Connecting {
-                        session.status = SessionStatus::Working;
+                        session.set_status(SessionStatus::Working);
                     }
                 }
             }
@@ -541,7 +541,7 @@ impl Waku {
                         // Covers submissions and the optimistic pursuit turn
                         // a `/goal` began: the provider's start confirms it.
                         session.mark_active_turn_provider_started();
-                        session.status = SessionStatus::Working;
+                        session.set_status(SessionStatus::Working);
                     } else if begin_provider_initiated_turn(session) {
                         self.state.mark_session_dirty(session_id);
                     }
@@ -588,7 +588,7 @@ impl Waku {
                 runtime.stream_phase = None;
                 runtime.park_announced = true;
                 if let Some(session) = self.state.session_mut(session_id) {
-                    session.status = SessionStatus::Background;
+                    session.set_status(SessionStatus::Background);
                     session.updated_at = unix_time();
                 }
                 if let Some(previous_kinds) = previous_kinds.as_deref() {
@@ -693,6 +693,14 @@ impl Waku {
             } => {
                 if self.accepts_turn_output(session_id) {
                     runtime.permission_note_open = false;
+                    // The row explains the blockage by what is being asked for,
+                    // so keep the request's own words before it moves into the
+                    // pending state.
+                    let waiting_on = if title.trim().is_empty() {
+                        detail.clone()
+                    } else {
+                        title.clone()
+                    };
                     runtime.pending_permission = Some(PendingPermission {
                         request_id,
                         title,
@@ -700,7 +708,8 @@ impl Waku {
                         options,
                     });
                     if let Some(session) = self.state.session_mut(session_id) {
-                        session.status = SessionStatus::Waiting;
+                        session.set_status(SessionStatus::Waiting);
+                        session.set_blocked_reason(waiting_on);
                     }
                 }
             }
@@ -720,6 +729,18 @@ impl Waku {
                     .find(|session| session.id == session_id)
                     .is_some_and(|session| session.provider.supports_user_input_cancellation());
                 if !questions.is_empty() && (dismissible || self.accepts_turn_output(session_id)) {
+                    // What the row names as the blockage, captured before the
+                    // questions move into the pending state.
+                    let waiting_on = questions
+                        .first()
+                        .map(|question| {
+                            if question.header.trim().is_empty() {
+                                question.question.clone()
+                            } else {
+                                question.header.clone()
+                            }
+                        })
+                        .unwrap_or_default();
                     runtime.pending_user_input =
                         Some(PendingUserInput::new(request_id, questions, dismissible));
                     if self.state.selected_session == Some(session_id) {
@@ -729,7 +750,8 @@ impl Waku {
                     if let Some(session) = self.state.session_mut(session_id)
                         && session.active_turn_id().is_some()
                     {
-                        session.status = SessionStatus::Waiting;
+                        session.set_status(SessionStatus::Waiting);
+                        session.set_blocked_reason(waiting_on);
                     }
                 }
             }
@@ -1049,7 +1071,8 @@ impl Waku {
                     && has_active_turn
                 {
                     if session.status != SessionStatus::Working {
-                        session.status = SessionStatus::Failed;
+                        session.set_status(SessionStatus::Failed);
+                        session.set_blocked_reason(error.clone());
                     }
                     if should_append {
                         session.push_message(MessageRole::Assistant, error);
@@ -1076,7 +1099,8 @@ impl Waku {
                 let should_finish_turn = if let Some(session) = self.state.session_mut(session_id)
                     && session.status.is_busy()
                 {
-                    session.status = SessionStatus::Failed;
+                    session.set_status(SessionStatus::Failed);
+                    session.set_blocked_reason(failure_message.clone());
                     session.updated_at = unix_time();
                     if needs_fallback {
                         session.push_message(MessageRole::Assistant, failure_message);
@@ -1393,7 +1417,7 @@ pub(super) fn begin_provider_initiated_turn(session: &mut AgentSession) -> bool 
     }
     session.begin_provider_turn();
     session.mark_active_turn_provider_started();
-    session.status = SessionStatus::Working;
+    session.set_status(SessionStatus::Working);
     true
 }
 
@@ -1407,7 +1431,7 @@ pub(super) fn session_accepts_turn_output(session: &mut AgentSession) -> bool {
     }
     session.mark_active_turn_provider_started();
     if session.status == SessionStatus::Connecting {
-        session.status = SessionStatus::Working;
+        session.set_status(SessionStatus::Working);
     }
     true
 }

@@ -1265,7 +1265,7 @@ impl Waku {
         if has_active_turn {
             let needs_fallback = !self.turn_has_assistant_message(session_id);
             if let Some(session) = self.state.session_mut(session_id) {
-                session.status = SessionStatus::Idle;
+                session.set_status(SessionStatus::Idle);
                 if needs_fallback {
                     session.push_message(MessageRole::Assistant, tr!("session.stopped"));
                 }
@@ -1314,7 +1314,7 @@ impl Waku {
             runtime.permission_note_open = false;
         }
         if let Some(session) = self.selected_session_mut() {
-            session.status = SessionStatus::Working;
+            session.set_status(SessionStatus::Working);
         }
         cx.notify();
     }
@@ -1560,7 +1560,7 @@ impl Waku {
         if let Some(session) = self.state.session_mut(session_id)
             && session.active_turn_id().is_some()
         {
-            session.status = SessionStatus::Working;
+            session.set_status(SessionStatus::Working);
         }
         self.user_input_answer
             .update(cx, |input, cx| input.clear(cx));
@@ -1627,7 +1627,7 @@ impl Waku {
             runtime.driver.run_computer_tool(pending.request);
         }
         if let Some(session) = self.state.session_mut(session_id) {
-            session.status = SessionStatus::Working;
+            session.set_status(SessionStatus::Working);
         }
         self.runtimes.insert(session_id, runtime);
         cx.notify();

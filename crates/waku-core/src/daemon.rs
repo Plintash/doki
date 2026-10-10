@@ -425,6 +425,7 @@ impl Backend for WakuBackend {
                             merge_stale_session_metadata(existing, session);
                         } else {
                             preserve_daemon_checkpoints(existing, &mut session);
+                            preserve_daemon_triage(existing, &mut session);
                             *existing = session;
                         }
                     } else {
@@ -498,6 +499,21 @@ impl Backend for WakuBackend {
                         .collect::<Vec<_>>()
                 };
                 drop(disposed);
+                Ok(ResponsePayload::Ack)
+            }
+            Command::SetTaskArchived { archived } => {
+                {
+                    let mut state = self.task_state.lock();
+                    if let Some(session) = state
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.id == session_id)
+                    {
+                        session.archived_at = archived.then(crate::model::unix_time);
+                        state.mark_session_dirty(session_id);
+                    }
+                    self.task_store.save(&mut state)?;
+                }
                 Ok(ResponsePayload::Ack)
             }
             Command::HydrateSession { session_id } => {
@@ -1032,6 +1048,32 @@ fn preserve_daemon_checkpoints(existing: &AgentSession, incoming: &mut AgentSess
     }
 }
 
+/// The daemon generates the objective, counts what a settled turn did, and
+/// applies an archive action, so a client's copy of those can never be newer:
+/// a projection that never loaded the transcript must not erase them. Blocked
+/// state is different — the client that noticed the transition owns it — so a
+/// projection is allowed to report one, and the client that leaves the blocked
+/// status is the authority on the blockage having ended.
+fn preserve_daemon_triage(existing: &AgentSession, incoming: &mut AgentSession) {
+    incoming.objective = existing.objective.clone();
+    incoming.turn_count = existing.turn_count;
+    incoming.changed_files = existing.changed_files;
+    incoming.archived_at = existing.archived_at;
+    if matches!(
+        incoming.status,
+        SessionStatus::Waiting | SessionStatus::Failed
+    ) {
+        incoming.blocked_since = incoming.blocked_since.or(existing.blocked_since);
+        incoming.blocked_reason = incoming
+            .blocked_reason
+            .clone()
+            .or_else(|| existing.blocked_reason.clone());
+    } else {
+        incoming.blocked_since = None;
+        incoming.blocked_reason = None;
+    }
+}
+
 impl WakuBackend {
     /// Fork a response using only daemon-host state.
     ///
@@ -1250,7 +1292,7 @@ impl WakuBackend {
             rewound.provider_cursor = Some(cursor);
         }
         rewound.truncate_after_turn(retained_turn_count);
-        rewound.status = SessionStatus::Idle;
+        rewound.set_status(SessionStatus::Idle);
 
         let pinned = self.sessions.lock().keys().copied().collect();
         let mut state = self.task_state.lock();
@@ -1868,6 +1910,7 @@ fn handle_driver_command(
         | Command::LoadTaskState
         | Command::SaveTaskState { .. }
         | Command::RemoveSession
+        | Command::SetTaskArchived { .. }
         | Command::HydrateSession { .. }
         | Command::SearchSessionMessages { .. }
         | Command::ListProviderSessions { .. }
@@ -1966,6 +2009,90 @@ mod tests {
         preserve_daemon_checkpoints(&existing, &mut incoming);
 
         assert_eq!(incoming.turns[0].checkpoint.as_ref(), Some(&checkpoint));
+    }
+
+    #[test]
+    fn a_client_projection_cannot_clear_daemon_owned_triage_state() {
+        let mut existing = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        existing.objective = Some("Sidebar schedules tasks by state".into());
+        existing.turn_count = Some(12);
+        existing.changed_files = Some(6);
+        existing.archived_at = Some(1_700_000_000);
+        existing.status = SessionStatus::Waiting;
+        existing.blocked_since = Some(1_700_000_100);
+        existing.blocked_reason = Some("Waiting for the npm test decision".into());
+
+        // What an older client sends: the projection has none of it.
+        let mut incoming = existing.clone();
+        incoming.objective = None;
+        incoming.turn_count = None;
+        incoming.changed_files = None;
+        incoming.archived_at = None;
+        incoming.blocked_since = None;
+        incoming.blocked_reason = None;
+
+        preserve_daemon_triage(&existing, &mut incoming);
+
+        assert_eq!(incoming.objective.as_deref(), existing.objective.as_deref());
+        assert_eq!(incoming.turn_count, Some(12));
+        assert_eq!(incoming.changed_files, Some(6));
+        assert_eq!(incoming.archived_at, existing.archived_at);
+        assert_eq!(incoming.blocked_since, existing.blocked_since);
+        assert_eq!(incoming.blocked_reason, existing.blocked_reason);
+    }
+
+    #[test]
+    fn leaving_the_blocked_status_clears_the_blockage() {
+        let mut existing = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        existing.status = SessionStatus::Waiting;
+        existing.blocked_since = Some(1_700_000_100);
+        existing.blocked_reason = Some("Waiting for the npm test decision".into());
+
+        let mut incoming = existing.clone();
+        incoming.status = SessionStatus::Working;
+
+        preserve_daemon_triage(&existing, &mut incoming);
+
+        assert!(
+            incoming.blocked_since.is_none(),
+            "the client that left the status owns the blockage having ended"
+        );
+        assert!(incoming.blocked_reason.is_none());
+    }
+
+    #[test]
+    fn a_stale_projection_keeps_the_objective_and_the_archive() {
+        let runtime_id = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let mut existing = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        existing.objective = Some("The parser survives malformed rows".into());
+        existing.archived_at = Some(1_700_000_000);
+        existing.turn_count = Some(4);
+        existing.runtime_event_cursor = Some(crate::model::RuntimeEventCursor {
+            runtime_id,
+            epoch,
+            sequence: 10,
+        });
+
+        let mut stale = existing.clone();
+        stale.objective = None;
+        stale.archived_at = None;
+        stale.turn_count = None;
+        stale.runtime_event_cursor = Some(crate::model::RuntimeEventCursor {
+            runtime_id,
+            epoch,
+            sequence: 7,
+        });
+        assert!(session_projection_precedes(&existing, &stale, Some(runtime_id)));
+
+        merge_stale_session_metadata(&mut existing, stale);
+
+        assert_eq!(
+            existing.objective.as_deref(),
+            Some("The parser survives malformed rows")
+        );
+        assert_eq!(existing.archived_at, Some(1_700_000_000));
+        assert_eq!(existing.turn_count, Some(4));
     }
 
     #[test]

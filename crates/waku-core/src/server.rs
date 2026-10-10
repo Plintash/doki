@@ -156,6 +156,15 @@ struct SessionCatalogEntry {
     status: SessionStatus,
     created_at: u64,
     last_reply_at: Option<u64>,
+    // Triage state a client renders from the list row: a change to any of these
+    // has to move the revision, or a client that is already holding the task
+    // never learns about it.
+    objective: Option<String>,
+    blocked_since: Option<u64>,
+    blocked_reason: Option<String>,
+    turn_count: Option<u32>,
+    changed_files: Option<u32>,
+    archived_at: Option<u64>,
 }
 
 impl From<&AgentSession> for SessionCatalogEntry {
@@ -169,6 +178,12 @@ impl From<&AgentSession> for SessionCatalogEntry {
             status: session.status,
             created_at: session.created_at,
             last_reply_at: session.last_reply_at,
+            objective: session.objective.clone(),
+            blocked_since: session.blocked_since,
+            blocked_reason: session.blocked_reason.clone(),
+            turn_count: session.turn_count,
+            changed_files: session.changed_files,
+            archived_at: session.archived_at,
         }
     }
 }
@@ -800,6 +815,7 @@ fn command_targets_runtime(command: &Command) -> bool {
             | Command::CloseTerminal
             | Command::CloseSession
             | Command::RemoveSession
+            | Command::SetTaskArchived { .. }
     )
 }
 
@@ -1002,6 +1018,7 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
             projects: projects.clone(),
         },
         Command::RemoveSession
+        | Command::SetTaskArchived { .. }
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. } => TaskCatalogAction::Changed,
         _ => TaskCatalogAction::None,
