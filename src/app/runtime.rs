@@ -114,6 +114,18 @@ pub(super) fn session_has_active_provider_turn(session: &AgentSession) -> bool {
             .is_some_and(|turn| turn.status == TurnStatus::Running && turn.provider_turn_started)
 }
 
+/// Whether a submission waits behind the session's live turn instead of
+/// becoming its next prompt.
+///
+/// A session can be busy without a turn: Pi settles a turn as soon as the
+/// agent's reply ends, and the detached work that reply left running keeps the
+/// session's own status busy until the provider wakes it (see
+/// `sync_background_wait_status`). A message then is the next prompt, not a
+/// follow-up for a turn that will never take it.
+pub(super) fn submission_waits_for_a_turn(status: SessionStatus, provider_turn_live: bool) -> bool {
+    status.is_busy() && !(status == SessionStatus::Background && !provider_turn_live)
+}
+
 /// Merge the daemon's list-only session projection into the desktop catalog.
 ///
 /// Existing rows may already contain a hydrated transcript, so only list
@@ -2964,9 +2976,16 @@ impl Waku {
         }
         if session.status == SessionStatus::Background {
             // The turn is parked on detached work and the provider is idle,
-            // so the message goes straight in as a steer: queued, it would
-            // wait for a settle that only the message itself could hasten.
-            self.steer_composer_submission(submission, cx);
+            // so the message goes straight in: queued, it would wait for a
+            // settle that only the message itself could hasten. A parked turn
+            // that is still open takes it as a steer; a provider that settled
+            // its turn before the detached work landed (Pi) has nothing to
+            // steer, and the message is simply that session's next prompt.
+            if session_has_active_provider_turn(session) {
+                self.steer_composer_submission(submission, cx);
+            } else {
+                self.submit_submission_for_session(session.id, submission, cx);
+            }
             return;
         }
         if session.is_busy() {
@@ -3236,7 +3255,11 @@ impl Waku {
             self.defer_queue_drain(session_id);
             return;
         }
-        if session.status.is_busy() {
+        // A session whose turn ended while detached work still runs stays
+        // busy for as long as that work does (see
+        // `sync_background_wait_status`), but there is no turn for a message
+        // to wait behind: it is the session's next prompt.
+        if submission_waits_for_a_turn(session.status, session_has_active_provider_turn(session)) {
             self.enqueue_follow_up_submission(session_id, submission, cx);
             return;
         }

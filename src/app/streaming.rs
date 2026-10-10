@@ -648,6 +648,10 @@ impl Waku {
                 // survive a settled or rewound turn and therefore bypasses
                 // `accepts_turn_output` deliberately.
                 self.handle_background_work_event(session_id, event);
+                // Detached work is what a settled Pi turn left behind: while
+                // it is live the session has not finished, even though the
+                // provider is idle waiting to be woken.
+                self.sync_background_wait_status(session_id);
             }
             DriverEvent::ExtensionMessage { text, display, .. } => {
                 if let Some(session) = self.state.session_mut(session_id) {
@@ -988,6 +992,10 @@ impl Waku {
                     }
                 }
                 self.finish_active_turn(session_id, turn_status);
+                // A settlement that left detached work behind is not a finish
+                // on Pi: the child the reply started still runs, and the wake
+                // it will produce continues the session. Only the turn closes.
+                self.sync_background_wait_status(session_id);
                 runtime.pending_permission = None;
                 runtime.permission_note_open = false;
                 runtime.pending_user_input = None;
