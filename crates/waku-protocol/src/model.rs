@@ -1142,6 +1142,8 @@ impl AgentSession {
     /// columns, not transcript detail: the composer renders each of them
     /// straight from this projection until hydration lands, so they travel with
     /// the list or the chips jump when it does.
+    ///
+    /// The objective travels resolved, see [`Self::resolved_objective`].
     pub fn list_projection(&self) -> Self {
         Self {
             id: self.id,
@@ -1160,7 +1162,7 @@ impl AgentSession {
             created_at: self.created_at,
             updated_at: self.updated_at,
             last_reply_at: self.last_reply_at,
-            objective: self.objective.clone(),
+            objective: self.resolved_objective().map(str::to_owned),
             blocked_since: self.blocked_since,
             blocked_reason: self.blocked_reason.clone(),
             turn_count: self.turn_count,
@@ -1181,6 +1183,20 @@ impl AgentSession {
             queued_messages: Vec::new(),
             detail_loaded: false,
         }
+    }
+
+    /// The objective a client displays: a goal the user or the provider owns
+    /// when the task has one, otherwise the generated objective Waku stores.
+    ///
+    /// [`Self::objective`] holds only the generated value, so resolving the
+    /// goal into it would let a goal edit rewrite the fallback a cleared goal
+    /// returns to. Every client renders this one value instead of ranking the
+    /// two itself, so two clients cannot disagree about the same task.
+    pub fn resolved_objective(&self) -> Option<&str> {
+        self.thread_goal
+            .as_ref()
+            .map(|goal| goal.objective.as_str())
+            .or(self.objective.as_deref())
     }
 
     pub fn is_busy(&self) -> bool {
@@ -5646,6 +5662,95 @@ mod tests {
         assert_eq!(projection.turn_count, Some(12));
         assert_eq!(projection.changed_files, Some(6));
         assert_eq!(projection.archived_at, session.archived_at);
+    }
+
+    /// A test goal the way a provider reports one.
+    fn thread_goal(objective: &str) -> ThreadGoal {
+        ThreadGoal {
+            objective: objective.to_owned(),
+            status: ThreadGoalStatus::Active,
+            token_budget: None,
+            tokens_used: 0,
+            time_used_seconds: 0,
+        }
+    }
+
+    /// A goal the user or the provider owns is the objective, and the list
+    /// entry carries it. Resolving here is what keeps two clients from ranking
+    /// the goal against the generated value differently.
+    #[test]
+    fn a_goal_outranks_the_stored_objective_in_the_list_projection() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.objective = Some("Sidebar schedules tasks by state".into());
+        session.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+
+        assert_eq!(
+            session.resolved_objective(),
+            Some("The sidebar groups tasks by what they need")
+        );
+
+        let projection = session.list_projection();
+
+        assert_eq!(
+            projection.objective.as_deref(),
+            Some("The sidebar groups tasks by what they need")
+        );
+        assert!(projection.thread_goal.is_none());
+        // Resolving the hand-off leaves the stored pair alone: the generated
+        // objective is what a cleared goal returns to.
+        assert_eq!(
+            session.objective.as_deref(),
+            Some("Sidebar schedules tasks by state")
+        );
+    }
+
+    /// Clearing the goal releases the field: the stored generated objective is
+    /// the objective again, and a task that has none falls back to none.
+    #[test]
+    fn clearing_the_goal_releases_the_objective() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.objective = Some("Sidebar schedules tasks by state".into());
+        session.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+
+        session.thread_goal = None;
+
+        assert_eq!(
+            session.resolved_objective(),
+            Some("Sidebar schedules tasks by state")
+        );
+        assert_eq!(
+            session.list_projection().objective.as_deref(),
+            Some("Sidebar schedules tasks by state")
+        );
+
+        let mut never_generated = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        never_generated.thread_goal =
+            Some(thread_goal("The sidebar groups tasks by what they need"));
+        never_generated.thread_goal = None;
+
+        assert_eq!(never_generated.resolved_objective(), None);
+        assert_eq!(never_generated.list_projection().objective, None);
+    }
+
+    /// The projection carries the resolved objective for a task whose
+    /// transcript was never loaded, so no client hydrates to render a row.
+    #[test]
+    fn the_list_projection_resolves_the_objective_without_the_transcript() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+        session.begin_turn("A prompt the list never reads");
+        session.push_message(MessageRole::Assistant, "An answer the list never reads");
+
+        let projection = session.list_projection();
+
+        assert_eq!(
+            projection.objective.as_deref(),
+            Some("The sidebar groups tasks by what they need")
+        );
+        assert!(!projection.detail_loaded);
+        assert!(projection.messages.is_empty());
+        assert!(projection.turns.is_empty());
+        assert!(projection.thread_goal.is_none());
     }
 
     #[test]
