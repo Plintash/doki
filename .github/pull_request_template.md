@@ -1,9 +1,3 @@
-<!--
-Write all responses yourself: PR descriptions and comments must not be LLM
-generated. PRs with obviously LLM-generated text will be closed immediately
-without review.
--->
-
 ## Problem and solution
 
 <!-- Explain the problem and why you chose this solution. -->
@@ -31,6 +25,4 @@ not use AI, write "None". -->
 
 - [ ] I understand the entire change and take responsibility for the code and
   all actions taken.
-- [ ] I wrote this description myself, without LLM-generated text, and will
-  write PR comments myself.
 - [ ] I disclosed all AI usage, including the tools and extent of involvement.
