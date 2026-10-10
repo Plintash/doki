@@ -2410,9 +2410,6 @@ impl Waku {
         rows: &ListState,
         viewport: Bounds<Pixels>,
     ) -> Option<(usize, MessageBodyWindow)> {
-        if viewport.size.height <= Pixels::ZERO {
-            return None;
-        }
         let session = self.selected_session()?;
         let row_index = self
             .transcript_row_kinds
