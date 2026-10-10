@@ -148,8 +148,9 @@ moment any scrollbar became visible.
   wrap-width, metric, or rewrite change drops the ledger, and the next frame's
   full pass re-measures. Only a pass a window can read keeps and fills it — the
   streaming response body, on every frame including the ones its window falls
-  back to a plain walk; a settled body and the live reasoning tail, which
-  streams through `markdown_tail`, skip the per-block measuring wrapper
+  back to a plain walk; a settled body, the live reasoning tail, which streams
+  through `markdown_tail`, and a body holding an image or a formula, which no
+  window is built for, skip the per-block measuring wrapper
   entirely. Planning itself still
   walks the whole ledger — two vectors and two scans a frame — so it stays
   proportional to the document, and the build is proportional to the viewport

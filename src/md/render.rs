@@ -1727,7 +1727,8 @@ fn search_text(
 ///
 /// This is the pass a windowless frame of the streamed response takes, and the
 /// one [`markdown_windowed`] falls back to, so it fills the height ledger while
-/// the body streams.
+/// the body streams — except for a body holding an image or a formula, which no
+/// window is built for.
 pub fn markdown<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<AnyElement> {
     markdown_capped(view, ctx, usize::MAX, true)
 }
@@ -1761,8 +1762,8 @@ struct BodyPass<'a> {
     blocks: Vec<&'a TopBlock>,
     ctx: Ctx<'a>,
     /// Measured height of every top-level block, filled only on the pass of a
-    /// body a window can read and only while that body streams: a window is
-    /// the ledger's one reader, and only a streaming body is windowed.
+    /// streaming body a window can read: a window is the ledger's one reader,
+    /// and a body holding an image or a formula is never windowed.
     heights: Option<BlockHeights>,
     /// Whether this body is streaming with the dissolve animating.
     animate: bool,
@@ -1804,8 +1805,10 @@ fn begin_body<'a>(
     // every frame of that body, including the ones its window falls back to a
     // plain walk — those measure the blocks the windowed frames then size their
     // spacers from. Every other pass would pay one wrapper element per
-    // top-level block per frame for a ledger nothing reads.
-    let heights = (keeps_heights && view.streaming.get()).then(|| {
+    // top-level block per frame for a ledger nothing reads: a settled body, the
+    // live reasoning tail, and a body holding an image or a formula, which
+    // `markdown_windowed` refuses before it gets here.
+    let heights = (keeps_heights && view.streaming.get() && !view.has_async_blocks()).then(|| {
         let heights = view.heights.clone();
         heights.borrow_mut().resize(blocks.len(), (0..0, None));
         heights
@@ -3567,6 +3570,22 @@ mod tests {
             view.heights.borrow().len(),
             2,
             "the ledger is sized before any block is built"
+        );
+
+        // A body holding an image or a formula is never windowed, so its pass
+        // has no reader either: it keeps nothing.
+        let mut resizable = MarkdownView::new();
+        resizable.set_text("one\n\n![alt](pic.png)", true);
+        assert!(resizable.has_async_blocks());
+        assert!(
+            begin_body(&resizable, &ctx, true)
+                .unwrap()
+                .heights
+                .is_none()
+        );
+        assert!(
+            resizable.heights.borrow().is_empty(),
+            "a body no window reads sizes nothing"
         );
 
         // The live reasoning peek streams, but through `markdown_tail`: no

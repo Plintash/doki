@@ -2565,13 +2565,13 @@ impl Waku {
                             // tail, because a row that keeps growing under a
                             // preserved scrollback anchor reads as a tremor.
                             // A settled row takes the same call, which
-                            // releases the clip.
-                            if message.role == MessageRole::Assistant {
-                                view.advance_clip(
-                                    animate_streaming && rests_at_tail,
-                                    std::time::Instant::now(),
-                                );
-                            }
+                            // releases the clip; so does a row whose body was
+                            // never measured — a user message, whose body
+                            // `clip_body` hands back untouched.
+                            view.advance_clip(
+                                animate_streaming && rests_at_tail,
+                                std::time::Instant::now(),
+                            );
                             &*view
                         });
                     let sent_annotations = self.sent_annotation_indicator(&message, cx);

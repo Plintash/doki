@@ -7,6 +7,5 @@ target
 /dist
 node_modules
 temp/
-.scratch/
 
 .DS_Store
