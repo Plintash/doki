@@ -403,6 +403,68 @@ impl CommandPaletteUi {
     }
 }
 
+/// The tasks the palette can offer, in the client's own order.
+///
+/// Every started task is a candidate, including the ones the sidebar has put
+/// away. Hiding is a rendering concern: the catalog this reads keeps every
+/// task, so search still finds what the list is not showing, and selecting an
+/// archived result opens it like any other.
+fn palette_task_candidates(
+    sessions: &[AgentSession],
+    projects: &HashMap<Uuid, (String, String)>,
+    selected_session: Option<Uuid>,
+    message_matches: &HashMap<Uuid, crate::persistence::SessionMessageMatch>,
+) -> Vec<CommandPaletteItem> {
+    sessions
+        .iter()
+        .filter(|session| session.has_started())
+        .enumerate()
+        .map(|(order, session)| {
+            let (project, project_path) = projects
+                .get(&session.project_id)
+                .cloned()
+                .unwrap_or_else(|| (tr!("project.no_project_name"), String::new()));
+            let (workspace_path, branch) = match &session.workspace {
+                SessionWorkspace::Local => (String::new(), None),
+                SessionWorkspace::NewWorktree { base_branch } => {
+                    (String::new(), base_branch.as_deref())
+                }
+                SessionWorkspace::Worktree { path, branch } => {
+                    (path.to_string_lossy().into_owned(), Some(branch.as_str()))
+                }
+            };
+            let mut details = vec![project.clone()];
+            if let Some(branch) = branch {
+                details.push(format!("#{branch}"));
+            }
+            if Some(session.id) == selected_session {
+                details.push(tr!("command_palette.current"));
+            }
+            let detail = details.join(" · ");
+            let label = session.display_title().to_owned();
+            let content_match = message_matches.get(&session.id).cloned();
+            CommandPaletteItem {
+                section: PaletteSection::Tasks,
+                search_text: format!(
+                    "{label} {project} {project_path} {workspace_path} {} {} {} {} task session chat conversation",
+                    branch.unwrap_or_default(),
+                    session.provider.short_name(),
+                    session.provider.display_name(),
+                    session.model.as_deref().unwrap_or_default(),
+                ),
+                label,
+                detail: Some(detail),
+                icon: PaletteIcon::Provider(session.provider),
+                shortcut: None,
+                action: PaletteAction::SelectTask(session.id),
+                content_match,
+                order,
+                recency: session.updated_at,
+            }
+        })
+        .collect()
+}
+
 impl Waku {
     pub(super) fn open_resume_picker_action(
         &mut self,
@@ -884,59 +946,12 @@ impl Waku {
                 )
             })
             .collect::<HashMap<_, _>>();
-        self.state
-            .sessions
-            .iter()
-            .filter(|session| session.has_started())
-            .enumerate()
-            .map(|(order, session)| {
-                let (project, project_path) = projects
-                    .get(&session.project_id)
-                    .cloned()
-                    .unwrap_or_else(|| (tr!("project.no_project_name"), String::new()));
-                let (workspace_path, branch) = match &session.workspace {
-                    SessionWorkspace::Local => (String::new(), None),
-                    SessionWorkspace::NewWorktree { base_branch } => {
-                        (String::new(), base_branch.as_deref())
-                    }
-                    SessionWorkspace::Worktree { path, branch } => {
-                        (path.to_string_lossy().into_owned(), Some(branch.as_str()))
-                    }
-                };
-                let mut details = vec![project.clone()];
-                if let Some(branch) = branch {
-                    details.push(format!("#{branch}"));
-                }
-                if Some(session.id) == self.state.selected_session {
-                    details.push(tr!("command_palette.current"));
-                }
-                let detail = details.join(" · ");
-                let label = session.display_title().to_owned();
-                let content_match = self
-                    .command_palette
-                    .message_matches
-                    .get(&session.id)
-                    .cloned();
-                CommandPaletteItem {
-                    section: PaletteSection::Tasks,
-                    search_text: format!(
-                        "{label} {project} {project_path} {workspace_path} {} {} {} {} task session chat conversation",
-                        branch.unwrap_or_default(),
-                        session.provider.short_name(),
-                        session.provider.display_name(),
-                        session.model.as_deref().unwrap_or_default(),
-                    ),
-                    label,
-                    detail: Some(detail),
-                    icon: PaletteIcon::Provider(session.provider),
-                    shortcut: None,
-                    action: PaletteAction::SelectTask(session.id),
-                    content_match,
-                    order,
-                    recency: session.updated_at,
-                }
-            })
-            .collect()
+        palette_task_candidates(
+            &self.state.sessions,
+            &projects,
+            self.state.selected_session,
+            &self.command_palette.message_matches,
+        )
     }
 
     fn command_palette_resume_candidates(&self) -> Vec<CommandPaletteItem> {
@@ -2070,6 +2085,35 @@ mod tests {
         let mut matcher = crate::composer_complete::matcher();
         let mut buf = Vec::new();
         pattern.score(Utf32Str::new(candidate, &mut buf), &mut matcher)
+    }
+
+    /// Search is the way back to a task that was put away: the sidebar hides
+    /// it, the catalog keeps it, and the palette offers it like any other
+    /// task — found by a word from its title and opened by selecting it.
+    #[test]
+    fn an_archived_task_is_still_a_search_result() {
+        let mut archived = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        archived.set_title("Fix the sidebar row");
+        archived.begin_turn("Ask");
+        archived.archived_at = Some(1_700_000_000);
+        let draft = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+
+        let items = palette_task_candidates(
+            &[archived.clone(), draft],
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            items.iter().map(|item| &item.action).collect::<Vec<_>>(),
+            vec![&PaletteAction::SelectTask(archived.id)],
+            "the archived task is offered, and the draft that never started is not"
+        );
+        assert!(
+            items[0].search_text.contains("Fix the sidebar row"),
+            "a word from the title finds it"
+        );
     }
 
     #[test]

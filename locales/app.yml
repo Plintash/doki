@@ -505,6 +505,14 @@ sidebar.section_running:
   en: Running
 sidebar.section_recent:
   en: Recent
+sidebar.section_archived:
+  en: Archived
+sidebar.show_archived:
+  en: Show archived tasks
+sidebar.put_away:
+  en: Put away
+sidebar.bring_back:
+  en: Bring back
 sidebar.ordering:
   en: Ordering
 sidebar.ordering_newest:

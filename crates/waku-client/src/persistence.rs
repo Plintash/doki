@@ -424,6 +424,11 @@ struct AppState {
     sidebar_grouping_chosen: bool,
     #[serde(default)]
     sidebar_ordering: SidebarOrdering,
+    /// Whether tasks that were put away are revealed in the sidebar's trailing
+    /// archived section. A list preference, not a change to any task: the
+    /// catalog keeps every task either way.
+    #[serde(default)]
+    sidebar_show_archived: bool,
     #[serde(default = "default_right_panel_width")]
     right_panel_width: f32,
     /// Whether markdown files in the right panel open as a rendered preview
@@ -491,6 +496,10 @@ pub struct PersistedState {
     pub sidebar_grouping_chosen: bool,
     #[serde(default)]
     pub sidebar_ordering: SidebarOrdering,
+    /// Whether tasks that were put away are revealed in the sidebar's trailing
+    /// archived section.
+    #[serde(default)]
+    pub sidebar_show_archived: bool,
     #[serde(default = "default_right_panel_width")]
     pub right_panel_width: f32,
     /// Whether markdown files in the right panel open as a rendered preview
@@ -564,6 +573,7 @@ impl PersistedState {
             sidebar_grouping: SidebarGrouping::default(),
             sidebar_grouping_chosen: false,
             sidebar_ordering: SidebarOrdering::Newest,
+            sidebar_show_archived: false,
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             markdown_preview: false,
             window_state: None,
@@ -710,6 +720,7 @@ impl PersistedState {
             sidebar_grouping: self.sidebar_grouping,
             sidebar_grouping_chosen: self.sidebar_grouping_chosen,
             sidebar_ordering: self.sidebar_ordering,
+            sidebar_show_archived: self.sidebar_show_archived,
             right_panel_width: self.right_panel_width,
             markdown_preview: self.markdown_preview,
             window_state: self.window_state,
@@ -749,6 +760,7 @@ impl PersistedState {
         );
         self.sidebar_grouping_chosen = app_state.sidebar_grouping_chosen;
         self.sidebar_ordering = app_state.sidebar_ordering;
+        self.sidebar_show_archived = app_state.sidebar_show_archived;
         self.right_panel_width = app_state.right_panel_width;
         self.markdown_preview = app_state.markdown_preview;
         self.window_state = app_state.window_state;
@@ -1227,6 +1239,20 @@ impl StateStore {
             .map_err(to_io_error)
     }
 
+    /// Ask the daemon to put one task away, or to bring it back. The daemon
+    /// stamps the archive time itself; a client never writes the field, which
+    /// is what keeps a stale or older client from clearing it.
+    pub fn set_task_archived(&self, session_id: Uuid, archived: bool) -> io::Result<()> {
+        self.daemon
+            .client()
+            .notify(
+                session_id,
+                Uuid::nil(),
+                Command::SetTaskArchived { archived },
+            )
+            .map_err(to_io_error)
+    }
+
     pub fn blob_sweep(&self) -> impl FnOnce() + Send + 'static {
         let daemon = self.daemon.clone();
         move || {
@@ -1426,7 +1452,35 @@ mod tests {
 
         assert_eq!(state.sidebar_grouping, SidebarGrouping::Project);
         assert_eq!(state.sidebar_ordering, SidebarOrdering::Newest);
+        assert!(!state.sidebar_show_archived);
         assert_eq!(state.last_runtime_mode, RuntimeMode::FullAccess);
+    }
+
+    /// Revealing the tasks that were put away is a preference of the same
+    /// document the grouping lives in, and it stays off until the user asks:
+    /// a document written before the toggle existed reveals nothing.
+    #[test]
+    fn showing_archived_tasks_persists_beside_the_grouping() {
+        let mut state = PersistedState::empty();
+        assert!(!state.sidebar_show_archived, "off until the user asks");
+
+        state.sidebar_show_archived = true;
+        let document = serde_json::to_value(state.app_state()).unwrap();
+        assert_eq!(document["sidebar_show_archived"], true);
+        assert!(
+            serde_json::to_value(state.app_settings())
+                .unwrap()
+                .get("sidebar_show_archived")
+                .is_none(),
+            "it belongs to the document the grouping is stored in"
+        );
+
+        let mut restored = PersistedState::empty();
+        restored.apply_app_state(serde_json::from_value(document).unwrap());
+        assert!(
+            restored.sidebar_show_archived,
+            "the choice survives a restart"
+        );
     }
 
     #[test]
