@@ -1627,99 +1627,6 @@ impl Waku {
             })
     }
 
-    /// Resolve every ordinary local project's branch in one background pass.
-    /// The render path only computes an allocation-free source fingerprint;
-    /// collection building and daemon requests happen once when that moves.
-    fn ensure_sidebar_branch_labels(&self, cx: &mut Context<Self>) {
-        if self.state.sidebar_grouping != SidebarGrouping::Project {
-            return;
-        }
-
-        let mut fingerprint = 0xb4a7_c4e5_51de_ba11;
-        for session in &self.state.sessions {
-            if session.has_started() && matches!(&session.workspace, SessionWorkspace::Local) {
-                fingerprint = mix_uuid(fingerprint, session.id);
-                fingerprint = mix_uuid(fingerprint, session.project_id);
-            }
-        }
-        for project in &self.state.projects {
-            fingerprint = mix_uuid(fingerprint, project.id);
-        }
-        if self.sidebar_branch_scan_fingerprint.get() == Some(fingerprint) {
-            return;
-        }
-        self.sidebar_branch_scan_fingerprint.set(Some(fingerprint));
-        let generation = self.sidebar_branch_scan_generation.get().wrapping_add(1);
-        self.sidebar_branch_scan_generation.set(generation);
-
-        let local_project_ids = self
-            .state
-            .sessions
-            .iter()
-            .filter(|session| {
-                session.has_started() && matches!(&session.workspace, SessionWorkspace::Local)
-            })
-            .map(|session| session.project_id)
-            .collect::<HashSet<_>>();
-        let projectless_root = crate::projectless::workspace_root();
-        let paths = self
-            .state
-            .projects
-            .iter()
-            .filter(|project| local_project_ids.contains(&project.id))
-            .filter(|project| !sidebar_project_is_projectless(project, projectless_root.as_deref()))
-            .map(|project| project.path.clone())
-            .collect::<HashSet<_>>();
-        if paths.is_empty() {
-            self.sidebar_branch_labels.borrow_mut().clear();
-            return;
-        }
-
-        let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
-        cx.spawn(async move |waku, cx| {
-            let labels = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut labels = HashMap::new();
-                    for path in paths {
-                        let branch = match workspace.request(
-                            waku_client::WorkspaceOperation::InspectBranches { cwd: path.clone() },
-                        ) {
-                            Ok(waku_client::WorkspaceResult::Branches {
-                                snapshot: Some(snapshot),
-                            }) => snapshot.display_branch().map(str::to_owned),
-                            _ => None,
-                        };
-                        if let Some(branch) = branch {
-                            labels.insert(path, branch);
-                        }
-                    }
-                    labels
-                })
-                .await;
-            let _ = waku.update(cx, |waku, cx| {
-                if waku.sidebar_branch_scan_generation.get() != generation {
-                    return;
-                }
-                *waku.sidebar_branch_labels.borrow_mut() = labels
-                    .into_iter()
-                    .map(|(path, branch)| (path, SharedString::from(branch)))
-                    .collect();
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    pub(super) fn cache_sidebar_branch_label(&self, path: &Path, branch: Option<&str>) {
-        let mut labels = self.sidebar_branch_labels.borrow_mut();
-        if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
-            labels.insert(path.to_path_buf(), SharedString::from(branch.to_owned()));
-        } else {
-            labels.remove(path);
-        }
-    }
-
     pub(super) fn render_sidebar(
         &self,
         width: f32,
@@ -1727,7 +1634,6 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = Theme::current(cx);
-        self.ensure_sidebar_branch_labels(cx);
         let is_resizing = self
             .panel_resize_drag
             .is_some_and(|drag| drag.target == PanelResizeTarget::Sidebar);
@@ -2500,9 +2406,6 @@ impl Waku {
         // it on the next launch.
         self.state.sidebar_grouping_chosen = true;
         self.sidebar_rows_fingerprint.set(None);
-        self.sidebar_branch_scan_fingerprint.set(None);
-        self.sidebar_branch_scan_generation
-            .set(self.sidebar_branch_scan_generation.get().wrapping_add(1));
         self.sidebar_list_state.scroll_to(ListOffset {
             item_ix: 0,
             offset_in_item: Pixels::ZERO,

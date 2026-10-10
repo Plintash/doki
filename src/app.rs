@@ -1672,11 +1672,6 @@ pub struct Waku {
     sidebar_status_section_counts: RefCell<[usize; SidebarStatusSection::ALL.len()]>,
     /// How many tasks the trailing archived section held in that same pass.
     sidebar_archived_count: Cell<usize>,
-    /// Branch labels for ordinary local project paths, resolved together on a
-    /// background executor so sidebar rows only read memory.
-    sidebar_branch_labels: RefCell<HashMap<PathBuf, SharedString>>,
-    sidebar_branch_scan_fingerprint: Cell<Option<u64>>,
-    sidebar_branch_scan_generation: Cell<u64>,
     /// What the sidebar's second line reports about each started task, keyed by
     /// session id and refreshed where the session's data changes. The plan step
     /// lives in the transcript, so it is resolved into this cache there rather
@@ -3199,9 +3194,6 @@ impl Waku {
                 sidebar_rows_snapshot: RefCell::new(Rc::new(Vec::new())),
                 sidebar_status_section_counts: RefCell::new([0; SidebarStatusSection::ALL.len()]),
                 sidebar_archived_count: Cell::new(0),
-                sidebar_branch_labels: RefCell::new(HashMap::new()),
-                sidebar_branch_scan_fingerprint: Cell::new(None),
-                sidebar_branch_scan_generation: Cell::new(0),
                 sidebar_session_facts: RefCell::new(HashMap::new()),
                 transcript_row_kinds: RefCell::new(Vec::new()),
                 transcript_row_kinds_fingerprint: Cell::new(None),
