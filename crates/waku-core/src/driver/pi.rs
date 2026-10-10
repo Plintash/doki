@@ -1684,17 +1684,21 @@ impl PiStreamState {
     /// Clears the per-run stream state between runs. The run handle and the
     /// dialogs survive, because the writer thread reads liveness through its
     /// own clone of the run and a dialog the client has not answered yet must
-    /// not be forgotten. The compaction counter survives too: a row's id is
+    /// not be forgotten. The compaction state survives too: a row's id is
     /// matched against every row this session already has, so a second
-    /// compaction must not reuse the first one's id even in a later turn.
+    /// compaction must not reuse the first one's id even in a later turn, and
+    /// a compaction that outlives the settlement still completes the row its
+    /// start opened.
     fn reset(&mut self) {
         let run = self.run.clone();
         let dialogs = self.dialogs.clone();
         let compaction_sequence = self.compaction_sequence;
+        let open_compaction = self.open_compaction.take();
         *self = Self {
             run,
             dialogs,
             compaction_sequence,
+            open_compaction,
             ..Self::default()
         };
     }
@@ -1890,10 +1894,10 @@ fn handle_pi_message(
             let compaction_tokens = result
                 .and_then(|result| result.get("estimatedTokensAfter"))
                 .and_then(Value::as_u64);
-            // The row belongs to the start that opened it. Its start can be
-            // gone when a settlement reset the stream state while a compaction
-            // was unwinding, and an end with no row completes nothing rather
-            // than fabricating a finished one.
+            // A row exists while a start is open; the end completes that one.
+            // Pi emits the start before the end, so a row can only be missing
+            // for an end the stream never opened one for, and then there is
+            // nothing to complete.
             if let Some(id) = state.open_compaction.take() {
                 let item = if aborted {
                     // The stop that aborted it already said what happened; the

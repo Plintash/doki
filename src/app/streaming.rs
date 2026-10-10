@@ -836,8 +836,6 @@ impl Waku {
                 interrupted,
             } => {
                 // A manual compaction's settlement carries no turn id, so the
-                // recorded compaction turn is what identifies it. When that
-                // A manual compaction's settlement carries no turn id, so the
                 // recorded compaction turn only decides whether this turn skips
                 // the fallback line. Taking it consumes the record either way,
                 // so a command the provider ignored cannot swallow the next
