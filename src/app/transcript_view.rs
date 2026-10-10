@@ -244,9 +244,8 @@ impl Waku {
             .checked_sub(1)
             .and_then(|last_row| transcript_rows.bounds_for_item(last_row))
             .map(|bounds| bounds.bottom());
-        let rests_at_tail =
-            transcript_rests_at_tail(viewport_bottom, tail_bottom, anchor_end_space)
-                .unwrap_or(self.transcript_rests_at_tail.get());
+        let tail_rest = transcript_rests_at_tail(viewport_bottom, tail_bottom, anchor_end_space);
+        let rests_at_tail = tail_rest.unwrap_or(self.transcript_rests_at_tail.get());
         self.transcript_rests_at_tail.set(rests_at_tail);
         // Scrolling back down onto the tail by hand re-engages following, just
         // as the affordance below does. GPUI re-engages its own tail pin when a
@@ -256,8 +255,7 @@ impl Waku {
         // watching the reply grow past the bottom edge with no way but the
         // button to rejoin it.
         if self.transcript_tail_recheck.get()
-            && let Some(rests_at_tail) =
-                transcript_rests_at_tail(viewport_bottom, tail_bottom, anchor_end_space)
+            && let Some(rests_at_tail) = tail_rest
         {
             self.transcript_tail_recheck.set(false);
             if rests_at_tail {

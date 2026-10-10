@@ -721,7 +721,7 @@ impl MarkdownView {
         // exists, and the row's reported height never steps. It stays at or
         // above the last measured body height and the veil holds newly
         // appended graphemes invisible, so the gap under the text is the only
-        // artefact, bounded by the rate lead.
+        // artifact, bounded by the rate lead.
         let growth = match self.clip_last_height.get() {
             Some(previous) if height > previous => f32::from(height - previous),
             _ => 0.0,
@@ -2072,7 +2072,7 @@ pub fn clip_body(view: &MarkdownView, body: AnyElement) -> AnyElement {
 }
 
 /// Wrap a streaming body so the clip controller knows its real height.
-pub fn measure_body(view: &MarkdownView, inner: AnyElement) -> AnyElement {
+fn measure_body(view: &MarkdownView, inner: AnyElement) -> AnyElement {
     MeasuredBody {
         inner,
         height: view.body_height.clone(),
@@ -3545,7 +3545,7 @@ mod tests {
     /// The clip is a height at one wrapping, and a retained one cuts a body
     /// that has since grown past it. Settling and a reflow both drop it.
     #[test]
-    fn settling_and_refowing_release_the_container_height() {
+    fn settling_and_reflowing_release_the_container_height() {
         let mut view = MarkdownView::new();
         view.set_render_width(600.0);
         view.set_text("hello", true);
