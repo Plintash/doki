@@ -75,16 +75,16 @@ the turn id on the runtime when the prompt is a compact invocation for Pi, and
 `TurnFinished` skips that fallback for exactly that turn. Any other settlement
 path (a refused prompt, a dead process, a stop) keeps its normal behaviour.
 
-## The RPC answer
+## The request carries no answer to await
 
-The `compact` request carries an id, and its answer arrives after
-`compaction_end` (the handler awaits the same operation). It exists for the
-case the events cannot describe: a build whose RPC does not know the command
-answers with an error and emits no events at all, which would leave the turn
-spinning. The driver therefore reads the answer as well: when no
-`compaction_end` settled the request first, the refusal settles that
-submission as undelivered. When the end event did settle it, the answer adds
-nothing.
+Like `abort` and `clear_queue`, the `compact` request is written without an
+id: every outcome the provider reports — the start, the end, the summary and
+the token estimate — arrives on the event stream, and summarizing a full
+context routinely outlasts the control timeout, so the writer thread must not
+be sitting on it. A provider build that does not know the command ignores the
+request exactly as it ignores any other unknown one; the RPC surface this
+transport targets documents it, and the driver does not grow a second,
+parallel answer path for it.
 
 ## Out of scope
 

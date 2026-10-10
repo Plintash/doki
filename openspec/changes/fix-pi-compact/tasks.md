@@ -7,13 +7,13 @@
 ## 2. The composer offers it
 
 - [x] 2.1 Push Pi's built-in `compact` into the catalogue assembled in `crates/waku-core/src/composer_complete.rs` (scope `Builtin`, hint `[focus]`, no template, description from a new locale key) so it is discoverable and dedup still lets a project, user or skill command of that name win; verified by a catalogue test for a Pi session with no reported commands and with a same-named project command
-- [x] 2.2 Add `commands.compact_description` to `locales/app.yml`, `locales/zh-CN.yml` and `locales/ja.yml`; verified by the web i18n parity test (the two keys appear in both translated catalogs; its remaining nine missing keys are the pre-existing #19 set on `main`)
+- [x] 2.2 Add `commands.compact_description` to `locales/app.yml`, `locales/zh-CN.yml` and `locales/ja.yml`; verified by the web i18n parity test (the new keys appear in both translated catalogs; the remaining six missing keys are the pre-existing #19 set on `main`, and the three `activity.compaction_*` keys this feature renders are now translated too)
 
 ## 3. The driver runs it instead of the model
 
 - [x] 3.1 Route a `CommandMessage::Prompt` through one function in `crates/waku-core/src/driver/pi.rs`: a Pi-flavour compact invocation with no live run writes `{"type":"compact","customInstructions"?…}` with an id whose answer is awaited by the reader, and any other prompt is sent as before; verified by a wire test for the bare and focused forms and a same-wire test that Oh My Pi still prompts
 - [x] 3.2 Refuse a compact prompt that arrives while a run is live: no compact RPC is written and the submission settles as undelivered with a reason, because Pi's `session.compact()` would abort the run; verified by a driver test that opens the run liveness first
-- [x] 3.3 Read the `compact` answer: when no `compaction_end` settled the request first, the provider's error settles the submission as undelivered; when the end event did settle it, the answer adds nothing; verified by driver tests for both orders
+- [x] 3.3 Write the request without an id and await nothing, like `abort` and `clear_queue`: every outcome the supported RPC reports arrives as an event, so no parallel answer path is added; verified by the wire test asserting the write carries no id and registers no pending response
 - [x] 3.4 Add `errors.compact_turn_running` to the three locale catalogs; verified by the parity test
 
 ## 4. Compaction is visible
@@ -25,7 +25,7 @@
 ## 5. The settling turn gets no synthetic reply
 
 - [x] 5.1 Record the turn on the session runtime when the resolved prompt handed to the transport is a Pi compact invocation, at `finish_submission_preparation` in `src/app/runtime.rs`; verified by `cargo check` and the app tests
-- [x] 5.2 Skip the answerless-turn fallback in `TurnFinished` for exactly that recorded turn in `src/app/streaming.rs`, taking the record with it; verified by the app test suite and the manual app check
+- [x] 5.2 Skip the answerless-turn fallback in `TurnFinished` for exactly that recorded turn in `src/app/streaming.rs`, taking the record with it; verified by the app test suite and the manual app check (no separate stale-settlement guard is added: the recorded turn is consumed by its own settlement)
 
 ## 6. Documentation and validation
 

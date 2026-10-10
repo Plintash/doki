@@ -183,10 +183,6 @@ enum CommandMessage {
 enum PendingResponse {
     Request(Sender<Result<Value, String>>),
     Prompt,
-    /// A manual compaction request. Its answer arrives only after the
-    /// provider's own end event, so it exists for the one outcome the stream
-    /// cannot report: a rejection before the compaction ever started.
-    Compact,
 }
 
 type PendingResponses = Arc<Mutex<HashMap<String, PendingResponse>>>;
@@ -1054,10 +1050,8 @@ fn send_prompt(
     let id = format!("waku-{}", next_request_id);
     {
         let mut pending = pending.lock();
-        // A response from an older prompt cannot settle the next turn. A
-        // pending control request and a compaction answer stay registered:
-        // they answer for themselves, not for the turn.
-        pending.retain(|_, response| !matches!(response, PendingResponse::Prompt));
+        // A response from an older prompt cannot settle the next turn.
+        pending.retain(|_, response| matches!(response, PendingResponse::Request(_)));
         pending.insert(id.clone(), PendingResponse::Prompt);
     }
     // OMP built-ins can hold the prompt response until compaction or another
@@ -1118,7 +1112,7 @@ fn dispatch_prompt(
         if run.is_live() {
             Err(tr!("errors.compact_turn_running"))
         } else {
-            write_compact(stdin, pending, next_request_id, invocation.instructions())
+            write_compact(stdin, invocation.instructions())
         }
     } else {
         send_prompt(stdin, pending, next_request_id, &prompt)
@@ -1141,30 +1135,17 @@ fn dispatch_prompt(
 
 /// Writes the provider's compaction request.
 ///
-/// The answer is awaited by the reader thread rather than this one: a build
-/// whose RPC does not know the command answers with an error and emits no
-/// event at all, which is the one outcome the stream cannot report. The write
-/// itself never waits — summarizing a full context routinely outlasts the
-/// control timeout, and the writer must stay free for the stop that cancels
-/// it.
-fn write_compact(
-    stdin: &mut impl Write,
-    pending: &PendingResponses,
-    next_request_id: &mut u64,
-    instructions: Option<String>,
-) -> Result<(), String> {
-    *next_request_id += 1;
-    let id = format!("waku-{}", next_request_id);
-    pending.lock().insert(id.clone(), PendingResponse::Compact);
-    let mut request = json!({"id": id, "type": "compact"});
+/// No request id, like `abort` and `clear_queue`: every outcome the provider
+/// reports — progress, usage and the end itself — arrives as an event, so
+/// there is nothing to await. Summarizing a full context routinely outlasts
+/// the control timeout besides, and the writer has to stay free for the stop
+/// that cancels it.
+fn write_compact(stdin: &mut impl Write, instructions: Option<String>) -> Result<(), String> {
+    let mut request = json!({"type": "compact"});
     if let Some(instructions) = instructions {
         request["customInstructions"] = Value::String(instructions);
     }
-    if let Err(error) = write_json_line(stdin, &request) {
-        pending.lock().remove(&id);
-        return Err(format!("transport write failed: {error}"));
-    }
-    Ok(())
+    write_json_line(stdin, &request).map_err(|error| format!("transport write failed: {error}"))
 }
 
 /// Hands a steering message to the provider.
@@ -1378,6 +1359,15 @@ impl ChunkAssembly {
             .map(Some)
             .map_err(|error| format!("chunked frame was not valid JSON: {error}"))
     }
+}
+
+/// Reports the context occupancy the provider just computed. The window is
+/// unchanged, and `None` keeps the one the meter already has.
+fn report_context_tokens(events: &impl DriverEventSink, tokens: u64) {
+    let _ = events.send(DriverEvent::UsageUpdated {
+        context_tokens: Some(tokens),
+        context_window: None,
+    });
 }
 
 /// Pi already computes context occupancy for its own footer. Prefer that
@@ -1639,11 +1629,7 @@ struct PiStreamState {
     /// The activity row of the compaction currently running, so its end event
     /// completes the same row. Pi names no compaction, so Waku counts them.
     open_compaction: Option<String>,
-    compaction_rows: u64,
-    /// Whether a `compaction_end` already reported the outcome of a manual
-    /// compaction whose RPC answer is still in flight. The answer then adds
-    /// nothing; while it is false the answer is the only report there is.
-    compaction_settled: bool,
+    compaction_sequence: u64,
 }
 
 impl PiStreamState {
@@ -1656,11 +1642,11 @@ impl PiStreamState {
     fn reset(&mut self) {
         let run = self.run.clone();
         let dialogs = self.dialogs.clone();
-        let compaction_rows = self.compaction_rows;
+        let compaction_sequence = self.compaction_sequence;
         *self = Self {
             run,
             dialogs,
-            compaction_rows,
+            compaction_sequence,
             ..Self::default()
         };
     }
@@ -1740,51 +1726,6 @@ fn handle_pi_message(
             state.reset();
             return;
         }
-        if matches!(pending.lock().get(id), Some(PendingResponse::Compact)) {
-            pending.lock().remove(id);
-            // The end event already reported the outcome and settled the
-            // turn. The answer carries the one thing no event could: a
-            // refusal before the compaction ever started, which leaves the
-            // submission undelivered with the provider's reason.
-            let settled = std::mem::take(&mut state.compaction_settled);
-            let success = value.get("success").and_then(Value::as_bool) == Some(true);
-            if settled {
-                return;
-            }
-            if success {
-                if let Some(tokens) = value
-                    .pointer("/data/estimatedTokensAfter")
-                    .and_then(Value::as_u64)
-                {
-                    let _ = events.send(DriverEvent::UsageUpdated {
-                        context_tokens: Some(tokens),
-                        context_window: None,
-                    });
-                }
-                let _ = events.send(DriverEvent::TurnFinished {
-                    interrupted: false,
-                    success: true,
-                    summary: None,
-                });
-            } else {
-                let error = value
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        tr!(
-                            "errors.provider_rejected_prompt",
-                            provider = flavor.display_name()
-                        )
-                    });
-                let _ = events.send(DriverEvent::TurnFinished {
-                    interrupted: false,
-                    success: false,
-                    summary: Some(error),
-                });
-            }
-            return;
-        }
         let Some(PendingResponse::Request(response)) = pending.lock().remove(id) else {
             return;
         };
@@ -1830,7 +1771,7 @@ fn handle_pi_message(
         if state.run.is_live() {
             pending
                 .lock()
-                .retain(|_, response| !matches!(response, PendingResponse::Prompt));
+                .retain(|_, response| matches!(response, PendingResponse::Request(_)));
             // A settlement must not leave text parked in the provider's queue.
             // Measured against pi 1.0.0: an aborted run settles without
             // draining its queue, and pi does not run that message afterwards
@@ -1882,8 +1823,8 @@ fn handle_pi_message(
             // Pi compacts both on request and on its own (the threshold or an
             // overflow). Both are the same two events, so both get the same
             // row; an automatic compaction belongs to the run already open.
-            state.compaction_rows += 1;
-            let id = format!("pi-compaction-{}", state.compaction_rows);
+            state.compaction_sequence += 1;
+            let id = format!("pi-compaction-{}", state.compaction_sequence);
             state.open_compaction = Some(id.clone());
             let item = activity::tool_activity(
                 Some(id),
@@ -1908,7 +1849,7 @@ fn handle_pi_message(
             let id = state
                 .open_compaction
                 .take()
-                .unwrap_or_else(|| format!("pi-compaction-{}", state.compaction_rows));
+                .unwrap_or_else(|| format!("pi-compaction-{}", state.compaction_sequence));
             let mut compaction_tokens = None;
             let item = if aborted {
                 // The stop that aborted it already said what happened; the
@@ -1959,17 +1900,13 @@ fn handle_pi_message(
             };
             let _ = events.send(DriverEvent::RichActivity(item));
             if let Some(tokens) = compaction_tokens {
-                let _ = events.send(DriverEvent::UsageUpdated {
-                    context_tokens: Some(tokens),
-                    context_window: None,
-                });
+                report_context_tokens(events, tokens);
             }
             if manual {
                 // A manual compaction has no run behind it, so its end event
                 // settles the turn that submitted it. A failed compaction is
                 // still a completed turn: the failed row is the record, and
                 // the task must not read as failed because maintenance did.
-                state.compaction_settled = true;
                 let _ = events.send(DriverEvent::TurnFinished {
                     interrupted: aborted,
                     success: true,
@@ -2045,10 +1982,7 @@ fn handle_pi_message(
                     // This is the context the next call starts from, not the
                     // cumulative billed total for the whole session.
                     if let Some(tokens) = message.and_then(pi_message_context_tokens) {
-                        let _ = events.send(DriverEvent::UsageUpdated {
-                            context_tokens: Some(tokens),
-                            context_window: None,
-                        });
+                        report_context_tokens(events, tokens);
                     }
                     emit_completed_message_fallback(message, events, state);
                 }
@@ -5073,11 +5007,11 @@ mod tests {
         assert_eq!(writes.len(), 1, "a compaction is not also a prompt");
         assert_eq!(writes[0]["type"], "compact");
         assert_eq!(writes[0]["customInstructions"], "focus on the API");
-        assert_eq!(writes[0]["id"], "waku-1");
-        assert!(matches!(
-            pending.lock().get("waku-1"),
-            Some(PendingResponse::Compact)
-        ));
+        assert!(
+            writes[0].get("id").is_none(),
+            "the command answers through its events, so it awaits nothing"
+        );
+        assert!(pending.lock().is_empty());
         assert!(
             event_rx.try_recv().is_err(),
             "the command settles no turn yet"
@@ -5211,7 +5145,6 @@ mod tests {
             }
         ));
         assert!(event_rx.try_recv().is_err());
-        assert!(state.compaction_settled);
     }
 
     #[test]
@@ -5305,150 +5238,6 @@ mod tests {
             }
         ));
         assert!(event_rx.try_recv().is_err(), "no turn is settled for it");
-        assert!(!state.compaction_settled);
-    }
-
-    #[test]
-    fn a_refused_compaction_answer_settles_as_undelivered_when_no_event_came() {
-        // A build whose RPC does not know the command answers with an error
-        // and emits no compaction event at all: the answer is the only report
-        // there is, and the submission it answered goes undelivered with it.
-        let (pending, commands, _command_rx, mut state) = harness();
-        let (events, event_rx) = unbounded();
-        let mut wire = Vec::new();
-        dispatch_prompt(
-            &mut wire,
-            &pending,
-            &mut 0,
-            &events,
-            &RunLiveness::default(),
-            PiFlavor::Pi,
-            "/compact".into(),
-        );
-        handle_pi_message(
-            PiFlavor::Pi,
-            json!({
-                "type": "response",
-                "id": "waku-1",
-                "command": "compact",
-                "success": false,
-                "error": "Unknown command: compact",
-            }),
-            &pending,
-            &commands,
-            &events,
-            &mut state,
-        );
-
-        let DriverEvent::TurnFinished {
-            success, summary, ..
-        } = event_rx.recv().unwrap()
-        else {
-            panic!("the refusal settles the submission")
-        };
-        assert!(!success);
-        assert_eq!(summary.as_deref(), Some("Unknown command: compact"));
-        assert!(event_rx.try_recv().is_err());
-        assert!(pending.lock().is_empty());
-    }
-
-    #[test]
-    fn a_compaction_answer_after_its_end_event_adds_nothing() {
-        let (pending, commands, _command_rx, mut state) = harness();
-        let (events, event_rx) = unbounded();
-        let mut wire = Vec::new();
-        dispatch_prompt(
-            &mut wire,
-            &pending,
-            &mut 0,
-            &events,
-            &RunLiveness::default(),
-            PiFlavor::Pi,
-            "/compact".into(),
-        );
-        for frame in [
-            json!({"type": "compaction_start", "reason": "manual"}),
-            json!({
-                "type": "compaction_end",
-                "reason": "manual",
-                "result": {"summary": "Summary", "estimatedTokensAfter": 32000},
-                "aborted": false,
-                "willRetry": false,
-            }),
-            json!({
-                "type": "response",
-                "id": "waku-1",
-                "command": "compact",
-                "success": true,
-                "data": {"estimatedTokensAfter": 32000},
-            }),
-        ] {
-            handle_pi_message(
-                PiFlavor::Pi,
-                frame,
-                &pending,
-                &commands,
-                &events,
-                &mut state,
-            );
-        }
-
-        // Start row, end row, usage, settlement — and then nothing for the
-        // answer, which the end event already accounted for.
-        for _ in 0..4 {
-            event_rx.recv().unwrap();
-        }
-        assert!(event_rx.try_recv().is_err());
-        assert!(!state.compaction_settled, "the answer consumes the flag");
-        assert!(pending.lock().is_empty());
-    }
-
-    #[test]
-    fn a_compaction_answer_without_an_end_event_settles_its_turn() {
-        // The success answer normally arrives after its end event; if that
-        // event is ever missing, the turn still must not spin.
-        let (pending, commands, _command_rx, mut state) = harness();
-        let (events, event_rx) = unbounded();
-        let mut wire = Vec::new();
-        dispatch_prompt(
-            &mut wire,
-            &pending,
-            &mut 0,
-            &events,
-            &RunLiveness::default(),
-            PiFlavor::Pi,
-            "/compact".into(),
-        );
-        handle_pi_message(
-            PiFlavor::Pi,
-            json!({
-                "type": "response",
-                "id": "waku-1",
-                "command": "compact",
-                "success": true,
-                "data": {"estimatedTokensAfter": 32000},
-            }),
-            &pending,
-            &commands,
-            &events,
-            &mut state,
-        );
-
-        assert!(matches!(
-            event_rx.recv().unwrap(),
-            DriverEvent::UsageUpdated {
-                context_tokens: Some(32_000),
-                ..
-            }
-        ));
-        assert!(matches!(
-            event_rx.recv().unwrap(),
-            DriverEvent::TurnFinished {
-                success: true,
-                interrupted: false,
-                ..
-            }
-        ));
     }
 
     #[test]

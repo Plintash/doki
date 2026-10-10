@@ -342,6 +342,9 @@ activity.described_command_failed: "命令执行失败：%{description}"
 activity.running_command: 正在运行命令
 activity.ran_command: 已运行命令
 activity.command_failed: 命令执行失败
+activity.compacting_context: 正在压缩上下文
+activity.compacted_context: 已压缩上下文
+activity.compaction_failed: 上下文压缩失败
 activity.edit_file: 编辑文件
 activity.write_file: 写入文件
 activity.editing_named_file: 正在编辑 %{file}
