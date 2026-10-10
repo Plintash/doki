@@ -1,5 +1,5 @@
 use chrono::{DateTime, Datelike, Days, Local, NaiveDate, Utc};
-use gpui::{AnyView, KeyBinding, actions};
+use gpui::{AnyView, ElementId, KeyBinding, actions};
 
 use crate::ui::menu::{anchor_popover, open_popover};
 
@@ -713,6 +713,10 @@ fn live_plan_step(session: &AgentSession) -> Option<SharedString> {
 /// so a hover can never issue a request, retry, or spawn work.
 #[derive(Clone)]
 struct SidebarTaskCard {
+    /// The task this card is about. It names the card's animation ids: gpui
+    /// tracks an animation by element id, so a fixed id would hand the next
+    /// card the previous one's finished animation instead of starting its own.
+    session_id: Uuid,
     title: SharedString,
     /// What the task is working toward, when a summary has been generated.
     objective: Option<SharedString>,
@@ -740,6 +744,7 @@ fn sidebar_task_card(
     now: u64,
 ) -> SidebarTaskCard {
     SidebarTaskCard {
+        session_id: session.id,
         title: SharedString::from(localized_session_title(session)),
         objective: facts.objective.clone(),
         state: sidebar_row_detail(session, facts)
@@ -805,15 +810,33 @@ impl Render for SidebarTaskCard {
     }
 }
 
-/// The card's one compact stack, drawn: no dividers and no columns. The facts
-/// are the shortest line, so they are pushed to the right edge the longer lines
-/// leave rather than getting a column of their own.
+/// The card's one compact stack, drawn: no dividers and no columns, every line
+/// one line tall. The facts are the shortest line, so they take the right edge
+/// of the block that carries them rather than a row of their own.
 fn sidebar_task_card_view(
     card: &SidebarTaskCard,
     cx: &mut Context<SidebarTaskCard>,
 ) -> impl IntoElement {
     let theme = Theme::current(cx);
+    let reduce_motion = cx.reduce_motion();
+    let facts = sidebar_card_facts_line(card.turns, card.changed_files, &card.recency);
+    let facts_element = |color: Hsla, facts: SharedString| {
+        div()
+            .flex_none()
+            .pl(px(8.0))
+            .text_size(sp(11.5))
+            .text_color(color)
+            .child(facts)
+            .into_any_element()
+    };
+    // The objective is where a reader looks first for "what is this", so the
+    // facts ride its line; a card with no objective keeps them on the title
+    // instead of adding a row.
+    let objective = card.objective.clone();
+    let facts_ride_the_title = objective.is_none();
+
     div()
+        .id("sidebar-task-card")
         .w(px(SIDEBAR_CARD_WIDTH))
         .flex()
         .flex_col()
@@ -827,63 +850,167 @@ fn sidebar_task_card_view(
         .text_size(sp(12.5))
         .line_height(sp(16.0))
         .child(
-            div()
-                .text_size(sp(13.5))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.text)
-                .child(card.title.clone()),
+            sidebar_card_line(
+                ElementId::Name(SharedString::from(format!(
+                    "card-{}-title",
+                    card.session_id
+                ))),
+                None,
+                card.title.clone(),
+                theme.text,
+                theme.raised,
+                facts_ride_the_title.then(|| facts_element(theme.text_ghost, facts.clone())),
+                reduce_motion,
+            )
+            .text_size(sp(13.5))
+            .font_weight(FontWeight::MEDIUM),
         )
-        .when_some(card.objective.clone(), |element, objective| {
+        .when_some(objective, |element, objective| {
             element.child(sidebar_card_line(
-                "icons/target.svg",
+                ElementId::Name(SharedString::from(format!(
+                    "card-{}-objective",
+                    card.session_id
+                ))),
+                Some("icons/target.svg"),
                 objective,
                 theme.text_secondary,
+                theme.raised,
+                (!facts_ride_the_title).then(|| facts_element(theme.text_ghost, facts.clone())),
+                reduce_motion,
             ))
         })
         .when_some(card.state.as_ref(), |element, state| {
             element.child(sidebar_card_line(
-                state.icon(),
+                ElementId::Name(SharedString::from(format!(
+                    "card-{}-state",
+                    card.session_id
+                ))),
+                Some(state.icon()),
                 state.text().clone(),
                 theme.text_secondary,
+                theme.raised,
+                None,
+                reduce_motion,
             ))
         })
         .child(sidebar_card_line(
-            "icons/folder.svg",
+            ElementId::Name(SharedString::from(format!(
+                "card-{}-project",
+                card.session_id
+            ))),
+            Some("icons/folder.svg"),
             card.project.clone(),
             theme.text_tertiary,
+            theme.raised,
+            None,
+            reduce_motion,
         ))
         .when_some(card.branch.clone(), |element, branch| {
             element.child(sidebar_card_line(
-                "icons/git-branch.svg",
+                ElementId::Name(SharedString::from(format!(
+                    "card-{}-branch",
+                    card.session_id
+                ))),
+                Some("icons/git-branch.svg"),
                 branch,
                 theme.text_tertiary,
+                theme.raised,
+                None,
+                reduce_motion,
             ))
+        })
+}
+
+/// How wide the fade at a clipped line's end is. The composer masks text that
+/// runs under its controls with the same band, so a clipped line here fades into
+/// the card exactly the way text there fades into the composer.
+const SIDEBAR_CARD_FADE_WIDTH: f32 = 22.0;
+
+/// How long a line takes to glide to its end once the card is revealed.
+const SIDEBAR_CARD_MARQUEE: Duration = Duration::from_millis(1_400);
+
+/// One line of the card: an optional icon, then the text, then an optional
+/// trailing element that takes the space the text leaves.
+///
+/// A line is one line tall, so a long title cannot grow the card. Instead the
+/// text glides to its end once, and the last characters fade into the card's
+/// surface rather than stopping dead at the edge. The glide is one animation on
+/// `ease_out_quint`, which is what makes it arrive at the end instead of
+/// hitting it - and it is skipped entirely when the system asks for reduced
+/// motion, which leaves the fade as the whole treatment.
+#[allow(clippy::too_many_arguments)]
+fn sidebar_card_line(
+    id: ElementId,
+    icon_path: Option<&'static str>,
+    text: SharedString,
+    color: Hsla,
+    surface: Hsla,
+    trailing: Option<AnyElement>,
+    reduce_motion: bool,
+) -> Div {
+    let scroll = ScrollHandle::new();
+    let animated_scroll = scroll.clone();
+    let text = div().whitespace_nowrap().child(text);
+    let text = if reduce_motion {
+        text.into_any_element()
+    } else {
+        text.with_animation(
+            id.clone(),
+            Animation::new(SIDEBAR_CARD_MARQUEE).with_easing(ease_out_quint()),
+            move |element, delta| {
+                let overflow = animated_scroll.max_offset().x;
+                if overflow > px(0.0) {
+                    animated_scroll.set_offset(point(-overflow * delta, px(0.0)));
+                }
+                element
+            },
+        )
+        .into_any_element()
+    };
+
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .text_color(color)
+        .when_some(icon_path, |element, path| {
+            element.child(icon(path, 12.5, color))
         })
         .child(
             div()
-                .w_full()
-                .flex()
-                .justify_end()
-                .text_size(sp(11.5))
-                .text_color(theme.text_ghost)
-                .child(sidebar_card_facts_line(
-                    card.turns,
-                    card.changed_files,
-                    &card.recency,
-                )),
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .id(id)
+                        .overflow_x_scroll()
+                        .track_scroll(&scroll)
+                        .child(text),
+                )
+                .child(sidebar_card_line_fade(surface)),
         )
+        .when_some(trailing, |element, trailing| element.child(trailing))
 }
 
-/// One line of the card: an icon, so what a line means never rests on its color
-/// alone, then text that wraps to the card's width.
-fn sidebar_card_line(icon_path: &'static str, text: SharedString, color: Hsla) -> Div {
+/// The band that covers a line's end.
+///
+/// It is always drawn: the cover is the point, because a line that stops at the
+/// edge reads as cut off, while one that fades into the card reads as
+/// continuing. The composer masks text that runs under its controls with the
+/// same 22-point band, so this is the app's own way of saying the same thing.
+fn sidebar_card_line_fade(surface: Hsla) -> impl IntoElement {
     div()
-        .flex()
-        .items_start()
-        .gap(px(6.0))
-        .text_color(color)
-        .child(icon(icon_path, 12.5, color))
-        .child(div().flex_1().whitespace_normal().child(text))
+        .absolute()
+        .right_0()
+        .top_0()
+        .bottom_0()
+        .w(px(SIDEBAR_CARD_FADE_WIDTH))
+        .bg(linear_gradient(
+            90.0,
+            linear_color_stop(surface.opacity(0.0), 0.0),
+            linear_color_stop(surface, 1.0),
+        ))
 }
 
 /// Attach a row's card: GPUI's own tooltip for the pointer, and the same card
@@ -901,8 +1028,12 @@ fn with_sidebar_task_card(
     let hover = card.clone();
     // While the card stands for this row's keyboard focus the tooltip stays
     // off, so the pointer never draws a second copy of it.
+    //
+    // The card is a *hoverable* tooltip: a line glides to its end over about a
+    // second, so the pointer has to be able to come to rest on the card and read
+    // it. A plain tooltip vanishes the moment the pointer leaves the row.
     let row = row.when(!card_handle.is_open(), |row| {
-        row.tooltip(move |_window, cx| hover.clone().into_view(cx))
+        row.hoverable_tooltip(move |_window, cx| hover.clone().into_view(cx))
     });
     anchor_popover(row, card_handle, MenuAlign::BelowLeft, move |_, _, cx| {
         card.clone().into_view(cx).into_any_element()
@@ -1267,29 +1398,50 @@ impl Waku {
     /// The visible way to change what the sidebar groups by.
     ///
     /// The options menu still carries the same choice, but that is two clicks
-    /// deep and tells a reader nothing about the view they are in. This chip
-    /// names the current view, shows its glyph, and opens the three of them, so
+    /// deep and tells a reader nothing about the view they are in. This button
+    /// shows the current view's glyph and opens the three of them by name, so
     /// the project and updated views stay one click away now that the status
-    /// view exists beside them. `popover` owns the trigger's focus and key
-    /// handling, so Tab reaches it and Enter or Space opens it.
+    /// view exists beside them.
+    ///
+    /// It is deliberately glyph-only: the titlebar already spends 86 points on
+    /// the traffic lights, 26 on the panel toggle and 52 on the history arrows,
+    /// which at the default 252-point sidebar leaves about 70 for everything
+    /// else. A labeled chip needed 75 of them and was clipped off the edge - the
+    /// bug this replaces. The view's name lives in the tooltip and in the menu,
+    /// where there is room for it. `dropdown_menu` owns the trigger's focus and
+    /// key handling, so Tab reaches this and Enter or Space opens it.
     fn render_sidebar_view_switch(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
         let grouping = self.state.sidebar_grouping;
         let menu = self.menu_handle("sidebar-view-switch", cx);
         let open = menu.is_open();
         let weak = cx.entity().downgrade();
-        let trigger = MenuChip::new("sidebar-view-switch")
-            .icon(
+        let trigger = div()
+            .id("sidebar-view-switch")
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex_none()
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_default()
+            .when(open, |element| element.bg(theme.overlay_strong))
+            .hover(|element| element.bg(theme.overlay))
+            .active(|element| element.bg(theme.overlay_strong))
+            .tooltip(Tooltip::text(tr!(
+                "sidebar.view_switch",
+                view = sidebar_grouping_label(grouping)
+            )))
+            .child(icon(
                 sidebar_grouping_glyph(grouping),
+                14.0,
                 if open {
                     theme.text
                 } else {
                     theme.text_secondary
                 },
-            )
-            .label(sidebar_grouping_label(grouping))
-            .height(px(22.0))
-            .selected(open);
+            ));
 
         div()
             .pr(px(10.0))

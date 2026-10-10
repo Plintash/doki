@@ -244,6 +244,7 @@ sidebar.grouping: 分组
 sidebar.grouping_project: 项目
 sidebar.grouping_updated: 更新时间
 sidebar.grouping_status: 状态
+sidebar.view_switch: 切换分组
 sidebar.section_needs_you: 需要你
 sidebar.section_running: 进行中
 sidebar.section_recent: 最近

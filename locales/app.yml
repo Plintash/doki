@@ -499,6 +499,8 @@ sidebar.grouping_updated:
   en: Updated
 sidebar.grouping_status:
   en: Status
+sidebar.view_switch:
+  en: Switch grouping
 sidebar.section_needs_you:
   en: Needs you
 sidebar.section_running:
