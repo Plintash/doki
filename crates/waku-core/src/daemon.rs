@@ -198,11 +198,43 @@ impl WakuBackend {
                 .find(|turn| turn.turn_count == turn_count)
             {
                 turn.checkpoint = Some(checkpoint.clone());
-                state.mark_session_dirty(session_id);
-                self.task_store.save(&mut state)?;
             }
+            record_settled_turn(&mut state.sessions[index], turn_count, &checkpoint);
+            state.mark_session_dirty(session_id);
+            self.task_store.save(&mut state)?;
         }
         Ok(checkpoint)
+    }
+}
+
+/// Record what a settled turn did on the task itself.
+///
+/// The row card's facts line reads a turn count and a changed-file count, and
+/// neither can be derived when it is drawn: the list projection carries no
+/// transcript, so `turns` is empty there, and the file count lives in the
+/// ending checkpoint. Capturing that checkpoint is the one moment the daemon
+/// holds both the settled turn and its file list, so the counts are recorded
+/// here and preserved against client saves like the rest of the daemon-owned
+/// triage state.
+///
+/// `settled_turn` counts itself: a client captures an ending checkpoint only
+/// after finishing the turn, while the save that carries the settlement to the
+/// daemon can land after this capture does. Counting the turns up to and
+/// including it therefore reads a turn that just ended as settled, where
+/// reading a stored status would read it as still running.
+fn record_settled_turn(session: &mut AgentSession, settled_turn: usize, checkpoint: &Checkpoint) {
+    session.turn_count = Some(
+        session
+            .turns
+            .iter()
+            .filter(|turn| turn.turn_count <= settled_turn)
+            .count() as u32,
+    );
+    // An unavailable checkpoint says nothing about how many files the turn
+    // touched, which is not the same as touching none: keep the last count a
+    // real capture reported rather than reporting a zero nobody measured.
+    if matches!(checkpoint.status, CheckpointStatus::Ready) {
+        session.changed_files = Some(checkpoint.files.len() as u32);
     }
 }
 
@@ -1228,6 +1260,19 @@ fn preserve_daemon_checkpoints(existing: &AgentSession, incoming: &mut AgentSess
 /// projection is allowed to report one, and the client that leaves the blocked
 /// status is the authority on the blockage having ended.
 fn preserve_daemon_triage(existing: &AgentSession, incoming: &mut AgentSession) {
+    // The goal is what the list resolves a task's objective from, and after a
+    // restart the narrow row is the only copy of it: the detail that also
+    // holds it is not loaded until the task is opened. A skeleton save lacks
+    // the goal because the client never loaded it, which is not the same as
+    // the provider having cleared it, so it fills the gap rather than taking
+    // the stored goal away. A hydrated client's save is the authority on the
+    // goal being gone.
+    if !incoming.detail_loaded {
+        incoming.thread_goal = incoming
+            .thread_goal
+            .clone()
+            .or_else(|| existing.thread_goal.clone());
+    }
     incoming.objective = existing.objective.clone();
     incoming.turn_count = existing.turn_count;
     incoming.changed_files = existing.changed_files;
@@ -2202,6 +2247,73 @@ mod tests {
         assert_eq!(incoming.turns[0].checkpoint.as_ref(), Some(&checkpoint));
     }
 
+    fn checkpoint_with_files(turn_count: usize, files: &[&str]) -> Checkpoint {
+        Checkpoint {
+            turn_count,
+            git_ref: format!("refs/waku/checkpoint-{turn_count}"),
+            status: CheckpointStatus::Ready,
+            files: files
+                .iter()
+                .map(|path| crate::model::CheckpointFile {
+                    path: (*path).to_owned(),
+                    additions: 1,
+                    deletions: 0,
+                })
+                .collect(),
+            additions: files.len() as u64,
+            deletions: 0,
+            created_at: 1,
+        }
+    }
+
+    /// The card's facts line reads a turn count and a changed-file count, and
+    /// nothing wrote either one: every value the row could show was preserved
+    /// and re-published but never produced, so the line could only ever show
+    /// recency. Settlement is where the daemon holds both numbers.
+    #[test]
+    fn a_settled_turn_records_the_counts_the_row_card_reports() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        session.begin_turn("Do the work");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+
+        record_settled_turn(
+            &mut session,
+            1,
+            &checkpoint_with_files(1, &["a.rs", "b.rs"]),
+        );
+        assert_eq!(session.turn_count, Some(1), "one turn has settled");
+        assert_eq!(session.changed_files, Some(2));
+
+        // A second turn settles before the save that says so reaches the
+        // daemon: the turn's own number is what counts it, and the newest
+        // checkpoint's file list is what the card reports.
+        session.begin_turn("Do more");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+        record_settled_turn(&mut session, 2, &checkpoint_with_files(2, &["c.rs"]));
+        assert_eq!(session.turn_count, Some(2));
+        assert_eq!(session.changed_files, Some(1));
+
+        // A checkpoint the daemon could not take measures nothing. Reporting
+        // it as zero files would claim the turn touched none, so the count a
+        // real capture reported stands.
+        session.begin_turn("Do a third");
+        record_settled_turn(
+            &mut session,
+            3,
+            &Checkpoint {
+                status: CheckpointStatus::Unavailable,
+                files: Vec::new(),
+                ..checkpoint_with_files(3, &[])
+            },
+        );
+        assert_eq!(session.turn_count, Some(3));
+        assert_eq!(
+            session.changed_files,
+            Some(1),
+            "the last measured count stands"
+        );
+    }
+
     #[test]
     fn a_client_projection_neither_sets_nor_clears_daemon_owned_triage_state() {
         let mut existing = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
@@ -2266,6 +2378,27 @@ mod tests {
             cleared.resolved_objective(),
             Some("Sidebar schedules tasks by state")
         );
+    }
+
+    #[test]
+    fn a_skeleton_save_cannot_clear_the_goal_the_narrow_row_holds() {
+        let mut existing = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        existing.thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+
+        // A client that never hydrated the task: its projection carries no
+        // goal, and "not loaded here" is not "the provider cleared it".
+        let mut incoming = existing.clone();
+        incoming.detail_loaded = false;
+        incoming.thread_goal = None;
+        preserve_daemon_triage(&existing, &mut incoming);
+        assert_eq!(incoming.thread_goal, existing.thread_goal);
+
+        // A hydrated client clearing the goal is the authority on it being
+        // gone, and its save carries the transcript that says so.
+        let mut cleared = existing.clone();
+        cleared.thread_goal = None;
+        preserve_daemon_triage(&existing, &mut cleared);
+        assert!(cleared.thread_goal.is_none());
     }
 
     #[test]
