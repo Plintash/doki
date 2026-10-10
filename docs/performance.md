@@ -145,11 +145,12 @@ moment any scrollbar became visible.
   document, and the build is proportional to the viewport **per top-level
   block**: the planner selects whole blocks, so a body that is a single block
   — one list, one table, one fenced code block, one wall-of-text paragraph —
-  is one group covering the whole body and rebuilds in full every frame,
-  paying the planning on top. In the bench below a single 400-item list costs
-  ~14 ms a frame against ~12 ms for the plain walk, where the same payload
-  spread over 400 top-level blocks drops the windowed frame well under a
-  millisecond.
+  is one group covering the whole body, and no spacer can stand in for any of
+  it: that frame rebuilds the whole body, at the plain walk's cost. Windowing
+  pays off only once a body spans many top-level blocks, because the part the
+  spacers can drop is exactly the part the viewport cannot reach — the bench
+  below times both shapes, and the same payload spread over 400 top-level
+  blocks drops the windowed frame well under a millisecond.
   Bodies containing an image or formula are never windowed, because those
   blocks can change height after their first frame and a spacer would freeze
   the old value (that holds for a formula only while math rendering is on:
