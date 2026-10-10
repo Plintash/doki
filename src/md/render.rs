@@ -26,11 +26,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Font, FontStyle,
-    FontWeight, Hsla, InteractiveText, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, SharedString, StrikethroughStyle,
-    StyledText, TextLayout, TextRun, UnderlineStyle, Window, canvas, div, font, img, point,
-    prelude::*, px, quad, relative, size,
+    AnyElement, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Element, Font,
+    FontStyle, FontWeight, Hsla, InteractiveText, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, SharedString,
+    StrikethroughStyle, StyledText, TextLayout, TextRun, UnderlineStyle, Window, canvas, div, font,
+    img, point, prelude::*, px, quad, relative, size,
 };
 use regex::Regex;
 
@@ -494,6 +494,18 @@ pub fn flatten_plain(
 
 // ── Per-message state ──────────────────────────────────────────────────────
 
+/// Ceiling, in pixels, on how far the leading height may run ahead of the
+/// measured body; also caps the feed-forward lookahead on a fast stream.
+const CLIP_RUNWAY_MAX: f32 = 44.0;
+
+/// Measured height of every top-level block of one body, one entry per block
+/// index. An entry is keyed by the block's *source range*: mending
+/// re-partitions the tail as it settles, so a block's index is not a stable
+/// identity and an index-keyed ledger would hand one block's height to
+/// another. `None` means the block has never been laid out at the current
+/// width, which forces one full pass so the spacers cannot guess.
+type BlockHeights = Rc<RefCell<Vec<(Range<usize>, Option<Pixels>)>>>;
+
 /// Everything the renderer keeps between frames for one markdown body.
 ///
 /// The flatten cache is keyed by element ordinal and pruned only back to the
@@ -515,11 +527,38 @@ pub struct MarkdownView {
     /// Per-element opacity spans for the live response. Text is committed to
     /// layout immediately; only these paint colors animate.
     veil: RefCell<RowVeil>,
+    /// Measured height of every top-level block, recorded as the renderer
+    /// lays each one out. A long streaming body is rendered as the window of
+    /// blocks near the viewport plus the volatile tail; the unrendered blocks
+    /// stand in as spacers sized from these heights.
+    heights: BlockHeights,
+    /// Wrap width the recorded heights were measured at. A reflow invalidates
+    /// every height, because a block's height is a function of its width.
+    heights_width: Cell<Option<f32>>,
     /// Code-block ordinals currently showing successful copy feedback. Kept
     /// outside the parsed/flattened caches so a three-second icon change never
     /// invalidates text shaping.
     copied_code_blocks: Rc<RefCell<HashMap<usize, u64>>>,
     streaming: Cell<bool>,
+    /// Whether the parsed body contains an image or a formula. Both size
+    /// themselves asynchronously, so a block holding one can change height
+    /// without being rebuilt; the window planner refuses to stand in for
+    /// blocks it cannot re-measure.
+    async_blocks: Cell<bool>,
+    /// Height the streaming body is clipped to while it grows. `None` shows
+    /// the whole body; the controller keeps it continuous so the row never
+    /// jumps by a line, and never lets it fall behind the measured body.
+    clip: Cell<Option<Pixels>>,
+    /// Natural height of the full arrived body, measured at paint.
+    body_height: Rc<Cell<Option<Pixels>>>,
+    /// When `advance_clip` last ran.
+    clip_at: Cell<Instant>,
+    /// Last measured body height and smoothed growth rate, for the leading
+    /// container height.
+    clip_last_height: Cell<Option<Pixels>>,
+    clip_rate: Cell<f32>,
+    /// Spring velocity of the leading container height.
+    clip_velocity: Cell<f32>,
 }
 
 impl Default for MarkdownView {
@@ -537,8 +576,17 @@ impl MarkdownView {
             volatile_from: Cell::new(0),
             style: Cell::new(None),
             veil: RefCell::new(RowVeil::default()),
+            heights: Rc::new(RefCell::new(Vec::new())),
+            heights_width: Cell::new(None),
             copied_code_blocks: Rc::new(RefCell::new(HashMap::new())),
             streaming: Cell::new(false),
+            async_blocks: Cell::new(false),
+            clip: Cell::new(None),
+            body_height: Rc::new(Cell::new(None)),
+            clip_at: Cell::new(Instant::now()),
+            clip_last_height: Cell::new(None),
+            clip_rate: Cell::new(0.0),
+            clip_velocity: Cell::new(0.0),
         }
     }
 
@@ -556,18 +604,22 @@ impl MarkdownView {
         *self.veil.borrow_mut() = RowVeil::seeded();
     }
 
-    /// Point the view at `text`. `mend` closes hanging inline markers, which is
-    /// wanted while a response streams and not once it has settled.
     /// Bytes of source this view retains. Parsed structures run to roughly
     /// seventeen times this, so it is the honest unit for bounding a cache.
     pub fn source_len(&self) -> usize {
         self.parser.text().len()
     }
 
+    /// Parse and point the caches at `text`, the body in full. `mend` closes
+    /// hanging inline markers, which is wanted while a response streams and not
+    /// once it has settled.
     pub fn set_text(&mut self, text: &str, mend: bool) {
         let was_streaming = self.streaming.replace(mend);
         if !mend && was_streaming {
+            // Settling drops the veil, so there is no invisible text left for
+            // a cut to land on; the row reports the body's real height again.
             *self.veil.borrow_mut() = RowVeil::default();
+            self.release_clip();
         } else if mend && !was_streaming && !self.parser.text().is_empty() {
             // A completed body that starts streaming again already has a
             // rendered baseline. Do not make that history dissolve again.
@@ -577,6 +629,11 @@ impl MarkdownView {
         let append = !changed || text.starts_with(self.parser.text());
         if changed {
             self.parser.set_text(text);
+            if !append {
+                // A rewrite (edit, rewind, replacement) can change every
+                // block, so the measured heights no longer describe the body.
+                self.forget_measured_geometry();
+            }
         }
         // The mended display tail depends only on the source and the
         // streaming flag. Deriving it re-mends — and, with a hanging marker,
@@ -589,6 +646,22 @@ impl MarkdownView {
             } else {
                 Vec::new()
             };
+            if changed {
+                // A height measured while a block sat in the mended tail can
+                // differ from the same range's settled render (mending closes
+                // markers without changing the source range), so those entries
+                // go stale the moment a block settles. Drop everything from
+                // the previous volatile start: those blocks are rendered every
+                // frame anyway, and one that just left the region forces a
+                // single measuring pass instead of sizing a spacer with a
+                // mended height.
+                let volatile = self.volatile_from.get() >> BLOCK_ORDINAL_STRIDE_BITS;
+                self.heights
+                    .borrow_mut()
+                    .iter_mut()
+                    .skip(volatile)
+                    .for_each(|entry| entry.1 = None);
+            }
             if changed || tail != self.tail {
                 self.tail = tail;
                 // Markdown block structure only ever extends the final block,
@@ -599,11 +672,142 @@ impl MarkdownView {
                     .borrow_mut()
                     .retain(|ordinal, _| *ordinal < boundary);
             }
+            if changed {
+                // Inline math or an image can arrive inside an existing block
+                // without moving a block boundary, so the block count is no
+                // test for whether the async content changed: scan whenever
+                // the content did.
+                self.async_blocks
+                    .set(self.blocks().any(block_has_async_content));
+            }
         }
+    }
+
+    /// Advance the clipped height toward the body's real height.
+    ///
+    /// The row's height is what the transcript pins to, and text layout grows
+    /// it in whole-line steps; pinning that step is the vertical jolt no
+    /// amount of grapheme fading hides. This keeps the row's *reported* height
+    /// continuous instead: it leads the height measured last frame, so a line
+    /// laid out this frame lands in space that already exists, and the row
+    /// never reports a step. It never falls below that measured height either,
+    /// so only text appended since the measurement can lie under the clip —
+    /// and the veil has not painted that yet. That justification depends on the
+    /// veil and on the body growing only by appended text: without animation
+    /// there is nothing holding appended text invisible, and an image or
+    /// formula lands opaque and resizes the block it sits in, so both release
+    /// the clip and let the row report the body's real height.
+    pub fn advance_clip(&self, animate: bool, now: Instant) {
+        let dt = now
+            .saturating_duration_since(self.clip_at.get())
+            .as_secs_f32();
+        self.clip_at.set(now);
+        let Some(height) = self.body_height.get() else {
+            self.release_clip();
+            return;
+        };
+        if !animate || self.async_blocks.get() || self.veil.borrow().is_seeding() {
+            // A pinned clip is the height measured last frame. Without the
+            // veil, every appended line has since grown past it and those
+            // bytes are opaque, so pinning would only cut the text the reader
+            // is waiting for. An image or formula has the same problem with
+            // the veil on: it lands opaque on a later frame and can grow the
+            // body past a height measured before it, and no veiled grapheme
+            // is what would be cut. A seeded veil is the same story for a
+            // re-attach: it adopts the body it finds, text that arrived while
+            // the row was off screen included, at full opacity, so a height
+            // measured before the attach would cut exactly that text.
+            self.release_clip();
+            return;
+        }
+        // The container paves the road *ahead* of the body: it grows at the
+        // body's smoothed rate so the next line lands in space that already
+        // exists, and the row's reported height never steps. It stays at or
+        // above the last measured body height and the veil holds newly
+        // appended graphemes invisible, so the gap under the text is the only
+        // artifact, bounded by the rate lead.
+        let growth = match self.clip_last_height.get() {
+            Some(previous) if height > previous => f32::from(height - previous),
+            _ => 0.0,
+        };
+        let observed = if dt > 0.0 { growth / dt } else { 0.0 };
+        let rate = if growth > 0.0 {
+            self.clip_rate.get() * 0.75 + observed * 0.25
+        } else {
+            self.clip_rate.get() * 0.9
+        };
+        self.clip_rate.set(rate);
+        self.clip_last_height.set(Some(height));
+
+        let current = self.clip.get().unwrap_or(height);
+        // Feed-forward: chase a target a short slice of growth ahead, so the
+        // spring absorbs steps instead of lagging the arrival.
+        let target = (height + px(rate * 0.10)).min(height + px(CLIP_RUNWAY_MAX));
+        // Critically damped spring on (position, velocity). A body step
+        // changes only the acceleration, so the row's motion stays smooth
+        // through it.
+        let stiffness = 220.0_f32;
+        let damping = 2.0 * (stiffness).sqrt();
+        let mut velocity = self.clip_velocity.get();
+        let accel = stiffness * f32::from(target - current) - damping * velocity;
+        velocity = (velocity + accel * dt).max(0.0);
+        self.clip_velocity.set(velocity);
+        let next = (current + px(velocity * dt)).max(height);
+        self.clip.set(Some(next.min(height + px(CLIP_RUNWAY_MAX))));
+    }
+
+    /// Forget the geometry measured for the old body: the block heights, the
+    /// body height, and the clip sized from them. They are one answer at one
+    /// wrapping, and the clip alone is not enough to drop: `advance_clip`
+    /// reads the body height back and would pin the stale height on the very
+    /// frame that has since re-wrapped.
+    fn forget_measured_geometry(&self) {
+        self.heights.borrow_mut().clear();
+        self.body_height.set(None);
+        self.release_clip();
+    }
+
+    /// Drop the leading container height. `None` reports the whole body, which
+    /// is what anything that invalidates the measured height needs: a retained
+    /// clip is a height the body has since grown past, and the row would cut
+    /// off the text below it.
+    fn release_clip(&self) {
+        self.clip.set(None);
+        self.clip_last_height.set(None);
+        self.clip_rate.set(0.0);
+        self.clip_velocity.set(0.0);
+    }
+
+    /// The container height the row should report, when the controller holds
+    /// one. It is never below the height measured last frame, so it hides no
+    /// text the veil has already painted.
+    pub fn clip_height(&self) -> Option<Pixels> {
+        self.clip.get()
     }
 
     pub fn is_fading(&self) -> bool {
         self.streaming.get() && self.veil.borrow().is_fading()
+    }
+
+    /// Whether an image or formula anywhere in the body can resize itself on
+    /// a later frame, which makes it unsafe to window this body.
+    pub fn has_async_blocks(&self) -> bool {
+        self.async_blocks.get()
+    }
+
+    /// Point the height ledger at the width the next pass lays out at. A
+    /// changed width drops every recorded height: a block re-wraps, so the
+    /// spacer arithmetic would otherwise carry the old reflow into the row.
+    /// The transcript row records the width before every body render, because
+    /// its own frame is the only place that knows one: a windowed frame is not
+    /// guaranteed, and a pass that wraps the body at a new width has to drop
+    /// the geometry measured at the old one either way.
+    pub fn set_render_width(&self, width: f32) {
+        if self.heights_width.replace(Some(width)) != Some(width) {
+            // The clip is a height at the old wrapping, so it is no more valid
+            // than the heights are: keeping it would cut the re-wrapped body.
+            self.forget_measured_geometry();
+        }
     }
 
     /// Drop cached flats if the style they were built for no longer applies.
@@ -612,6 +816,9 @@ impl MarkdownView {
         if self.style.get() != Some(current) {
             self.style.set(Some(current));
             self.flats.borrow_mut().clear();
+            // A metrics change moves every block's height, so the spacer
+            // ledger has to be rebuilt at the new scale too.
+            self.forget_measured_geometry();
         }
     }
 
@@ -626,17 +833,18 @@ impl MarkdownView {
 
     /// Display blocks in document order: the settled prefix, then the mended
     /// tail when one is active.
-    fn blocks(&self) -> impl Iterator<Item = &Block> + '_ {
+    fn top_blocks(&self) -> impl Iterator<Item = &TopBlock> + '_ {
         let all = &self.parser.tree().blocks;
         let settled = if self.tail.is_empty() {
             all.len()
         } else {
             self.parser.display_tail_start()
         };
-        all[..settled]
-            .iter()
-            .chain(self.tail.iter())
-            .map(|top| &top.block)
+        all[..settled].iter().chain(self.tail.iter())
+    }
+
+    fn blocks(&self) -> impl Iterator<Item = &Block> + '_ {
+        self.top_blocks().map(|top| &top.block)
     }
 }
 
@@ -693,6 +901,26 @@ impl<'a> Ctx<'a> {
 
     pub fn selection(&self) -> &TranscriptSelection {
         &self.selection
+    }
+
+    /// Whether this render carries search marks whose geometry a reveal pass
+    /// reads back from the frame's registry. A windowed body must not hide a
+    /// block the reveal is looking for.
+    pub fn has_search(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Annotation marks need the same registry geometry as search marks.
+    pub fn has_annotations(&self) -> bool {
+        self.annotations.is_some()
+    }
+
+    /// Whether a selection is live. Its spans and its drag anchor name
+    /// registry entries — a shift-click resolves against them — so a windowed
+    /// body must not omit the blocks they sit in.
+    pub fn has_selection(&self) -> bool {
+        let selection = self.selection.selection.borrow();
+        selection.anchor().is_some() || !selection.spans().is_empty()
     }
 
     pub fn with_link_handler(mut self, handler: LinkHandler) -> Self {
@@ -1503,72 +1731,329 @@ fn search_text(
 }
 
 /// Render a markdown body. Returns `None` when it has no content.
+///
+/// This is the pass a windowless frame of the streamed response takes, and the
+/// one [`markdown_windowed`] falls back to, so it fills the height ledger while
+/// the body streams — except for a body holding an image or a formula, which no
+/// window is built for.
 pub fn markdown<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<AnyElement> {
-    markdown_capped(view, ctx, usize::MAX)
+    markdown_capped(view, ctx, usize::MAX, true)
 }
 
 /// Like [`markdown`], but builds only the trailing `max_blocks` top-level
 /// blocks. The live reasoning peek shows a tail-pinned viewport while a
 /// thought streams, and building the whole growing document every pulse tick
 /// made a long think O(document) per frame; the cap makes it O(window).
+///
+/// A tail is never a body a window reads, so it keeps no height ledger: the
+/// peek would otherwise pay one measured wrapper per rendered block per pulse
+/// tick for heights nothing reads.
 pub fn markdown_tail<'a>(
     view: &'a MarkdownView,
     ctx: &Ctx<'a>,
     max_blocks: usize,
 ) -> Option<AnyElement> {
-    markdown_capped(view, ctx, max_blocks.max(1))
+    markdown_capped(view, ctx, max_blocks, false)
+}
+
+/// Extra pixels above and below the viewport that a windowed body renders.
+/// It covers a scroll between frames: the plan is built from the row bounds of
+/// the previous frame, so a jump larger than this leaves the dropped blocks
+/// unbuilt until the bounds catch up on the next frame.
+pub const MARKDOWN_WINDOW_MARGIN: f32 = 600.0;
+
+/// The prologue every body pass shares: the document's top-level blocks, the
+/// flatten cache scoped to this view, the height ledger a streaming body
+/// keeps, and the veil frame it opens.
+struct BodyPass<'a> {
+    blocks: Vec<&'a TopBlock>,
+    ctx: Ctx<'a>,
+    /// Measured height of every top-level block, filled only on the pass of a
+    /// streaming body a window can read: a window is the ledger's one reader,
+    /// and a body holding an image or a formula is never windowed.
+    heights: Option<BlockHeights>,
+    /// Whether this body is streaming with the dissolve animating.
+    animate: bool,
+}
+
+/// Collect what a body pass needs before it builds a block. `keeps_heights`
+/// marks the passes whose body a window can read — [`markdown`] and
+/// [`markdown_windowed`], never [`markdown_tail`], whose live reasoning peek no
+/// window reads. `None` when the body has no content — the veil frame is closed
+/// first, so a caller returns straight through.
+fn begin_body<'a>(
+    view: &'a MarkdownView,
+    ctx: &Ctx<'a>,
+    keeps_heights: bool,
+) -> Option<BodyPass<'a>> {
+    let blocks = view.top_blocks().collect::<Vec<_>>();
+    let animate = ctx.animate_streaming && view.streaming.get();
+    if blocks.is_empty() {
+        if animate {
+            let mut veil = view.veil.borrow_mut();
+            veil.begin_frame();
+            veil.finish_frame(ctx.now);
+        }
+        return None;
+    }
+
+    view.sync_style(ctx.palette, &ctx.metrics);
+    if animate {
+        view.veil.borrow_mut().begin_frame();
+    }
+    // Everything before the final block is settled, so its flattened elements
+    // stay cacheable across appends; the volatile region is the mended display
+    // tail, whose elements must be built even when the viewport is elsewhere.
+    view.volatile_from
+        .set(block_ordinal_base(view.parser.display_tail_start()));
+    // Sized before any block is built, so every `Measured` wrapper knows its
+    // own slot; `resize` truncates too, which is what a shrunk body needs.
+    // Only a streaming body a window can read keeps the ledger, and it fills on
+    // every frame of that body, including the ones its window falls back to a
+    // plain walk — those measure the blocks the windowed frames then size their
+    // spacers from. Every other pass would pay one wrapper element per
+    // top-level block per frame for a ledger nothing reads: a settled body, the
+    // live reasoning tail, and a body holding an image or a formula, which
+    // `markdown_windowed` refuses before it gets here.
+    let heights = (keeps_heights && view.streaming.get() && !view.has_async_blocks()).then(|| {
+        let heights = view.heights.clone();
+        heights.borrow_mut().resize(blocks.len(), (0..0, None));
+        heights
+    });
+    Some(BodyPass {
+        blocks,
+        ctx: ctx.with_cache(view),
+        heights,
+        animate,
+    })
+}
+
+/// The part of a long streaming body the transcript viewport can see, in the
+/// row's own pixel coordinates. The body's own offset within the row — the
+/// row's padding plus the turn gap, under 64 px — is left in: it is far inside
+/// `MARKDOWN_WINDOW_MARGIN`, which is what makes the plan conservative. The
+/// renderer builds only the blocks that intersect this range (plus a margin
+/// and the volatile tail), so a dissolve tick costs the visible body rather
+/// than the whole response.
+#[derive(Clone, Copy)]
+pub struct MessageBodyWindow {
+    pub visible_top: f32,
+    pub visible_height: f32,
+}
+
+/// Render only the part of a long streaming body that a frame can show.
+///
+/// A streaming response row is one virtualized list item: the moment any part
+/// of it is visible, `list()` rebuilds and lays out the *whole* body, and the
+/// dissolve lease repeats that at up to 120 fps. This walks the block offsets
+/// recorded from earlier layouts, builds the blocks intersecting the viewport
+/// (plus a margin and the volatile tail), and stands in for the rest with
+/// spacers sized from the same ledger. A body whose heights are not all known
+/// yet falls back to one full pass, which measures it.
+pub fn markdown_windowed<'a>(
+    view: &'a MarkdownView,
+    ctx: &Ctx<'a>,
+    window: MessageBodyWindow,
+) -> Option<AnyElement> {
+    // A window stands in for the blocks it drops, which is only sound while
+    // the frame has no other use for them: a search mark, an annotation mark,
+    // and a selection are read back from the registry the built elements
+    // fill, and a body holding an image or a formula can resize a block after
+    // its first frame.
+    if view.has_async_blocks() || ctx.has_search() || ctx.has_annotations() || ctx.has_selection() {
+        return markdown(view, ctx);
+    }
+    let BodyPass {
+        blocks,
+        ctx,
+        heights,
+        animate,
+    } = begin_body(view, ctx, true)?;
+    // A window is only ever built for a streaming body, which is the same
+    // condition the ledger is kept under.
+    let heights = heights.expect("a windowed body always keeps its height ledger");
+
+    let gap = px(ctx.metrics.block_gap);
+    let plan = window_plan(
+        &heights,
+        &blocks,
+        gap,
+        window.visible_top,
+        window.visible_height,
+        view.parser.display_tail_start(),
+    );
+
+    let mut children = Vec::with_capacity(plan.child_count());
+    for (group_ix, group) in plan.groups.iter().enumerate() {
+        if let Some(spacer) = plan.spacers[group_ix] {
+            children.push(spacer_element(spacer));
+        }
+        children.extend(render_block_range(
+            &blocks,
+            &ctx,
+            group.clone(),
+            Some(&heights),
+        ));
+    }
+
+    if animate {
+        view.veil.borrow_mut().finish_frame(ctx.now);
+    }
+
+    Some(block_column(children, &ctx).into_any_element())
+}
+
+/// Which blocks one frame of a windowed body builds, and the spacers that
+/// stand in for the rest. `spacers` runs one entry per group: the spacer that
+/// enters *before* that group. `None` marks a boundary at the body's own edge,
+/// where no block was dropped and so no gap is owed; `Some` is a dropped
+/// span's exact height, which is zero for a span of exactly one block gap and
+/// must still be built for that gap. No spacer is owed after the last group:
+/// the volatile tail always closes the window at the body's last block.
+struct WindowPlan {
+    groups: Vec<Range<usize>>,
+    spacers: Vec<Option<Pixels>>,
+}
+
+impl WindowPlan {
+    /// Elements one frame of this plan builds: every block of every group,
+    /// plus the spacers standing in for the blocks it dropped.
+    fn child_count(&self) -> usize {
+        self.spacers
+            .iter()
+            .filter(|spacer| spacer.is_some())
+            .count()
+            + self.groups.iter().map(Range::len).sum::<usize>()
+    }
+}
+
+/// Choose the block window for a viewport at `visible_top` in the body's own
+/// coordinates. Blocks whose height is not yet known make the spacer
+/// arithmetic a guess, so the plan falls back to the whole body and lets that
+/// pass measure it.
+fn window_plan(
+    heights: &BlockHeights,
+    blocks: &[&TopBlock],
+    gap: Pixels,
+    visible_top: f32,
+    visible_height: f32,
+    volatile_start: usize,
+) -> WindowPlan {
+    let heights = heights.borrow();
+    let count = blocks.len();
+    // A height counts only when it was measured for the block that currently
+    // owns this index; a re-partition makes the stored range disagree, and the
+    // plan then measures afresh instead of using another block's height.
+    let measured: Option<Vec<Pixels>> = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, top)| match heights.get(index) {
+            Some((stored, height)) if stored == &top.range => *height,
+            // The volatile region is always built — the merge below starts
+            // every group at its first block — so its heights never size a
+            // spacer, and mending rewrites its range every frame. Only a
+            // mismatch before it means the ledger itself is misaligned.
+            _ if index >= volatile_start => Some(Pixels::ZERO),
+            _ => None,
+        })
+        .collect();
+    let Some(measured) = measured else {
+        return WindowPlan {
+            groups: vec![0..count],
+            spacers: vec![None],
+        };
+    };
+
+    // `starts[i]` is block `i`'s top within the body; the trailing `gap` is
+    // folded into each step so the flex column's own gap matches it exactly.
+    let mut starts = Vec::with_capacity(count);
+    let mut cursor = Pixels::ZERO;
+    for height in &measured {
+        starts.push(cursor);
+        cursor += *height + gap;
+    }
+
+    let from = visible_top - MARKDOWN_WINDOW_MARGIN;
+    let to = visible_top + visible_height + MARKDOWN_WINDOW_MARGIN;
+    let mut groups: Vec<Range<usize>> = Vec::with_capacity(2);
+    let start = starts
+        .iter()
+        .enumerate()
+        .position(|(index, top)| f32::from(*top) + f32::from(measured[index]) > from)
+        .unwrap_or(count);
+    let end = starts
+        .iter()
+        .position(|top| f32::from(*top) >= to)
+        .unwrap_or(count);
+    if start < end {
+        groups.push(start..end);
+    }
+    // The volatile tail is built every frame and always reaches the body's
+    // last block, so it closes the window: no block is ever dropped below the
+    // last group, and nothing is owed after it.
+    let volatile = volatile_start..count;
+    if volatile.start < volatile.end {
+        match groups.last_mut() {
+            // No height of the volatile region is ever measured, so none of it
+            // may be dropped: a viewport whose own window starts inside the
+            // region still has to build it from its first block, or the blocks
+            // between the two starts disappear and no spacer stands in for
+            // them.
+            Some(last) if volatile.start <= last.end => {
+                last.start = last.start.min(volatile.start);
+                last.end = last.end.max(volatile.end);
+            }
+            _ => groups.push(volatile),
+        }
+    }
+
+    // One spacer per group, standing in for the blocks dropped above it: the
+    // hidden span minus one `gap`, because the flex column adds a gap on each
+    // side of it, which is exactly the boundary the hidden block would have
+    // had. The first span has only one neighbour, and a boundary at the body's
+    // own edge drops no block and so owes no gap.
+    let mut spacers = Vec::with_capacity(groups.len());
+    for (index, group) in groups.iter().enumerate() {
+        let before = if index == 0 {
+            (group.start > 0).then(|| starts[group.start] - gap)
+        } else {
+            Some(starts[group.start] - starts[groups[index - 1].end] - gap)
+        };
+        spacers.push(before);
+    }
+
+    WindowPlan { groups, spacers }
+}
+
+/// A spacer standing in for the dropped blocks between two groups. It is built
+/// even at zero height: the flex column's gaps on either side are the whole
+/// point of it, and a span of exactly one gap leaves no height to give it.
+fn spacer_element(height: Pixels) -> AnyElement {
+    div().flex_none().w_full().h(height).into_any_element()
 }
 
 fn markdown_capped<'a>(
     view: &'a MarkdownView,
     ctx: &Ctx<'a>,
     max_blocks: usize,
+    keeps_heights: bool,
 ) -> Option<AnyElement> {
-    let blocks = view.blocks().collect::<Vec<_>>();
-    let Some((&last, leading)) = blocks.split_last() else {
-        if ctx.animate_streaming && view.streaming.get() {
-            let mut veil = view.veil.borrow_mut();
-            veil.begin_frame();
-            veil.finish_frame();
-        }
-        return None;
-    };
+    let BodyPass {
+        blocks,
+        ctx,
+        heights,
+        animate,
+    } = begin_body(view, ctx, keeps_heights)?;
 
-    view.sync_style(ctx.palette, &ctx.metrics);
-    let ctx = ctx.with_cache(view);
-    if ctx.animate_streaming && view.streaming.get() {
-        view.veil.borrow_mut().begin_frame();
-    }
     let first = blocks.len().saturating_sub(max_blocks);
-    let mut children = Vec::with_capacity(blocks.len() - first);
-    for (block_ix, block) in leading.iter().enumerate().skip(first) {
-        ctx.next_ordinal.set(block_ordinal_base(block_ix));
-        children.push(render_block(block, &ctx));
-        debug_assert!(
-            ctx.next_ordinal.get() - block_ordinal_base(block_ix) < 1 << BLOCK_ORDINAL_STRIDE_BITS,
-            "a single block overflowed its ordinal stride"
-        );
-    }
-    // Everything before the final block is settled, so its flattened elements
-    // stay cacheable across appends.
-    let last_base = block_ordinal_base(blocks.len() - 1);
-    ctx.next_ordinal.set(last_base);
-    view.volatile_from
-        .set(block_ordinal_base(view.parser.display_tail_start()));
-    children.push(render_block(last, &ctx));
-    if ctx.animate_streaming && view.streaming.get() {
+    let children = render_block_range(&blocks, &ctx, first..blocks.len(), heights.as_ref());
+    if animate {
         // Every element visible on the attach pass has synchronously adopted
         // its baseline. Elements introduced by later appends should now fade.
-        view.veil.borrow_mut().finish_frame();
+        view.veil.borrow_mut().finish_frame(ctx.now);
     }
 
-    let element = div()
-        .w_full()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .gap(px(ctx.metrics.block_gap))
-        .children(children);
+    let element = block_column(children, &ctx);
     Some(
         if ctx.math_enabled
             && ctx.wrap_math_menu
@@ -1584,6 +2069,190 @@ fn markdown_capped<'a>(
             element.into_any_element()
         },
     )
+}
+
+fn block_column(children: Vec<AnyElement>, ctx: &Ctx) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(ctx.metrics.block_gap))
+        .children(children)
+}
+
+/// Whether `block` contains content whose layout arrives after its first
+/// frame: an image loading, or a formula rasterizing from selectable source.
+fn block_has_async_content(block: &Block) -> bool {
+    match block {
+        Block::Image { .. } | Block::DisplayMath { .. } => true,
+        Block::Paragraph { runs } | Block::Heading { runs, .. } => {
+            runs.iter().any(|run| run.style.math)
+        }
+        Block::CodeBlock { .. } | Block::Rule => false,
+        Block::BlockQuote { children } => children.iter().any(block_has_async_content),
+        Block::List { items, .. } => items
+            .iter()
+            .any(|item| item.blocks.iter().any(block_has_async_content)),
+        Block::Table { header, rows, .. } => header
+            .iter()
+            .flatten()
+            .chain(rows.iter().flatten().flatten())
+            .any(|run| run.style.math),
+    }
+}
+
+/// Build one contiguous run of top-level blocks. Where the pass keeps a height
+/// ledger, every rendered block records its laid-out height, which is what
+/// lets a later frame window the body.
+fn render_block_range(
+    blocks: &[&TopBlock],
+    ctx: &Ctx,
+    range: Range<usize>,
+    heights: Option<&BlockHeights>,
+) -> Vec<AnyElement> {
+    let mut children = Vec::with_capacity(range.len());
+    for block_ix in range {
+        ctx.next_ordinal.set(block_ordinal_base(block_ix));
+        let rendered = render_block(&blocks[block_ix].block, ctx);
+        debug_assert!(
+            ctx.next_ordinal.get() - block_ordinal_base(block_ix) < 1 << BLOCK_ORDINAL_STRIDE_BITS,
+            "a single block overflowed its ordinal stride"
+        );
+        children.push(match heights {
+            None => rendered,
+            Some(heights) => Measured {
+                inner: rendered,
+                sink: MeasureSink::Block {
+                    heights: heights.clone(),
+                    index: block_ix,
+                    range: blocks[block_ix].range.clone(),
+                },
+            }
+            .into_any_element(),
+        });
+    }
+    children
+}
+
+/// Wrap a streaming body in the clip layer: measure its real height, and
+/// while a gap is open report the continuous clip height instead. Only a
+/// streaming body has a controller reading that height, so a settled one is
+/// handed back untouched.
+pub fn clip_body(view: &MarkdownView, body: AnyElement) -> AnyElement {
+    if !view.streaming.get() {
+        return body;
+    }
+    let body = measure_body(view, body);
+    match view.clip_height() {
+        // `items_start` matters: a default flex row would stretch the body to
+        // the clip height, and the controller would never see the real one.
+        Some(clip) => div()
+            .w_full()
+            .min_w_0()
+            .h(clip)
+            .flex()
+            .items_start()
+            .overflow_hidden()
+            .child(body)
+            .into_any_element(),
+        None => body,
+    }
+}
+
+/// Wrap a streaming body so the clip controller knows its real height.
+fn measure_body(view: &MarkdownView, inner: AnyElement) -> AnyElement {
+    Measured {
+        inner,
+        sink: MeasureSink::Body(view.body_height.clone()),
+    }
+    .into_any_element()
+}
+
+/// Where a [`Measured`] wrapper records the height it laid out at.
+enum MeasureSink {
+    /// The streaming body's own height, for the clip controller.
+    Body(Rc<Cell<Option<Pixels>>>),
+    /// One block's slot in the height ledger, for the window planner.
+    Block {
+        heights: BlockHeights,
+        index: usize,
+        range: Range<usize>,
+    },
+}
+
+/// Wraps an element to record the height it laid out at, for whoever asked to
+/// measure it: the clip controller ([`clip_body`]) or the window planner
+/// ([`render_block_range`]).
+struct Measured {
+    inner: AnyElement,
+    sink: MeasureSink,
+}
+
+impl IntoElement for Measured {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for Measured {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, ()) {
+        (self.inner.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        match &self.sink {
+            MeasureSink::Body(height) => height.set(Some(bounds.size.height)),
+            MeasureSink::Block {
+                heights,
+                index,
+                range,
+            } => {
+                heights.borrow_mut()[*index] = (range.clone(), Some(bounds.size.height));
+            }
+        }
+        self.inner.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        self.inner.paint(window, cx);
+    }
 }
 
 fn render_block(block: &Block, ctx: &Ctx) -> AnyElement {
@@ -1962,9 +2631,9 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &Ctx) -> AnyElemen
         .w_full()
         .min_w_0()
         .rounded(px(8.0))
-        .border_1()
-        .border_color(ctx.palette.border)
-        .bg(ctx.palette.inset)
+        // The faint wash the tool activity detail blocks use, so a fenced
+        // block reads as part of the prose instead of a dark panel.
+        .bg(ctx.palette.overlay.opacity(0.7))
         .overflow_hidden()
         .child(
             div()
@@ -2558,6 +3227,891 @@ mod tests {
         });
         assert!(!bold, "a settled response must not invent a closer");
         assert_eq!(view.blocks().count(), 2);
+    }
+
+    /// Manual streaming-frame measurement, mirroring the transcript's worst
+    /// case: one long visible body redrawn at the dissolve cadence. Run with
+    /// `cargo test --locked -p waku --lib bench_markdown_frame -- --ignored --nocapture`.
+    #[gpui::test]
+    #[ignore = "manual performance measurement"]
+    fn bench_markdown_frame(cx: &mut TestAppContext) {
+        struct BenchData {
+            view: MarkdownView,
+            palette: Palette,
+            /// `Some((visible_top, visible_height))` renders windowed.
+            window: Option<(f32, f32)>,
+        }
+
+        struct BenchWindow {
+            data: Rc<RefCell<BenchData>>,
+        }
+
+        impl gpui::Render for BenchWindow {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                let data = self.data.borrow();
+                let ctx = Ctx::new(
+                    "bench",
+                    &data.palette,
+                    Metrics::BODY,
+                    TranscriptSelection::default(),
+                );
+                let body = match data.window {
+                    Some((top, height)) => markdown_windowed(
+                        &data.view,
+                        &ctx,
+                        MessageBodyWindow {
+                            visible_top: top,
+                            visible_height: height,
+                        },
+                    ),
+                    None => markdown(&data.view, &ctx),
+                };
+                div()
+                    .w(px(700.0))
+                    .child(body.unwrap_or_else(|| div().into_any_element()))
+            }
+        }
+
+        let data = Rc::new(RefCell::new(BenchData {
+            view: MarkdownView::new(),
+            palette: Palette::from_theme(&Theme::dark()),
+            window: None,
+        }));
+        let (entity, visual) = cx.add_window_view(|_, _| BenchWindow {
+            data: Rc::clone(&data),
+        });
+        let draw = |visual: &mut gpui::VisualTestContext, entity: &gpui::Entity<BenchWindow>| {
+            visual.update(|window, cx| {
+                entity.update(cx, |_, cx| cx.notify());
+                window.draw(cx).clear(cx);
+            });
+        };
+        let paragraphs = |count: usize| {
+            let mut source = String::new();
+            for i in 0..count {
+                source.push_str(&format!(
+                    "Paragraph {i} with several words that need shaping and wrapping across the transcript column.\n\n"
+                ));
+            }
+            source
+        };
+        let list_items = |count: usize| {
+            let mut source = String::new();
+            for i in 0..count {
+                source.push_str(&format!(
+                    "- Item {i} with several words that need shaping and wrapping across the transcript column.\n"
+                ));
+            }
+            source
+        };
+        // A single top-level block is one window group, so the window cannot
+        // bound its frame however tall it grows. Both shapes are timed.
+        for (label, source) in [
+            ("50 paragraph blocks", paragraphs(50)),
+            ("400 paragraph blocks", paragraphs(400)),
+            ("one list of 400 items", list_items(400)),
+        ] {
+            {
+                let mut data = data.borrow_mut();
+                data.view.set_text(&source, true);
+                // The row records the wrap width before every body render; the
+                // body below lays out at the same 700 px.
+                data.view.set_render_width(700.0);
+                data.window = None;
+            }
+            // Two frames so the ledger is filled before it is timed.
+            draw(visual, &entity);
+            draw(visual, &entity);
+
+            const FRAMES: u32 = 10;
+            let start = std::time::Instant::now();
+            for _ in 0..FRAMES {
+                draw(visual, &entity);
+            }
+            println!("{label} full per-frame={:?}", start.elapsed() / FRAMES);
+
+            let (total, gap) = {
+                let data = data.borrow();
+                let heights = data.view.heights.borrow();
+                let gap = px(Metrics::BODY.block_gap);
+                let total = heights
+                    .iter()
+                    .filter_map(|(_, height)| *height)
+                    .sum::<Pixels>()
+                    + gap * (heights.len().saturating_sub(1)) as f32;
+                (f32::from(total), f32::from(gap))
+            };
+            data.borrow_mut().window = Some(((total - 900.0).max(0.0), 800.0));
+            draw(visual, &entity);
+            let start = std::time::Instant::now();
+            for _ in 0..FRAMES {
+                draw(visual, &entity);
+            }
+            println!(
+                "{label} windowed per-frame={:?} (gap={gap})",
+                start.elapsed() / FRAMES
+            );
+            data.borrow_mut().window = None;
+        }
+    }
+
+    fn plan_height(plan: &WindowPlan, heights: &[Pixels], gap: Pixels) -> Pixels {
+        let mut height = Pixels::ZERO;
+        let mut children = 0usize;
+        for (index, group) in plan.groups.iter().enumerate() {
+            if let Some(spacer) = plan.spacers[index] {
+                height += spacer;
+                children += 1;
+            }
+            for block in group.clone() {
+                height += heights[block];
+                children += 1;
+            }
+        }
+        if children > 1 {
+            height += gap * (children - 1) as f32;
+        }
+        height
+    }
+
+    /// The planner reads nothing but each block's source range, so a test
+    /// hands it ranges dressed as blocks.
+    fn ranged_blocks(ranges: &[Range<usize>]) -> Vec<TopBlock> {
+        ranges
+            .iter()
+            .map(|range| TopBlock {
+                range: range.clone(),
+                block: Block::Rule,
+            })
+            .collect()
+    }
+
+    /// The spacers stand in for hidden blocks, so a windowed body has to
+    /// measure exactly what the full body would — and it must build every
+    /// block the viewport can reach.
+    #[test]
+    fn window_plan_spacers_reconstruct_the_body_height() {
+        let gap = px(10.0);
+        let heights = (0..60)
+            .map(|index| {
+                (
+                    index..index + 1,
+                    Some(px(((index % 7) as f32 + 1.0) * 24.0)),
+                )
+            })
+            .collect::<Vec<(Range<usize>, Option<Pixels>)>>();
+        let measured = heights
+            .iter()
+            .map(|(_, height)| height.unwrap())
+            .collect::<Vec<_>>();
+        let ranges = heights
+            .iter()
+            .map(|(range, _)| range.clone())
+            .collect::<Vec<_>>();
+        let body = ranged_blocks(&ranges);
+        let blocks = body.iter().collect::<Vec<_>>();
+        let full = measured.iter().copied().sum::<Pixels>() + gap * (measured.len() - 1) as f32;
+        let heights = Rc::new(RefCell::new(heights));
+
+        for (top, height) in [
+            (0.0_f32, 200.0_f32),
+            (400.0, 200.0),
+            (2600.0, 200.0),
+            (1_000_000.0, 200.0),
+        ] {
+            // The volatile tail is the last two blocks; it is always built.
+            let plan = window_plan(&heights, &blocks, gap, top, height, measured.len() - 2);
+            assert!(
+                f32::from(plan_height(&plan, &measured, gap) - full).abs() < 0.01,
+                "top={top} groups={:?}",
+                plan.groups
+            );
+            assert_eq!(
+                plan.groups.last().map(|group| group.end),
+                Some(measured.len()),
+                "the volatile tail always closes the window"
+            );
+
+            let mut cursor = Pixels::ZERO;
+            for (index, block) in measured.iter().enumerate() {
+                let block_top = cursor;
+                let block_bottom = cursor + *block;
+                if f32::from(block_bottom) > top && f32::from(block_top) < top + height {
+                    assert!(
+                        plan.groups.iter().any(|group| group.contains(&index)),
+                        "top={top} hid visible block {index}: {:?}",
+                        plan.groups
+                    );
+                }
+                cursor = block_bottom + gap;
+            }
+        }
+
+        // An unknown height makes the spacer arithmetic a guess, so the plan
+        // renders the whole body and lets that pass measure it.
+        heights.borrow_mut()[7].1 = None;
+        let plan = window_plan(&heights, &blocks, gap, 400.0, 200.0, measured.len() - 2);
+        assert_eq!(plan.groups, vec![0..measured.len()]);
+        assert_eq!(plan.spacers, vec![None]);
+    }
+
+    /// A hidden span of exactly one gap owes a zero-height spacer, not none:
+    /// the spacer is what carries the flex column's two surrounding gaps, so
+    /// dropping it would shorten the body by a whole gap. Block 0 measures
+    /// zero here, which makes the span above block 1 exactly that.
+    #[test]
+    fn a_zero_height_hidden_span_still_reconstructs_its_gap() {
+        let gap = px(10.0);
+        let heights = Rc::new(RefCell::new(vec![
+            (0..1, Some(px(0.0))),
+            (1..2, Some(px(1_000.0))),
+            (2..3, Some(px(1_000.0))),
+        ]));
+        let body = ranged_blocks(&[0..1, 1..2, 2..3]);
+        let blocks = body.iter().collect::<Vec<_>>();
+        let measured = [px(0.0), px(1_000.0), px(1_000.0)];
+        let full = px(2_000.0) + gap * 2.0;
+
+        // A viewport on the second half leaves block 0 outside the window.
+        let plan = window_plan(&heights, &blocks, gap, 1_500.0, 100.0, 3);
+        assert_eq!(plan.groups, vec![1..3], "{:?}", plan.groups);
+        assert_eq!(
+            plan.spacers,
+            vec![Some(Pixels::ZERO)],
+            "the boundary above block 1 dropped a zero-height block"
+        );
+        assert_eq!(plan_height(&plan, &measured, gap), full);
+    }
+
+    /// The volatile region's heights are never measured, so a window may start
+    /// only at its first block: a viewport whose own window starts inside the
+    /// region would otherwise drop the blocks between them with no height to
+    /// stand in for them.
+    #[test]
+    fn a_window_starting_inside_the_volatile_region_builds_all_of_it() {
+        let gap = px(10.0);
+        // Blocks 3-5 are the volatile tail: sized, but unmeasured — the state
+        // `begin_body` leaves them in.
+        let heights = Rc::new(RefCell::new(vec![
+            (0..1, Some(px(100.0))),
+            (1..2, Some(px(100.0))),
+            (2..3, Some(px(100.0))),
+            (0..0, None),
+            (0..0, None),
+            (0..0, None),
+        ]));
+        let body = ranged_blocks(&[0..1, 1..2, 2..3, 3..4, 4..5, 5..6]);
+        let blocks = body.iter().collect::<Vec<_>>();
+
+        // The margin puts the viewport's own window start at block 4, inside
+        // the volatile region.
+        let plan = window_plan(&heights, &blocks, gap, 935.0, 10.0, 3);
+        assert_eq!(plan.groups, vec![3..6], "{:?}", plan.groups);
+        assert_eq!(
+            plan.spacers,
+            vec![Some(px(320.0))],
+            "the spacer still stands in for the three hidden blocks"
+        );
+    }
+
+    /// The height ledger is what makes the spacers exact: appends keep it,
+    /// and anything that re-wraps or rewrites the body drops it.
+    #[test]
+    fn the_height_ledger_survives_appends_and_clears_on_reflow() {
+        let mut view = MarkdownView::new();
+        view.set_render_width(600.0);
+        view.set_text("First.\n\nSecond", true);
+        view.heights
+            .borrow_mut()
+            .extend([(0..1, Some(px(20.0))), (1..2, Some(px(30.0)))]);
+        // Block 0 is settled, block 1 is the mended tail.
+        view.volatile_from.set(1 << 16);
+
+        view.set_text("First.\n\nSecond and more", true);
+        assert_eq!(
+            view.heights.borrow().len(),
+            2,
+            "an append keeps the recorded heights"
+        );
+        assert!(
+            view.heights.borrow()[0].1.is_some(),
+            "a settled block's height survives an append"
+        );
+        assert!(
+            view.heights.borrow()[1].1.is_none(),
+            "the volatile block must be measured again"
+        );
+
+        view.set_render_width(500.0);
+        assert!(
+            view.heights.borrow().is_empty(),
+            "a reflow drops the ledger"
+        );
+
+        view.heights.borrow_mut().push((0..1, Some(px(20.0))));
+        view.set_text("Rewritten completely", true);
+        assert!(
+            view.heights.borrow().is_empty(),
+            "a rewrite drops the ledger"
+        );
+    }
+
+    /// The ledger costs one wrapper element per top-level block per frame, and
+    /// a window is its only reader, so only a streaming body a window can read
+    /// carries one — including on the frames that body's window falls back to a
+    /// plain walk, which are the frames that measure what a window later sizes
+    /// its spacers from.
+    #[test]
+    fn the_height_ledger_is_kept_only_where_a_window_reads_it() {
+        let palette = Palette::from_theme(&Theme::dark());
+        let mut view = MarkdownView::new();
+        view.set_text("one\n\ntwo", true);
+        let ctx = Ctx::new(
+            "row",
+            &palette,
+            Metrics::BODY,
+            TranscriptSelection::default(),
+        );
+        assert!(begin_body(&view, &ctx, true).unwrap().heights.is_some());
+        assert_eq!(
+            view.heights.borrow().len(),
+            2,
+            "the ledger is sized before any block is built"
+        );
+
+        // A body holding an image or a formula is never windowed, so its pass
+        // has no reader either: it keeps nothing.
+        let mut resizable = MarkdownView::new();
+        resizable.set_text("one\n\n![alt](pic.png)", true);
+        assert!(resizable.has_async_blocks());
+        assert!(
+            begin_body(&resizable, &ctx, true)
+                .unwrap()
+                .heights
+                .is_none()
+        );
+        assert!(
+            resizable.heights.borrow().is_empty(),
+            "a body no window reads sizes nothing"
+        );
+
+        // The live reasoning peek streams, but through `markdown_tail`: no
+        // window ever reads it, so its pass keeps nothing.
+        view.heights.borrow_mut().clear();
+        assert!(begin_body(&view, &ctx, false).unwrap().heights.is_none());
+        assert!(
+            view.heights.borrow().is_empty(),
+            "a pass no window reads sizes nothing"
+        );
+
+        view.set_text("one\n\ntwo", false);
+        assert!(begin_body(&view, &ctx, true).unwrap().heights.is_none());
+        assert!(
+            view.heights.borrow().is_empty(),
+            "a settled pass sizes nothing"
+        );
+    }
+
+    /// An append that starts a new top-level block is the one append that
+    /// costs a full pass. Its range match still holds — the block keeps the
+    /// source range it had in the mended tail — but its height is gone, so the
+    /// planner has nothing to size a spacer with and builds the whole body for
+    /// that frame. The ledger keeps every other entry, so the next frame
+    /// windows again.
+    #[test]
+    fn a_structural_append_costs_one_full_measuring_pass() {
+        let gap = px(10.0);
+        let mut view = MarkdownView::new();
+        view.set_render_width(600.0);
+        view.set_text("A\n\nB\n\nC\n\nD\n\nE\n\nF", true);
+        let recorded = view
+            .top_blocks()
+            .map(|top| (top.range.clone(), Some(px(1_000.0))))
+            .collect::<Vec<_>>();
+        assert_eq!(recorded.len(), 6, "fixture must parse to six blocks");
+        let volatile = view.parser.display_tail_start();
+        assert_eq!(volatile, 5, "only the last block is the mended tail");
+        view.volatile_from.set(block_ordinal_base(volatile));
+        *view.heights.borrow_mut() = recorded;
+
+        // A viewport on the last block builds it and the volatile block only;
+        // everything above them is a spacer.
+        let blocks = view.top_blocks().collect::<Vec<_>>();
+        let plan = window_plan(&view.heights, &blocks, gap, 5_000.0, 100.0, volatile);
+        assert_eq!(plan.groups, vec![4..6], "{:?}", plan.groups);
+
+        // Appending a seventh block promotes block 5 out of the tail: it keeps
+        // its range and loses its height, so this frame builds all seven.
+        view.set_text("A\n\nB\n\nC\n\nD\n\nE\n\nF\n\nG", true);
+        let blocks = view.top_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 7, "the append started a new top-level block");
+        let plan = window_plan(&view.heights, &blocks, gap, 5_000.0, 100.0, 6);
+        assert_eq!(plan.groups, vec![0..7], "{:?}", plan.groups);
+        assert_eq!(plan.spacers, vec![None]);
+    }
+
+    /// Images and formulas size themselves after their first frame, so a body
+    /// holding one cannot stand in for a hidden block with a remembered
+    /// height: it must render fully every pass.
+    #[test]
+    fn async_content_disables_windowing() {
+        let mut view = MarkdownView::new();
+        view.set_text("plain prose", true);
+        assert!(!view.has_async_blocks());
+
+        view.set_text("plain prose\n\n$$x^2$$", true);
+        assert!(view.has_async_blocks(), "display math");
+
+        let mut image = MarkdownView::new();
+        image.set_text("![alt](pic.png)", true);
+        assert!(image.has_async_blocks(), "image");
+
+        let mut math = MarkdownView::new();
+        math.set_text("inline $x^2$ here", true);
+        assert!(math.has_async_blocks(), "inline math");
+
+        let mut code = MarkdownView::new();
+        code.set_text("```txt\n$a^2$\n```", true);
+        assert!(!code.has_async_blocks(), "math in code stays literal");
+    }
+
+    /// Inline math can arrive inside an existing block without moving a block
+    /// boundary, so the async scan cannot be skipped when the block count
+    /// holds: `see $x` is one literal block and `see $x$` is one math block,
+    /// and only the scan sees the difference.
+    #[test]
+    fn async_content_is_rescanned_on_a_pure_append() {
+        let mut view = MarkdownView::new();
+        view.set_text("see $x", true);
+        assert!(!view.has_async_blocks(), "an unclosed $ stays literal");
+        view.set_text("see $x$", true);
+        assert!(
+            view.has_async_blocks(),
+            "inline math arrived on a pure append"
+        );
+    }
+
+    /// A live selection parks spans and a drag anchor in the frame registry,
+    /// which is the same geometry a search reveal reads back: a windowed body
+    /// must keep the full walk while one exists.
+    #[test]
+    fn a_live_selection_disables_windowing() {
+        let selection = TranscriptSelection::default();
+        let palette = Palette::from_theme(&Theme::dark());
+        let ctx = Ctx::new("row", &palette, Metrics::BODY, selection.clone());
+        assert!(!ctx.has_selection(), "nothing is selected yet");
+
+        selection
+            .selection
+            .borrow_mut()
+            .begin(TextKey::new("row", 0), 3);
+        assert!(ctx.has_selection(), "a drag anchor");
+
+        selection.selection.borrow_mut().clear();
+        assert!(!ctx.has_selection(), "a cleared selection");
+    }
+
+    /// The container height leads the streaming body: it grows at the body's
+    /// smoothed rate so the row never reports a line step, and it never dips
+    /// below the body. Without the dissolve there is no veil holding appended
+    /// text invisible, so the same call releases the clip instead of pinning
+    /// the reader's view at the previous frame's height.
+    #[test]
+    fn the_container_height_leads_the_body() {
+        let mut view = MarkdownView::new();
+        view.set_text("hello", true);
+        let start = Instant::now();
+        let frame = Duration::from_millis(8);
+        // One laid-out line of the body, and the cadence the stream lays one
+        // out at: the height the body measures steps, the reported height is
+        // the one that has to stay smooth.
+        let line = 13.0_f32;
+        let mut measured = px(100.0);
+        let mut now = start;
+        view.body_height.set(Some(measured));
+        view.advance_clip(true, now);
+        assert_eq!(
+            view.clip_height(),
+            Some(measured),
+            "the first frame reports the body it measured"
+        );
+
+        let mut samples = Vec::new();
+        for frame_ix in 0..(15 * 12) {
+            if frame_ix > 0 && frame_ix % 15 == 0 {
+                measured += px(line);
+            }
+            view.body_height.set(Some(measured));
+            now += frame;
+            view.advance_clip(true, now);
+            let clip = view.clip_height().expect("a container height");
+            assert!(clip >= measured, "the clip fell behind the body: {clip:?}");
+            assert!(
+                clip <= measured + px(CLIP_RUNWAY_MAX),
+                "the clip ran past its runway: {clip:?}"
+            );
+            samples.push((measured, clip));
+        }
+
+        // The row glides: it never gives back height it has already reported
+        // and never takes the body's whole line step, which is what a
+        // controller pinned to the measured height reports exactly.
+        let steps = samples
+            .windows(2)
+            .map(|pair| f32::from(pair[1].1 - pair[0].1))
+            .collect::<Vec<_>>();
+        assert!(
+            steps.iter().all(|step| *step >= 0.0),
+            "the reported height dipped: {steps:?}"
+        );
+        // The one frame that does take the whole step is the first: the
+        // smoothed rate is zero until the body has grown once, so only after
+        // that can the container bank the lead the next line lands in.
+        assert!(
+            steps[15..].iter().all(|step| *step < line),
+            "a settled frame repeated the body's line step: {:?}",
+            &steps[15..]
+        );
+        // Banked ahead of the body, not level with it: the last line steps
+        // still report the body's own height as already covered.
+        assert!(
+            samples[samples.len() - 15..]
+                .iter()
+                .all(|(measured, clip)| clip > measured),
+            "the container stopped leading the body: {:?}",
+            &samples[samples.len() - 15..]
+        );
+
+        view.advance_clip(false, now + frame);
+        assert_eq!(
+            view.clip_height(),
+            None,
+            "without the veil the body reports its real height"
+        );
+    }
+
+    /// An image or a formula lands opaque on a later frame and can grow the
+    /// body past a height measured before it, which no veil holds invisible:
+    /// a body holding one reports its real height, not a clip around it.
+    #[test]
+    fn a_body_that_can_repaint_taller_releases_the_container_height() {
+        let mut view = MarkdownView::new();
+        view.set_text("the value $x^2$ arrives", true);
+        assert!(view.has_async_blocks(), "inline math");
+        view.body_height.set(Some(px(100.0)));
+        view.advance_clip(true, Instant::now());
+        assert_eq!(
+            view.clip_height(),
+            None,
+            "a block that can resize itself releases the clip"
+        );
+    }
+
+    /// The clip is a height the row reports, not one the body lays out at. If
+    /// the clipped layer stretched its child, the controller would read the
+    /// clip back as the body's height and keep the row there forever, hiding
+    /// every line the body grew by.
+    #[gpui::test]
+    fn a_clipped_body_still_measures_its_natural_height(cx: &mut TestAppContext) {
+        struct ClippedBody {
+            view: MarkdownView,
+            palette: Palette,
+            clip: Rc<Cell<Option<Pixels>>>,
+            reported: BlockHeights,
+        }
+
+        impl gpui::Render for ClippedBody {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                // Stands in for the clip controller, which runs before the row
+                // builds this body.
+                self.view.clip.set(self.clip.get());
+                let ctx = Ctx::new(
+                    "clip",
+                    &self.palette,
+                    Metrics::BODY,
+                    TranscriptSelection::default(),
+                );
+                let body = markdown(&self.view, &ctx).unwrap_or_else(|| div().into_any_element());
+                let reported = Measured {
+                    inner: clip_body(&self.view, body),
+                    sink: MeasureSink::Block {
+                        heights: self.reported.clone(),
+                        index: 0,
+                        range: 0..1,
+                    },
+                };
+                div().w(px(700.0)).flex().items_start().child(reported)
+            }
+        }
+
+        let source = "Paragraph with enough words to wrap across the transcript column at least once and give the body a real height.\n\n";
+        let mut view = MarkdownView::new();
+        view.set_text(source, true);
+        let height = view.body_height.clone();
+        let clip = Rc::new(Cell::new(Some(px(40.0))));
+        let reported = Rc::new(RefCell::new(vec![(0..0, None)]));
+        let (entity, visual) = cx.add_window_view(|_, _| ClippedBody {
+            view,
+            palette: Palette::from_theme(&Theme::dark()),
+            clip: clip.clone(),
+            reported: reported.clone(),
+        });
+        let draw = |visual: &mut gpui::VisualTestContext, entity: &gpui::Entity<ClippedBody>| {
+            visual.update(|cxt, cx| {
+                entity.update(cx, |_, cx| cx.notify());
+                cxt.draw(cx).clear(cx);
+            });
+        };
+
+        draw(visual, &entity);
+        let natural = height.get().expect("the body was laid out");
+        assert_eq!(
+            reported.borrow()[0].1.expect("the row was laid out"),
+            px(40.0),
+            "the row reports the clip"
+        );
+        assert!(
+            natural > px(40.0),
+            "a clipped body still measures its own height: {natural:?}"
+        );
+
+        // A body that grows still measures taller: the clip is not what the
+        // controller reads back as the body's height.
+        let mut grown = String::from(source);
+        grown.push_str(concat!(
+            "A second paragraph, appended after the first measurement, that the ",
+            "clip must not hide.\n\n"
+        ));
+        visual.update(|_, cx| entity.update(cx, |body, _| body.view.set_text(&grown, true)));
+        draw(visual, &entity);
+        let taller = height.get().expect("the body was laid out again");
+        assert!(taller > natural, "the body measures taller: {taller:?}");
+    }
+
+    /// The clip is a height at one wrapping, and a retained one cuts a body
+    /// that has since grown past it. Settling and a reflow both drop it, and
+    /// the reflow takes the measurement with it: the controller reads that
+    /// height back, so a clip released while it stands is pinned right back on
+    /// the frame that has already re-wrapped.
+    #[test]
+    fn settling_and_reflowing_release_the_container_height() {
+        let mut view = MarkdownView::new();
+        view.set_render_width(600.0);
+        view.set_text("hello", true);
+        view.body_height.set(Some(px(100.0)));
+        view.advance_clip(true, Instant::now());
+        assert_eq!(view.clip_height(), Some(px(100.0)), "streaming clips");
+
+        // Settling drops the veil, so the row reports the body's real height
+        // instead of a clip the tail may have grown past.
+        view.set_text("hello", false);
+        assert_eq!(view.clip_height(), None, "settling releases the clip");
+
+        // A reflow re-wraps every block, so a height kept across one is no
+        // more valid than the heights the spacers were sized from.
+        let mut view = MarkdownView::new();
+        view.set_render_width(600.0);
+        view.set_text("hello", true);
+        view.body_height.set(Some(px(100.0)));
+        view.advance_clip(true, Instant::now());
+        assert_eq!(view.clip_height(), Some(px(100.0)), "streaming clips");
+        view.set_render_width(500.0);
+        assert_eq!(view.clip_height(), None, "a reflow releases the clip");
+        view.advance_clip(true, Instant::now());
+        assert_eq!(
+            view.clip_height(),
+            None,
+            "the height measured at the old wrap is forgotten, so the clip stays released"
+        );
+    }
+
+    /// Re-attaching to a body that streamed while its row was off screen
+    /// seeds the veil, which adopts everything it finds — the text that
+    /// arrived meanwhile included — at full opacity. A height measured before
+    /// the attach would cut exactly that text, so the attach's first frame
+    /// reports the body's real height instead.
+    #[test]
+    fn a_seeded_attach_releases_the_container_height() {
+        let mut view = MarkdownView::new();
+        view.set_text("hello", true);
+        view.body_height.set(Some(px(100.0)));
+        view.advance_clip(true, Instant::now());
+        assert_eq!(view.clip_height(), Some(px(100.0)), "streaming clips");
+
+        view.seed_streaming_baseline();
+        view.advance_clip(true, Instant::now());
+        assert_eq!(
+            view.clip_height(),
+            None,
+            "a seeded attach releases the clip"
+        );
+    }
+
+    /// Mending re-partitions the tail as it settles. A height measured for
+    /// the block that used to own an index must never size the block that
+    /// owns it now, or the spacer arithmetic drifts by whole blocks.
+    #[test]
+    fn a_repartitioned_block_never_borrows_another_blocks_height() {
+        let gap = px(10.0);
+        let heights = Rc::new(RefCell::new(vec![
+            (0..10, Some(px(100.0))),
+            (10..20, Some(px(50.0))),
+        ]));
+        // The same indices now describe different source ranges.
+        let body = ranged_blocks(&[0..5, 5..20]);
+        let blocks = body.iter().collect::<Vec<_>>();
+        let plan = window_plan(&heights, &blocks, gap, 0.0, 100.0, 1);
+        assert_eq!(
+            plan.groups,
+            vec![0..2],
+            "a misaligned settled block forces a measuring pass"
+        );
+
+        // The volatile region's range changes every frame; that alone must
+        // not drop the window, or a stream would re-measure everything.
+        let volatile = ranged_blocks(&[0..10, 10..99]);
+        let volatile_blocks = volatile.iter().collect::<Vec<_>>();
+        let plan = window_plan(&heights, &volatile_blocks, gap, 0.0, 100.0, 1);
+        assert_eq!(plan.groups, vec![0..2], "still one range to build");
+    }
+
+    /// A windowed pass must lay out at exactly the height the full pass did,
+    /// and must not re-lay-out the blocks its window hid.
+    #[gpui::test]
+    fn windowed_body_measures_the_same_as_the_full_body(cx: &mut TestAppContext) {
+        struct WindowedBody {
+            view: Rc<MarkdownView>,
+            palette: Palette,
+            window: Rc<Cell<Option<(f32, f32)>>>,
+            height: BlockHeights,
+            selection: TranscriptSelection,
+        }
+
+        impl gpui::Render for WindowedBody {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                let ctx = Ctx::new(
+                    "window",
+                    &self.palette,
+                    Metrics::BODY,
+                    self.selection.clone(),
+                );
+                let body = match self.window.get() {
+                    Some((top, height)) => markdown_windowed(
+                        &self.view,
+                        &ctx,
+                        MessageBodyWindow {
+                            visible_top: top,
+                            visible_height: height,
+                        },
+                    ),
+                    None => markdown(&self.view, &ctx),
+                };
+                // The recorder reads the body column's own bounds: the window
+                // root otherwise stretches to the whole viewport.
+                let measured = Measured {
+                    inner: body.unwrap_or_else(|| div().into_any_element()),
+                    sink: MeasureSink::Block {
+                        heights: self.height.clone(),
+                        index: 0,
+                        range: 0..1,
+                    },
+                };
+                div().w(px(700.0)).flex().items_start().child(measured)
+            }
+        }
+
+        let mut source = String::new();
+        for i in 0..60 {
+            source.push_str(&format!(
+                "Paragraph {i} with enough words to wrap across the transcript column at least once and give the block a real height.\n\n"
+            ));
+        }
+        let mut view = MarkdownView::new();
+        view.set_text(&source, true);
+        let view = Rc::new(view);
+        // The row records the wrap width before every body render; this stands
+        // in for that, so the first windowed pass does not read as a reflow.
+        view.set_render_width(700.0);
+        let window = Rc::new(Cell::new(None));
+        let height = Rc::new(RefCell::new(vec![(0..0, None)]));
+        let selection = TranscriptSelection::default();
+        let (entity, visual) = cx.add_window_view(|_, _| WindowedBody {
+            view: view.clone(),
+            palette: Palette::from_theme(&Theme::dark()),
+            window: window.clone(),
+            height: height.clone(),
+            selection: selection.clone(),
+        });
+        let draw = |visual: &mut gpui::VisualTestContext, entity: &gpui::Entity<WindowedBody>| {
+            visual.update(|cxt, cx| {
+                entity.update(cx, |_, cx| cx.notify());
+                cxt.draw(cx).clear(cx);
+            });
+        };
+        let body_height =
+            |height: &BlockHeights| height.borrow()[0].1.expect("the body was laid out");
+
+        draw(visual, &entity);
+        let full = body_height(&height);
+        let gap = px(Metrics::BODY.block_gap);
+        let measured = view
+            .heights
+            .borrow()
+            .iter()
+            .map(|(_, height)| height.expect("a full pass measures every block"))
+            .collect::<Vec<_>>();
+        assert_eq!(measured.len(), 60);
+        let ledger = measured.iter().copied().sum::<Pixels>() + gap * 59.0;
+        assert!(
+            f32::from(full - ledger).abs() < 0.5,
+            "full render {full:?} disagrees with the ledger {ledger:?}"
+        );
+
+        let middle = measured[..30].iter().copied().sum::<Pixels>() + gap * 30.0;
+        window.set(Some((f32::from(middle), 200.0)));
+        draw(visual, &entity);
+        let windowed = body_height(&height);
+        assert!(
+            f32::from(windowed - full).abs() < 0.5,
+            "windowed {windowed:?} does not fill the full height {full:?}"
+        );
+
+        // Stamp a height no layout would produce (smaller, so the window
+        // does not slide up to include the block). If the hidden block were
+        // rebuilt, the stamp would be overwritten.
+        view.heights.borrow_mut()[0].1 = Some(px(1.0));
+        draw(visual, &entity);
+        let expected = view
+            .heights
+            .borrow()
+            .iter()
+            .map(|(_, height)| height.unwrap())
+            .sum::<Pixels>()
+            + gap * 59.0;
+        let stamped = body_height(&height);
+        assert!(
+            f32::from(stamped - expected).abs() < 0.5,
+            "the hidden block was rebuilt: {stamped:?} instead of {expected:?}"
+        );
+        assert_eq!(
+            view.heights.borrow()[0].1,
+            Some(px(1.0)),
+            "the hidden block's remembered height survived"
+        );
+
+        // A selection parks its spans in the frame registry, which a reveal
+        // and a shift-click read back, so the same window has to walk the
+        // whole body: the stamp is replaced by a real measurement.
+        selection
+            .selection
+            .borrow_mut()
+            .begin(TextKey::new("window", 0), 3);
+        draw(visual, &entity);
+        assert_ne!(
+            view.heights.borrow()[0].1,
+            Some(px(1.0)),
+            "a selection keeps the full walk"
+        );
     }
 
     #[test]

@@ -261,6 +261,20 @@ fn assemble_slash_commands(
                 );
                 scan_skill_files(provider, &home.join(".pi/agent/skills"), &mut commands);
             }
+            // Pi's `get_commands` reports extension commands, prompt templates
+            // and skills only: its own built-in slash commands belong to the
+            // interactive CLI. `/compact` is the one Waku bridges — the
+            // driver turns the submitted prompt into the RPC compaction
+            // command — so it is offered beside them. Built-in scope keeps a
+            // project, user or skill command of the same name in charge; an
+            // extension command of that name is shadowed by it.
+            commands.push(SlashCommand {
+                name: "compact".to_owned(),
+                description: crate::i18n::translate("commands.compact_description"),
+                scope: CommandScope::Builtin,
+                argument_hint: Some("[focus]".to_owned()),
+                template: None,
+            });
         }
         ProviderKind::OhMyPi => {
             scan_command_files(
@@ -1257,6 +1271,43 @@ mod tests {
         );
         // Multi-byte characters produce byte-wide ranges.
         assert_eq!(highlight_byte_ranges("é.rs", &[0, 1], 0), vec![0..3]);
+    }
+
+    #[test]
+    fn pi_offers_its_compact_builtin_while_a_named_command_still_owns_it() {
+        let root = std::env::temp_dir().join(format!("waku-pi-compact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Pi's `get_commands` never reports its built-ins, so the index has to
+        // carry the one Waku bridges on its own.
+        let commands = assemble_slash_commands(ProviderKind::Pi, &root, Vec::new());
+        let compact = commands
+            .iter()
+            .find(|command| command.name == "compact")
+            .expect("Pi must offer /compact");
+        assert_eq!(compact.scope, CommandScope::Builtin);
+        assert_eq!(compact.argument_hint.as_deref(), Some("[focus]"));
+        assert!(compact.template.is_none(), "the transport resolves it");
+        assert!(!compact.description.is_empty());
+        assert_eq!(
+            resolved_submission(ProviderKind::Pi, "/compact focus on the API", &commands),
+            None,
+            "the builtin stays literal for the transport to recognise"
+        );
+
+        // A project command named `compact` is more specific and keeps the
+        // name, exactly as it does for every other provider command.
+        std::fs::create_dir_all(root.join(".pi/prompts")).unwrap();
+        std::fs::write(root.join(".pi/prompts/compact.md"), "A user's own compact").unwrap();
+        let owned = assemble_slash_commands(ProviderKind::Pi, &root, Vec::new());
+        let named: Vec<_> = owned
+            .iter()
+            .filter(|command| command.name == "compact")
+            .collect();
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].scope, CommandScope::Project);
+        assert!(named[0].template.is_some());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

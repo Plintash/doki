@@ -385,6 +385,9 @@ pub(super) struct MessageRender<'a> {
     pub(super) attachments_can_reveal: bool,
     /// The parsed human or assistant body. System messages remain verbatim.
     pub(super) markdown: Option<&'a MarkdownView>,
+    /// Set for the live streaming response: the slice of the body the
+    /// transcript viewport can see, used to window a long reply.
+    pub(super) body_window: Option<MessageBodyWindow>,
     pub(super) ctx: &'a MarkdownCtx<'a>,
     pub(super) menu: ContextMenuHandle,
     pub(super) waku: gpui::WeakEntity<Waku>,
@@ -544,11 +547,18 @@ fn render_sent_message_attachments(
 fn render_markdown_message_body<'a>(
     content: &str,
     markdown: Option<&'a MarkdownView>,
+    window: Option<MessageBodyWindow>,
     theme: &Theme,
     ctx: &MarkdownCtx<'a>,
 ) -> AnyElement {
-    markdown
-        .and_then(|markdown| md::render::markdown(markdown, ctx))
+    let body = markdown
+        .and_then(|markdown| match window {
+            // Whether this frame may be windowed is the renderer's answer, not
+            // the row's: `markdown_windowed` drops the window for a body or a
+            // frame that has to walk every block.
+            Some(window) => md::render::markdown_windowed(markdown, ctx, window),
+            None => md::render::markdown(markdown, ctx),
+        })
         // Empty or not-yet-parsed content still needs a selectable fallback.
         .unwrap_or_else(|| {
             md::render::plain_text(
@@ -558,7 +568,17 @@ fn render_markdown_message_body<'a>(
                 theme.text,
                 ctx,
             )
-        })
+        });
+    // The clip layer: report a leading height to the row so the transcript
+    // pins to a height that glides instead of stepping a line at a time. The
+    // clip never falls below the height measured last frame, and text appended
+    // since that measurement is still unborn in the veil — where the veil
+    // instead adopts a body at full opacity, `advance_clip` has already
+    // released the clip — so nothing painted is ever cut.
+    let Some(markdown) = markdown else {
+        return body;
+    };
+    md::render::clip_body(markdown, body)
 }
 
 /// The compact annotation indicator under a sent user message: a count the
@@ -720,6 +740,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
         attachment_images,
         attachments_can_reveal,
         markdown,
+        body_window,
         ctx,
         menu,
         waku,
@@ -849,7 +870,8 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                 );
             } else {
                 if !content.trim().is_empty() {
-                    let body = render_markdown_message_body(&content, markdown, theme, ctx);
+                    let body =
+                        render_markdown_message_body(&content, markdown, body_window, theme, ctx);
                     column = column.child(
                         div()
                             .id(SharedString::from(format!(
@@ -862,8 +884,10 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                             .overflow_hidden()
                             .rounded(px(12.0))
                             .border_1()
-                            .border_color(theme.raised)
-                            .bg(theme.raised)
+                            // The composer's surface and edge, so the transcript
+                            // reuses one card recipe instead of another gray.
+                            .border_color(theme.border)
+                            .bg(theme.composer)
                             .px(px(11.0))
                             .py(px(7.0))
                             .text_size(sp(14.0))
@@ -897,13 +921,13 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                                         body.child(scrollbar::edge_fade(
                                             viewport.scroll_handle.clone(),
                                             scrollbar::FadeEdge::Top,
-                                            theme.raised,
+                                            theme.composer,
                                         ))
                                         .child(
                                             scrollbar::edge_fade(
                                                 viewport.scroll_handle.clone(),
                                                 scrollbar::FadeEdge::Bottom,
-                                                theme.raised,
+                                                theme.composer,
                                             ),
                                         )
                                     }),
@@ -1034,7 +1058,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
         }
         MessageRole::Assistant => {
             let group_name = SharedString::from(format!("assistant-message-{message_id}"));
-            let body = render_markdown_message_body(&content, markdown, theme, ctx);
+            let body = render_markdown_message_body(&content, markdown, body_window, theme, ctx);
             let mut column = div()
                 .w_full()
                 .min_w_0()

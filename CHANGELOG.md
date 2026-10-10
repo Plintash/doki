@@ -16,10 +16,29 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+- A long streamed reply grows with the dissolve instead of jumping a line at a time, and a reply that spans many blocks now rebuilds only the blocks on screen, so streaming such a reply keeps its frame pacing at 120 fps on a long transcript
+- Closing the window leaves the app running in the Dock: in-flight turns and terminals keep going, reopening restores the last task, layout, terminal, and browser tabs by URL, and unsaved file edits ask before the window closes — with a right-panel tab open, ⌘W closes that tab first
+
+## [26.10.8-rc.3]
+
+- Streamed replies dissolve in as a paced character wave instead of arriving a commit at a time; Settings → General chooses 30, 60, or 120 fps
+- Choose whether Enter steers the running turn or queues a follow-up while an agent works; ⌘Enter does the opposite for one message (Settings → General)
+- Pi: a steer the provider acknowledged and then refused now reads as undelivered instead of looking delivered
+- Tasks that were still running when the app was killed survive the next launch instead of being deleted, and renaming a task before opening it no longer wipes its stored history
+
+## [26.10.8-rc.2]
+
+- Group sidebar tasks by project by default — the date headings it replaced are still in the sidebar's options menu, and switching back keeps them for good
+- Drop the sidebar's tree lines: a project's tasks are indented under it instead of joined by guide rules that ran through the rows they crossed
+
+## [26.10.8-rc.1]
+
 - Pi: a message sent while the agent is still working is delivered instead of refused, and a prompt the provider refuses now reads as undelivered rather than as an answer
 - Pi: stopping a turn takes its queued message back and returns the text to you instead of letting the message run afterwards
 - Pi: a background subagent's completion now wakes the task — the child's outcome appears with detached work, and the reply it produced lands in the transcript
+- Pi: a background subagent keeps the task busy while it runs — the run appears with detached work and the task reads as waiting for it instead of looking finished
 - Pi: an extension's notifications, status, widgets and questions reach the UI instead of being dropped or cancelled on your behalf
+- Pi: type `/compact` to run its context compaction — offered in the composer, never sent to the model, with its progress and the refreshed context meter visible
 
 ## [26.9.21]
 

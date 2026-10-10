@@ -2,21 +2,218 @@
 
 import { $ } from "bun";
 import { bundleComputerUse } from "./cua-driver";
-import { watch, type FSWatcher } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, watch, type FSWatcher } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "..");
 const isMacOS = process.platform === "darwin";
-const appName = "Doki Debug";
 const targetDir = resolve(root, process.env.CARGO_TARGET_DIR || "target");
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
+const devDatabasePath = join(root, "temp", "app.db");
+
+type DevOptions = {
+  flavor?: string;
+  seedScale?: number;
+  print: boolean;
+};
+
+function usage(): string {
+  return [
+    "usage: bun ./scripts/dev.ts [flavor] [--seed[=scale]] [--print]",
+    "",
+    "  flavor       what this build tests; the debug app is named for it",
+    "               (default: the branch or the checkout name; WAKU_DEV_FLAVOR",
+    "               overrides the derivation)",
+    "  --seed[=N]   construct the checkout's debug database with oversized",
+    "               mock sessions (N scales the volume) and relaunch to load",
+    "               them; the database is created by one launch when missing",
+    "  --print      print the resolved app name and database path, then exit",
+    "",
+    "When this checkout's database has no sessions yet, the watcher inherits a",
+    "copy of the primary checkout's dev database before launching, so a fresh",
+    "worktree window opens with your existing tasks.",
+  ].join("\n");
+}
+
+function fail(message: string): never {
+  console.error(`[waku-dev] ${message}\n\n${usage()}`);
+  process.exit(2);
+}
+
+function parseOptions(argv: string[]): DevOptions {
+  const options: DevOptions = { print: false };
+  for (const arg of argv) {
+    if (arg === "--seed") {
+      options.seedScale = 1;
+    } else if (arg.startsWith("--seed=")) {
+      const scale = Number(arg.slice("--seed=".length));
+      if (!Number.isFinite(scale) || scale <= 0) {
+        fail("--seed needs a positive number");
+      }
+      options.seedScale = scale;
+    } else if (arg === "--print") {
+      options.print = true;
+    } else if (arg === "--help" || arg === "-h") {
+      console.log(usage());
+      process.exit(0);
+    } else if (arg.startsWith("--")) {
+      fail(`unknown flag: ${arg}`);
+    } else if (options.flavor === undefined) {
+      options.flavor = arg;
+    } else {
+      fail("only one flavor may be given");
+    }
+  }
+  return options;
+}
+
+/// A short, filesystem-safe phrase naming what a checkout is testing.
+function humanize(value: string): string | undefined {
+  const words = value
+    .replace(/^(?:feat|fix|chore|docs|refactor|test|dev|opsx|release)[/-]/, "")
+    .replace(/[/\\:]+/g, " ")
+    .replace(/[-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return words.length > 0 ? words.slice(0, 48).trim() : undefined;
+}
+
+/// `pi compact` reads better than `pi-compact` in the Dock.
+function titleCase(value: string | undefined): string | undefined {
+  return value
+    ?.split(" ")
+    .map((word) =>
+      word.length > 0 ? word[0].toUpperCase() + word.slice(1) : word,
+    )
+    .join(" ");
+}
+
+function currentBranch(): string | undefined {
+  const result = Bun.spawnSync({
+    cmd: ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+    cwd: root,
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  if (result.exitCode !== 0) return undefined;
+  const branch = result.stdout.toString().trim();
+  return branch.length > 0 ? branch : undefined;
+}
+
+/// What the debug app's name says it tests, when the caller did not say it
+/// itself: the branch first, then the worktree directory. The main checkout
+/// on a plain branch keeps the familiar unflavored name.
+function deriveFlavor(): string | undefined {
+  const branch = currentBranch();
+  if (branch !== undefined && !["main", "dev", "HEAD"].includes(branch)) {
+    const flavor = titleCase(humanize(branch));
+    if (flavor !== undefined) return flavor;
+  }
+  const directory = basename(root);
+  if (directory.startsWith("waku-")) {
+    return titleCase(humanize(directory.slice("waku-".length)));
+  }
+  return undefined;
+}
+
+/// `pkill` and `pgrep` read their pattern as a regular expression, and a
+/// flavor may contain regex characters.
+function pgrepPattern(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const options = parseOptions(process.argv.slice(2));
+const explicitFlavor = options.flavor ?? process.env.WAKU_DEV_FLAVOR;
+const trimmedFlavor = explicitFlavor?.trim();
+const flavor =
+  trimmedFlavor !== undefined && trimmedFlavor.length > 0
+    ? trimmedFlavor
+    : deriveFlavor();
+// A feature flavor gives this worktree's debug app its own bundle name,
+// identity and data directory, so a second worktree's watcher can run beside
+// it. Every worktree derives one, so a debug window always says what it
+// tests; only the main checkout on a plain branch keeps "Doki Debug".
+const appName = flavor ? `Doki Debug — ${flavor}` : "Doki Debug";
+if (flavor) {
+  const slug = flavor
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  process.env.WAKU_APP_NAME = appName;
+  process.env.WAKU_APP_ID = `sh.doki.dev.${slug}`;
+  process.env.WAKU_DATA_DIR = appName;
+}
 const appPath = isMacOS
-  ? join(targetDir, "debug/Doki Debug.app")
+  ? join(targetDir, `debug/${appName}.app`)
   : join(targetDir, `debug/waku${executableSuffix}`);
 const daemonPath = join(
   targetDir,
   `debug/waku-debug-daemon${executableSuffix}`,
 );
+
+if (options.print) {
+  console.log(`app: ${appName}`);
+  console.log(`app path: ${appPath}`);
+  console.log(`database: ${devDatabasePath}`);
+  process.exit(0);
+}
+
+function sessionCount(database: string): number {
+  if (!existsSync(database)) return 0;
+  const result = Bun.spawnSync({
+    cmd: ["sqlite3", database, "select count(*) from sessions;"],
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  const count = Number(result.stdout.toString().trim());
+  return Number.isFinite(count) ? count : 0;
+}
+
+/// The primary checkout's dev database, which is what a fresh worktree wants
+/// to test against.
+function primaryDatabasePath(): string | undefined {
+  const result = Bun.spawnSync({
+    cmd: ["git", "worktree", "list", "--porcelain"],
+    cwd: root,
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  if (result.exitCode !== 0) return undefined;
+  const first = result.stdout
+    .toString()
+    .split("\n")
+    .find((line) => line.startsWith("worktree "));
+  if (first === undefined) return undefined;
+  return join(first.slice("worktree ".length).trim(), "temp", "app.db");
+}
+
+/// A fresh checkout's debug database has no sessions, which makes its window
+/// useless for anything that needs stored tasks. When this one is empty and
+/// the primary checkout has history, inherit a consistent copy of it — the
+/// sqlite backup is safe while the other app is open.
+function inheritPrimaryDatabase(): void {
+  if (sessionCount(devDatabasePath) > 0) return;
+  const primary = primaryDatabasePath();
+  if (primary === undefined || resolve(primary) === resolve(devDatabasePath)) {
+    return;
+  }
+  if (sessionCount(primary) === 0) return;
+  mkdirSync(dirname(devDatabasePath), { recursive: true });
+  const backup = Bun.spawnSync({
+    cmd: ["sqlite3", primary, `.backup '${devDatabasePath}'`],
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (backup.exitCode !== 0) {
+    console.warn("[waku-dev] Could not inherit the primary debug database.");
+    return;
+  }
+  console.log(
+    `[waku-dev] Inherited ${sessionCount(devDatabasePath)} session(s) from ${primary}`,
+  );
+}
+
+inheritPrimaryDatabase();
 const watchedDirectories = [
   "src",
   "crates",
@@ -355,7 +552,7 @@ async function stopApp(): Promise<void> {
   const waiter = app;
   app = undefined;
   if (isMacOS) {
-    await $`pkill -TERM -x ${appName}`.quiet().nothrow();
+    await $`pkill -TERM -x ${pgrepPattern(appName)}`.quiet().nothrow();
   } else if (waiter?.exitCode === null) {
     waiter.kill("SIGTERM");
   }
@@ -366,7 +563,31 @@ async function stopApp(): Promise<void> {
 
 function launchApp(): ReturnType<typeof Bun.spawn> {
   console.log(`[waku-dev] Launching ${appPath}`);
-  const command = isMacOS ? ["open", "-n", "-W", appPath] : [appPath];
+  // `open` launches through LaunchServices, which does not pass the caller's
+  // environment; the daemon path and the flavor identity have to travel as
+  // explicit --env options or the app cannot find its daemon.
+  const launchEnvironment: Array<[string, string]> = [
+    ["WAKU_DAEMON_PATH", daemonPath],
+  ];
+  if (flavor) {
+    launchEnvironment.push(
+      ["WAKU_APP_NAME", appName],
+      ["WAKU_APP_ID", process.env.WAKU_APP_ID ?? ""],
+      ["WAKU_DATA_DIR", process.env.WAKU_DATA_DIR ?? ""],
+    );
+  }
+  const command = isMacOS
+    ? [
+        "open",
+        "-n",
+        "-W",
+        ...launchEnvironment.flatMap(([key, value]) => [
+          "--env",
+          `${key}=${value}`,
+        ]),
+        appPath,
+      ]
+    : [appPath];
   const launchedApp = Bun.spawn(command, {
     cwd: root,
     env: { ...process.env, WAKU_DAEMON_PATH: daemonPath },
@@ -384,6 +605,41 @@ function launchApp(): ReturnType<typeof Bun.spawn> {
     process.exitCode = exitCode;
   });
   return launchedApp;
+}
+
+/// Constructs the checkout's debug database with the oversized mock sessions
+/// `seed-mock-sessions.ts` writes, then relaunches so the app loads them. A
+/// fresh checkout has no database until the app runs once, so the watcher
+/// waits for the app to create it instead of requiring a manual first launch.
+async function seedDevDatabase(scale: number): Promise<void> {
+  if (!existsSync(devDatabasePath)) {
+    console.log(
+      "[waku-dev] Waiting for the app to create the debug database before seeding...",
+    );
+    const deadline = Date.now() + 30_000;
+    while (!existsSync(devDatabasePath) && Date.now() < deadline) {
+      await Bun.sleep(250);
+    }
+  }
+  if (!existsSync(devDatabasePath)) {
+    console.warn(
+      "[waku-dev] Debug database was not created; skipping the seed.",
+    );
+    return;
+  }
+  console.log(
+    `[waku-dev] Seeding mock sessions (scale ${scale}) into ${devDatabasePath}`,
+  );
+  const result =
+    await $`bun ${join(root, "scripts/seed-mock-sessions.ts")} --db ${devDatabasePath} --scale ${String(scale)}`.nothrow();
+  if (result.exitCode !== 0) {
+    console.warn("[waku-dev] Seeding failed; keeping the current database.");
+    return;
+  }
+  console.log("[waku-dev] Relaunching so the seeded sessions load.");
+  await stopApp();
+  await prepareHyprlandLaunch();
+  if (!stopping) app = launchApp();
 }
 
 function clearRebuildTimer(): void {
@@ -534,6 +790,13 @@ if (appChangeRevision === initialAppRevision) {
   if (queuedBuild !== undefined) void drainBuildQueue();
 }
 
+if (!stopping && options.seedScale !== undefined) {
+  await seedDevDatabase(options.seedScale);
+}
+
+console.log(
+  `[waku-dev] ${appName} · database ${devDatabasePath}`,
+);
 console.log(
   "[waku-dev] Watching for source changes. Daemon-only edits hot-reload without relaunching Doki.",
 );

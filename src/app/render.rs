@@ -248,6 +248,9 @@ impl Render for Waku {
             let command_palette = self.render_command_palette(window, cx);
             let commit_dialog = self.render_commit_dialog(cx);
             let goal_dialog = self.render_goal_dialog(window, cx);
+            // A dirty editor can sit behind the settings page, and its
+            // confirmation is the only way the window may close.
+            let close_confirmation = self.render_window_close_confirmation(cx);
             let toast = self.render_active_toast(cx);
             let content = div()
                 .relative()
@@ -268,8 +271,9 @@ impl Render for Waku {
                 .children(goal_dialog)
                 .children(image_preview)
                 .children(task_switcher)
+                .children(close_confirmation)
                 .into_any_element();
-            return self.render_window_frame(content, window, cx);
+            return content;
         }
         // Re-armed every frame this window shows time labels; parks while
         // settings covers them and while the window isn't drawing at all.
@@ -282,6 +286,7 @@ impl Render for Waku {
         let command_palette = self.render_command_palette(window, cx);
         let commit_dialog = self.render_commit_dialog(cx);
         let goal_dialog = self.render_goal_dialog(window, cx);
+        let close_confirmation = self.render_window_close_confirmation(cx);
         let toast = self.render_active_toast(cx);
         let content = div()
             .key_context("Waku")
@@ -294,6 +299,7 @@ impl Render for Waku {
             .on_action(cx.listener(Self::toggle_command_palette_action))
             .on_action(cx.listener(Self::open_resume_picker_action))
             .on_action(cx.listener(Self::toggle_fps_counter_action))
+            .on_action(cx.listener(Self::toggle_full_screen_action))
             .on_action(cx.listener(Self::navigate_back_action))
             .on_action(cx.listener(Self::navigate_forward_action))
             .on_action(cx.listener(Self::switch_task_forward_action))
@@ -427,9 +433,10 @@ impl Render for Waku {
             .children(goal_dialog)
             .children(image_preview)
             .children(task_switcher)
+            .children(close_confirmation)
             .into_any_element();
 
-        self.render_window_frame(content, window, cx)
+        content
     }
 }
 

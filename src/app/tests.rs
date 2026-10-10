@@ -5,7 +5,9 @@ use super::composer::{
     ComposerSubmitAction, annotation_comment_value, composer_submit_action, dropped_file_mention,
     merged_submission, next_picker_highlight, visible_branch_entries,
 };
-use super::runtime::{merge_remote_session_catalog, session_has_active_provider_turn};
+use super::runtime::{
+    merge_remote_session_catalog, session_has_active_provider_turn, submission_waits_for_a_turn,
+};
 use super::sessions::denial_answer;
 use super::settings::visible_settings_pages;
 use super::{ComposerAttachment, ComposerSubmission};
@@ -549,6 +551,27 @@ fn composer_only_offers_stop_after_submission_preparation() {
 }
 
 #[test]
+fn a_settled_session_with_detached_work_takes_the_next_prompt() {
+    // Pi's settled turn is busy without a live turn while the detached work it
+    // started still runs, so a message is that session's next prompt rather
+    // than a follow-up waiting for a settle that only the message itself could
+    // hasten.
+    assert!(submission_waits_for_a_turn(SessionStatus::Working, true));
+    assert!(submission_waits_for_a_turn(SessionStatus::Waiting, true));
+    assert!(submission_waits_for_a_turn(
+        SessionStatus::Connecting,
+        false
+    ));
+    assert!(submission_waits_for_a_turn(SessionStatus::Background, true));
+    assert!(!submission_waits_for_a_turn(
+        SessionStatus::Background,
+        false
+    ));
+    assert!(!submission_waits_for_a_turn(SessionStatus::Idle, false));
+    assert!(!submission_waits_for_a_turn(SessionStatus::Failed, false));
+}
+
+#[test]
 fn connecting_status_does_not_hide_a_started_provider_turn_from_steering() {
     let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
     session.begin_turn("inspect the project");
@@ -986,59 +1009,33 @@ fn anchor_end_space_keeps_a_short_new_turn_at_the_viewport_top() {
 
 #[test]
 fn scroll_to_bottom_only_appears_while_the_tail_is_below_the_viewport() {
-    let viewport_bottom = px(700.0);
-
     assert_eq!(
-        should_show_scroll_to_bottom(false, false, true, viewport_bottom, None, Pixels::ZERO),
+        should_show_scroll_to_bottom(false, false, true, None),
         Some(false)
     );
     assert_eq!(
-        should_show_scroll_to_bottom(
-            true,
-            true,
-            true,
-            viewport_bottom,
-            Some(px(900.0)),
-            Pixels::ZERO,
-        ),
+        should_show_scroll_to_bottom(true, true, true, Some(false)),
         Some(false)
     );
     // Disclosure pinning keeps `is_scrolled` true and a splice can leave the
     // tail temporarily unmeasured, but a collapsed transcript that fits the
     // viewport has nowhere to scroll back to.
     assert_eq!(
-        should_show_scroll_to_bottom(true, false, false, viewport_bottom, None, Pixels::ZERO),
+        should_show_scroll_to_bottom(true, false, false, None),
         Some(false)
     );
     assert_eq!(
-        should_show_scroll_to_bottom(
-            true,
-            false,
-            true,
-            viewport_bottom,
-            Some(px(701.0)),
-            Pixels::ZERO,
-        ),
+        should_show_scroll_to_bottom(true, false, true, Some(false)),
         Some(true)
     );
     assert_eq!(
-        should_show_scroll_to_bottom(
-            true,
-            false,
-            true,
-            viewport_bottom,
-            Some(px(500.0)),
-            px(200.0),
-        ),
+        should_show_scroll_to_bottom(true, false, true, Some(true)),
         Some(false)
     );
     // A stream commit remeasures the tail rows, so the frame after each one has
     // no bounds to read. Answering "show" there strobes the button against the
     // measured frames between commits; the caller holds its last answer instead.
-    assert_eq!(
-        should_show_scroll_to_bottom(true, false, true, viewport_bottom, None, Pixels::ZERO),
-        None
-    );
+    assert_eq!(should_show_scroll_to_bottom(true, false, true, None), None);
 }
 
 #[test]
@@ -2275,6 +2272,36 @@ fn a_busy_turn_pins_the_working_indicator_after_the_last_row() {
     // A settled turn swaps the indicator for its final transcript shape.
     session.status = SessionStatus::Working;
     session.finish_active_turn(TurnStatus::Completed);
+    session.status = SessionStatus::Idle;
+    assert_eq!(
+        folded_transcript_row_kinds(&session, &HashSet::new()),
+        vec![Message(0), Message(1), ResponseFooter(turn_id, 1)]
+    );
+}
+
+#[test]
+fn a_settled_pi_turn_keeps_waiting_on_the_work_it_started() {
+    // The reply ends the turn while the background children it launched keep
+    // running, and Pi wakes the session when they settle. There is no live
+    // turn to hold the indicator open, so the wait itself has to: the row
+    // reads "Waiting for background tasks" until the wake arrives.
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    let turn_id = session.begin_turn("Review the branch");
+    session.push_message(MessageRole::Assistant, "Two reviewers are on it.");
+    session.finish_active_turn(TurnStatus::Completed);
+    session.status = SessionStatus::Background;
+    assert_eq!(
+        folded_transcript_row_kinds(&session, &HashSet::new()),
+        vec![
+            Message(0),
+            Message(1),
+            ResponseFooter(turn_id, 1),
+            WorkingIndicator
+        ]
+    );
+
+    // Once the work settles and the wake has run, the session rests like any
+    // other finished turn.
     session.status = SessionStatus::Idle;
     assert_eq!(
         folded_transcript_row_kinds(&session, &HashSet::new()),

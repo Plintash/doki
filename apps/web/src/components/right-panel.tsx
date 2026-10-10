@@ -1438,6 +1438,9 @@ function TerminalPanel({
   const [error, setError] = useState<string | null>(null)
   const [exited, setExited] = useState(false)
   const cwd = session && project ? sessionCwd(session, project) : undefined
+  // The daemon scopes a terminal to the task that opened it, so the request
+  // names the task the panel is showing.
+  const taskId = session?.id
 
   useEffect(() => {
     let disposed = false
@@ -1454,7 +1457,7 @@ function TerminalPanel({
   }, [])
 
   useEffect(() => {
-    if (!client || phase !== 'connected' || !cwd) return
+    if (!client || phase !== 'connected' || !cwd || !taskId) return
     let disposed = false
     titleScanner.current = new TerminalTitleScanner()
     const unsubscribe = client.subscribe(terminalId, terminalId, (event) => {
@@ -1474,7 +1477,7 @@ function TerminalPanel({
     })
 
     void client.request(
-      { type: 'openTerminal', cwd, cols: 80, rows: 24 },
+      { type: 'openTerminal', taskId, cwd, cols: 80, rows: 24 },
       terminalId,
       terminalId,
     ).catch((cause) => {
@@ -1488,7 +1491,7 @@ function TerminalPanel({
       unsubscribe()
       void client.notify({ type: 'closeTerminal' }, terminalId, terminalId).catch(() => {})
     }
-  }, [client, cwd, phase, terminalId, write])
+  }, [client, cwd, phase, taskId, terminalId, write])
 
   if (!cwd) return <PanelMessage title={t('files.no_project_open')} detail={t('terminal.no_workspace_description')} />
   return (

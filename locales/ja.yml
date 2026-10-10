@@ -23,10 +23,14 @@ menu.toggle_model_picker: モデル選択の表示を切り替える
 menu.toggle_usage_panel: 使用状況パネルの表示を切り替える
 menu.window: ウインドウ
 menu.toggle_fps_counter: FPS カウンターの表示を切り替える
+menu.toggle_full_screen: フルスクリーンを切り替え
 menu.close_window: ウインドウを閉じる
 window.minimize: 最小化
 window.maximize: 最大化
 window.restore: 元に戻す
+window_close.title: 未保存の変更
+window_close.body: このウインドウに保存されていないファイル編集があります。閉じると破棄されます。
+window_close.discard: 破棄して閉じる
 
 updater.update: アップデート
 updater.updating: アップデート中…
@@ -80,7 +84,7 @@ settings.providers: プロバイダー
 settings.usage: 使用状況
 settings.daemon: デーモン
 settings.computer_use: コンピュータ操作
-settings.general_keywords: 一般 ローカル プロジェクト 会話 プライバシー アップデート 自動 バージョン 数学 数式 math latex
+settings.general_keywords: 一般 ローカル プロジェクト 会話 プライバシー アップデート 自動 バージョン 数学 数式 math latex フォローアップ キュー 指示 enter
 settings.appearance_keywords: 外観 テーマ システム ライト ダーク 言語 英語 中国語 簡体字 日本語 フォント サイズ 文字 エディタ
 settings.providers_keywords: プロバイダー エージェント モデル CLI バージョン インストール 検出 claude codex cursor opencode amp grok pi
 settings.skills: スキル
@@ -163,6 +167,12 @@ settings.code_font_size: コードのフォントサイズ
 settings.code_font_size_description: ファイルエディタ、差分表示、コードブロック、ツール出力の文字サイズ
 settings.render_math: 数式を描画
 settings.render_math_description: Markdown の数式を整形して表示します。オフにすると LaTeX ソースを表示します。
+settings.stream_dissolve: ストリーミングのフェード
+settings.stream_dissolve_description: 流れてくるテキストのフェードに使うフレームレート。高リフレッシュレートの画面では高いほど滑らかで、低いほど省電力です。
+settings.follow_up_behavior: フォローアップの動作
+settings.follow_up_behavior_description: エージェントの実行中に Enter が行う動作。%{shortcut} は次のメッセージだけ反対の動作を行います。
+settings.follow_up_behavior_queue: キューに追加
+settings.follow_up_behavior_steer: 指示を追加
 settings.theme_system: システム
 settings.theme_light: ライト
 settings.theme_dark: ダーク
@@ -359,6 +369,9 @@ activity.described_command_failed: "コマンドの実行に失敗しました�
 activity.running_command: コマンドを実行中
 activity.ran_command: コマンドを実行しました
 activity.command_failed: コマンドの実行に失敗しました
+activity.compacting_context: コンテキストを圧縮中
+activity.compacted_context: コンテキストを圧縮しました
+activity.compaction_failed: コンテキストの圧縮に失敗しました
 activity.edit_file: ファイルを編集
 activity.write_file: ファイルに書き込む
 activity.editing_named_file: "%{file} を編集中"
@@ -563,6 +576,7 @@ skills.enable_named: "%{name} を有効にする"
 skills.disable_named: "%{name} を無効にする"
 
 commands.fast_description: 高速モードを切り替え
+commands.compact_description: コンテキストを圧縮
 commands.fast_enabled: 高速モードを有効にしました
 commands.fast_disabled: 高速モードを無効にしました
 commands.goal_description: このタスクが継続して追求するゴールを設定
@@ -602,6 +616,7 @@ user_input.progress: "%{current} / %{total}"
 user_input.dismiss: 閉じる
 composer.preparing_task: タスクを準備中…
 composer.queue_followup: フォローアップとしてキューに追加（⏎）
+composer.steer_followup: 現在のターンに指示を追加（⏎）
 composer.message: メッセージ
 composer.queue_placeholder: フォローアップを追加…
 composer.prompt_placeholder: Doki に作業を依頼…
@@ -728,6 +743,8 @@ errors.provider_rejected_steer: "%{provider} が追加の指示を拒否しま�
 errors.provider_stopped_receiving: "%{provider} はメッセージの受信を停止しました"
 errors.provider_initialize_session: "%{provider} はこのセッションを初期化できませんでした"
 errors.provider_rejected_prompt: "%{provider} は実行前にプロンプトを拒否しました"
+errors.compact_turn_running: コンテキストを圧縮する前に、実行中のターンを停止してください
+errors.compact_queued_until_settled: 圧縮は実行中のターンが終わるまで待機します
 errors.provider_complete_turn: "%{provider} はこのターンを完了できませんでした"
 errors.provider_reported_error: "%{provider} からエラーが報告されました"
 

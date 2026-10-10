@@ -205,6 +205,30 @@ mod tests {
             &*rust_i18n::t!("session.rewound", locale = "ja", turn = 3),
             "タスクをターン 3 の前まで巻き戻しました"
         );
+        assert_eq!(
+            &*rust_i18n::t!(
+                "settings.follow_up_behavior_description",
+                locale = "en",
+                shortcut = "⌘↩"
+            ),
+            "What Enter does while the agent is working; ⌘↩ does the opposite for one message."
+        );
+        assert_eq!(
+            &*rust_i18n::t!(
+                "settings.follow_up_behavior_description",
+                locale = "zh-CN",
+                shortcut = "⌘↩"
+            ),
+            "智能体工作时回车的行为；⌘↩ 对单条消息执行另一项。"
+        );
+        assert_eq!(
+            &*rust_i18n::t!(
+                "settings.follow_up_behavior_description",
+                locale = "ja",
+                shortcut = "⌘↩"
+            ),
+            "エージェントの実行中に Enter が行う動作。⌘↩ は次のメッセージだけ反対の動作を行います。"
+        );
     }
 
     #[test]

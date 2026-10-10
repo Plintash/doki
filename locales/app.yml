@@ -46,6 +46,8 @@ menu.window:
   en: Window
 menu.toggle_fps_counter:
   en: Toggle FPS Counter
+menu.toggle_full_screen:
+  en: Toggle Full Screen
 menu.close_window:
   en: Close Window
 window.minimize:
@@ -54,6 +56,12 @@ window.maximize:
   en: Maximize
 window.restore:
   en: Restore
+window_close.title:
+  en: Unsaved changes
+window_close.body:
+  en: This window has unsaved file edits. Closing it discards them.
+window_close.discard:
+  en: Discard and Close
 
 updater.update:
   en: Update
@@ -157,7 +165,7 @@ settings.daemon:
 settings.computer_use:
   en: Computer Use
 settings.general_keywords:
-  en: general local projects conversations privacy updates automatic sparkle version math latex formula expression
+  en: general local projects conversations privacy updates automatic sparkle version math latex formula expression follow-up steer queue enter
 settings.appearance_keywords:
   en: appearance theme system light dark language english chinese simplified font size text editor
 settings.providers_keywords:
@@ -322,6 +330,18 @@ settings.render_math:
   en: Render math expressions
 settings.render_math_description:
   en: Show formatted math in Markdown. Turn off to show LaTeX source.
+settings.stream_dissolve:
+  en: Streaming dissolve
+settings.stream_dissolve_description:
+  en: Frame rate for text fading in as it streams. Higher is smoother on high-refresh displays; lower saves battery.
+settings.follow_up_behavior:
+  en: Follow-up behavior
+settings.follow_up_behavior_description:
+  en: What Enter does while the agent is working; %{shortcut} does the opposite for one message.
+settings.follow_up_behavior_queue:
+  en: Queue
+settings.follow_up_behavior_steer:
+  en: Steer
 settings.theme_system:
   en: System
 settings.theme_light:
@@ -1111,6 +1131,8 @@ skills.disable_named:
 
 commands.fast_description:
   en: Toggle fast mode
+commands.compact_description:
+  en: Compact the context
 commands.fast_enabled:
   en: Fast mode enabled
 commands.fast_disabled:
@@ -1196,6 +1218,8 @@ composer.preparing_task:
   en: Preparing task…
 composer.queue_followup:
   en: Queue as follow-up (⏎)
+composer.steer_followup:
+  en: Steer the running turn (⏎)
 composer.message:
   en: Message
 composer.queue_placeholder:
@@ -1438,6 +1462,10 @@ errors.provider_initialize_session:
   en: "%{provider} could not initialize this session"
 errors.provider_rejected_prompt:
   en: "%{provider} rejected the prompt before it ran"
+errors.compact_turn_running:
+  en: Stop the running turn before compacting the context
+errors.compact_queued_until_settled:
+  en: compaction waits for the running turn to settle
 errors.provider_complete_turn:
   en: "%{provider} could not complete this turn"
 errors.provider_reported_error:

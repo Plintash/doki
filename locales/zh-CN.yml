@@ -23,10 +23,14 @@ menu.toggle_model_picker: 打开或关闭模型选择器
 menu.toggle_usage_panel: 打开或关闭用量面板
 menu.window: 窗口
 menu.toggle_fps_counter: 显示或隐藏帧率
+menu.toggle_full_screen: 切换全屏
 menu.close_window: 关闭窗口
 window.minimize: 最小化
 window.maximize: 最大化
 window.restore: 还原
+window_close.title: 有未保存的更改
+window_close.body: 此窗口中有尚未保存的文件编辑，关闭后将丢弃这些修改。
+window_close.discard: 丢弃并关闭
 updater.update: 更新
 updater.updating: 正在更新…
 updater.up_to_date: Doki 已是最新版本
@@ -76,7 +80,7 @@ settings.providers: 服务商
 settings.usage: 用量
 settings.daemon: 守护进程
 settings.computer_use: 电脑操作
-settings.general_keywords: 通用 本地 项目 对话 隐私 更新 自动 版本 数学 公式 表达式 math latex
+settings.general_keywords: 通用 本地 项目 对话 隐私 更新 自动 版本 数学 公式 表达式 math latex 后续 排队 引导 enter
 settings.appearance_keywords: 外观 主题 系统 浅色 深色 语言 英语 中文 简体 字号 字体 大小 编辑器
 settings.providers_keywords: 服务商 智能体 模型 命令行 版本 安装 检测 claude codex cursor opencode amp grok pi
 settings.skills: 技能
@@ -159,6 +163,12 @@ settings.code_font_size: 代码字号
 settings.code_font_size_description: 文件编辑器、差分视图、代码块与工具输出的文字大小
 settings.render_math: 渲染数学公式
 settings.render_math_description: 在 Markdown 中显示排版后的公式。关闭后显示 LaTeX 源码。
+settings.stream_dissolve: 流式渐显
+settings.stream_dissolve_description: 流式文字到达时的渐显帧率。高刷新率屏幕下越高越顺滑，越低越省电。
+settings.follow_up_behavior: 后续消息行为
+settings.follow_up_behavior_description: 智能体工作时回车的行为；%{shortcut} 对单条消息执行另一项。
+settings.follow_up_behavior_queue: 排队
+settings.follow_up_behavior_steer: 引导
 settings.theme_system: 跟随系统
 settings.theme_light: 浅色
 settings.theme_dark: 深色
@@ -342,6 +352,9 @@ activity.described_command_failed: "命令执行失败：%{description}"
 activity.running_command: 正在运行命令
 activity.ran_command: 已运行命令
 activity.command_failed: 命令执行失败
+activity.compacting_context: 正在压缩上下文
+activity.compacted_context: 已压缩上下文
+activity.compaction_failed: 上下文压缩失败
 activity.edit_file: 编辑文件
 activity.write_file: 写入文件
 activity.editing_named_file: 正在编辑 %{file}
@@ -535,6 +548,7 @@ skills.section_user_skills: 用户技能
 skills.enable_named: 启用%{name}
 skills.disable_named: 停用%{name}
 commands.fast_description: 切换快速模式
+commands.compact_description: 压缩上下文
 commands.fast_enabled: 已启用快速模式
 commands.fast_disabled: 已关闭快速模式
 commands.goal_description: 为此任务设定一个持续追求的目标
@@ -574,6 +588,7 @@ user_input.progress: "%{current} / %{total}"
 user_input.dismiss: 忽略
 composer.preparing_task: 正在准备任务…
 composer.queue_followup: 排队为后续消息（⏎）
+composer.steer_followup: 引导当前回合（⏎）
 composer.message: 消息
 composer.queue_placeholder: 添加后续消息…
 composer.prompt_placeholder: 让 Doki 构建些什么…
@@ -694,6 +709,8 @@ errors.provider_rejected_steer: "%{provider} 拒绝了补充指示：%{error}"
 errors.provider_stopped_receiving: "%{provider} 已停止接收消息"
 errors.provider_initialize_session: "%{provider} 未能初始化此任务"
 errors.provider_rejected_prompt: "%{provider} 在开始处理前拒绝了消息"
+errors.compact_turn_running: 请先停止正在执行的回合，再压缩上下文
+errors.compact_queued_until_settled: 压缩会等待当前回合结束后再进行
 errors.provider_complete_turn: "%{provider} 未能完成本轮任务"
 errors.provider_reported_error: "%{provider} 报告了错误"
 session.response_unavailable: 该回复已不可用

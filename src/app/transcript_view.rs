@@ -235,6 +235,7 @@ impl Waku {
         let entity = cx.entity().downgrade();
         let scrollbar_handle = transcript_rows.clone();
         let viewport_bounds = transcript_rows.viewport_bounds();
+        let streaming_window = self.streaming_body_window(&transcript_rows, viewport_bounds);
         let transcript_scrollable = viewport_bounds.size.height > Pixels::ZERO
             && transcript_rows.max_offset_for_scrollbar().y > px(0.5);
         let viewport_bottom = viewport_bounds.bottom();
@@ -243,6 +244,9 @@ impl Waku {
             .checked_sub(1)
             .and_then(|last_row| transcript_rows.bounds_for_item(last_row))
             .map(|bounds| bounds.bottom());
+        let tail_rest = transcript_rests_at_tail(viewport_bottom, tail_bottom, anchor_end_space);
+        let rests_at_tail = tail_rest.unwrap_or(self.transcript_rests_at_tail.get());
+        self.transcript_rests_at_tail.set(rests_at_tail);
         // Scrolling back down onto the tail by hand re-engages following, just
         // as the affordance below does. GPUI re-engages its own tail pin when a
         // bottom-aligned list reaches the end, but a turn renders through the
@@ -251,8 +255,7 @@ impl Waku {
         // watching the reply grow past the bottom edge with no way but the
         // button to rejoin it.
         if self.transcript_tail_recheck.get()
-            && let Some(rests_at_tail) =
-                transcript_rests_at_tail(viewport_bottom, tail_bottom, anchor_end_space)
+            && let Some(rests_at_tail) = tail_rest
         {
             self.transcript_tail_recheck.set(false);
             if rests_at_tail {
@@ -263,9 +266,7 @@ impl Waku {
             self.transcript_is_scrolled.get(),
             self.transcript_anchor_following.get(),
             transcript_scrollable,
-            viewport_bottom,
-            tail_bottom,
-            anchor_end_space,
+            tail_rest,
         )
         .unwrap_or_else(|| self.transcript_scroll_to_bottom_visible.get());
         self.transcript_scroll_to_bottom_visible
@@ -375,7 +376,12 @@ impl Waku {
                     entity
                         .upgrade()
                         .map(|entity| {
-                            entity.update(cx, |this, cx| this.transcript_row(index, window, cx))
+                            entity.update(cx, |this, cx| {
+                                let body_window = streaming_window
+                                    .filter(|(row, _)| *row == index)
+                                    .map(|(_, window)| window);
+                                this.transcript_row(index, body_window, rests_at_tail, window, cx)
+                            })
                         })
                         .unwrap_or_else(|| div().into_any_element())
                 })
@@ -891,7 +897,7 @@ impl Waku {
                 }
             }
             if changed {
-                self.save();
+                self.save(cx);
             }
         }
         self.close_annotation_editor(cx);
@@ -927,7 +933,7 @@ impl Waku {
             }
         }
         if changed {
-            self.save();
+            self.save(cx);
         }
     }
 
@@ -2390,9 +2396,50 @@ impl Waku {
         handle
     }
 
+    /// The part of the live streaming row the transcript viewport can show, in
+    /// the row's own pixel coordinates, resolved while the `ListState` is
+    /// still readable.
+    ///
+    /// `ListState`'s accessors borrow its inner state, which the list holds
+    /// mutably while it runs the item builder, so this must be asked before
+    /// `list()` starts and handed to the row. The cached bounds are a frame
+    /// old, which is what the planner wants: a row is rebuilt before it is
+    /// re-measured, so the previous frame is the only position available.
+    fn streaming_body_window(
+        &self,
+        rows: &ListState,
+        viewport: Bounds<Pixels>,
+    ) -> Option<(usize, MessageBodyWindow)> {
+        let session = self.selected_session()?;
+        // Only a streaming reply has a windowed body, so a settled transcript
+        // has nothing to find.
+        let row_index = self
+            .transcript_row_kinds
+            .borrow()
+            .iter()
+            .position(|kind| match kind {
+                TranscriptRowKind::Message(message_index) => {
+                    session.messages.get(*message_index).is_some_and(|message| {
+                        message.role == MessageRole::Assistant && message.streaming
+                    })
+                }
+                _ => false,
+            })?;
+        let bounds = rows.bounds_for_item(row_index)?;
+        Some((
+            row_index,
+            MessageBodyWindow {
+                visible_top: f32::from(viewport.top() - bounds.top()),
+                visible_height: f32::from(viewport.size.height),
+            },
+        ))
+    }
+
     pub(super) fn transcript_row(
         &mut self,
         index: usize,
+        body_window: Option<MessageBodyWindow>,
+        rests_at_tail: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2512,6 +2559,27 @@ impl Waku {
                         .then(|| {
                             let view = markdown.entry(message.id).or_default();
                             view.set_text(message.visible_content(), message.streaming);
+                            // The ledger and the clip are geometry at one wrap
+                            // width, and every frame that lays this body out
+                            // records it — not only a windowed one. A stream
+                            // commit remeasures the tail rows, so the frame
+                            // after each one has no bounds to window with, and
+                            // a narrow drag keeps landing there: without this a
+                            // clip measured at the wider wrap would cut the
+                            // lines the new wrap pushed below it.
+                            view.set_render_width(f32::from(self.transcript_layout_width.get()));
+                            // The clipped height is what the row reports; it
+                            // only animates while the reader rests on the
+                            // tail, because a row that keeps growing under a
+                            // preserved scrollback anchor reads as a tremor.
+                            // A settled row takes the same call, which
+                            // releases the clip; so does a row whose body was
+                            // never measured — a user message, whose body
+                            // `clip_body` hands back untouched.
+                            view.advance_clip(
+                                animate_streaming && rests_at_tail,
+                                std::time::Instant::now(),
+                            );
                             &*view
                         });
                     let sent_annotations = self.sent_annotation_indicator(&message, cx);
@@ -2531,6 +2599,7 @@ impl Waku {
                             attachment_images,
                             attachments_can_reveal,
                             markdown: view,
+                            body_window,
                             ctx: &ctx,
                             menu,
                             waku,
@@ -2539,18 +2608,19 @@ impl Waku {
                         cx,
                     );
                     if animate_streaming && view.is_some_and(MarkdownView::is_fading) {
-                        // Advance the dissolve from the shared pulse clock,
-                        // not `request_animation_frame`: chunks land every
-                        // stream commit, so a fade is active for essentially
-                        // the whole response and a display-rate re-arm held
-                        // the window at 120 Hz — and every one of those
-                        // frames rebuilds each visible row. ~30 fps across a
-                        // 120-400 ms dissolve is visually equivalent at a
-                        // quarter of the redraws, the same trade the loaders
-                        // make, and the lease parks once the last chunk
-                        // settles. Leasing `current_view` (the transcript
-                        // pane) keeps the tick from busting sibling islands.
-                        motion::pulse_lease(window.current_view(), cx);
+                        // Advance the dissolve from a shared clock, not
+                        // `request_animation_frame`: chunks land every stream
+                        // commit, so a fade is active for essentially the
+                        // whole response and a display-rate re-arm held the
+                        // window at 120 Hz — and every one of those frames
+                        // rebuilt the root and busted sibling pane caches. The
+                        // paced grapheme wave moves on every display frame, so
+                        // it leases the cadence chosen in Settings (120 fps
+                        // rides the display clock; 60 and 30 stride the loader
+                        // clock). A lease is still one notify on the transcript
+                        // pane (the current view), so a tick costs one pane
+                        // rebuild, and it parks once the last grapheme settles.
+                        motion::dissolve_lease(window.current_view(), self.state.dissolve_fps, cx);
                     }
                     rendered
                 })
@@ -3320,9 +3390,13 @@ impl Waku {
             return cluster.into_any_element();
         }
         // `Theme::overlay` is 5% alpha and GPUI's `opacity` multiplies it.
+        // Expanded detail uses this faint wash instead of a border or a
+        // divider line, the way Codex and Paseo mark an open tool call.
         let activity_surface = theme.surface.blend(theme.overlay.opacity(0.7));
-        let activity_hover_surface = theme.surface.blend(theme.overlay);
-        let activity_active_surface = theme.surface.blend(theme.overlay_strong.opacity(0.72));
+        // Hover and active stay a step below the expanded detail wash so a
+        // highlighted row never reads darker than the content it opens.
+        let activity_hover_surface = theme.surface.blend(theme.overlay.opacity(0.5));
+        let activity_active_surface = theme.surface.blend(theme.overlay.opacity(0.8));
         let mut items = div()
             .w_full()
             .min_w_0()
@@ -3427,26 +3501,17 @@ impl Waku {
                 .min_w_0()
                 .overflow_hidden()
                 .rounded(px(9.0))
-                .border_1()
-                .border_color(theme.border_strong)
-                .bg(activity_surface)
                 .flex()
                 .flex_col()
                 .child(
                     div()
                         .id(SharedString::from(format!("activity-item-{id}")))
-                        // The parent owns a 1px border on each edge, so a
-                        // 28px row makes the visible activity header 30px.
                         .h(px(28.0))
                         .px(px(8.0))
                         .flex()
                         .items_center()
                         .gap(px(8.0))
-                        .rounded_tl(px(8.0))
-                        .rounded_tr(px(8.0))
-                        .when(!item_expanded, |element| {
-                            element.rounded_bl(px(8.0)).rounded_br(px(8.0))
-                        })
+                        .rounded(px(9.0))
                         .text_size(sp(12.5))
                         .line_height(sp(16.0))
                         .when(has_detail, |element| {
@@ -3585,10 +3650,11 @@ impl Waku {
                         .w_full()
                         .min_w_0()
                         .relative()
+                        .mt(px(4.0))
                         .max_h(px(400.0))
                         .overflow_hidden()
-                        .border_t_1()
-                        .border_color(theme.border_strong)
+                        .rounded(px(9.0))
+                        .bg(activity_surface)
                         .child(
                             div()
                                 .id(SharedString::from(format!("reasoning-scroll-{id}")))
@@ -3653,8 +3719,9 @@ impl Waku {
                 let mut detail_card = div()
                     .w_full()
                     .min_w_0()
-                    .border_t_1()
-                    .border_color(theme.border_strong)
+                    .mt(px(4.0))
+                    .rounded(px(9.0))
+                    .bg(activity_surface)
                     .px(px(12.0))
                     .py(px(8.0))
                     .flex()
@@ -3921,10 +3988,11 @@ impl Waku {
             .w_full()
             .min_w_0()
             .relative()
+            .mt(px(4.0))
             .max_h(px(ACTIVITY_DIFF_MAX_HEIGHT))
             .overflow_hidden()
-            .border_t_1()
-            .border_color(theme.border_strong)
+            .rounded(px(9.0))
+            .bg(surface)
             .child(rows)
             .child(scrollbar::edge_fade(
                 viewport.scroll_handle.clone(),

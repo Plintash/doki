@@ -719,7 +719,10 @@ pub(super) fn transcript_anchor_end_space(
 /// `is_scrolled` set after a collapse removes all overflow. The final row's
 /// bounds then distinguish the tail position for both list alignments:
 /// `ListScrollEvent::is_scrolled` alone stays true at the bottom of the
-/// top-aligned list used while a turn is anchored.
+/// top-aligned list used while a turn is anchored. `tail_rest` is the caller's
+/// [`transcript_rests_at_tail`] answer for this frame, which it reads anyway to
+/// pace the streaming reveal: taking it in keeps one answer per frame instead
+/// of asking the same question twice.
 ///
 /// The caller holds the previous answer through `None` rather than resolving
 /// it. Every stream commit remeasures the tail rows, so the frame after each
@@ -730,19 +733,13 @@ pub(super) fn should_show_scroll_to_bottom(
     is_scrolled: bool,
     anchor_following: bool,
     transcript_scrollable: bool,
-    viewport_bottom: Pixels,
-    tail_bottom: Option<Pixels>,
-    end_space: Pixels,
+    tail_rest: Option<bool>,
 ) -> Option<bool> {
     if !is_scrolled || anchor_following || !transcript_scrollable {
         return Some(false);
     }
 
-    Some(!transcript_rests_at_tail(
-        viewport_bottom,
-        tail_bottom,
-        end_space,
-    )?)
+    Some(!tail_rest?)
 }
 
 /// Whether the transcript currently sits at the end of its content, or `None`
@@ -947,10 +944,14 @@ pub(super) fn folded_transcript_row_kinds(
             rows.push(row);
         }
     }
-    // A busy session with a live turn closes with the working indicator. The
-    // busy check matters on its own: a driver error can fail the session while
-    // its turn is still marked running, and "Working" over a failure misleads.
-    if session.status.is_busy() && session.active_turn_id().is_some() {
+    // A busy session closes with the working indicator: the live turn while
+    // it runs, and a Pi turn that ended while the detached work it started
+    // still runs, which has no turn left to hold but is not finished either.
+    // The busy check matters on its own: a driver error can fail the session
+    // while its turn is still marked running, and "Working" over a failure
+    // misleads.
+    let waits_for_detached_work = session.status == SessionStatus::Background;
+    if session.status.is_busy() && (session.active_turn_id().is_some() || waits_for_detached_work) {
         rows.push(TranscriptRowKind::WorkingIndicator);
     }
 
