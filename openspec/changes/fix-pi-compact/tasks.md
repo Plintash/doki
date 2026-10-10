@@ -24,8 +24,8 @@
 
 ## 5. The settling turn gets no synthetic reply
 
-- [x] 5.1 Record the turn on the session runtime when the resolved prompt handed to the transport is a Pi compact invocation, at `finish_submission_preparation` in `src/app/runtime.rs`; verified by `cargo check` and the app tests
-- [x] 5.2 Skip the answerless-turn fallback in `TurnFinished` for exactly that recorded turn in `src/app/streaming.rs`, consuming the record either way so a command the provider ignored cannot swallow a later settlement; verified by the app test suite
+- [x] 5.1 Record the turn on the session runtime when the resolved prompt handed to the transport is a Pi compact invocation, at `finish_submission_preparation` in `src/app/runtime.rs`; verified by `cargo check` and the operator's app validation
+- [x] 5.2 Skip the answerless-turn fallback in `TurnFinished` for exactly that recorded turn in `src/app/streaming.rs`, consuming the record either way so a command the provider ignored cannot swallow a later settlement; verified by `cargo check` and the operator's app validation
 
 ## 6. Documentation and validation
 

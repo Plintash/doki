@@ -1886,11 +1886,6 @@ fn handle_pi_message(
             let manual = value.get("reason").and_then(Value::as_str) == Some("manual");
             let aborted = value.get("aborted").and_then(Value::as_bool) == Some(true);
             let result = value.get("result");
-            let error = value
-                .get("errorMessage")
-                .or_else(|| value.get("error"))
-                .and_then(Value::as_str)
-                .filter(|error| !error.trim().is_empty());
             let compaction_tokens = result
                 .and_then(|result| result.get("estimatedTokensAfter"))
                 .and_then(Value::as_u64);
@@ -1914,12 +1909,7 @@ fn handle_pi_message(
                         true,
                     )
                 } else {
-                    let message = error.map(str::to_owned).unwrap_or_else(|| {
-                        tr!(
-                            "errors.provider_reported_error",
-                            provider = flavor.display_name()
-                        )
-                    });
+                    let message = pi_error_message(flavor, &value);
                     compaction_activity(
                         id,
                         tr!("activity.compaction_failed"),
@@ -5021,8 +5011,7 @@ mod tests {
         // Pi's RPC prompt path expands extension commands, skills and prompt
         // templates and nothing else: a typed `/compact` would otherwise reach
         // the model as literal text. The transport recognises the invocation
-        // and writes the compaction request instead, answer registered for the
-        // reader thread.
+        // and writes the compaction request instead.
         let (pending, _commands, _command_rx, _state) = harness();
         let (events, event_rx) = unbounded();
         let mut wire = Vec::new();

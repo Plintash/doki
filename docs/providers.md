@@ -358,7 +358,7 @@ it, and a project, user or skill command named `compact` still wins it through
 the ordinary precedence. Oh My Pi's flavour is untouched: only Pi's RPC has
 been verified to take the command.
 
-**Inbound stream** ([pi.rs:1703](../crates/waku-core/src/driver/pi.rs#L1703)):
+**Inbound stream** ([pi.rs:1707](../crates/waku-core/src/driver/pi.rs#L1707)):
 
 | Event | Becomes |
 | --- | --- |
