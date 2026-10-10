@@ -41,13 +41,15 @@ pub const DEFAULT_RIGHT_PANEL_WIDTH: f32 = 460.0;
 /// Project-first by default: a day's work is spread across every project it
 /// touched, so date headings pile unrelated tasks on top of each other, while
 /// the tasks sharing a project are the ones a user resumes together. Date
-/// headings stay one click away in the sidebar's options menu.
+/// headings and the status view — which groups tasks by what they need from
+/// the user — stay one click away in the sidebar's options menu.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarGrouping {
     #[default]
     Project,
     Updated,
+    Status,
 }
 
 /// Direction of task history inside the sidebar's current grouping.
@@ -1438,6 +1440,29 @@ mod tests {
             SidebarGrouping::Updated,
             "a switch back to date headings survives the next launch"
         );
+    }
+
+    #[test]
+    fn the_status_view_is_stored_by_name_and_survives_a_round_trip() {
+        let stored: AppState = serde_json::from_str(
+            r#"{"app_state_version":1,"sidebar_grouping":"status","sidebar_grouping_chosen":true}"#,
+        )
+        .unwrap();
+
+        assert_eq!(stored.sidebar_grouping, SidebarGrouping::Status);
+        assert_eq!(
+            sidebar_grouping_for(stored.sidebar_grouping_chosen, stored.sidebar_grouping),
+            SidebarGrouping::Status,
+            "an explicit choice of the status view outlives the default"
+        );
+        assert_eq!(
+            sidebar_grouping_for(false, SidebarGrouping::Status),
+            SidebarGrouping::Project
+        );
+
+        let written = serde_json::to_string(&stored).unwrap();
+        let read_back: AppState = serde_json::from_str(&written).unwrap();
+        assert_eq!(read_back.sidebar_grouping, SidebarGrouping::Status);
     }
 
     #[test]

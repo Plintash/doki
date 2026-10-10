@@ -1666,6 +1666,10 @@ pub struct Waku {
     /// Fingerprint + snapshot pair backing `sidebar_rows_cached`.
     sidebar_rows_fingerprint: Cell<Option<u64>>,
     sidebar_rows_snapshot: RefCell<Rc<Vec<SidebarRow>>>,
+    /// How many started tasks each status section holds, from the pass that
+    /// built `sidebar_rows_snapshot`, so a section header labels itself without
+    /// counting the session list while it renders.
+    sidebar_status_section_counts: RefCell<[usize; SidebarStatusSection::ALL.len()]>,
     /// Branch labels for ordinary local project paths, resolved together on a
     /// background executor so sidebar rows only read memory.
     sidebar_branch_labels: RefCell<HashMap<PathBuf, SharedString>>,
@@ -1837,7 +1841,7 @@ pub use goal_dialog::init as init_goal_dialog_keys;
 pub use image_preview::init as init_image_preview_keys;
 pub use settings::init as init_settings_keys;
 pub use sidebar::init as init_sidebar_keys;
-use sidebar::{SidebarGroup, SidebarRow};
+use sidebar::{SidebarGroup, SidebarRow, SidebarStatusSection};
 pub use skills_page::init as init_skills_keys;
 use streaming::*;
 use transcript::*;
@@ -3186,6 +3190,7 @@ impl Waku {
                 sidebar_row_cache: RefCell::new(Vec::new()),
                 sidebar_rows_fingerprint: Cell::new(None),
                 sidebar_rows_snapshot: RefCell::new(Rc::new(Vec::new())),
+                sidebar_status_section_counts: RefCell::new([0; SidebarStatusSection::ALL.len()]),
                 sidebar_branch_labels: RefCell::new(HashMap::new()),
                 sidebar_branch_scan_fingerprint: Cell::new(None),
                 sidebar_branch_scan_generation: Cell::new(0),

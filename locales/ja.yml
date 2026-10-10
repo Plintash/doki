@@ -254,6 +254,10 @@ sidebar.options: サイドバーオプション
 sidebar.grouping: グループ化
 sidebar.grouping_project: プロジェクト
 sidebar.grouping_updated: 更新日
+sidebar.grouping_status: ステータス
+sidebar.section_needs_you: あなたの対応待ち
+sidebar.section_running: 実行中
+sidebar.section_recent: 最近
 sidebar.ordering: 並び順
 sidebar.ordering_newest: 新しい順
 sidebar.ordering_oldest: 古い順
