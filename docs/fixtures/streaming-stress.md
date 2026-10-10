@@ -709,7 +709,7 @@ Case 160 — 结束。
 073  the ordinal stride caps one block
 074  a debug assert catches an overflow
 075  the spacer is a flex-none div
-076  the spacer is skipped under half a pixel
+076  a short line in the giant fence
 077  the group is a contiguous range
 078  the group count is usually one
 079  the group count can be two
@@ -724,7 +724,7 @@ Case 160 — 结束。
 088  the window ignores the annotation override
 089  the planning gap matches the column gap
 090  the trailing gap never counts
-091  the total is clamped at zero
+091  a short line in the giant fence
 092  the starts vector is built once per frame
 093  the group search is a linear scan
 094  the scan is bounded by block count
@@ -741,7 +741,7 @@ Case 160 — 结束。
 105  the stream ends with a settle
 106  the settle clears the streaming flag
 107  the settle sets volatile_from to the end
-108  the settle keeps the ledger for scrolling
+108  a short line in the giant fence
 109  the ledger survives until a rewrite
 110  the ledger is cheap: one option per block
 111  the ledger is measured, never guessed

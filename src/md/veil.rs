@@ -306,6 +306,14 @@ impl RowVeil {
     pub fn is_fading(&self) -> bool {
         self.elements.values().any(ElementVeil::is_fading)
     }
+
+    /// Whether this veil is still adopting everything it sees at full
+    /// opacity: the first render after an attach, and the only state in which
+    /// appended text reaches paint without a fade. A caller holding text back
+    /// from paint has nothing to hold while this is true.
+    pub fn is_seeding(&self) -> bool {
+        self.seeding
+    }
 }
 
 /// Split runs at veil boundaries and multiply only paint colors by the

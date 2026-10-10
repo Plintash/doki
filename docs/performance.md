@@ -95,7 +95,13 @@ for the same per-frame work a display-rate redraw costs; the fee is that the
 whole visible transcript (not just the fading tail) rebuilds per frame while
 text streams. The reasoning peek keeps its ≈ 15 Hz pulse lease: minutes of
 thinking would pay that rebuild at display rate for a dim, compact, secondary
-surface.
+surface. A windowed body builds only the blocks the viewport can reach, so the
+veil carries two rules of its own: a fade in a block the window dropped expires
+on the wall clock, because nothing on screen would ever drain it and a unit
+that never expires would leave `is_fading` true with nothing fading, holding
+the display-rate lease open for the rest of the turn; and a block the window
+builds again is adopted at full opacity rather than re-dissolved, because the
+reader has already read past it.
 
 **Overlay scrollbars are the classic violator of both cadences.** A streaming
 surface moves its content every commit, so the bar sits in its reveal hold for
@@ -183,15 +189,19 @@ moment any scrollbar became visible.
   clip edge — and the veil has not painted that yet, because a newly appended
   grapheme is born at zero opacity. The gap under the text is the only
   artifact, bounded by the rate lead (`CLIP_RUNWAY_MAX`). That trade holds
-  only while the dissolve runs: with animation off — reduce motion, or a
-  reader scrolled away from the tail — nothing holds appended text
-  invisible, so the same call releases the clip and the row reports the
-  body's real height. Settling, a rewrite, a reflow, and a metric change all
+  only while the reader rests on the tail with the dissolve running: reduce
+  motion, or a viewport scrolled away from the tail — where a row that keeps
+  growing under a preserved scrollback anchor reads as a tremor — turns the
+  same call into a release, and the row reports the body's real height.
+  Settling, a rewrite, a reflow, a metric change, and a seeded re-attach all
   release the clip too, because a height kept across any of them would cut a
   body that has since grown past it. So does a body holding an image or a
   formula: such a block can land on a later frame and grow the body past a
   height measured before it, and unlike appended text it paints opaque, so
-  the clip would cut it in the open. Only a streaming body is measured for
+  the clip would cut it in the open. The seeded re-attach is the subtle one:
+  it adopts the body it finds, text that arrived while the row was off screen
+  included, at full opacity, so nothing holds that text back from paint and
+  the clip goes with it. Only a streaming body is measured for
   that controller at all; a settled one skips the wrapper.
 - `MarkdownView::set_text` derives the mended display tail only when content
   or the streaming flag changed — the derivation re-parses the final block and

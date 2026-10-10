@@ -706,14 +706,17 @@ impl MarkdownView {
             self.release_clip();
             return;
         };
-        if !animate || self.async_blocks.get() {
+        if !animate || self.async_blocks.get() || self.veil.borrow().is_seeding() {
             // A pinned clip is the height measured last frame. Without the
             // veil, every appended line has since grown past it and those
             // bytes are opaque, so pinning would only cut the text the reader
             // is waiting for. An image or formula has the same problem with
             // the veil on: it lands opaque on a later frame and can grow the
             // body past a height measured before it, and no veiled grapheme
-            // is what would be cut.
+            // is what would be cut. A seeded veil is the same story for a
+            // re-attach: it adopts the body it finds, text that arrived while
+            // the row was off screen included, at full opacity, so a height
+            // measured before the attach would cut exactly that text.
             self.release_clip();
             return;
         }
@@ -3761,12 +3764,38 @@ mod tests {
         view.set_text("hello", false);
         assert_eq!(view.clip_height(), None, "settling releases the clip");
 
+        // A reflow re-wraps every block, so a height kept across one is no
+        // more valid than the heights the spacers were sized from.
+        let mut view = MarkdownView::new();
+        view.set_render_width(600.0);
         view.set_text("hello", true);
         view.body_height.set(Some(px(100.0)));
         view.advance_clip(true, Instant::now());
         assert_eq!(view.clip_height(), Some(px(100.0)), "streaming clips");
         view.set_render_width(500.0);
         assert_eq!(view.clip_height(), None, "a reflow releases the clip");
+    }
+
+    /// Re-attaching to a body that streamed while its row was off screen
+    /// seeds the veil, which adopts everything it finds — the text that
+    /// arrived meanwhile included — at full opacity. A height measured before
+    /// the attach would cut exactly that text, so the attach's first frame
+    /// reports the body's real height instead.
+    #[test]
+    fn a_seeded_attach_releases_the_container_height() {
+        let mut view = MarkdownView::new();
+        view.set_text("hello", true);
+        view.body_height.set(Some(px(100.0)));
+        view.advance_clip(true, Instant::now());
+        assert_eq!(view.clip_height(), Some(px(100.0)), "streaming clips");
+
+        view.seed_streaming_baseline();
+        view.advance_clip(true, Instant::now());
+        assert_eq!(
+            view.clip_height(),
+            None,
+            "a seeded attach releases the clip"
+        );
     }
 
     /// Mending re-partitions the tail as it settles. A height measured for
