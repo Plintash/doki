@@ -115,6 +115,27 @@ Differences worth knowing:
   Keyboard and IME are unaffected — those still reach the page directly once
   it holds focus.
 
+## Building from source
+
+The debug app and the release bundle need Rust 1.96 or newer, Bun, and the
+MSVC toolchain (Visual Studio Build Tools with the C++ workload and the Windows
+SDK) so Cargo can link and the resource compiler is available for the
+executable's icon and version block.
+
+```sh
+bun scripts/bundle-windows.ts
+```
+
+The portable zip and the installer both land under `target/release`. The zip
+holds the two executables side by side beneath one versioned directory — the
+layout Waku needs to find its daemon — and the installer is built from
+[`resources/windows/waku.iss`](../resources/windows/waku.iss), so Inno Setup
+6.3 or newer must be installed (`choco install innosetup`); the architecture
+gate uses identifiers added in 6.3. Set `WINDOWS_CERTIFICATE` (base64 `.pfx`)
+and `WINDOWS_CERTIFICATE_PASSWORD` to Authenticode-sign them; without those the
+script packages unsigned binaries and says so. [RELEASING.md](../RELEASING.md)
+documents the signed update feed.
+
 ## Computer Use
 
 Debug builds expose Computer Use for supported providers through the bundled
