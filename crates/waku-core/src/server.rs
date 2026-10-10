@@ -97,6 +97,21 @@ impl EventSink {
             .emit(self.session_id, self.runtime_id, event, false);
         Ok(())
     }
+
+    /// Publishes a daemon-owned change to this session's objective.
+    ///
+    /// The daemon writes a generated objective itself, with no client save
+    /// behind it, so there is no source subscriber to skip: every attached
+    /// client has to reload the task state to see it. The catalog entry keeps
+    /// the value the clients now render, or the next save would look like a
+    /// change the daemon had not published yet.
+    pub fn task_objective_published(&self, objective: String) {
+        let mut state = self.hub.state.lock();
+        if let Some(entry) = state.catalog_sessions.get_mut(&self.session_id) {
+            entry.objective = Some(objective);
+        }
+        Hub::broadcast_task_state_changed(&mut state, u64::MAX);
+    }
 }
 
 /// One connected client's delivery state.
@@ -1206,6 +1221,46 @@ mod tests {
             observer_rx.recv_timeout(Duration::from_secs(1)),
             Ok(ServerMessage::TaskStateChanged { revision: 1 })
         ));
+    }
+
+    #[test]
+    fn a_daemon_generated_objective_reaches_every_client_and_stays_published() {
+        // The daemon writes a generated objective itself: no client's save is
+        // behind it, so no subscriber is the source and every one of them has
+        // to reload the task state. The catalog then records what the clients
+        // will find there — an objective the daemon has already published — so
+        // the next client save carrying it is not read as a change the daemon
+        // still owes them.
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let (author_tx, author_rx) = unbounded();
+        hub.subscribe(&[], Subscriber::new(author_tx).0);
+        let (observer_tx, observer_rx) = unbounded();
+        hub.subscribe(&[], Subscriber::new(observer_tx).0);
+
+        let mut session = AgentSession::new(session_id, ProviderKind::Pi);
+        session.objective = Some("The list says why each task exists".into());
+        hub.replace_task_catalog(&[], std::slice::from_ref(&session));
+        hub.event_sink(session_id, runtime_id)
+            .task_objective_published("The list says why each task exists".to_owned());
+
+        for subscriber in [&author_rx, &observer_rx] {
+            assert!(matches!(
+                subscriber.recv_timeout(Duration::from_secs(1)),
+                Ok(ServerMessage::TaskStateChanged { revision: 1 })
+            ));
+        }
+
+        // The catalog now holds the objective, so a client reporting the value
+        // it just loaded moves nothing.
+        hub.task_state_saved(u64::MAX, &[], std::slice::from_ref(&session));
+        for subscriber in [&author_rx, &observer_rx] {
+            assert!(
+                subscriber.recv_timeout(Duration::from_millis(50)).is_err(),
+                "a client's copy of a published objective is not a change"
+            );
+        }
     }
 
     /// A goal change has to move the task catalog revision. The entry records

@@ -3,12 +3,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crate::{
     Backend, Command, EventSink, Request, ResponsePayload, WireDriverEvent, WorkspaceOperation,
     WorkspaceResult,
 };
 use anyhow::{Context as _, anyhow, bail};
+use crossbeam_channel::RecvTimeoutError;
 use parking_lot::Mutex;
 use serde_json::Value;
 use uuid::Uuid;
@@ -59,8 +61,12 @@ pub struct WakuBackend {
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
     settings: DaemonSettingsStore,
-    task_store: StateStore,
-    task_state: Mutex<PersistedState>,
+    /// The task store and the state it holds are shared with the per-session
+    /// event threads: a generated objective is written by the daemon itself,
+    /// with no client save behind it, and the thread that reads the session's
+    /// driver events is the one that has it.
+    task_store: Arc<StateStore>,
+    task_state: Arc<Mutex<PersistedState>>,
     removed_session_ids: Mutex<HashSet<Uuid>>,
     composer_drafts: ComposerDraftStore,
     attachments: AttachmentStore,
@@ -95,8 +101,8 @@ impl WakuBackend {
             #[cfg(all(test, unix))]
             terminal_shell: None,
             settings,
-            task_store,
-            task_state: Mutex::new(task_state),
+            task_store: Arc::new(task_store),
+            task_state: Arc::new(Mutex::new(task_state)),
             removed_session_ids: Mutex::new(HashSet::new()),
             composer_drafts,
             attachments,
@@ -900,23 +906,26 @@ impl Backend for WakuBackend {
                 let (event_sender, event_receiver) = driver::event_channel(wake);
                 let handle = driver::start_local(provider, options, event_sender)?;
                 let supports_steer = handle.supports_steer();
+                let digest = TaskDigestThread {
+                    digest: TaskDigest {
+                        session_id,
+                        driver: handle.clone(),
+                        // Only Pi carries the extension that answers a
+                        // trigger. Every other provider's sessions forward
+                        // their events as they always have: no schedule, no
+                        // generation, and no catalog revision from one.
+                        writer: (provider == ProviderKind::Pi).then(|| ObjectiveStore {
+                            task_state: self.task_state.clone(),
+                            task_store: self.task_store.clone(),
+                        }),
+                        schedule: crate::task_digest::DigestSchedule::default(),
+                        turn_open: false,
+                    },
+                    events: events.clone(),
+                };
                 std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
-                    .spawn(move || {
-                        while let Ok(event) = event_receiver.recv() {
-                            let wire = event_to_wire(event).unwrap_or_else(|error| {
-                                WireDriverEvent::new(
-                                    "error",
-                                    Value::String(format!(
-                                        "could not encode daemon event: {error}"
-                                    )),
-                                )
-                            });
-                            if events.send(wire).is_err() {
-                                break;
-                            }
-                        }
-                    })
+                    .spawn(move || digest.forward(event_receiver))
                     .context("could not start daemon event forwarding thread")?;
                 self.sessions
                     .lock()
@@ -977,6 +986,162 @@ impl Backend for WakuBackend {
         drop(sessions);
         let terminals = std::mem::take(&mut *self.terminals.lock());
         drop(terminals);
+    }
+}
+
+/// One session's generated objective.
+///
+/// The daemon owns the objective — no client's save carries it — so the
+/// per-session event thread is what stores a generated one and publishes the
+/// catalog revision every client reloads on.
+///
+/// Only a turn that announced itself can settle: a refusal, and a command an
+/// extension consumed, answer a prompt with no run behind them. So a task that
+/// was merely opened or resumed generates nothing, and no pass over stored
+/// history exists — this only ever sees what happens while the session runs.
+struct TaskDigest {
+    session_id: Uuid,
+    driver: DriverHandle,
+    /// `None` on a provider whose sessions carry no extension to answer a
+    /// trigger. Such a session generates nothing, and its events are forwarded
+    /// exactly as they always were.
+    writer: Option<ObjectiveStore>,
+    schedule: crate::task_digest::DigestSchedule,
+    /// Whether the provider's turn announced itself and has not settled yet.
+    turn_open: bool,
+}
+
+impl TaskDigest {
+    /// What one driver event means for the task's objective.
+    ///
+    /// The objective a published result replaced is what the caller publishes;
+    /// every other event changes nothing that reaches anyone.
+    fn observe(&mut self, event: &DriverEvent, now: Instant) -> Option<String> {
+        match event {
+            DriverEvent::TurnStarted => {
+                self.turn_open = true;
+                None
+            }
+            DriverEvent::TurnFinished { .. } => {
+                if !self.turn_open {
+                    return None;
+                }
+                self.turn_open = false;
+                if self.writer.is_some() {
+                    self.schedule.settled(now);
+                }
+                None
+            }
+            DriverEvent::ExtensionMessage {
+                custom_type, text, ..
+            } if custom_type == crate::task_digest::DIGEST_SURFACE => {
+                let result = crate::task_digest::parse_result(text)?;
+                // A result counts only for the dispatch the daemon is waiting
+                // on: one that arrives after its timeout, or that answers a
+                // generation this task never asked for, changes nothing.
+                if !self.schedule.resolve(result.dispatch) {
+                    return None;
+                }
+                self.writer
+                    .as_ref()?
+                    .store(self.session_id, &result.objective)
+            }
+            _ => None,
+        }
+    }
+
+    /// The dispatch to trigger, when a generation is due.
+    fn due(&mut self, now: Instant) -> Option<Uuid> {
+        self.writer.as_ref()?;
+        match self.schedule.advance(now) {
+            // The driver is what refuses to send this to a session whose
+            // provider never reported the command: on such a session the
+            // trigger would be an ordinary prompt, and the task would gain a
+            // real turn.
+            crate::task_digest::DigestStep::Dispatch(dispatch) => Some(dispatch),
+            // A generation that published nothing is the silent failure the
+            // objective is allowed to have, and a quiet task has nothing due.
+            crate::task_digest::DigestStep::Timeout(_) | crate::task_digest::DigestStep::Idle => {
+                None
+            }
+        }
+    }
+}
+
+/// The state one session's events are forwarded to, and the objective work the
+/// forwarding notices on the way.
+struct TaskDigestThread {
+    digest: TaskDigest,
+    events: EventSink,
+}
+
+impl TaskDigestThread {
+    /// Forwards this session's driver events, and acts on the two that decide
+    /// the task's objective: a settlement schedules a generation, and a
+    /// published result becomes the objective and one catalog revision.
+    fn forward(mut self, events: crossbeam_channel::Receiver<DriverEvent>) {
+        loop {
+            let event = match self.digest.schedule.next_wake() {
+                // Sleeping until the next deadline is what makes the quiet
+                // period and the generation timeout real without a timer thread
+                // per task: the wake is this session's own event stream.
+                Some(deadline) => match events.recv_deadline(deadline) {
+                    Ok(event) => Some(event),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                },
+                None => match events.recv() {
+                    Ok(event) => Some(event),
+                    Err(_) => break,
+                },
+            };
+            if let Some(event) = event {
+                let now = Instant::now();
+                if let Some(objective) = self.digest.observe(&event, now) {
+                    self.events.task_objective_published(objective);
+                }
+                let wire = event_to_wire(event).unwrap_or_else(|error| {
+                    WireDriverEvent::new(
+                        "error",
+                        Value::String(format!("could not encode daemon event: {error}")),
+                    )
+                });
+                if self.events.send(wire).is_err() {
+                    break;
+                }
+            }
+            if let Some(dispatch) = self.digest.due(Instant::now()) {
+                let trigger = crate::task_digest::trigger_prompt(dispatch);
+                self.digest.driver.prompt(trigger);
+            }
+        }
+    }
+}
+
+/// The daemon-owned state a generated objective is written to, shared with the
+/// per-session event threads.
+#[derive(Clone)]
+struct ObjectiveStore {
+    task_state: Arc<Mutex<PersistedState>>,
+    task_store: Arc<StateStore>,
+}
+
+impl ObjectiveStore {
+    /// Stores one generated objective for `session_id`.
+    ///
+    /// The returned objective is the one clients now render, or `None` when the
+    /// store — and every client holding it — is untouched: a task the daemon
+    /// does not know, an objective the parser rejects, a rewrite that says what
+    /// the stored text already says, and a task whose goal owns the field all
+    /// end here with nothing written and no revision emitted.
+    fn store(&self, session_id: Uuid, candidate: &str) -> Option<String> {
+        let mut state = self.task_state.lock();
+        let objective =
+            crate::task_digest::store_generated_objective(&mut state, session_id, candidate)?;
+        // A store that cannot be written is not news for the user, and the
+        // objective is in the daemon's memory either way.
+        let _ = self.task_store.save(&mut state);
+        Some(objective)
     }
 }
 
@@ -1958,6 +2123,13 @@ fn ensure_shell_environment() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::DriverControl;
+    use crate::task_digest::{
+        DIGEST_SURFACE, DigestSchedule, DigestStep, GENERATION_TIMEOUT, QUIET_PERIOD,
+        trigger_dispatch, trigger_prompt,
+    };
+    use serde_json::json;
+    use std::time::Duration;
     use waku_protocol::event_from_wire;
 
     /// A goal the way a provider reports one.
@@ -2227,5 +2399,363 @@ mod tests {
             DriverEvent::PromptSubmitted { message, turn_id: decoded_turn, message_id: decoded_message }
                 if message == "ship it" && decoded_turn == turn_id && decoded_message == message_id
         ));
+    }
+
+    /// A driver that records what the daemon asks it to do.
+    #[derive(Default)]
+    struct RecordingDriver(Mutex<Vec<String>>);
+
+    impl RecordingDriver {
+        fn prompts(&self) -> Vec<String> {
+            self.0.lock().clone()
+        }
+    }
+
+    impl DriverControl for RecordingDriver {
+        fn prompt(&self, prompt: String) {
+            self.0.lock().push(prompt);
+        }
+
+        fn cancel(&self) {}
+
+        fn respond(&self, _request_id: String, _option_id: String) {}
+
+        fn rollback(&self, _turns: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
+            bail!("rolling back is not part of this test")
+        }
+    }
+
+    /// One task's objective generation, the driver it triggers, and the store
+    /// it writes to — the three things the daemon's event thread holds.
+    struct DigestUnderTest {
+        digest: TaskDigest,
+        driver: Arc<RecordingDriver>,
+        task_state: Arc<Mutex<PersistedState>>,
+        task_store: Arc<StateStore>,
+    }
+
+    impl DigestUnderTest {
+        /// A Pi task whose store lives in a directory of its own. `objective`
+        /// is what the task already carries.
+        fn new(name: &str, objective: Option<&str>) -> Self {
+            let root = std::env::temp_dir().join(format!("waku-{name}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let task_store = StateStore::daemon(root.join("app.db"));
+            let mut state = task_store.load().expect("a fresh task store");
+            let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+            session.title = "Sidebar groups tasks by what they need".into();
+            session.objective = objective.map(str::to_owned);
+            // A task with a settled turn behind it: a draft that never started
+            // owns no row, and the objective is a column of that row.
+            session.begin_turn("describe what this is for");
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+            let session_id = session.id;
+            state.push_session(session);
+
+            let driver = Arc::new(RecordingDriver::default());
+            let task_state = Arc::new(Mutex::new(state));
+            let task_store = Arc::new(task_store);
+            Self {
+                digest: TaskDigest {
+                    session_id,
+                    driver: DriverHandle::from_control(driver.clone()),
+                    writer: Some(ObjectiveStore {
+                        task_state: task_state.clone(),
+                        task_store: task_store.clone(),
+                    }),
+                    schedule: DigestSchedule::default(),
+                    turn_open: false,
+                },
+                driver,
+                task_state,
+                task_store,
+            }
+        }
+
+        /// Asks for a generation and returns the dispatch it sent.
+        fn dispatch(&mut self, now: Instant) -> Uuid {
+            let dispatch = self
+                .digest
+                .due(now)
+                .expect("a settled task's generation is due");
+            let trigger = trigger_prompt(dispatch);
+            self.digest.driver.prompt(trigger.clone());
+            assert_eq!(
+                trigger_dispatch(&trigger),
+                Some(dispatch),
+                "the trigger names the dispatch its result must carry"
+            );
+            assert_eq!(
+                self.driver.prompts().last().map(String::as_str),
+                Some(trigger.as_str()),
+                "the trigger reaches the driver"
+            );
+            dispatch
+        }
+
+        fn objective(&self) -> Option<String> {
+            self.task_state
+                .lock()
+                .sessions
+                .first()
+                .and_then(|session| session.objective.clone())
+        }
+
+        fn turn(&mut self, at: Instant) {
+            self.digest.observe(&DriverEvent::TurnStarted, at);
+            self.settle(at);
+        }
+
+        fn settle(&mut self, at: Instant) {
+            self.digest.observe(
+                &DriverEvent::TurnFinished {
+                    interrupted: false,
+                    success: true,
+                    summary: None,
+                },
+                at,
+            );
+        }
+    }
+
+    /// One published result, as the provider reports it.
+    fn digest_result(dispatch: Uuid, objective: &str) -> DriverEvent {
+        DriverEvent::ExtensionMessage {
+            custom_type: DIGEST_SURFACE.to_owned(),
+            text: json!({"v": 1, "dispatch": dispatch, "objective": objective}).to_string(),
+            display: false,
+        }
+    }
+
+    #[test]
+    fn a_settled_turn_generates_once_after_the_task_goes_quiet() {
+        let mut task = DigestUnderTest::new("digest-settles", None);
+        let base = Instant::now();
+        // A rapid back-and-forth: four turns settle inside one quiet period.
+        for offset in 0..4 {
+            task.turn(base + Duration::from_secs(offset));
+        }
+
+        assert_eq!(task.digest.due(base + Duration::from_secs(3)), None);
+        let dispatch = task.dispatch(base + QUIET_PERIOD + Duration::from_secs(3));
+        assert_eq!(
+            task.digest
+                .due(base + QUIET_PERIOD + Duration::from_secs(4)),
+            None,
+            "one generation runs at a time"
+        );
+
+        // The result answers the dispatch, and the task carries the objective.
+        let now = base + QUIET_PERIOD + Duration::from_secs(5);
+        assert_eq!(
+            task.digest.observe(
+                &digest_result(dispatch, "The task list says why each task exists"),
+                now
+            ),
+            Some("The task list says why each task exists".to_owned())
+        );
+        assert_eq!(
+            task.objective().as_deref(),
+            Some("The task list says why each task exists")
+        );
+        assert_eq!(
+            task.digest.due(base + Duration::from_secs(120)),
+            None,
+            "four settled turns are one generation, and it already answered"
+        );
+        assert_eq!(task.driver.prompts().len(), 1);
+    }
+
+    #[test]
+    fn an_answer_with_no_run_behind_it_generates_nothing() {
+        // A refusal, and a command the provider itself handled, both end a
+        // prompt without a turn ever starting. Neither is work to describe, and
+        // generating from one would describe the user's message rather than
+        // what the task is for.
+        let mut task = DigestUnderTest::new("digest-no-run", None);
+        let base = Instant::now();
+        for offset in 0..3 {
+            let at = base + Duration::from_secs(offset);
+            task.digest.observe(
+                &DriverEvent::TurnFinished {
+                    interrupted: false,
+                    success: offset != 1,
+                    summary: (offset == 1).then(|| "the prompt was refused".to_owned()),
+                },
+                at,
+            );
+        }
+
+        assert_eq!(task.digest.due(base + Duration::from_secs(3600)), None);
+        assert!(task.driver.prompts().is_empty());
+    }
+
+    #[test]
+    fn a_generation_only_the_daemon_asked_for_becomes_the_objective() {
+        let mut task = DigestUnderTest::new("digest-dispatch", Some("The list says why"));
+        let base = Instant::now();
+        task.turn(base);
+        let dispatch = task.dispatch(base + QUIET_PERIOD);
+
+        // A result for a generation this task never asked for — one from an
+        // earlier session, or one answering after its timeout — is stale.
+        assert_eq!(
+            task.digest.observe(
+                &digest_result(Uuid::new_v4(), "Something else entirely"),
+                base + QUIET_PERIOD
+            ),
+            None
+        );
+        assert_eq!(task.objective().as_deref(), Some("The list says why"));
+
+        // A result the daemon is not waiting on, because the generation timed
+        // out, is stale too: silence keeps the previous objective.
+        let after_timeout = base + QUIET_PERIOD + GENERATION_TIMEOUT;
+        assert_eq!(task.digest.due(after_timeout), None, "the dispatch gave up");
+        assert_eq!(
+            task.digest.observe(
+                &digest_result(dispatch, "A late answer nobody is waiting for"),
+                after_timeout
+            ),
+            None
+        );
+        assert_eq!(task.objective().as_deref(), Some("The list says why"));
+    }
+
+    #[test]
+    fn a_hostile_or_reworded_result_leaves_the_stored_objective_alone() {
+        let mut task = DigestUnderTest::new("digest-hostile", Some("The list says why"));
+        let base = Instant::now();
+        task.turn(base);
+        let dispatch = task.dispatch(base + QUIET_PERIOD);
+        let now = base + QUIET_PERIOD;
+
+        for (candidate, why) in [
+            ("Update src/app/sidebar.rs", "a path"),
+            ("Extend the schema in schema.ts", "a file"),
+            ("Rename render_sidebar_session_item", "a symbol"),
+            ("Sidebar groups tasks by what they need", "the title again"),
+            ("The list says why", "what is stored already"),
+        ] {
+            assert_eq!(
+                task.digest
+                    .observe(&digest_result(dispatch, candidate), now),
+                None,
+                "{candidate:?} ({why}) must not reach a client"
+            );
+            assert_eq!(task.objective().as_deref(), Some("The list says why"));
+        }
+    }
+
+    #[test]
+    fn a_goal_the_user_set_owns_the_objective() {
+        let mut task = DigestUnderTest::new("digest-goal", Some("The list says why"));
+        task.task_state
+            .lock()
+            .sessions
+            .first_mut()
+            .unwrap()
+            .thread_goal = Some(thread_goal("The sidebar groups tasks by what they need"));
+        let base = Instant::now();
+        task.turn(base);
+        let dispatch = task.dispatch(base + QUIET_PERIOD);
+
+        assert_eq!(
+            task.digest.observe(
+                &digest_result(dispatch, "A different outcome entirely"),
+                base + QUIET_PERIOD
+            ),
+            None,
+            "a goal the user set outranks a generated objective"
+        );
+        assert_eq!(task.objective().as_deref(), Some("The list says why"));
+    }
+
+    #[test]
+    fn a_session_without_the_extension_generates_nothing() {
+        // Only Pi carries the extension that answers a trigger, so every other
+        // session forwards its events exactly as it always did.
+        let mut task = DigestUnderTest::new("digest-no-extension", None);
+        task.digest.writer = None;
+        let base = Instant::now();
+        task.turn(base);
+
+        assert_eq!(task.digest.due(base + QUIET_PERIOD), None);
+        assert!(task.driver.prompts().is_empty());
+    }
+
+    #[test]
+    fn a_stored_objective_survives_a_reload() {
+        // The daemon writes the objective itself, so it is also the daemon that
+        // has to record the task as changed: a client that never saved anything
+        // would otherwise be looking at a revision the store does not back.
+        let mut task = DigestUnderTest::new("digest-persisted", None);
+        let base = Instant::now();
+        task.turn(base);
+        let dispatch = task.dispatch(base + QUIET_PERIOD);
+        task.digest.observe(
+            &digest_result(dispatch, "The task list says why each task exists"),
+            base + QUIET_PERIOD,
+        );
+
+        let reloaded = task.task_store.load().expect("the task store reloads");
+        assert_eq!(
+            reloaded
+                .sessions
+                .first()
+                .and_then(|session| session.objective.as_deref()),
+            Some("The task list says why each task exists")
+        );
+    }
+
+    #[test]
+    fn an_objective_for_a_task_the_daemon_does_not_know_is_dropped() {
+        // The event thread is the only writer, so a result for a task that is
+        // not in the store — one removed while its runtime lived on — is not
+        // news, and publishing a revision for it would tell every client to
+        // reload for nothing.
+        let mut task = DigestUnderTest::new("digest-unknown", None);
+        task.task_state.lock().sessions.clear();
+        let base = Instant::now();
+        task.turn(base);
+        let dispatch = task.dispatch(base + QUIET_PERIOD);
+
+        assert_eq!(
+            task.digest.observe(
+                &digest_result(dispatch, "The task list says why each task exists"),
+                base + QUIET_PERIOD
+            ),
+            None
+        );
+        assert!(task.task_state.lock().sessions.is_empty());
+    }
+
+    #[test]
+    fn the_schedule_times_out_a_generation_nobody_answered() {
+        // The timeout is the daemon's own: the generation is forgotten and the
+        // next settled turn may ask for another.
+        let mut task = DigestUnderTest::new("digest-timeout", None);
+        let base = Instant::now();
+        task.turn(base);
+        let dispatch = task.dispatch(base + QUIET_PERIOD);
+
+        let deadline = base + QUIET_PERIOD + GENERATION_TIMEOUT;
+        assert_eq!(task.digest.due(deadline - Duration::from_secs(1)), None);
+        assert_eq!(task.digest.due(deadline), None);
+        assert_eq!(
+            task.digest.schedule.advance(deadline),
+            DigestStep::Idle,
+            "the timed-out generation is forgotten"
+        );
+
+        task.turn(deadline + Duration::from_secs(1));
+        task.dispatch(deadline + Duration::from_secs(1) + QUIET_PERIOD);
+        assert_eq!(
+            task.driver.prompts().len(),
+            2,
+            "a task may generate again after a failure"
+        );
+        assert_ne!(task.driver.prompts()[0], task.driver.prompts()[1]);
+        let _ = dispatch;
     }
 }

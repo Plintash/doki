@@ -54,6 +54,7 @@ pub mod projectless;
 pub mod settings;
 pub mod skills;
 mod slash_command_catalog;
+pub mod task_digest;
 pub mod terminal;
 pub mod theme;
 pub mod usage;
