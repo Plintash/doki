@@ -55,7 +55,7 @@ use gpui::{
 };
 
 use crate::app::Waku;
-use crate::identity::{APP_ID, APP_NAME};
+use crate::identity::{app_id, app_name};
 actions!(
     waku,
     [
@@ -204,7 +204,7 @@ pub fn run() {
             // Linux uses this for Wayland app_id/X11 WM_CLASS and notification
             // attribution. Other platforms also benefit from one stable
             // process identity.
-            cx.set_app_identity(APP_ID, APP_NAME);
+            cx.set_app_identity(app_id(), app_name());
             crate::assets::register_fonts(cx).expect("failed to register bundled fonts");
             crate::input::init(cx);
             crate::ui::menu::init(cx);
@@ -342,7 +342,7 @@ pub fn run() {
                 .open_window(
                     WindowOptions {
                         titlebar: Some(TitlebarOptions {
-                            title: Some(APP_NAME.into()),
+                            title: Some(app_name().into()),
                             // Windows creates the window without `WS_CAPTION`
                             // either way; asking for the transparent titlebar
                             // is what extends the client area over the frame
@@ -365,7 +365,7 @@ pub fn run() {
                         } else {
                             WindowBackgroundAppearance::Opaque
                         },
-                        app_id: Some(APP_ID.to_owned()),
+                        app_id: Some(app_id().to_owned()),
                         // GPUI defaults to compositor/server decorations. If a
                         // Wayland compositor declines them, it reports the
                         // client fallback and Waku renders that frame itself.
@@ -427,10 +427,10 @@ pub fn run() {
 pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
     cx.set_menus(vec![
         Menu {
-            name: APP_NAME.into(),
+            name: app_name().into(),
             disabled: false,
             items: {
-                let mut items = vec![MenuItem::action(tr!("menu.about", app = APP_NAME), About)];
+                let mut items = vec![MenuItem::action(tr!("menu.about", app = app_name()), About)];
                 if updater_available {
                     items.push(MenuItem::action(
                         tr!("menu.check_for_updates"),
@@ -441,7 +441,7 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
                 items.extend([
                     MenuItem::action(tr!("menu.settings"), OpenSettings),
                     MenuItem::separator(),
-                    MenuItem::action(tr!("menu.quit", app = APP_NAME), Quit),
+                    MenuItem::action(tr!("menu.quit", app = app_name()), Quit),
                 ]);
                 items
             },

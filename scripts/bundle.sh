@@ -38,9 +38,11 @@ else
 fi
 case "$profile" in
   debug)
-    app_name="Doki Debug"
-    helper_name="Doki Debug Computer Use"
-    bundle_identifier="sh.doki.dev"
+    # A second debug worktree may run beside the first; its watcher names the
+    # bundle and identity through the environment so the two never collide.
+    app_name="${WAKU_APP_NAME:-Doki Debug}"
+    helper_name="$app_name Computer Use"
+    bundle_identifier="${WAKU_APP_ID:-sh.doki.dev}"
     icon_file="AppIconDev.icns"
     ;;
   release)

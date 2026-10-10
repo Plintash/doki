@@ -688,7 +688,7 @@ fn concise_stderr(bytes: &[u8]) -> String {
 fn preference_path() -> Option<PathBuf> {
     Some(
         dirs::data_local_dir()?
-            .join(waku_protocol::identity::DATA_DIRECTORY_NAME)
+            .join(waku_protocol::identity::data_directory_name())
             .join("updater.json"),
     )
 }

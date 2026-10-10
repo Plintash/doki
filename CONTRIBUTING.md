@@ -32,13 +32,25 @@ bun install
 bun run dev
 ```
 
-On macOS the watcher builds and signs `target/debug/Waku Debug.app`; on Linux
-and Windows it builds `target/debug/waku`. In both cases the provider daemon remains an
-external `target/debug/waku-debug-daemon`: provider-only edits rebuild and
-hot-swap that process without relaunching the app, while desktop edits rebuild
-and relaunch the app normally. Keep that watcher running while you work. Do
-not start a second watcher or manually relaunch the debug app. Press `Ctrl-C`,
-or quit the app, to stop it.
+On macOS the watcher builds and signs `target/debug/Doki Debug — <Flavor>.app`;
+on Linux and Windows it builds `target/debug/waku`. In both cases the provider
+daemon remains an external `target/debug/waku-debug-daemon`: provider-only edits
+rebuild and hot-swap that process without relaunching the app, while desktop
+edits rebuild and relaunch the app normally.
+
+Every checkout can run its own watcher, and each debug app is named for what
+that checkout tests — the first argument (`bun ./scripts/dev.ts "Pi Compact"`),
+else `WAKU_DEV_FLAVOR`, else the branch or worktree directory; `--print` shows
+the resolved name, bundle path and database and exits. The name, bundle
+identity and data directory all follow the flavor, so parallel worktrees cannot
+collide or fight over state, and each window says which build and database it
+shows. Every checkout has its own debug database at `temp/app.db` and its own
+daemon; when that database has no sessions yet, the watcher inherits a copy of
+the primary checkout's dev database before launching, so a fresh worktree opens
+with your existing tasks. `--seed` (optionally `--seed=2`) then constructs
+oversized mock sessions in the database and relaunches once so they load. Do
+not run `scripts/bundle.sh debug` for a checkout whose watcher is running: the
+watcher owns that bundle. Press `Ctrl-C`, or quit the app, to stop the watcher.
 
 The embedded browser and experimental computer-use integration are currently
 macOS-only. On Linux and Windows the browser reports that it is unavailable,
