@@ -553,10 +553,11 @@ fn render_markdown_message_body<'a>(
 ) -> AnyElement {
     let body = markdown
         .and_then(|markdown| match window {
-            Some(window) if !ctx.has_search() && !ctx.has_annotations() && !ctx.has_selection() => {
-                md::render::markdown_windowed(markdown, ctx, window)
-            }
-            _ => md::render::markdown(markdown, ctx),
+            // Whether this frame may be windowed is the renderer's answer, not
+            // the row's: `markdown_windowed` drops the window for a body or a
+            // frame that has to walk every block.
+            Some(window) => md::render::markdown_windowed(markdown, ctx, window),
+            None => md::render::markdown(markdown, ctx),
         })
         // Empty or not-yet-parsed content still needs a selectable fallback.
         .unwrap_or_else(|| {

@@ -157,7 +157,7 @@ moment any scrollbar became visible.
   disabled, it renders as static source text, though the body still keeps the
   full walk), and a body with a search or annotation mark keeps the full walk
   because a reveal reads its geometry back from the frame's registry — as does
-  the streaming body whenever any selection is live anywhere in the
+  the streaming body whenever a selection exists anywhere in the
   transcript: its spans and drag anchor live in the same registry a shift-click
   resolves against, so a hidden block could not be extended into.
   On a 400-block reply this takes the streaming frame from ~2.65 ms to ~0.21

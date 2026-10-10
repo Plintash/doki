@@ -1816,7 +1816,12 @@ pub fn markdown_windowed<'a>(
     window: MessageBodyWindow,
 ) -> Option<AnyElement> {
     view.set_render_width(window.width);
-    if view.has_async_blocks() {
+    // A window stands in for the blocks it drops, which is only sound while
+    // the frame has no other use for them: a search mark, an annotation mark,
+    // and a selection are read back from the registry the built elements
+    // fill, and a body holding an image or a formula can resize a block after
+    // its first frame.
+    if view.has_async_blocks() || ctx.has_search() || ctx.has_annotations() || ctx.has_selection() {
         return markdown_capped(view, ctx, usize::MAX);
     }
     let BodyPass {
@@ -3744,6 +3749,7 @@ mod tests {
             palette: Palette,
             window: Rc<Cell<Option<(f32, f32)>>>,
             height: BlockHeights,
+            selection: TranscriptSelection,
         }
 
         impl gpui::Render for WindowedBody {
@@ -3752,7 +3758,7 @@ mod tests {
                     "window",
                     &self.palette,
                     Metrics::BODY,
-                    TranscriptSelection::default(),
+                    self.selection.clone(),
                 );
                 let body = match self.window.get() {
                     Some((top, height)) => markdown_windowed(
@@ -3794,11 +3800,13 @@ mod tests {
         view.set_render_width(700.0);
         let window = Rc::new(Cell::new(None));
         let height = Rc::new(RefCell::new(vec![(0..0, None)]));
+        let selection = TranscriptSelection::default();
         let (entity, visual) = cx.add_window_view(|_, _| WindowedBody {
             view: view.clone(),
             palette: Palette::from_theme(&Theme::dark()),
             window: window.clone(),
             height: height.clone(),
+            selection: selection.clone(),
         });
         let draw = |visual: &mut gpui::VisualTestContext, entity: &gpui::Entity<WindowedBody>| {
             visual.update(|cxt, cx| {
@@ -3855,6 +3863,20 @@ mod tests {
             view.heights.borrow()[0].1,
             Some(px(1.0)),
             "the hidden block's remembered height survived"
+        );
+
+        // A selection parks its spans in the frame registry, which a reveal
+        // and a shift-click read back, so the same window has to walk the
+        // whole body: the stamp is replaced by a real measurement.
+        selection
+            .selection
+            .borrow_mut()
+            .begin(TextKey::new("window", 0), 3);
+        draw(visual, &entity);
+        assert_ne!(
+            view.heights.borrow()[0].1,
+            Some(px(1.0)),
+            "a selection keeps the full walk"
         );
     }
 

@@ -2564,7 +2564,9 @@ impl Waku {
                             // only animates while the reader rests on the
                             // tail, because a row that keeps growing under a
                             // preserved scrollback anchor reads as a tremor.
-                            if message.role == MessageRole::Assistant && message.streaming {
+                            // A settled row takes the same call, which
+                            // releases the clip.
+                            if message.role == MessageRole::Assistant {
                                 view.advance_clip(
                                     animate_streaming && rests_at_tail,
                                     std::time::Instant::now(),
