@@ -1,5 +1,7 @@
 use chrono::{DateTime, Datelike, Days, Local, NaiveDate, Utc};
-use gpui::{KeyBinding, actions};
+use gpui::{AnyView, KeyBinding, actions};
+
+use crate::ui::menu::{anchor_popover, open_popover};
 
 use super::*;
 
@@ -603,6 +605,295 @@ fn live_plan_step(session: &AgentSession) -> Option<SharedString> {
         .find(|activity| activity.kind == ActivityKind::Plan)
         .map(|activity| SharedString::from(activity_display_title(activity)))
         .filter(|step| !step.trim().is_empty())
+}
+
+/// The card a task row reveals on hover and on keyboard focus: what the task
+/// is and where it stands, for a reader who does not want to switch to it.
+///
+/// Every field is a value the client already holds — the task's list entry, its
+/// row facts, its project, and the branch the client knows it is on — and the
+/// field types are the guarantee that revealing the card cannot fetch anything:
+/// there is no daemon client, store, or path handle in here to fetch one with,
+/// so a hover can never issue a request, retry, or spawn work.
+#[derive(Clone)]
+struct SidebarTaskCard {
+    title: SharedString,
+    /// What the task is working toward, when a summary has been generated.
+    objective: Option<SharedString>,
+    /// Why a blocked task is blocked, or the provider's step for the live turn.
+    state: Option<SidebarRowDetail>,
+    project: SharedString,
+    /// The task's own worktree branch, when the client knows it.
+    branch: Option<SharedString>,
+    turns: Option<u32>,
+    changed_files: Option<u32>,
+    /// How long ago the task last moved, in the same words as the row's
+    /// trailing label.
+    recency: SharedString,
+}
+
+/// The card for one task, resolved from values the client already holds.
+///
+/// A row reports a busy task's objective only when the provider has no step for
+/// it; the card is what the task *is*, so it gives the objective its own line
+/// and lets the reason or the step say where the task stands.
+fn sidebar_task_card(
+    session: &AgentSession,
+    facts: &SidebarSessionFacts,
+    project: Option<&Project>,
+    now: u64,
+) -> SidebarTaskCard {
+    SidebarTaskCard {
+        title: SharedString::from(localized_session_title(session)),
+        objective: facts.objective.clone(),
+        state: sidebar_row_detail(session, facts)
+            .filter(|detail| !matches!(detail, SidebarRowDetail::Objective(_))),
+        project: sidebar_project_label(project),
+        branch: persisted_sidebar_branch_label(&session.workspace).map(SharedString::from),
+        turns: facts.turn_count,
+        changed_files: facts.changed_files,
+        recency: SharedString::from(format_time_ago(
+            now.saturating_sub(sidebar_session_timestamp(session)),
+        )),
+    }
+}
+
+/// The card's facts line: what is known about the task's size and recency, with
+/// the unknown left out rather than guessed. Recency is always known, so the
+/// line itself is always there.
+fn sidebar_card_facts_line(
+    turns: Option<u32>,
+    changed_files: Option<u32>,
+    recency: &str,
+) -> SharedString {
+    let mut facts = Vec::with_capacity(3);
+    if let Some(turns) = turns {
+        facts.push(tr!(
+            if turns == 1 {
+                "sidebar.card_turn_one"
+            } else {
+                "sidebar.card_turn_many"
+            },
+            count = turns
+        ));
+    }
+    if let Some(changed_files) = changed_files {
+        facts.push(tr!(
+            if changed_files == 1 {
+                "sidebar.card_file_one"
+            } else {
+                "sidebar.card_file_many"
+            },
+            count = changed_files
+        ));
+    }
+    facts.push(recency.to_owned());
+    SharedString::from(facts.join(" · "))
+}
+
+/// The card's width, matching the app's other summary cards. The card is one
+/// stack: this is the whole card, never a column inside it.
+const SIDEBAR_CARD_WIDTH: f32 = 300.0;
+
+impl SidebarTaskCard {
+    /// The view both routes to the card render: GPUI's hover tooltip and the
+    /// row's own anchored card.
+    fn into_view(self, cx: &mut App) -> AnyView {
+        cx.new(|_| self).into()
+    }
+}
+
+impl Render for SidebarTaskCard {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        sidebar_task_card_view(self, cx)
+    }
+}
+
+/// The card's one compact stack, drawn: no dividers and no columns. The facts
+/// are the shortest line, so they are pushed to the right edge the longer lines
+/// leave rather than getting a column of their own.
+fn sidebar_task_card_view(
+    card: &SidebarTaskCard,
+    cx: &mut Context<SidebarTaskCard>,
+) -> impl IntoElement {
+    let theme = Theme::current(cx);
+    div()
+        .w(px(SIDEBAR_CARD_WIDTH))
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .p(px(10.0))
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(theme.border_strong)
+        .bg(theme.raised)
+        .shadow_md()
+        .text_size(sp(12.5))
+        .line_height(sp(16.0))
+        .child(
+            div()
+                .text_size(sp(13.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(card.title.clone()),
+        )
+        .when_some(card.objective.clone(), |element, objective| {
+            element.child(sidebar_card_line(
+                "icons/target.svg",
+                objective,
+                theme.text_secondary,
+            ))
+        })
+        .when_some(card.state.as_ref(), |element, state| {
+            element.child(sidebar_card_line(
+                state.icon(),
+                state.text().clone(),
+                theme.text_secondary,
+            ))
+        })
+        .child(sidebar_card_line(
+            "icons/folder.svg",
+            card.project.clone(),
+            theme.text_tertiary,
+        ))
+        .when_some(card.branch.clone(), |element, branch| {
+            element.child(sidebar_card_line(
+                "icons/git-branch.svg",
+                branch,
+                theme.text_tertiary,
+            ))
+        })
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .justify_end()
+                .text_size(sp(11.5))
+                .text_color(theme.text_ghost)
+                .child(sidebar_card_facts_line(
+                    card.turns,
+                    card.changed_files,
+                    &card.recency,
+                )),
+        )
+}
+
+/// One line of the card: an icon, so what a line means never rests on its color
+/// alone, then text that wraps to the card's width.
+fn sidebar_card_line(icon_path: &'static str, text: SharedString, color: Hsla) -> Div {
+    div()
+        .flex()
+        .items_start()
+        .gap(px(6.0))
+        .text_color(color)
+        .child(icon(icon_path, 12.5, color))
+        .child(div().flex_1().whitespace_normal().child(text))
+}
+
+/// Attach a row's card: GPUI's own tooltip for the pointer, and the same card
+/// anchored to the row for keyboard focus through the row's second handle. The
+/// row keeps the first handle for its context menu, so opening one surface
+/// never opens the other.
+///
+/// Both routes draw the card the caller already resolved; revealing it is a
+/// paint, so neither can ask the daemon for anything.
+fn with_sidebar_task_card(
+    row: Stateful<Div>,
+    card: SidebarTaskCard,
+    card_handle: &ContextMenuHandle,
+) -> Div {
+    let hover = card.clone();
+    // While the card stands for this row's keyboard focus the tooltip stays
+    // off, so the pointer never draws a second copy of it.
+    let row = row.when(!card_handle.is_open(), |row| {
+        row.tooltip(move |_window, cx| hover.clone().into_view(cx))
+    });
+    anchor_popover(row, card_handle, MenuAlign::BelowLeft, move |_, _, cx| {
+        card.clone().into_view(cx).into_any_element()
+    })
+}
+
+/// The focus identity of a task row, as a tab stop.
+///
+/// gpui reads tab membership off the *handle*, and a handle from
+/// `focus_handle()` starts outside the tab order: the element's own
+/// `tab_index`/`tab_stop` only seed a handle gpui creates for it. Without this
+/// a row is reachable only by clicking it, which is the one route its card
+/// deliberately leaves to the tooltip.
+fn sidebar_row_focus(menu: &ContextMenuHandle) -> FocusHandle {
+    let focus = menu.trigger_focus_handle();
+    if focus.tab_stop {
+        return focus.clone();
+    }
+    focus.clone().tab_stop(true).tab_index(0)
+}
+
+/// The handle behind a row's card, with the focus wiring that reveals it,
+/// created the first frame the row draws one and kept as that row's own element
+/// state for as long as the row keeps drawing.
+///
+/// A row already owns one handle for its context menu, and one handle drives
+/// one surface, so the card gets a second one; opening either surface takes
+/// focus, which blurs the row, which dismisses the card, so the two never stand
+/// at the same time.
+///
+/// The state is the row's, not the menu registry's: the registry is cleared for
+/// every task switch, and a focus listener registered per handle would
+/// otherwise accumulate a stale copy per switch, each kept alive by the
+/// listener that captured it. Element state is dropped with the row, which is
+/// exactly when its card should stop existing.
+fn sidebar_task_card_handle(
+    session_id: Uuid,
+    row_focus: &FocusHandle,
+    window: &mut Window,
+    cx: &mut Context<Waku>,
+) -> ContextMenuHandle {
+    let key = SharedString::from(format!("session-card-{session_id}"));
+    let row_focus = row_focus.clone();
+    window
+        .use_keyed_state(key, cx, move |window, cx| {
+            SidebarTaskCardState::new(row_focus, window, cx)
+        })
+        .read(cx)
+        .handle
+        .clone()
+}
+
+/// One row's card: the second handle, and the row focus it follows.
+///
+/// Held as the row's element state, so it is created with the row and dropped
+/// when the row stops being drawn. Its focus listeners belong to this entity,
+/// which means a dropped row's listeners go with it rather than staying
+/// subscribed to a focus handle nothing draws any more.
+struct SidebarTaskCardState {
+    handle: ContextMenuHandle,
+}
+
+impl SidebarTaskCardState {
+    fn new(row_focus: FocusHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // No toggle observer: a card that follows focus updates nothing else,
+        // so opening and closing it may run inside the focus listener itself.
+        let handle = ContextMenuHandle::new(cx);
+        let opened = handle.clone();
+        cx.on_focus(&row_focus, window, move |_this, window, cx| {
+            // A click focuses a row too — GPUI transfers focus on mouse down —
+            // but the pointer has its own route to this card, the row's
+            // tooltip, and a card pinned over the list by every click would
+            // stand in the way of the next task. Only keyboard focus opens
+            // this one.
+            if window.last_input_was_keyboard() && !opened.is_open() {
+                open_popover(&opened, MenuAlign::BelowLeft, window, cx);
+            }
+        })
+        .detach();
+        let dismissed = handle.clone();
+        cx.on_blur(&row_focus, window, move |_this, window, cx| {
+            dismissed.close(window, cx);
+            window.refresh();
+        })
+        .detach();
+        Self { handle }
+    }
 }
 
 /// Compact "how long ago" for the sidebar: "just now", then one coarse unit —
@@ -1397,19 +1688,16 @@ impl Waku {
                     .relative()
                     .child(
                         div().px(px(10.0)).size_full().child(
-                            list(
-                                self.sidebar_list_state.clone(),
-                                move |index, _window, cx| {
-                                    entity
-                                        .upgrade()
-                                        .map(|entity| {
-                                            entity.update(cx, |this, cx| {
-                                                this.sidebar_row(index, &rows, cx)
-                                            })
+                            list(self.sidebar_list_state.clone(), move |index, window, cx| {
+                                entity
+                                    .upgrade()
+                                    .map(|entity| {
+                                        entity.update(cx, |this, cx| {
+                                            this.sidebar_row(index, &rows, window, cx)
                                         })
-                                        .unwrap_or_else(|| div().into_any_element())
-                                },
-                            )
+                                    })
+                                    .unwrap_or_else(|| div().into_any_element())
+                            })
                             .size_full(),
                         ),
                     )
@@ -1717,7 +2005,13 @@ impl Waku {
         }
     }
 
-    fn sidebar_row(&self, index: usize, rows: &[SidebarRow], cx: &mut Context<Self>) -> AnyElement {
+    fn sidebar_row(
+        &self,
+        index: usize,
+        rows: &[SidebarRow],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(row) = rows.get(index) else {
             return div().into_any_element();
         };
@@ -1727,7 +2021,7 @@ impl Waku {
                 .render_sidebar_group_header(group, index == 1, cx)
                 .into_any_element(),
             SidebarRow::Session(session_id) => self
-                .render_sidebar_session_item(session_id, cx)
+                .render_sidebar_session_item(session_id, window, cx)
                 .into_any_element(),
             SidebarRow::ShowMore(group) => {
                 self.render_sidebar_show_more(group, cx).into_any_element()
@@ -2144,7 +2438,12 @@ impl Waku {
         cx.notify();
     }
 
-    fn render_sidebar_session_item(&self, session_id: Uuid, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar_session_item(
+        &self,
+        session_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::current(cx);
         let Some(session) = self
             .state
@@ -2186,6 +2485,13 @@ impl Waku {
             .cloned()
             .unwrap_or_default();
         let detail = sidebar_row_detail(session, &facts);
+        // What the card answers with, resolved once here from the values the
+        // client already holds: the hover tooltip and the focus-revealed card
+        // render the same content.
+        let card = sidebar_task_card(session, &facts, project, unix_time());
+        let menu = self.menu_handle(format!("session-{session_id}"), cx);
+        let row_focus = sidebar_row_focus(&menu);
+        let card_handle = sidebar_task_card_handle(session_id, &row_focus, window, cx);
         // A view whose sections are not projects has to keep naming the
         // project in the row; a project section heading already names it, so
         // there the state stands alone. The label is resolved only when it is
@@ -2232,8 +2538,6 @@ impl Waku {
                 .into_any_element()
         };
         let waku = cx.entity().downgrade();
-        let menu = self.menu_handle(format!("session-{session_id}"), cx);
-        let row_focus = menu.trigger_focus_handle().clone();
         let keyboard_menu = menu.clone();
         let row = div()
             .id(SharedString::from(format!("session-{}", session.id)))
@@ -2372,7 +2676,7 @@ impl Waku {
                 .into_any_element()
         } else {
             context_menu(
-                div().w_full().child(row),
+                with_sidebar_task_card(row, card, &card_handle),
                 SharedString::from(format!("session-menu-{session_id}")),
                 &menu,
                 move |_| {
@@ -3427,6 +3731,265 @@ mod tests {
         assert!(facts.is_empty());
     }
 
+    fn card_test_project(id: Uuid, name: &str) -> Project {
+        Project {
+            id,
+            name: name.to_owned(),
+            path: PathBuf::from(format!("/tmp/dev/{name}")),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_task_card_carries_everything_the_client_holds() {
+        let mut task = task_with_a_live_plan_step("Move the row's second line");
+        task.set_title("Fix the sidebar row");
+        task.objective = Some("The sidebar row says where the task stands".to_owned());
+        task.workspace = SessionWorkspace::Worktree {
+            path: PathBuf::from("/tmp/worktree"),
+            branch: "waku/fix-the-sidebar-row".to_owned(),
+        };
+        task.turn_count = Some(4);
+        task.changed_files = Some(3);
+        task.last_reply_at = Some(1_000);
+        let project = card_test_project(task.project_id, "doki");
+
+        let facts = sidebar_session_facts(&task);
+        let card = sidebar_task_card(&task, &facts, Some(&project), 1_300);
+
+        assert_eq!(card.title, SharedString::from("Fix the sidebar row"));
+        assert_eq!(
+            card.objective,
+            Some(SharedString::from(
+                "The sidebar row says where the task stands"
+            ))
+        );
+        assert_eq!(
+            card.state,
+            Some(SidebarRowDetail::PlanStep(
+                "Move the row's second line".into()
+            ))
+        );
+        assert_eq!(card.project, SharedString::from("doki"));
+        assert_eq!(
+            card.branch,
+            Some(SharedString::from("waku/fix-the-sidebar-row"))
+        );
+        assert_eq!(card.turns, Some(4));
+        assert_eq!(card.changed_files, Some(3));
+        assert_eq!(card.recency, SharedString::from("5m"));
+        assert_eq!(
+            sidebar_card_facts_line(card.turns, card.changed_files, &card.recency),
+            SharedString::from("4 turns · 3 files · 5m")
+        );
+    }
+
+    /// The card is not the row: a busy task whose row shows its step still has
+    /// an objective to answer "what is this" with, and one whose row falls back
+    /// to the objective does not say the same sentence twice.
+    #[test]
+    fn a_busy_task_card_keeps_the_objective_and_the_step_apart() {
+        let mut stepped = task_with_a_live_plan_step("Refresh the cache");
+        stepped.objective = Some("The sidebar row says where the task stands".to_owned());
+        let facts = sidebar_session_facts(&stepped);
+        let card = sidebar_task_card(&stepped, &facts, None, 0);
+
+        assert_eq!(
+            card.state,
+            Some(SidebarRowDetail::PlanStep("Refresh the cache".into()))
+        );
+        assert_eq!(
+            card.objective,
+            Some(SharedString::from(
+                "The sidebar row says where the task stands"
+            ))
+        );
+
+        let mut unstepped = task_without_a_live_plan_step();
+        unstepped.objective = Some("The sidebar row says where the task stands".to_owned());
+        let facts = sidebar_session_facts(&unstepped);
+        let card = sidebar_task_card(&unstepped, &facts, None, 0);
+
+        assert_eq!(card.state, None);
+        assert_eq!(
+            card.objective,
+            Some(SharedString::from(
+                "The sidebar row says where the task stands"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_blocked_task_card_says_why_it_is_blocked() {
+        let mut task = task_with_a_live_plan_step("Refresh the cache");
+        task.set_status(SessionStatus::Waiting);
+        task.set_blocked_reason("Approve the network request");
+
+        let facts = sidebar_session_facts(&task);
+        let card = sidebar_task_card(&task, &facts, None, 0);
+
+        assert_eq!(
+            card.state,
+            Some(SidebarRowDetail::BlockedReason(
+                "Approve the network request".into()
+            ))
+        );
+    }
+
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+
+    /// Stands in for a sidebar row: a control before it to Tab from, the row's
+    /// card wired the way the real row wires it, and the row's context menu.
+    struct CardFocusHarness {
+        before_focus: FocusHandle,
+        row_focus: FocusHandle,
+        card: Entity<SidebarTaskCardState>,
+        menu: ContextMenuHandle,
+    }
+
+    impl Render for CardFocusHarness {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let handle = self.card.read(cx).handle.clone();
+            div()
+                .size_full()
+                .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
+                .child(
+                    div()
+                        .id("before")
+                        .track_focus(&self.before_focus)
+                        .w(px(120.0))
+                        .h(px(16.0)),
+                )
+                .child(context_menu(
+                    with_sidebar_task_card(
+                        div()
+                            .id("row")
+                            .track_focus(&self.row_focus)
+                            .tab_index(0)
+                            .w(px(120.0))
+                            .h(px(32.0)),
+                        sidebar_task_card(
+                            &AgentSession::new(Uuid::new_v4(), ProviderKind::Claude),
+                            &SidebarSessionFacts::default(),
+                            None,
+                            0,
+                        ),
+                        &handle,
+                    ),
+                    "card-focus-row-menu",
+                    &self.menu,
+                    |_| vec![MenuItem::new("Entry", |_, _| {})],
+                ))
+        }
+    }
+
+    struct CardFocus {
+        before: FocusHandle,
+        row: FocusHandle,
+        card: ContextMenuHandle,
+        menu: ContextMenuHandle,
+    }
+
+    /// Builds the harness, hands its pieces to `body`, and gives the row
+    /// keyboard focus by tabbing from the control before it — the route the
+    /// card exists for, and the only one GPUI counts as keyboard input.
+    fn with_a_focused_row_card(
+        cx: &mut TestAppContext,
+        body: impl FnOnce(&mut VisualTestContext, CardFocus),
+    ) {
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new("tab", FocusNext, None)]);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let menu = ContextMenuHandle::new(cx);
+            let row_focus = sidebar_row_focus(&menu);
+            let card = cx.new(|cx| SidebarTaskCardState::new(row_focus.clone(), window, cx));
+            CardFocusHarness {
+                before_focus: cx.focus_handle().tab_stop(true).tab_index(0),
+                row_focus,
+                card,
+                menu,
+            }
+        });
+        let focus = view.read_with(cx, |harness, cx| CardFocus {
+            before: harness.before_focus.clone(),
+            row: harness.row_focus.clone(),
+            card: harness.card.read(cx).handle.clone(),
+            menu: harness.menu.clone(),
+        });
+        // GPUI hands focus listeners their before/after paths only while the
+        // window is active, and a test window starts inactive.
+        cx.update(|window, _| window.activate_window());
+        cx.update(|window, cx| window.focus(&focus.before, cx));
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, _| focus.row.is_focused(window)),
+            "the row is a tab stop"
+        );
+        assert!(
+            focus.card.is_open(),
+            "keyboard focus stands the row's card up"
+        );
+
+        body(cx, focus);
+    }
+
+    #[gpui::test]
+    fn keyboard_focus_reveals_a_rows_card(cx: &mut TestAppContext) {
+        with_a_focused_row_card(cx, |cx, focus| {
+            // Moving focus away is what hides it again.
+            cx.update(|window, cx| window.focus(&focus.before, cx));
+            cx.run_until_parked();
+            assert!(!focus.card.is_open(), "leaving the row takes its card down");
+
+            // The pointer focuses a row by clicking it, and has the tooltip
+            // for it: a click leaves no card pinned over the list.
+            cx.update(|window, cx| window.focus(&focus.row, cx));
+            cx.simulate_keystrokes("down");
+            cx.run_until_parked();
+            assert!(focus.card.is_open(), "keyboard focus still stands it up");
+            cx.simulate_mouse_down(
+                point(px(10.0), px(10.0)),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+            assert!(
+                !focus.card.is_open(),
+                "a click closes the card rather than pinning one of its own"
+            );
+        });
+    }
+
+    /// The card and the row's context menu never stand together: opening the
+    /// menu takes focus, which is what puts the card down.
+    #[gpui::test]
+    fn opening_a_rows_context_menu_puts_its_card_down(cx: &mut TestAppContext) {
+        with_a_focused_row_card(cx, |cx, focus| {
+            cx.simulate_mouse_down(
+                point(px(10.0), px(20.0)),
+                MouseButton::Right,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+            assert!(focus.menu.is_open(), "the right-click opened the menu");
+
+            // An open menu takes focus two frames later; a test window never
+            // runs the frame loop that waits, so the test hands it the focus
+            // the menu would take.
+            let menu_focus = focus.menu.focus_handle().clone();
+            cx.update(|window, cx| window.focus(&menu_focus, cx));
+            cx.run_until_parked();
+            assert!(
+                !focus.card.is_open(),
+                "the menu's focus took the card down, leaving neither half-open"
+            );
+        });
+    }
+
     #[test]
     fn a_task_with_no_known_branch_names_its_project() {
         let mut task = AgentSession::new(Uuid::new_v4(), ProviderKind::Claude);
@@ -3469,6 +4032,32 @@ mod tests {
         );
     }
 
+    /// The body of the `anchor` item in `source`, up to the next item at the
+    /// same or a shallower indent, or the test module. Source guards share it
+    /// so each one names what it holds and what it forbids, and nothing else.
+    fn source_body<'a>(source: &'a str, anchor: &str) -> &'a str {
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} must exist"));
+        let body = &source[start + 1..];
+        let end = [
+            "\nfn ",
+            "\npub(super) fn ",
+            "\npub(crate) fn ",
+            "\npub fn ",
+            "\n    fn ",
+            "\n    pub(super) fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub fn ",
+            "\n#[cfg(test)]",
+        ]
+        .into_iter()
+        .filter_map(|terminator| body.find(terminator))
+        .min()
+        .unwrap_or(body.len());
+        &body[..end]
+    }
+
     /// Row builders run for every visible row on every frame, so they may not
     /// reach a transcript: the plan step is resolved into the facts cache where
     /// the session changes instead. This reads the source rather than the
@@ -3485,23 +4074,65 @@ mod tests {
             "\npub(super) fn sidebar_row_detail(",
             "\nfn sidebar_row_identifier(",
         ] {
-            let start = source
-                .find(anchor)
-                .unwrap_or_else(|| panic!("{anchor} must exist"));
-            let body = &source[start + 1..];
-            let end = ["\n    fn ", "\nfn ", "\n#[cfg(test)]"]
-                .into_iter()
-                .filter_map(|terminator| body.find(terminator))
-                .min()
-                .unwrap_or(body.len());
-            let body = &body[..end];
             for forbidden in [".transcript_blocks", "live_plan_step("] {
                 assert!(
-                    !body.contains(forbidden),
+                    !source_body(source, anchor).contains(forbidden),
                     "{anchor} must not call `{forbidden}`; resolve it into the row facts cache \
                      where the session changes"
                 );
             }
+        }
+    }
+
+    /// The card answers from values the client already holds, so neither route
+    /// to it may reach for one: a card that could ask the daemon, a store or
+    /// the filesystem would turn the pointer crossing a list into work. This
+    /// reads the source because the cost of a regression only shows against a
+    /// real daemon on a real machine, and hovering draws no such thing.
+    #[test]
+    fn the_row_card_asks_for_nothing() {
+        let source = include_str!("sidebar.rs");
+        for anchor in [
+            "\nfn sidebar_task_card(",
+            "\nfn sidebar_card_facts_line(",
+            "\nfn sidebar_task_card_view(",
+            "\nfn sidebar_card_line(",
+            "\nfn with_sidebar_task_card(",
+            "\nfn sidebar_task_card_handle(",
+            "\n    fn new(row_focus: FocusHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {",
+        ] {
+            let body = source_body(source, anchor);
+            // The card's own view may mention no request machinery at all —
+            // including the view's body and the focus wiring that opens it,
+            // which is where a "fetch it if it is missing" regression lands.
+            let forbidden = [
+                ".daemon",
+                "background_executor(",
+                "cx.spawn(",
+                "store",
+                "std::fs",
+                "read_dir(",
+                "Command::new",
+                "PathBuf",
+                "SessionOptions",
+            ];
+            for forbidden in forbidden {
+                assert!(
+                    !body.contains(forbidden),
+                    "{anchor} must not mention `{forbidden}`; the card is drawn from values the \
+                     client already holds"
+                );
+            }
+        }
+        // And its signature cannot name a handle it could fetch with, whatever
+        // the body does.
+        let signature = source_body(source, "\nfn sidebar_task_card(");
+        let signature = &signature[..signature.find('{').expect("a function body")];
+        for forbidden in ["Path", "Client", "Store", "Handle"] {
+            assert!(
+                !signature.contains(forbidden),
+                "a `{forbidden}` in `{signature}` would let the card fetch what it draws"
+            );
         }
     }
 
