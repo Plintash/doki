@@ -74,8 +74,12 @@ assistant reply: the command runs maintenance, not an agent turn. The app
 would otherwise push its answerless-turn line ("Turn completed") under it. The
 hand-off point — where the resolved prompt leaves for the transport — records
 the turn id on the runtime when the prompt is a compact invocation for Pi, and
-`TurnFinished` skips that fallback for exactly that turn. Any other settlement
-path (a refused prompt, a dead process, a stop) keeps its normal behaviour.
+`TurnFinished` skips that fallback for exactly that turn. The settlement
+carries no turn id of its own, so the record is compared but never used to
+drop an event, and whichever settlement arrives next consumes it: a command
+the provider ignored cannot leave a record behind that swallows a later turn.
+Any other settlement path (a refused prompt, a dead process, a stop) keeps its
+normal behaviour.
 
 ## The request carries no answer to await
 

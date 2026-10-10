@@ -24,10 +24,10 @@ use super::{
     response_row_turn_id, returned_messages_draft, session_accepts_turn_output,
     session_is_reapable, set_extension_status, set_extension_widget, set_extension_window_title,
     should_refresh_branch_after_activity, should_show_navigation_rail,
-    should_show_scroll_to_bottom, stale_compaction_settlement, stored_queue_texts,
-    task_id_from_notification_tag, task_notification_tag, transcript_anchor_end_space,
-    transcript_navigation_turns, transcript_rests_at_tail, transcript_row_kinds,
-    transcript_row_splice, transcript_rows_fingerprint, widened_panel_width_for_file_editor,
+    should_show_scroll_to_bottom, stored_queue_texts, task_id_from_notification_tag,
+    task_notification_tag, transcript_anchor_end_space, transcript_navigation_turns,
+    transcript_rests_at_tail, transcript_row_kinds, transcript_row_splice,
+    transcript_rows_fingerprint, widened_panel_width_for_file_editor,
     widened_panel_width_for_review,
 };
 use crate::git_branch::BranchEntry;
@@ -2833,18 +2833,4 @@ fn an_extension_notifications_severity_reaches_the_notice_surface() {
         extension_notification_tone(NotificationSeverity::Info),
         ToastTone::Info
     );
-}
-
-/// A manual compaction's settlement has no turn id of its own: the recorded
-/// compaction turn is what decides whether the event belongs to the turn on
-/// screen. A stop that already ended it must not let the event settle whatever
-/// turn came next.
-#[test]
-fn a_compaction_settlement_only_belongs_to_its_recorded_turn() {
-    let recorded = Uuid::new_v4();
-    let other = Uuid::new_v4();
-    assert!(!stale_compaction_settlement(None, Some(other)));
-    assert!(!stale_compaction_settlement(Some(recorded), Some(recorded)));
-    assert!(stale_compaction_settlement(Some(recorded), Some(other)));
-    assert!(stale_compaction_settlement(Some(recorded), None));
 }

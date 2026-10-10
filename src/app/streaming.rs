@@ -837,9 +837,11 @@ impl Waku {
             } => {
                 // A manual compaction's settlement carries no turn id, so the
                 // recorded compaction turn is what identifies it. When that
-                // turn is no longer the active one, the app already ended it
-                // (a stop) and this event belongs to that ended turn; settling
-                // the current one with it would end a turn that never ended.
+                // A manual compaction's settlement carries no turn id, so the
+                // recorded compaction turn only decides whether this turn skips
+                // the fallback line. Taking it consumes the record either way,
+                // so a command the provider ignored cannot swallow the next
+                // turn's settlement.
                 let active_turn = self
                     .state
                     .sessions
@@ -847,9 +849,6 @@ impl Waku {
                     .find(|session| session.id == session_id)
                     .and_then(AgentSession::active_turn_id);
                 let compaction_turn = runtime.compaction_turn.take();
-                if stale_compaction_settlement(compaction_turn, active_turn) {
-                    return true;
-                }
                 // A prompt the provider refused before accepting it settles as
                 // the delivery failure of the message that asked for the run:
                 // that message stays, marked undelivered with the reason, and
@@ -906,9 +905,12 @@ impl Waku {
                 // A provider command whose transport answers without a model
                 // turn (Pi's `/compact`) settles with its activity row as the
                 // whole record; the answerless-turn fallback would add a
-                // synthetic reply under it. Only that recorded turn skips it.
+                // synthetic reply under it. Only the recorded turn skips it,
+                // so a settlement for any other turn reads as usual.
+                let compaction_settlement =
+                    compaction_turn.is_some() && compaction_turn == active_turn;
                 let needs_fallback =
-                    !self.turn_has_assistant_message(session_id) && compaction_turn.is_none();
+                    !self.turn_has_assistant_message(session_id) && !compaction_settlement;
                 if let Some(session) = self.state.session_mut(session_id) {
                     // A provider-side user stop — the Stop button, or a denied
                     // permission the provider aborted on — settles like the
@@ -1352,17 +1354,6 @@ pub(super) fn session_accepts_turn_output(session: &mut AgentSession) -> bool {
         session.status = SessionStatus::Working;
     }
     true
-}
-
-/// Whether an arriving settlement belongs to a compaction turn the app already
-/// ended.
-///
-/// A manual compaction's settlement carries no turn id, so the recorded
-/// compaction turn is what identifies it. A different active turn means a stop
-/// ended the compaction first, and settling the current turn with that event
-/// would end a turn that never ended.
-pub(super) fn stale_compaction_settlement(recorded: Option<Uuid>, active: Option<Uuid>) -> bool {
-    recorded.is_some() && recorded != active
 }
 
 /// A completed edit or shell command is the earliest provider-neutral point at

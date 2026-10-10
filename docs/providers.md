@@ -305,7 +305,7 @@ strictness is why its catalog probe cannot borrow Pi's argument list.
 Waku stamps each request with a string id (`waku-<n>`) and Pi answers with
 `{"type": "response", "id", "success", "data"}`. Everything else on the stream
 is an unsolicited event. Requests are issued synchronously by the writer thread
-with a 10 s timeout ([pi.rs:1003](../crates/waku-core/src/driver/pi.rs#L1003));
+with a 10 s timeout ([pi.rs:1004](../crates/waku-core/src/driver/pi.rs#L1004));
 events keep flowing on the reader thread meanwhile. The handshake gets 30 s
 instead: the agent does not answer at all until it has finished loading its
 extensions, resources and — when model networking is on — its model catalog,
@@ -358,7 +358,7 @@ it, and a project, user or skill command named `compact` still wins it through
 the ordinary precedence. Oh My Pi's flavour is untouched: only Pi's RPC has
 been verified to take the command.
 
-**Inbound stream** ([pi.rs:1655](../crates/waku-core/src/driver/pi.rs#L1655)):
+**Inbound stream** ([pi.rs:1703](../crates/waku-core/src/driver/pi.rs#L1703)):
 
 | Event | Becomes |
 | --- | --- |
@@ -407,7 +407,7 @@ here, not the CLI's, and lifting it is a matter of wiring Oh My Pi's permission
 requests to a `Permission` event.
 
 **Cancel** — `clear_queue` first, then `abort`
-([pi.rs:1220](../crates/waku-core/src/driver/pi.rs#L1220)). That order is Pi's own
+([pi.rs:1248](../crates/waku-core/src/driver/pi.rs#L1248)). That order is Pi's own
 Esc recipe, and it is the reason to keep it: a message the user stopped is taken
 out of the session instead of waiting there to be carried into whatever runs
 next. The abort carries no request id and is not awaited — Pi answers it only
@@ -420,7 +420,7 @@ held retracts it — the driver clears the queue and reports the text — rather
 than leaving it parked.
 
 **Steer** — `{"type": "steer", "message": …}`, and only into a run that is
-still live ([pi.rs:1163](../crates/waku-core/src/driver/pi.rs#L1163)). Pi queues
+still live ([pi.rs:1183](../crates/waku-core/src/driver/pi.rs#L1183)). Pi queues
 a steer whether or not a run is open, and splices what it parks there into the
 next turn's boundary, so a steer arriving after its run settled is written as a
 prompt instead. Its `disposition: "queued"` means the message was accepted into
@@ -430,7 +430,7 @@ delivered.
 **Rewind and branch** — both go through `get_fork_messages` → `fork {entryId}`
 (`get_branch_messages` → `branch` on Oh My Pi), or `clone` when nothing is
 removed, then `get_state`
-([pi.rs:1412](../crates/waku-core/src/driver/pi.rs#L1412)). Rewind adopts the fork
+([pi.rs:1460](../crates/waku-core/src/driver/pi.rs#L1460)). Rewind adopts the fork
 as the session's new cursor. Branch additionally `switch_session`es back to the
 source file and verifies it landed on the right session; if that restore fails
 the runtime is dropped, because the RPC process may still be sitting on the fork
@@ -439,7 +439,7 @@ the runtime is dropped, because the RPC process may still be sitting on the fork
 **Copying a whole session differs.** Removing no turns is a plain copy, which Pi
 performs in place. Oh My Pi only copies at launch, so Waku shells out to a
 throwaway `omp --mode rpc --yolo --fork <session file>` and reads the new cursor
-off it ([pi.rs:1524](../crates/waku-core/src/driver/pi.rs#L1524)). That is the
+off it ([pi.rs:1572](../crates/waku-core/src/driver/pi.rs#L1572)). That is the
 better shape anyway: the out-of-process copy never moves the live session, so
 unlike the in-place path it needs no restore afterwards and cannot strand the
 RPC process on the fork.

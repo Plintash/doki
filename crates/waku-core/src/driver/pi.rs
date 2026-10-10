@@ -1084,6 +1084,21 @@ fn send_prompt(
     Ok(())
 }
 
+/// The compaction this prompt asks this flavour to run, when it is one.
+///
+/// Pi's built-in slash commands are the interactive CLI's dispatch, so the
+/// transport is what recognises the invocation; Oh My Pi's RPC surface has no
+/// verified compaction command and keeps the prompt.
+fn pi_compact_invocation(
+    flavor: PiFlavor,
+    prompt: &str,
+) -> Option<waku_protocol::composer::CompactInvocation> {
+    if flavor != PiFlavor::Pi {
+        return None;
+    }
+    waku_protocol::composer::parse_compact_invocation(prompt)
+}
+
 /// Delivers a submitted prompt, or runs the one provider command Waku bridges
 /// in its place.
 ///
@@ -1107,9 +1122,7 @@ fn dispatch_prompt(
     flavor: PiFlavor,
     prompt: String,
 ) {
-    let delivered = if flavor == PiFlavor::Pi
-        && let Some(invocation) = waku_protocol::composer::parse_compact_invocation(&prompt)
-    {
+    let delivered = if let Some(invocation) = pi_compact_invocation(flavor, &prompt) {
         if run.is_live() {
             Err(tr!("errors.compact_turn_running"))
         } else {
@@ -1176,9 +1189,7 @@ fn send_steer(
     flavor: PiFlavor,
     prompt: String,
 ) {
-    if flavor == PiFlavor::Pi
-        && waku_protocol::composer::parse_compact_invocation(&prompt).is_some()
-    {
+    if pi_compact_invocation(flavor, &prompt).is_some() {
         let _ = events.send(DriverEvent::SteerRejected {
             message: prompt,
             reason: tr!("errors.compact_queued_until_settled"),
@@ -1873,14 +1884,16 @@ fn handle_pi_message(
             let result = value.get("result");
             let error = value
                 .get("errorMessage")
+                .or_else(|| value.get("error"))
                 .and_then(Value::as_str)
                 .filter(|error| !error.trim().is_empty());
             let compaction_tokens = result
                 .and_then(|result| result.get("estimatedTokensAfter"))
                 .and_then(Value::as_u64);
-            // The row belongs to the start that opened it. An end without one
-            // is not a compaction this session watched, so it completes
-            // nothing rather than fabricating a finished row.
+            // The row belongs to the start that opened it. Its start can be
+            // gone when a settlement reset the stream state while a compaction
+            // was unwinding, and an end with no row completes nothing rather
+            // than fabricating a finished one.
             if let Some(id) = state.open_compaction.take() {
                 let item = if aborted {
                     // The stop that aborted it already said what happened; the
