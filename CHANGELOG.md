@@ -16,7 +16,7 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
-- A long streamed reply grows with the dissolve instead of jumping a line at a time, and a reply that spans many blocks now rebuilds only the blocks on screen, so a long transcript keeps its frame pacing at 120 fps
+- A long streamed reply grows with the dissolve instead of jumping a line at a time, and a reply that spans many blocks now rebuilds only the blocks on screen, so streaming such a reply keeps its frame pacing at 120 fps on a long transcript
 
 ## [26.10.8-rc.3]
 

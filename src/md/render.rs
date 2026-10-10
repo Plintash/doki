@@ -1744,12 +1744,15 @@ pub fn markdown_tail<'a>(
 pub const MARKDOWN_WINDOW_MARGIN: f32 = 600.0;
 
 /// The prologue every body pass shares: the document's top-level blocks, the
-/// flatten cache scoped to this view, the height ledger, and the veil frame a
-/// streaming body opens.
+/// flatten cache scoped to this view, the height ledger a streaming body
+/// keeps, and the veil frame it opens.
 struct BodyPass<'a> {
     blocks: Vec<&'a TopBlock>,
     ctx: Ctx<'a>,
-    heights: BlockHeights,
+    /// Measured height of every top-level block, filled only while the body
+    /// streams: a window is the ledger's one reader, and only a streaming
+    /// body is windowed.
+    heights: Option<BlockHeights>,
     /// Whether this body is streaming with the dissolve animating.
     animate: bool,
 }
@@ -1780,8 +1783,17 @@ fn begin_body<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<BodyPass<'a>>
         .set(block_ordinal_base(view.parser.display_tail_start()));
     // Sized before any block is built, so every `Measured` wrapper knows its
     // own slot; `resize` truncates too, which is what a shrunk body needs.
-    let heights = view.heights.clone();
-    heights.borrow_mut().resize(blocks.len(), (0..0, None));
+    // Only a streaming body keeps the ledger: a window is the only reader, and
+    // a streaming body fills it on every frame, including the ones its window
+    // falls back to a plain walk — those measure the blocks the windowed
+    // frames then size their spacers from. Every other body would pay one
+    // wrapper element per top-level block per frame for a ledger nothing
+    // reads.
+    let heights = view.streaming.get().then(|| {
+        let heights = view.heights.clone();
+        heights.borrow_mut().resize(blocks.len(), (0..0, None));
+        heights
+    });
     Some(BodyPass {
         blocks,
         ctx: ctx.with_cache(view),
@@ -1791,9 +1803,12 @@ fn begin_body<'a>(view: &'a MarkdownView, ctx: &Ctx<'a>) -> Option<BodyPass<'a>>
 }
 
 /// The part of a long streaming body the transcript viewport can see, in the
-/// row's own pixel coordinates. The renderer builds only the blocks that
-/// intersect this range (plus a margin and the volatile tail), so a dissolve
-/// tick costs the visible body rather than the whole response.
+/// row's own pixel coordinates. The body's own offset within the row — the
+/// row's padding plus the turn gap, under 64 px — is left in: it is far inside
+/// `MARKDOWN_WINDOW_MARGIN`, which is what makes the plan conservative. The
+/// renderer builds only the blocks that intersect this range (plus a margin
+/// and the volatile tail), so a dissolve tick costs the visible body rather
+/// than the whole response.
 #[derive(Clone, Copy)]
 pub struct MessageBodyWindow {
     pub visible_top: f32,
@@ -1830,6 +1845,9 @@ pub fn markdown_windowed<'a>(
         heights,
         animate,
     } = begin_body(view, ctx)?;
+    // A window is only ever built for a streaming body, which is the same
+    // condition the ledger is kept under.
+    let heights = heights.expect("a windowed body always keeps its height ledger");
 
     let gap = px(ctx.metrics.block_gap);
     let plan = window_plan(
@@ -1846,7 +1864,12 @@ pub fn markdown_windowed<'a>(
         if let Some(spacer) = plan.spacers[group_ix] {
             children.push(spacer_element(spacer));
         }
-        children.extend(render_block_range(&blocks, &ctx, group.clone(), &heights));
+        children.extend(render_block_range(
+            &blocks,
+            &ctx,
+            group.clone(),
+            Some(&heights),
+        ));
     }
 
     if animate {
@@ -1989,7 +2012,7 @@ fn markdown_capped<'a>(
     } = begin_body(view, ctx)?;
 
     let first = blocks.len().saturating_sub(max_blocks);
-    let children = render_block_range(&blocks, &ctx, first..blocks.len(), &heights);
+    let children = render_block_range(&blocks, &ctx, first..blocks.len(), heights.as_ref());
     if animate {
         // Every element visible on the attach pass has synchronously adopted
         // its baseline. Elements introduced by later appends should now fade.
@@ -2045,13 +2068,14 @@ fn block_has_async_content(block: &Block) -> bool {
     }
 }
 
-/// Build one contiguous run of top-level blocks. Every rendered block records
-/// its laid-out height, which is what lets a later frame window the body.
+/// Build one contiguous run of top-level blocks. Where the pass keeps a height
+/// ledger, every rendered block records its laid-out height, which is what
+/// lets a later frame window the body.
 fn render_block_range(
     blocks: &[&TopBlock],
     ctx: &Ctx,
     range: Range<usize>,
-    heights: &BlockHeights,
+    heights: Option<&BlockHeights>,
 ) -> Vec<AnyElement> {
     let mut children = Vec::with_capacity(range.len());
     for block_ix in range {
@@ -2061,8 +2085,9 @@ fn render_block_range(
             ctx.next_ordinal.get() - block_ordinal_base(block_ix) < 1 << BLOCK_ORDINAL_STRIDE_BITS,
             "a single block overflowed its ordinal stride"
         );
-        children.push(
-            Measured {
+        children.push(match heights {
+            None => rendered,
+            Some(heights) => Measured {
                 inner: rendered,
                 sink: MeasureSink::Block {
                     heights: heights.clone(),
@@ -2071,7 +2096,7 @@ fn render_block_range(
                 },
             }
             .into_any_element(),
-        );
+        });
     }
     children
 }
@@ -3174,7 +3199,7 @@ mod tests {
     /// case: one long visible body redrawn at the dissolve cadence. Run with
     /// `cargo test --locked -p waku --lib bench_markdown_frame -- --ignored --nocapture`.
     #[gpui::test]
-    #[ignore]
+    #[ignore = "manual performance measurement"]
     fn bench_markdown_frame(cx: &mut TestAppContext) {
         struct BenchData {
             view: MarkdownView,
@@ -3461,6 +3486,38 @@ mod tests {
         assert!(
             view.heights.borrow().is_empty(),
             "a rewrite drops the ledger"
+        );
+    }
+
+    /// The ledger costs one wrapper element per top-level block per frame,
+    /// and a window is its only reader, so a settled body must not carry one —
+    /// including on the frames a streaming body's window falls back to a
+    /// plain walk, which are the frames that measure what a window later
+    /// sizes its spacers from.
+    #[test]
+    fn only_a_streaming_body_keeps_the_height_ledger() {
+        let palette = Palette::from_theme(&Theme::dark());
+        let mut view = MarkdownView::new();
+        view.set_text("one\n\ntwo", true);
+        let ctx = Ctx::new(
+            "row",
+            &palette,
+            Metrics::BODY,
+            TranscriptSelection::default(),
+        );
+        assert!(begin_body(&view, &ctx).unwrap().heights.is_some());
+        assert_eq!(
+            view.heights.borrow().len(),
+            2,
+            "the ledger is sized before any block is built"
+        );
+
+        view.heights.borrow_mut().clear();
+        view.set_text("one\n\ntwo", false);
+        assert!(begin_body(&view, &ctx).unwrap().heights.is_none());
+        assert!(
+            view.heights.borrow().is_empty(),
+            "a settled pass sizes nothing"
         );
     }
 

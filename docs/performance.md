@@ -140,10 +140,13 @@ moment any scrollbar became visible.
   height, so that commit's frame builds the whole body once and measures it
   (a pure text append stays windowed, and the next frame windows again). A
   wrap-width, metric, or rewrite change drops the ledger, and the next frame's
-  full pass re-measures. Planning itself still walks the whole ledger
-  — two vectors and two scans a frame — so it stays proportional to the
-  document, and the build is proportional to the viewport **per top-level
-  block**: the planner selects whole blocks, so a body that is a single block
+  full pass re-measures. Only a streaming body keeps and fills it, on every
+  frame including the ones its window falls back to a plain walk; a settled
+  body skips the per-block measuring wrapper entirely. Planning itself still
+  walks the whole ledger — two vectors and two scans a frame — so it stays
+  proportional to the document, and the build is proportional to the viewport
+  **per top-level block**: the planner selects whole blocks, so a body that is
+  a single block
   — one list, one table, one fenced code block, one wall-of-text paragraph —
   is one group covering the whole body, and no spacer can stand in for any of
   it: that frame rebuilds the whole body, at the plain walk's cost. Windowing
@@ -153,11 +156,12 @@ moment any scrollbar became visible.
   blocks drops the windowed frame well under a millisecond.
   Bodies containing an image or formula are never windowed, because those
   blocks can change height after their first frame and a spacer would freeze
-  the old value (that holds for a formula only while math rendering is on:
-  disabled, it renders as static source text, though the body still keeps the
-  full walk), and a body with a search or annotation mark keeps the full walk
-  because a reveal reads its geometry back from the frame's registry — as does
-  the streaming body whenever a selection exists anywhere in the
+  the old value. The gate is scanned from the parsed block tree, which marks a
+  formula's runs whether or not math rendering is on, so a body holding one
+  keeps the full walk even when the formula paints as static source text. And
+  a body with a search or annotation mark keeps the full walk because a reveal
+  reads its geometry back from the frame's registry — as does the streaming
+  body whenever a selection exists anywhere in the
   transcript: its spans and drag anchor live in the same registry a shift-click
   resolves against, so a hidden block could not be extended into.
   On a 400-block reply this takes the streaming frame from ~2.65 ms to ~0.21
@@ -226,9 +230,7 @@ original LaTeX byte ranges. The manual measurement is
 `docs/fixtures/streaming-stress.md` is the long mixed-Markdown payload used to
 exercise the streaming path by eye: roughly 200 top-level blocks, tall code
 blocks, tables and nested lists, no images or formulas so the windowed body
-stays on the windowed path. It is kept in the repo on purpose, for the
-streaming playground this work is expected to grow, so treat it as retained
-data rather than scope creep.
+stays on the windowed path.
 
 Sampling alone misled this investigation for hours; counters cracked it in one
 run. In order of usefulness:
