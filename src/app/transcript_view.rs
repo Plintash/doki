@@ -235,6 +235,7 @@ impl Waku {
         let entity = cx.entity().downgrade();
         let scrollbar_handle = transcript_rows.clone();
         let viewport_bounds = transcript_rows.viewport_bounds();
+        let streaming_window = self.streaming_body_window(&transcript_rows, viewport_bounds);
         let transcript_scrollable = viewport_bounds.size.height > Pixels::ZERO
             && transcript_rows.max_offset_for_scrollbar().y > px(0.5);
         let viewport_bottom = viewport_bounds.bottom();
@@ -243,6 +244,9 @@ impl Waku {
             .checked_sub(1)
             .and_then(|last_row| transcript_rows.bounds_for_item(last_row))
             .map(|bounds| bounds.bottom());
+        let tail_rest = transcript_rests_at_tail(viewport_bottom, tail_bottom, anchor_end_space);
+        let rests_at_tail = tail_rest.unwrap_or(self.transcript_rests_at_tail.get());
+        self.transcript_rests_at_tail.set(rests_at_tail);
         // Scrolling back down onto the tail by hand re-engages following, just
         // as the affordance below does. GPUI re-engages its own tail pin when a
         // bottom-aligned list reaches the end, but a turn renders through the
@@ -251,8 +255,7 @@ impl Waku {
         // watching the reply grow past the bottom edge with no way but the
         // button to rejoin it.
         if self.transcript_tail_recheck.get()
-            && let Some(rests_at_tail) =
-                transcript_rests_at_tail(viewport_bottom, tail_bottom, anchor_end_space)
+            && let Some(rests_at_tail) = tail_rest
         {
             self.transcript_tail_recheck.set(false);
             if rests_at_tail {
@@ -263,9 +266,7 @@ impl Waku {
             self.transcript_is_scrolled.get(),
             self.transcript_anchor_following.get(),
             transcript_scrollable,
-            viewport_bottom,
-            tail_bottom,
-            anchor_end_space,
+            tail_rest,
         )
         .unwrap_or_else(|| self.transcript_scroll_to_bottom_visible.get());
         self.transcript_scroll_to_bottom_visible
@@ -375,7 +376,12 @@ impl Waku {
                     entity
                         .upgrade()
                         .map(|entity| {
-                            entity.update(cx, |this, cx| this.transcript_row(index, window, cx))
+                            entity.update(cx, |this, cx| {
+                                let body_window = streaming_window
+                                    .filter(|(row, _)| *row == index)
+                                    .map(|(_, window)| window);
+                                this.transcript_row(index, body_window, rests_at_tail, window, cx)
+                            })
                         })
                         .unwrap_or_else(|| div().into_any_element())
                 })
@@ -2390,9 +2396,50 @@ impl Waku {
         handle
     }
 
+    /// The part of the live streaming row the transcript viewport can show, in
+    /// the row's own pixel coordinates, resolved while the `ListState` is
+    /// still readable.
+    ///
+    /// `ListState`'s accessors borrow its inner state, which the list holds
+    /// mutably while it runs the item builder, so this must be asked before
+    /// `list()` starts and handed to the row. The cached bounds are a frame
+    /// old, which is what the planner wants: a row is rebuilt before it is
+    /// re-measured, so the previous frame is the only position available.
+    fn streaming_body_window(
+        &self,
+        rows: &ListState,
+        viewport: Bounds<Pixels>,
+    ) -> Option<(usize, MessageBodyWindow)> {
+        let session = self.selected_session()?;
+        // Only a streaming reply has a windowed body, so a settled transcript
+        // has nothing to find.
+        let row_index = self
+            .transcript_row_kinds
+            .borrow()
+            .iter()
+            .position(|kind| match kind {
+                TranscriptRowKind::Message(message_index) => {
+                    session.messages.get(*message_index).is_some_and(|message| {
+                        message.role == MessageRole::Assistant && message.streaming
+                    })
+                }
+                _ => false,
+            })?;
+        let bounds = rows.bounds_for_item(row_index)?;
+        Some((
+            row_index,
+            MessageBodyWindow {
+                visible_top: f32::from(viewport.top() - bounds.top()),
+                visible_height: f32::from(viewport.size.height),
+            },
+        ))
+    }
+
     pub(super) fn transcript_row(
         &mut self,
         index: usize,
+        body_window: Option<MessageBodyWindow>,
+        rests_at_tail: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2512,6 +2559,27 @@ impl Waku {
                         .then(|| {
                             let view = markdown.entry(message.id).or_default();
                             view.set_text(message.visible_content(), message.streaming);
+                            // The ledger and the clip are geometry at one wrap
+                            // width, and every frame that lays this body out
+                            // records it — not only a windowed one. A stream
+                            // commit remeasures the tail rows, so the frame
+                            // after each one has no bounds to window with, and
+                            // a narrow drag keeps landing there: without this a
+                            // clip measured at the wider wrap would cut the
+                            // lines the new wrap pushed below it.
+                            view.set_render_width(f32::from(self.transcript_layout_width.get()));
+                            // The clipped height is what the row reports; it
+                            // only animates while the reader rests on the
+                            // tail, because a row that keeps growing under a
+                            // preserved scrollback anchor reads as a tremor.
+                            // A settled row takes the same call, which
+                            // releases the clip; so does a row whose body was
+                            // never measured — a user message, whose body
+                            // `clip_body` hands back untouched.
+                            view.advance_clip(
+                                animate_streaming && rests_at_tail,
+                                std::time::Instant::now(),
+                            );
                             &*view
                         });
                     let sent_annotations = self.sent_annotation_indicator(&message, cx);
@@ -2531,6 +2599,7 @@ impl Waku {
                             attachment_images,
                             attachments_can_reveal,
                             markdown: view,
+                            body_window,
                             ctx: &ctx,
                             menu,
                             waku,

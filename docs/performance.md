@@ -95,7 +95,13 @@ for the same per-frame work a display-rate redraw costs; the fee is that the
 whole visible transcript (not just the fading tail) rebuilds per frame while
 text streams. The reasoning peek keeps its ≈ 15 Hz pulse lease: minutes of
 thinking would pay that rebuild at display rate for a dim, compact, secondary
-surface.
+surface. A windowed body builds only the blocks the viewport can reach, so the
+veil carries two rules of its own: a fade in a block the window dropped expires
+on the wall clock, because nothing on screen would ever drain it and a unit
+that never expires would leave `is_fading` true with nothing fading, holding
+the display-rate lease open for the rest of the turn; and a block the window
+builds again is adopted at full opacity rather than re-dissolved, because the
+reader has already read past it.
 
 **Overlay scrollbars are the classic violator of both cadences.** A streaming
 surface moves its content every commit, so the bar sits in its reveal hold for
@@ -169,6 +175,84 @@ and the boundary with
   (`block_ix << 16 | position`, [src/md/render.rs](../src/md/render.rs)) let
   a capped walk hand settled blocks the same flatten-cache and veil keys as a
   full walk.
+- The live response body is **windowed by measured block offset**
+  (`markdown_windowed`, [src/md/render.rs](../src/md/render.rs)). A message
+  row is one `list()` item, so the whole body rebuilds whenever any of it is
+  visible; the dissolve lease then repeats that at up to 120 fps. The renderer
+  records each block's height as it lays it out and builds only the blocks the
+  transcript viewport can reach (plus `MARKDOWN_WINDOW_MARGIN` above and
+  below, and the volatile tail) with spacers sized from the same ledger, so
+  the row still measures exactly as tall as the full body. Appends keep the
+  ledger, with one exception: an append that starts a new top-level block
+  leaves the block that just left the mended tail with its source range but no
+  height, so that commit's frame builds the whole body once and measures it
+  (a pure text append stays windowed, and the next frame windows again). A
+  wrap-width, metric, or rewrite change drops the ledger, and the next frame's
+  full pass re-measures. The row records the width it is about to lay a body
+  out at before every body render — a windowed frame is not guaranteed, since a
+  stream commit remeasures the tail rows — so a reflow drops the ledger, the
+  measured body height, and the clip on the frame the body actually re-wraps,
+  whether or not that frame had bounds to window with. Only a pass a window can
+  read keeps and fills it — the streaming response body, on every frame
+  including the ones its window falls back to a plain walk; a settled body, the
+  live reasoning tail, which streams
+  through `markdown_tail`, and a body holding an image or a formula, which no
+  window is built for, skip the per-block measuring wrapper
+  entirely. Planning itself still
+  walks the whole ledger — two vectors and two scans a frame — so it stays
+  proportional to the document, and the build is proportional to the viewport
+  **per top-level block**: the planner selects whole blocks, so a body that is
+  a single block
+  — one list, one table, one fenced code block, one wall-of-text paragraph —
+  is one group covering the whole body, and no spacer can stand in for any of
+  it: that frame rebuilds the whole body, at the plain walk's cost. Windowing
+  pays off only once a body spans many top-level blocks, because the part the
+  spacers can drop is exactly the part the viewport cannot reach — the bench
+  below times both shapes, and the same payload spread over 400 top-level
+  blocks drops the windowed frame well under a millisecond.
+  Bodies containing an image or formula are never windowed, because those
+  blocks can change height after their first frame and a spacer would freeze
+  the old value. The gate is scanned from the parsed block tree, which marks a
+  formula's runs whether or not math rendering is on, so a body holding one
+  keeps the full walk even when the formula paints as static source text. And
+  a body with a search or annotation mark keeps the full walk because a reveal
+  reads its geometry back from the frame's registry — as does the streaming
+  body whenever a selection exists anywhere in the
+  transcript: its spans and drag anchor live in the same registry a shift-click
+  resolves against, so a hidden block could not be extended into.
+  On a 400-block reply this takes the streaming frame from ~2.7 ms to ~0.36
+  ms in the debug build
+  (`cargo test --locked -p waku --lib bench_markdown_frame -- --ignored
+  --nocapture`).
+- The live response body **reports a leading container height**
+  (`MarkdownView::advance_clip`, [src/md/render.rs](../src/md/render.rs)). Text
+  layout grows the row in whole-line steps, and the row's height is what the
+  tail pin follows, so pinning the measured height makes every wrap a vertical
+  jolt however smooth the grapheme fade is. The row instead reports a height
+  that leads the measured body through a critically damped spring fed by the
+  body's smoothed growth rate, so a layout step mostly goes into acceleration
+  rather than position — it steps only by growth beyond the lead the spring has
+  already banked (at most `CLIP_RUNWAY_MAX`), which steady streaming stays
+  inside. The clip stays at or above the height measured on the
+  previous frame, so a line laid out this frame lands in space that already
+  exists and only text appended since that measurement ever sits below the
+  clip edge — and the veil has not painted that yet, because a newly appended
+  grapheme is born at zero opacity. The gap under the text is the only
+  artifact, bounded by the rate lead (`CLIP_RUNWAY_MAX`). That trade holds
+  only while the reader rests on the tail with the dissolve running: reduce
+  motion, or a viewport scrolled away from the tail — where a row that keeps
+  growing under a preserved scrollback anchor reads as a tremor — turns the
+  same call into a release, and the row reports the body's real height.
+  Settling, a rewrite, a reflow, a metric change, and a seeded re-attach all
+  release the clip too, because a height kept across any of them would cut a
+  body that has since grown past it. So does a body holding an image or a
+  formula: such a block can land on a later frame and grow the body past a
+  height measured before it, and unlike appended text it paints opaque, so
+  the clip would cut it in the open. The seeded re-attach is the subtle one:
+  it adopts the body it finds, text that arrived while the row was off screen
+  included, at full opacity, so nothing holds that text back from paint and
+  the clip goes with it. Only a streaming body is measured for
+  that controller at all; a settled one skips the wrapper.
 - `MarkdownView::set_text` derives the mended display tail only when content
   or the streaming flag changed — the derivation re-parses the final block and
   runs for every visible row every frame.
@@ -203,6 +287,11 @@ original LaTeX byte ranges. The manual measurement is
 
 ## Measuring
 
+`docs/fixtures/streaming-stress.md` is the long mixed-Markdown payload used to
+exercise the streaming path by eye: roughly 200 top-level blocks, tall code
+blocks, tables and nested lists, no images or formulas so the windowed body
+stays on the windowed path.
+
 Sampling alone misled this investigation for hours; counters cracked it in one
 run. In order of usefulness:
 
@@ -229,173 +318,11 @@ claims on a release build.
 ## Known floor and next levers
 
 With both cadences enforced, a streaming frame still rebuilds every visible
-row (gpui `list()` semantics). If that ever needs to shrink: fork-level cached
-list rows need a measure-once extension to `ViewElement` caching (cached views
-lay out from style, not content, which breaks the list's measurement as-is);
-alternatively fold activities into the virtualized list as block-granularity
-rows. Smaller levers, in memory and unproven: stable
-`StyledText` element ids for gpui's per-element layout memo, and the per-row
-`Message` clones in the row builder.
-
-## Startup and reopen latency
-
-The window paints before the daemon answers, and closing it destroys it, so
-both the first launch and the rebuild that follows a Dock activation are
-measured properties with recorded budgets. Instrumentation is opt-in:
-
-- `WAKU_STARTUP_TRACE=1` (or `stderr`) writes one milestone line per completed
-  launch or rebuild to stderr.
-- `WAKU_STARTUP_TRACE=<path>` appends the same lines to a file, which is what
-  the harness uses because `open` sends an app's stderr to the unified log.
-
-A line is written when a run reaches `interactive`, from a writer thread rather
-than the frame that got there. `src/latency.rs` owns the format, the parser,
-and the budgets; `src/startup_trace.rs` owns the collection. Both are unit
-tested; only the launch timing itself needs the harness.
-
-```
-startup-trace pid=97892 run=0 kind=cold start_ms=0.000 process_start_ms=0.000 \
-  window_open_ms=55.000 first_frame_ms=108.000 daemon_ready_ms=190.000 \
-  tasks_hydrated_ms=303.000 interactive_ms=306.000
-```
-
-Every timestamp is milliseconds since the process started, and `start_ms` is
-the activation that produced the run: zero for the cold launch, the moment the
-window opener ran for a rebuild. A run's latency is `interactive - start_ms`,
-which is what the budgets bound. `run` and `kind` separate the two runs in one
-process's trace file.
-
-| Milestone | Recorded at |
-| --- | --- |
-| `process_start` | The first line of `run`, before GPUI is built; always 0 |
-| `window_open` | Just before `open_window`, and only when opening rather than focusing |
-| `first_frame` | The window's first render — skeleton content on a cold launch |
-| `daemon_ready` | The window observing `DaemonState::Ready`; for a rebuild the daemon was already connected |
-| `tasks_hydrated` | `Waku::new` returned, task state loaded from the daemon |
-| `interactive` | The first frame showing the hydrated workspace |
-
-`first_frame` and `interactive` are render passes, not confirmed presents:
-GPUI exposes no presented-frame callback, and the two are the same frame on a
-rebuild because the workspace is built while the window is constructed.
-
-### Baselines and budgets
-
-Measured on the reference machine (Apple silicon, debug build, 2026-10-08)
-over five warm runs plus the first launch after a bundle:
-
-| Run | `window_open` | `first_frame` | `daemon_ready` | `tasks_hydrated` | `interactive` | Latency |
-| --- | --- | --- | --- | --- | --- | --- |
-| Cold launch | 50–59 | 99–112 | 160–185 | 269–293 | 271–295 | **271–295 ms** |
-| Cold launch, first after a build | 51 | 95 | 809 | 929 | 933 | **933 ms** |
-| Reopen | 592–616 | 677–719 | 608–632 | 677–719 | 677–719 | **74–111 ms** |
-
-The first launch after a build is the slow one: the daemon binary is cold in
-the page cache, so `daemon_ready` alone is ~800 ms against ~170 ms warm. The
-rebuild reuses the running daemon and its process is warm, which is why it is
-an order of magnitude faster than the launch.
-
-Budgets are set from those baselines in `BUDGETS` (`src/latency.rs`) and
-repeated here; re-derive them on a materially slower machine rather than
-raising them on a hunch:
-
-| Budget | Baseline | Budget |
-| --- | --- | --- |
-| Cold launch | 271–933 ms | **3000 ms** |
-| Reopen | 74–111 ms | **500 ms** |
-
-The headroom is roughly three to five times the worst observed run. That is
-loose enough for a cold page cache and tight enough that putting a blocking
-daemon spawn or state load back on the reopen path fails: a rebuild that waits
-on the daemon pays the ~800 ms `daemon_ready` cost the launch pays.
-
-### Running the harness
-
-The harness is a local development and pre-tag gate, not a hosted CI job: it
-launches the GUI app, which a headless runner has no window server for. Run it
-before tagging a release, on the machine whose bundle it should measure.
-
-The harness launches the debug app with `open -g`, so it never takes focus,
-and terminates the app and its daemon when it is done. A traced cold launch
-closes its own window and rebuilds it through the same opener Dock activation
-uses, which is what produces the reopen run; driving AppKit's own reopen from
-outside needs accessibility control a repeatable harness cannot rely on.
-
-```sh
-cargo build --package waku-daemon --bin waku-daemon
-scripts/bundle.sh debug
-cargo run --bin waku-latency-harness
-```
-
-It prints each run's milestones and both budget verdicts, and exits non-zero
-when either budget is missed. Two ways to check the gate itself:
-
-- `cargo run --bin waku-latency-harness -- --reopen-budget-ms 1` fails without
-  rebuilding, which shows the comparison is live.
-- A deliberately slowed build fails for real. Adding a 1200 ms sleep to the
-  reopen path (`MainWindow::attach_workspace`, before `Waku::new`) pushes the
-  rebuild to ~1300 ms against the 500 ms budget while the cold launch stays
-  inside its own budget, and the harness reports the overrun.
-
-The harness assumes a debug bundle in `target/debug`; `--app` points it at
-another one. Debug builds overweight layout and scene generics, so treat the
-absolute numbers as structure, not as what users feel, and confirm user-facing
-claims on a release build.
-
-### Where reopen time goes
-
-Issue #41 profiled the rebuild below the milestone resolution to decide whether
-GPUI window or renderer initialization warranted a patch on the pinned GPUI
-fork (`egoist/zed`, branch `waku-webview`, `Cargo.toml`). It does not: a rebuild
-spends most of its time re-loading state from the daemon, not in GPUI.
-
-The split is available from the shipped milestones without new
-instrumentation. On a rebuild `daemon_ready` is recorded when the build
-closure asks the application for its daemon and finds it already connected
-(so `daemon::request` returns immediately), which makes
-`daemon_ready - window_open` the native window plus renderer initialization and
-`tasks_hydrated - daemon_ready` everything the workspace does to load and
-construct itself. To attribute that second span, temporary millisecond spans
-were placed around `Waku::new`'s daemon reads (`ComposerDraftStore::load`,
-`StateStore::load_or_fresh`) and a `sample <pid> 3 -file` capture was taken
-across the launch and rebuild. Four rebuilds (debug build, reference machine,
-2026-10-08):
-
-| Rebuild | Window + renderer init | State load + construction | Latency |
-| --- | --- | --- | --- |
-| 1 | 16.2 ms | 84.5 ms | 100.7 ms |
-| 2 | 17.7 ms | 64.8 ms | 82.6 ms |
-| 3 | 16.1 ms | 68.2 ms | 84.4 ms |
-| 4 | 30.4 ms | 57.7 ms | 88.2 ms |
-
-Inside the second column the temporary spans and the capture agree: the
-synchronous `LoadTaskState` round-trip is the one stable cost, ~52–54 ms in
-every run, and workspace construction after hydration is ~1–3 ms:
-
-| Rebuild | `LoadTaskState` | Composer drafts | View construction |
-| --- | --- | --- | --- |
-| 1 | 54.1 ms | 29.1 ms | 1.1 ms |
-| 2 | 52.2 ms | 9.9 ms | 2.3 ms |
-| 3 | 54.1 ms | 10.5 ms | 3.1 ms |
-| 4 | 52.3 ms | 1.1 ms | 2.3 ms |
-
-The `sample` capture of the rebuild's `open_main_window` path shows the same
-shape: `MacPlatform::open_window` holds ~13 of 1 ms samples against ~41 for
-`Waku::new` → `StateStore::load_or_fresh` → `StateStore::load`, i.e. the daemon
-request. The first-frame render that follows `interactive` was 2.5–18 ms.
-These runs had no selected session (`temp/state.json` in the debug profile has
-`selected_session: null`), so `StateStore::load_or_fresh` skipped the
-selected-session `HydrateSession`; on a profile with a selected task that
-request would extend the same hydration span.
-
-**Decision: no GPUI fork patch.** Window and renderer initialization is
-16–30 ms, roughly a fifth to a third of a rebuild, while the daemon round-trips
-that reload task state into the freshly built workspace are 55–83 ms. A fork
-patch could only address the smaller slice, and the rebuild already comes in
-~5–6× under the 500 ms budget, so the patch would add a third carried change to
-the fork for no user-visible win. The dominant cost is also the one the design
-already knows how to move: `Waku::new` fetches the whole task state (and the
-selected session's detail) synchronously inside the window's build closure, so
-a rebuild re-pays the hydration the cold launch pays even though it reuses the
-running daemon. If the budget ever tightens, the lever is moving or caching
-that hydration in `startup-latency` Phase 3 — app-side work that needs no GPUI
-change — which is why this profile is recorded instead of a patch.
+row (gpui `list()` semantics), and every visible row except the windowed
+streaming body lays out its whole content. If that ever needs to shrink:
+fork-level cached list rows need a measure-once extension to `ViewElement`
+caching (cached views lay out from style, not content, which breaks the
+list's measurement as-is); alternatively fold activities into the
+virtualized list as block-granularity rows. Smaller levers, in memory and
+unproven: stable `StyledText` element ids for gpui's per-element layout memo,
+and the per-row `Message` clones in the row builder.

@@ -1009,59 +1009,33 @@ fn anchor_end_space_keeps_a_short_new_turn_at_the_viewport_top() {
 
 #[test]
 fn scroll_to_bottom_only_appears_while_the_tail_is_below_the_viewport() {
-    let viewport_bottom = px(700.0);
-
     assert_eq!(
-        should_show_scroll_to_bottom(false, false, true, viewport_bottom, None, Pixels::ZERO),
+        should_show_scroll_to_bottom(false, false, true, None),
         Some(false)
     );
     assert_eq!(
-        should_show_scroll_to_bottom(
-            true,
-            true,
-            true,
-            viewport_bottom,
-            Some(px(900.0)),
-            Pixels::ZERO,
-        ),
+        should_show_scroll_to_bottom(true, true, true, Some(false)),
         Some(false)
     );
     // Disclosure pinning keeps `is_scrolled` true and a splice can leave the
     // tail temporarily unmeasured, but a collapsed transcript that fits the
     // viewport has nowhere to scroll back to.
     assert_eq!(
-        should_show_scroll_to_bottom(true, false, false, viewport_bottom, None, Pixels::ZERO),
+        should_show_scroll_to_bottom(true, false, false, None),
         Some(false)
     );
     assert_eq!(
-        should_show_scroll_to_bottom(
-            true,
-            false,
-            true,
-            viewport_bottom,
-            Some(px(701.0)),
-            Pixels::ZERO,
-        ),
+        should_show_scroll_to_bottom(true, false, true, Some(false)),
         Some(true)
     );
     assert_eq!(
-        should_show_scroll_to_bottom(
-            true,
-            false,
-            true,
-            viewport_bottom,
-            Some(px(500.0)),
-            px(200.0),
-        ),
+        should_show_scroll_to_bottom(true, false, true, Some(true)),
         Some(false)
     );
     // A stream commit remeasures the tail rows, so the frame after each one has
     // no bounds to read. Answering "show" there strobes the button against the
     // measured frames between commits; the caller holds its last answer instead.
-    assert_eq!(
-        should_show_scroll_to_bottom(true, false, true, viewport_bottom, None, Pixels::ZERO),
-        None
-    );
+    assert_eq!(should_show_scroll_to_bottom(true, false, true, None), None);
 }
 
 #[test]
