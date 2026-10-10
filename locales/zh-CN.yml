@@ -247,6 +247,10 @@ sidebar.grouping_status: 状态
 sidebar.section_needs_you: 需要你
 sidebar.section_running: 进行中
 sidebar.section_recent: 最近
+sidebar.section_archived: 已归档
+sidebar.show_archived: 显示已归档任务
+sidebar.put_away: 收起
+sidebar.bring_back: 取回
 sidebar.ordering: 排序
 sidebar.ordering_newest: 最新优先
 sidebar.ordering_oldest: 最旧优先

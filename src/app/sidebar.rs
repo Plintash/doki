@@ -97,6 +97,11 @@ impl SidebarStatusSection {
 /// sections in one set preserves disclosure state when the user switches
 /// between Project, Updated and Status grouping; a status section shares its
 /// identity with no other section, so folding one takes nothing else with it.
+///
+/// `Archived` is the one section more than one view draws — a put-away task
+/// belongs to no project and no status, so it is listed once, trailing
+/// whatever the view put above it, and folding it away is the same choice
+/// wherever the user made it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum SidebarGroup {
     Updated(SessionDateGroup),
@@ -105,6 +110,7 @@ pub(super) enum SidebarGroup {
     NeedsYou,
     Running,
     Recent,
+    Archived,
 }
 
 impl SidebarGroup {
@@ -116,6 +122,7 @@ impl SidebarGroup {
             Self::NeedsYou => "status-needs-you".into(),
             Self::Running => "status-running".into(),
             Self::Recent => "status-recent".into(),
+            Self::Archived => "archived".into(),
         }
     }
 
@@ -127,6 +134,7 @@ impl SidebarGroup {
             Self::NeedsYou => mix(fingerprint, 0x300),
             Self::Running => mix(fingerprint, 0x301),
             Self::Recent => mix(fingerprint, 0x302),
+            Self::Archived => mix(fingerprint, 0x303),
         }
     }
 }
@@ -210,6 +218,20 @@ fn append_sidebar_group_rows(
         if show_more {
             rows.push(SidebarRow::ShowMore(group));
         }
+    }
+    rows.push(SidebarRow::GroupSpacer);
+}
+
+/// Append the trailing archived section.
+///
+/// Unlike every other section, it stands even with nothing in it: it is
+/// rendered because the user asked for it — or because the open task is in it
+/// — and an empty heading is the honest answer to that request. `show_more`
+/// never applies here; archived tasks are listed in full or not at all.
+fn append_sidebar_archived_section(rows: &mut Vec<SidebarRow>, sessions: &[Uuid], collapsed: bool) {
+    rows.push(SidebarRow::Header(SidebarGroup::Archived));
+    if !collapsed {
+        rows.extend(sessions.iter().copied().map(SidebarRow::Session));
     }
     rows.push(SidebarRow::GroupSpacer);
 }
@@ -383,6 +405,68 @@ fn status_sidebar_sections(sessions: &[&AgentSession]) -> [Vec<Uuid>; 3] {
         }
     }
     sections.map(|section| section.into_iter().map(|session| session.id).collect())
+}
+
+/// Folds the archive-visibility inputs the row snapshot's shape depends on:
+/// the persisted reveal toggle, and whether the open task is itself archived.
+///
+/// The second one is not redundant. With the toggle off an archived task is
+/// hidden from every section, but the task the window is showing may not be a
+/// gap in the list that is showing it, so that one row stands in the archived
+/// section whatever the toggle says — and moving the selection on to a task
+/// that is not archived has to take the section down again.
+fn mix_sidebar_archived_visibility(
+    fingerprint: u64,
+    show_archived: bool,
+    active_task_archived: bool,
+) -> u64 {
+    mix(
+        mix(fingerprint, u64::from(show_archived)),
+        u64::from(active_task_archived),
+    )
+}
+
+/// Lift the started tasks that were put away out of the sections a view would
+/// otherwise file them in, keeping the order that view sorted them into, and
+/// say whether their trailing section stands.
+///
+/// An archived task is removed here whatever its status — waiting, running or
+/// idle — so a view's sections can never disagree with the trailing one about
+/// where a task belongs. The trailing section stands when the user asked to
+/// see what was put away, and also when the task the window is showing is one
+/// of them, which is what keeps the open task from becoming a gap in the list
+/// that is showing it.
+fn split_archived_sessions<'a>(
+    sessions: Vec<&'a AgentSession>,
+    show_archived: bool,
+    active_task_archived: bool,
+) -> (Vec<&'a AgentSession>, Vec<Uuid>, bool) {
+    let mut listed = Vec::with_capacity(sessions.len());
+    let mut archived = Vec::new();
+    for session in sessions {
+        if session.archived_at.is_some() {
+            archived.push(session.id);
+        } else {
+            listed.push(session);
+        }
+    }
+    (listed, archived, show_archived || active_task_archived)
+}
+
+/// Apply one archive action to a client-held task the way the daemon applies
+/// it: an archive stamps the time it happened, a restore clears it, and
+/// nothing else about the task is touched.
+///
+/// The action is the only thing that changes this state — no save can set or
+/// clear it — so the client mirrors the daemon's own move onto the row's copy,
+/// which is what lets the row leave the list on the frame the user asked
+/// instead of on the next catalog refresh. Returns whether the task moved
+/// between the two, which is what decides if the row snapshot has to be
+/// rebuilt.
+pub(super) fn apply_archive_action(session: &mut AgentSession, archived: bool, now: u64) -> bool {
+    let moved = session.archived_at.is_some() != archived;
+    session.archived_at = archived.then_some(now);
+    moved
 }
 
 fn project_sidebar_groups(
@@ -1174,6 +1258,7 @@ impl Waku {
         let weak = cx.entity().downgrade();
         let grouping = self.state.sidebar_grouping;
         let ordering = self.state.sidebar_ordering;
+        let show_archived = self.state.sidebar_show_archived;
         let options = dropdown_menu(
             div()
                 .id("sidebar-options")
@@ -1251,6 +1336,19 @@ impl Waku {
                         },
                     ));
                 }
+                // The archive toggle is a view of the same lists, not another
+                // list: it reveals what was put away without changing any
+                // task's archive state.
+                let show_archived_weak = weak.clone();
+                items.push(MenuItem::Separator);
+                items.push(
+                    MenuItem::new(tr!("sidebar.show_archived"), move |_, cx| {
+                        let _ = show_archived_weak.update(cx, |this, cx| {
+                            this.set_sidebar_show_archived(!show_archived, cx);
+                        });
+                    })
+                    .selected(show_archived),
+                );
                 items
             },
         );
@@ -1773,8 +1871,9 @@ impl Waku {
     /// boundary.
     ///
     /// A fact the rows are filtered or partitioned by has to be in here, or the
-    /// snapshot would outlive the rule that produced it — the archived-task
-    /// visibility toggle is one of those once it exists.
+    /// snapshot would outlive the rule that produced it — which is why the
+    /// archived-task visibility toggle, the archive state of the open task,
+    /// and each row's own status and archive state are all folded in.
     fn sidebar_rows_cached(&self, today: NaiveDate, now: u64) -> Rc<Vec<SidebarRow>> {
         let mut fingerprint = mix(0x51de_ba5e_5eed_c0de, today.num_days_from_ce() as u64);
         fingerprint = mix(
@@ -1792,9 +1891,13 @@ impl Waku {
                 SidebarOrdering::Oldest => 2,
             },
         );
+        let mut active_task_archived = false;
         for session in &self.state.sessions {
             if !session.has_started() {
                 continue;
+            }
+            if Some(session.id) == self.state.selected_session {
+                active_task_archived = session.archived_at.is_some();
             }
             fingerprint = mix_sidebar_session_facts(fingerprint, session);
             if self.state.sidebar_grouping == SidebarGrouping::Project {
@@ -1807,6 +1910,11 @@ impl Waku {
                 );
             }
         }
+        fingerprint = mix_sidebar_archived_visibility(
+            fingerprint,
+            self.state.sidebar_show_archived,
+            active_task_archived,
+        );
         if self.state.sidebar_grouping == SidebarGrouping::Project {
             for project in &self.state.projects {
                 fingerprint = mix_uuid(fingerprint, project.id);
@@ -1835,24 +1943,42 @@ impl Waku {
             collapsed,
         );
         if self.sidebar_rows_fingerprint.get() != Some(fingerprint) {
-            let (rows, status_section_counts) = self.sidebar_rows(today, now);
-            // Both halves come out of the same pass, so a header can never
-            // label itself with a count the rows do not back.
+            let (rows, status_section_counts, archived_count) = self.sidebar_rows(today, now);
+            // All three come out of the same pass, so a header can never label
+            // itself with a count the rows do not back.
             *self.sidebar_rows_snapshot.borrow_mut() = Rc::new(rows);
             *self.sidebar_status_section_counts.borrow_mut() = status_section_counts;
+            self.sidebar_archived_count.set(archived_count);
             self.sidebar_rows_fingerprint.set(Some(fingerprint));
         }
         self.sidebar_rows_snapshot.borrow().clone()
     }
 
+    /// Whether the open task is one that was put away. The task the window is
+    /// showing is never a gap in the list showing it, so this is the second
+    /// half of the trailing archived section's gate.
+    fn active_task_is_archived(&self) -> bool {
+        self.state.selected_session.is_some_and(|selected| {
+            self.state
+                .sessions
+                .iter()
+                .any(|session| session.id == selected && session.archived_at.is_some())
+        })
+    }
+
     /// Snapshot the session history as a flat list of lightweight rows under
-    /// the current grouping and ordering preferences, together with the
-    /// counts the status view's section headers label themselves with.
+    /// the current grouping and ordering preferences, together with the counts
+    /// the section headers label themselves with: one per active status
+    /// section, and the trailing archived section's own.
     fn sidebar_rows(
         &self,
         today: NaiveDate,
         now: u64,
-    ) -> (Vec<SidebarRow>, [usize; SidebarStatusSection::ALL.len()]) {
+    ) -> (
+        Vec<SidebarRow>,
+        [usize; SidebarStatusSection::ALL.len()],
+        usize,
+    ) {
         let mut sorted_sessions = self
             .state
             .sessions
@@ -1860,6 +1986,16 @@ impl Waku {
             .filter(|session| session.has_started())
             .collect::<Vec<_>>();
         sort_sidebar_sessions(&mut sorted_sessions, self.state.sidebar_ordering);
+
+        // An archived task has exactly one home, whatever its status and
+        // whatever the view above it would otherwise have done with it, so it
+        // is taken out of this view's sections here and put back in the
+        // trailing one at the bottom.
+        let (sorted_sessions, archived_ids, archived_section_stands) = split_archived_sessions(
+            sorted_sessions,
+            self.state.sidebar_show_archived,
+            self.active_task_is_archived(),
+        );
 
         let mut status_section_counts = [0usize; SidebarStatusSection::ALL.len()];
         let mut rows = vec![SidebarRow::Search];
@@ -1943,6 +2079,15 @@ impl Waku {
                 }
             }
         }
+        let archived_count = archived_ids.len();
+        if archived_section_stands {
+            append_sidebar_archived_section(
+                &mut rows,
+                &archived_ids,
+                self.sidebar_collapsed_groups
+                    .contains(&SidebarGroup::Archived),
+            );
+        }
         if rows.len() == 1 {
             // Keep the header actions visible while there is no history.
             let group = match self.state.sidebar_grouping {
@@ -1972,7 +2117,7 @@ impl Waku {
             };
             rows.push(SidebarRow::Header(group));
         }
-        (rows, status_section_counts)
+        (rows, status_section_counts, archived_count)
     }
 
     /// Keep the virtualized list in sync with the current row snapshot.
@@ -2061,6 +2206,7 @@ impl Waku {
             SidebarGroup::NeedsYou => tr!("sidebar.section_needs_you"),
             SidebarGroup::Running => tr!("sidebar.section_running"),
             SidebarGroup::Recent => tr!("sidebar.section_recent"),
+            SidebarGroup::Archived => tr!("sidebar.section_archived"),
             SidebarGroup::Project(project_id) => self
                 .state
                 .projects
@@ -2081,18 +2227,20 @@ impl Waku {
             .find(|section| section.group() == group);
         let count = status_section
             .map(|section| self.sidebar_status_section_counts.borrow()[section.index()])
+            .or_else(|| {
+                (group == SidebarGroup::Archived).then(|| self.sidebar_archived_count.get())
+            })
             .filter(|count| *count > 0);
-        let collapse_hint = (matches!(group, SidebarGroup::Updated(_)) || status_section.is_some())
-            .then(|| {
-                icon("icons/chevron-down.svg", 14.0, theme.text_secondary)
-                    .when(collapsed, |icon| {
-                        icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(
-                            0.75,
-                        )))
-                    })
-                    .invisible()
-                    .group_hover(group_name.clone(), |icon| icon.visible())
-            });
+        let collapse_hint = (matches!(group, SidebarGroup::Updated(_) | SidebarGroup::Archived)
+            || status_section.is_some())
+        .then(|| {
+            icon("icons/chevron-down.svg", 14.0, theme.text_secondary)
+                .when(collapsed, |icon| {
+                    icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.75)))
+                })
+                .invisible()
+                .group_hover(group_name.clone(), |icon| icon.visible())
+        });
         let compose = show_folder_icon.then(|| {
             let compose_focus = self
                 .sidebar_group_compose_focuses
@@ -2240,11 +2388,13 @@ impl Waku {
             SidebarGroup::Project(project_id) => self.select_project(project_id, cx),
             SidebarGroup::Projectless => self.create_projectless_session(cx),
             // Only a project section can start a task, so neither the status
-            // sections nor a date heading offer the action.
+            // sections, the archived section, nor a date heading offer the
+            // action.
             SidebarGroup::Updated(_)
             | SidebarGroup::NeedsYou
             | SidebarGroup::Running
-            | SidebarGroup::Recent => return,
+            | SidebarGroup::Recent
+            | SidebarGroup::Archived => return,
         }
         let focus = self.composer_focus(cx);
         window.focus(&focus, cx);
@@ -2372,6 +2522,57 @@ impl Waku {
             offset_in_item: Pixels::ZERO,
         });
         self.save(cx);
+        cx.notify();
+    }
+
+    /// Reveal or hide the tasks that have been put away.
+    ///
+    /// This is a list preference, not a change to any task: the catalog keeps
+    /// every task either way, which is what keeps an archived one findable by
+    /// search. Whether a task is archived at all is the daemon's to say, and
+    /// changes only through [`Self::set_session_archived`].
+    pub(super) fn set_sidebar_show_archived(
+        &mut self,
+        show_archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.sidebar_show_archived == show_archived {
+            return;
+        }
+        self.state.sidebar_show_archived = show_archived;
+        self.sidebar_rows_fingerprint.set(None);
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// Put one task away, or bring it back.
+    ///
+    /// The daemon owns the archive time and applies the action itself; the
+    /// client sends the action and mirrors the daemon's own move onto the
+    /// row's copy so the list changes on the frame the user asked rather than
+    /// on the next catalog refresh. Nothing else about the task is touched —
+    /// putting a task away frees nothing.
+    pub(super) fn set_session_archived(
+        &mut self,
+        session_id: Uuid,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+        let moved = apply_archive_action(session, archived, unix_time());
+        if let Err(error) = self.store.set_task_archived(session_id, archived) {
+            self.show_toast(tr!("errors.save_local_state", error = error));
+        }
+        if moved {
+            self.sidebar_rows_fingerprint.set(None);
+        }
         cx.notify();
     }
 
@@ -2539,6 +2740,10 @@ impl Waku {
         };
         let waku = cx.entity().downgrade();
         let keyboard_menu = menu.clone();
+        // A task that was put away says so on its own row, not only by where
+        // the row is filed: the one archived task the window can be showing
+        // while archived tasks are hidden is the task it is showing.
+        let archived = session.archived_at.is_some();
         let row = div()
             .id(SharedString::from(format!("session-{}", session.id)))
             .w_full()
@@ -2591,6 +2796,9 @@ impl Waku {
                             12.0,
                             status_color(&theme, session.status),
                         ))
+                    })
+                    .when(archived, |element| {
+                        element.child(icon("icons/package.svg", 12.0, theme.text_tertiary))
                     }),
             )
             .child(
@@ -2681,6 +2889,7 @@ impl Waku {
                 &menu,
                 move |_| {
                     let rename_waku = waku.clone();
+                    let archive_waku = waku.clone();
                     let remove_waku = waku.clone();
                     vec![
                         MenuItem::new(tr!("common.rename"), move |window, cx| {
@@ -2688,6 +2897,21 @@ impl Waku {
                                 waku.begin_session_rename(session_id, window, cx);
                             });
                         }),
+                        MenuItem::Separator,
+                        // An archived task is offered the way back instead: one
+                        // action, saying what this task's next move is.
+                        MenuItem::new(
+                            if archived {
+                                tr!("sidebar.bring_back")
+                            } else {
+                                tr!("sidebar.put_away")
+                            },
+                            move |_, cx| {
+                                let _ = archive_waku.update(cx, |waku, cx| {
+                                    waku.set_session_archived(session_id, !archived, cx);
+                                });
+                            },
+                        ),
                         MenuItem::Separator,
                         MenuItem::new(tr!("common.remove"), move |_, cx| {
                             let _ = remove_waku
@@ -3557,6 +3781,166 @@ mod tests {
         task.archived_at = Some(1_700_000_000);
 
         assert_ne!(test_snapshot_fingerprint(&[&task]), before);
+    }
+
+    /// The archived-visibility inputs `sidebar_rows_cached` folds over and
+    /// above the session list: turning the reveal preference on, or the open
+    /// task becoming one of the archived ones, has to re-section the rows.
+    #[test]
+    fn revealing_archived_tasks_re_sections_the_row_snapshot() {
+        let folded = |show_archived, active_task_archived| {
+            mix_sidebar_archived_visibility(0x5eed, show_archived, active_task_archived)
+        };
+
+        assert_ne!(
+            folded(false, false),
+            folded(true, false),
+            "the reveal toggle has to rebuild the snapshot"
+        );
+        assert_ne!(
+            folded(false, false),
+            folded(false, true),
+            "the open task being archived has to rebuild it too"
+        );
+    }
+
+    #[test]
+    fn an_archived_task_is_lifted_out_of_the_sections_its_status_implies() {
+        let mut archived_waiting = status_test_session(SessionStatus::Waiting);
+        archived_waiting.archived_at = Some(1_700_000_000);
+        let running = status_test_session(SessionStatus::Working);
+        let idle = status_test_session(SessionStatus::Idle);
+
+        let (listed, archived, stands) = split_archived_sessions(
+            vec![&archived_waiting as &AgentSession, &running, &idle],
+            false,
+            false,
+        );
+
+        assert_eq!(
+            listed.iter().map(|session| session.id).collect::<Vec<_>>(),
+            vec![running.id, idle.id],
+            "an archived task joins no active section, whatever its status"
+        );
+        assert_eq!(archived, vec![archived_waiting.id]);
+        assert!(
+            !stands,
+            "what was put away stays hidden until the user asks for it"
+        );
+    }
+
+    #[test]
+    fn the_archived_section_stands_when_the_user_asks_or_the_open_task_is_in_it() {
+        let mut archived = status_test_session(SessionStatus::Idle);
+        archived.archived_at = Some(1_700_000_000);
+
+        let (_, _, hidden) = split_archived_sessions(vec![&archived], false, false);
+        assert!(!hidden, "the default is not to reveal what was put away");
+
+        let (_, _, revealed) = split_archived_sessions(vec![&archived], true, false);
+        assert!(revealed, "the toggle reveals the trailing archived section");
+
+        let (_, _, open_task) = split_archived_sessions(vec![&archived], false, true);
+        assert!(
+            open_task,
+            "the open task is never a gap, so its section stands whatever the toggle says"
+        );
+    }
+
+    /// The action says what it does and no more. "Put away" is the whole
+    /// promise: nothing offered here may read as having freed disk space,
+    /// because archiving frees nothing.
+    #[test]
+    fn the_archive_action_promises_no_reclaimed_space() {
+        let wordings = [
+            tr!("sidebar.put_away"),
+            tr!("sidebar.bring_back"),
+            tr!("sidebar.show_archived"),
+            tr!("sidebar.section_archived"),
+        ];
+        for wording in &wordings {
+            let wording = wording.to_lowercase();
+            for forbidden in ["free", "space", "disk", "storage", "reclaim", "clean"] {
+                assert!(
+                    !wording.contains(forbidden),
+                    "`{wording}` claims something archiving does not do"
+                );
+            }
+        }
+        assert!(
+            tr!("sidebar.put_away").to_lowercase().contains("away"),
+            "the action is described as putting the task away"
+        );
+    }
+
+    /// The same task as JSON with the archive stamp taken out, so everything
+    /// else about it can be compared across an archive action.
+    fn session_without_archive_stamp(session: &AgentSession) -> serde_json::Value {
+        let mut value = serde_json::to_value(session).expect("a session serializes");
+        value
+            .as_object_mut()
+            .expect("a session is an object")
+            .remove("archived_at");
+        value
+    }
+
+    /// Archiving records that a task was put away and changes nothing else.
+    /// The messages, the stored transcript detail, the checkpoints' refs and
+    /// the worktree all survive it — putting a task away frees nothing.
+    #[test]
+    fn putting_a_task_away_leaves_everything_else_about_it_alone() {
+        let mut task = task_with_a_live_plan_step("Move the row's second line");
+        task.set_title("Fix the sidebar row");
+        task.objective = Some("The sidebar row says where the task stands".to_owned());
+        task.turn_count = Some(4);
+        task.changed_files = Some(3);
+        task.workspace = SessionWorkspace::Worktree {
+            path: PathBuf::from("/tmp/worktree"),
+            branch: "waku/fix-the-sidebar-row".to_owned(),
+        };
+        task.finish_active_turn(TurnStatus::Completed);
+        task.turns
+            .last_mut()
+            .expect("the test has a turn")
+            .checkpoint = Some(Checkpoint {
+            turn_count: 1,
+            git_ref: "refs/waku/test-turn-1".to_owned(),
+            status: CheckpointStatus::Ready,
+            files: vec![crate::model::CheckpointFile {
+                path: "src/app/sidebar.rs".to_owned(),
+                additions: 12,
+                deletions: 3,
+            }],
+            additions: 12,
+            deletions: 3,
+            created_at: 1,
+        });
+        let before = session_without_archive_stamp(&task);
+        assert!(!task.messages.is_empty(), "the task has messages to keep");
+        assert!(
+            !task.transcript_blocks.is_empty(),
+            "the task has stored transcript detail to keep"
+        );
+        assert!(task.turns.iter().any(|turn| turn.checkpoint.is_some()));
+
+        assert!(apply_archive_action(&mut task, true, 1_700_000_000));
+
+        assert_eq!(task.archived_at, Some(1_700_000_000));
+        assert_eq!(
+            session_without_archive_stamp(&task),
+            before,
+            "putting a task away deletes nothing"
+        );
+
+        // Bringing it back is the same field going away again, and it, too,
+        // leaves the rest of the task exactly where it was.
+        assert!(apply_archive_action(&mut task, false, 1_800_000_000));
+        assert_eq!(task.archived_at, None);
+        assert_eq!(session_without_archive_stamp(&task), before);
+
+        // Asking to put an already-parked task away again moves nothing.
+        assert!(apply_archive_action(&mut task, true, 1_900_000_000));
+        assert!(!apply_archive_action(&mut task, true, 2_000_000_000));
     }
 
     #[test]

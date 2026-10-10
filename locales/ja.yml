@@ -258,6 +258,10 @@ sidebar.grouping_status: ステータス
 sidebar.section_needs_you: あなたの対応待ち
 sidebar.section_running: 実行中
 sidebar.section_recent: 最近
+sidebar.section_archived: アーカイブ済み
+sidebar.show_archived: アーカイブ済みのタスクを表示
+sidebar.put_away: 片づける
+sidebar.bring_back: 戻す
 sidebar.ordering: 並び順
 sidebar.ordering_newest: 新しい順
 sidebar.ordering_oldest: 古い順
