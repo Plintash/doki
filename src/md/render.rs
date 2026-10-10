@@ -632,8 +632,7 @@ impl MarkdownView {
             if !append {
                 // A rewrite (edit, rewind, replacement) can change every
                 // block, so the measured heights no longer describe the body.
-                self.heights.borrow_mut().clear();
-                self.release_clip();
+                self.forget_measured_geometry();
             }
         }
         // The mended display tail depends only on the source and the
@@ -694,9 +693,10 @@ impl MarkdownView {
     /// never reports a step. It never falls below that measured height either,
     /// so only text appended since the measurement can lie under the clip —
     /// and the veil has not painted that yet. That justification depends on the
-    /// veil: without animation there is nothing holding appended text
-    /// invisible, so the clip is released and the row reports the body's real
-    /// height.
+    /// veil and on the body growing only by appended text: without animation
+    /// there is nothing holding appended text invisible, and an image or
+    /// formula lands opaque and resizes the block it sits in, so both release
+    /// the clip and let the row report the body's real height.
     pub fn advance_clip(&self, animate: bool, now: Instant) {
         let dt = now
             .saturating_duration_since(self.clip_at.get())
@@ -706,11 +706,14 @@ impl MarkdownView {
             self.release_clip();
             return;
         };
-        if !animate {
-            // A pinned clip is the height measured last frame, which every
-            // appended line has since grown past; with the veil off, those
+        if !animate || self.async_blocks.get() {
+            // A pinned clip is the height measured last frame. Without the
+            // veil, every appended line has since grown past it and those
             // bytes are opaque, so pinning would only cut the text the reader
-            // is waiting for.
+            // is waiting for. An image or formula has the same problem with
+            // the veil on: it lands opaque on a later frame and can grow the
+            // body past a height measured before it, and no veiled grapheme
+            // is what would be cut.
             self.release_clip();
             return;
         }
@@ -750,6 +753,14 @@ impl MarkdownView {
         self.clip.set(Some(next.min(height + px(CLIP_RUNWAY_MAX))));
     }
 
+    /// Forget the geometry measured for the old body: the block heights and
+    /// the clip that was sized from them. They are one answer, and dropping
+    /// either alone would cut a body that has since grown past it.
+    fn forget_measured_geometry(&self) {
+        self.heights.borrow_mut().clear();
+        self.release_clip();
+    }
+
     /// Drop the leading container height. `None` reports the whole body, which
     /// is what anything that invalidates the measured height needs: a retained
     /// clip is a height the body has since grown past, and the row would cut
@@ -783,10 +794,9 @@ impl MarkdownView {
     /// spacer arithmetic would otherwise carry the old reflow into the row.
     pub fn set_render_width(&self, width: f32) {
         if self.heights_width.replace(Some(width)) != Some(width) {
-            self.heights.borrow_mut().clear();
             // The clip is a height at the old wrapping, so it is no more valid
             // than the heights are: keeping it would cut the re-wrapped body.
-            self.release_clip();
+            self.forget_measured_geometry();
         }
     }
 
@@ -798,8 +808,7 @@ impl MarkdownView {
             self.flats.borrow_mut().clear();
             // A metrics change moves every block's height, so the spacer
             // ledger has to be rebuilt at the new scale too.
-            self.heights.borrow_mut().clear();
-            self.release_clip();
+            self.forget_measured_geometry();
         }
     }
 
@@ -1929,7 +1938,7 @@ fn window_plan(
     // The volatile tail is built every frame and always reaches the body's
     // last block, so it closes the window: no block is ever dropped below the
     // last group, and nothing is owed after it.
-    let volatile = volatile_start.min(count)..count;
+    let volatile = volatile_start..count;
     if volatile.start < volatile.end {
         match groups.last_mut() {
             Some(last) if volatile.start <= last.end => last.end = last.end.max(volatile.end),
@@ -2063,8 +2072,13 @@ fn render_block_range(
 }
 
 /// Wrap a streaming body in the clip layer: measure its real height, and
-/// while a gap is open report the continuous clip height instead.
+/// while a gap is open report the continuous clip height instead. Only a
+/// streaming body has a controller reading that height, so a settled one is
+/// handed back untouched.
 pub fn clip_body(view: &MarkdownView, body: AnyElement) -> AnyElement {
+    if !view.streaming.get() {
+        return body;
+    }
     let body = measure_body(view, body);
     match view.clip_height() {
         // `items_start` matters: a default flex row would stretch the body to
@@ -3569,6 +3583,104 @@ mod tests {
             None,
             "without the veil the body reports its real height"
         );
+    }
+
+    /// An image or a formula lands opaque on a later frame and can grow the
+    /// body past a height measured before it, which no veil holds invisible:
+    /// a body holding one reports its real height, not a clip around it.
+    #[test]
+    fn a_body_that_can_repaint_taller_releases_the_container_height() {
+        let mut view = MarkdownView::new();
+        view.set_text("the value $x^2$ arrives", true);
+        assert!(view.has_async_blocks(), "inline math");
+        view.body_height.set(Some(px(100.0)));
+        view.advance_clip(true, Instant::now());
+        assert_eq!(
+            view.clip_height(),
+            None,
+            "a block that can resize itself releases the clip"
+        );
+    }
+
+    /// The clip is a height the row reports, not one the body lays out at. If
+    /// the clipped layer stretched its child, the controller would read the
+    /// clip back as the body's height and keep the row there forever, hiding
+    /// every line the body grew by.
+    #[gpui::test]
+    fn a_clipped_body_still_measures_its_natural_height(cx: &mut TestAppContext) {
+        struct ClippedBody {
+            view: MarkdownView,
+            palette: Palette,
+            clip: Rc<Cell<Option<Pixels>>>,
+            reported: BlockHeights,
+        }
+
+        impl gpui::Render for ClippedBody {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                // Stands in for the clip controller, which runs before the row
+                // builds this body.
+                self.view.clip.set(self.clip.get());
+                let ctx = Ctx::new(
+                    "clip",
+                    &self.palette,
+                    Metrics::BODY,
+                    TranscriptSelection::default(),
+                );
+                let body = markdown(&self.view, &ctx).unwrap_or_else(|| div().into_any_element());
+                let reported = Measured {
+                    inner: clip_body(&self.view, body),
+                    sink: MeasureSink::Block {
+                        heights: self.reported.clone(),
+                        index: 0,
+                        range: 0..1,
+                    },
+                };
+                div().w(px(700.0)).flex().items_start().child(reported)
+            }
+        }
+
+        let source = "Paragraph with enough words to wrap across the transcript column at least once and give the body a real height.\n\n";
+        let mut view = MarkdownView::new();
+        view.set_text(source, true);
+        let height = view.body_height.clone();
+        let clip = Rc::new(Cell::new(Some(px(40.0))));
+        let reported = Rc::new(RefCell::new(vec![(0..0, None)]));
+        let (entity, visual) = cx.add_window_view(|_, _| ClippedBody {
+            view,
+            palette: Palette::from_theme(&Theme::dark()),
+            clip: clip.clone(),
+            reported: reported.clone(),
+        });
+        let draw = |visual: &mut gpui::VisualTestContext, entity: &gpui::Entity<ClippedBody>| {
+            visual.update(|cxt, cx| {
+                entity.update(cx, |_, cx| cx.notify());
+                cxt.draw(cx).clear(cx);
+            });
+        };
+
+        draw(visual, &entity);
+        let natural = height.get().expect("the body was laid out");
+        assert_eq!(
+            reported.borrow()[0].1.expect("the row was laid out"),
+            px(40.0),
+            "the row reports the clip"
+        );
+        assert!(
+            natural > px(40.0),
+            "a clipped body still measures its own height: {natural:?}"
+        );
+
+        // A body that grows still measures taller: the clip is not what the
+        // controller reads back as the body's height.
+        let mut grown = String::from(source);
+        grown.push_str(concat!(
+            "A second paragraph, appended after the first measurement, that the ",
+            "clip must not hide.\n\n"
+        ));
+        visual.update(|_, cx| entity.update(cx, |body, _| body.view.set_text(&grown, true)));
+        draw(visual, &entity);
+        let taller = height.get().expect("the body was laid out again");
+        assert!(taller > natural, "the body measures taller: {taller:?}");
     }
 
     /// The clip is a height at one wrapping, and a retained one cuts a body

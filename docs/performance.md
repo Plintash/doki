@@ -184,7 +184,11 @@ moment any scrollbar became visible.
   invisible, so the same call releases the clip and the row reports the
   body's real height. Settling, a rewrite, a reflow, and a metric change all
   release the clip too, because a height kept across any of them would cut a
-  body that has since grown past it.
+  body that has since grown past it. So does a body holding an image or a
+  formula: such a block can land on a later frame and grow the body past a
+  height measured before it, and unlike appended text it paints opaque, so
+  the clip would cut it in the open. Only a streaming body is measured for
+  that controller at all; a settled one skips the wrapper.
 - `MarkdownView::set_text` derives the mended display tail only when content
   or the streaming flag changed — the derivation re-parses the final block and
   runs for every visible row every frame.
