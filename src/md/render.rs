@@ -3484,6 +3484,44 @@ mod tests {
         );
     }
 
+    /// An append that starts a new top-level block is the one append that
+    /// costs a full pass. Its range match still holds — the block keeps the
+    /// source range it had in the mended tail — but its height is gone, so the
+    /// planner has nothing to size a spacer with and builds the whole body for
+    /// that frame. The ledger keeps every other entry, so the next frame
+    /// windows again.
+    #[test]
+    fn a_structural_append_costs_one_full_measuring_pass() {
+        let gap = px(10.0);
+        let mut view = MarkdownView::new();
+        view.set_render_width(600.0);
+        view.set_text("A\n\nB\n\nC\n\nD\n\nE\n\nF", true);
+        let recorded = view
+            .top_blocks()
+            .map(|top| (top.range.clone(), Some(px(1_000.0))))
+            .collect::<Vec<_>>();
+        assert_eq!(recorded.len(), 6, "fixture must parse to six blocks");
+        let volatile = view.parser.display_tail_start();
+        assert_eq!(volatile, 5, "only the last block is the mended tail");
+        view.volatile_from.set(block_ordinal_base(volatile));
+        *view.heights.borrow_mut() = recorded;
+
+        // A viewport on the last block builds it and the volatile block only;
+        // everything above them is a spacer.
+        let blocks = view.top_blocks().collect::<Vec<_>>();
+        let plan = window_plan(&view.heights, &blocks, gap, 5_000.0, 100.0, volatile);
+        assert_eq!(plan.groups, vec![4..6], "{:?}", plan.groups);
+
+        // Appending a seventh block promotes block 5 out of the tail: it keeps
+        // its range and loses its height, so this frame builds all seven.
+        view.set_text("A\n\nB\n\nC\n\nD\n\nE\n\nF\n\nG", true);
+        let blocks = view.top_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 7, "the append started a new top-level block");
+        let plan = window_plan(&view.heights, &blocks, gap, 5_000.0, 100.0, 6);
+        assert_eq!(plan.groups, vec![0..7], "{:?}", plan.groups);
+        assert_eq!(plan.spacers, vec![None]);
+    }
+
     /// Images and formulas size themselves after their first frame, so a body
     /// holding one cannot stand in for a hidden block with a remembered
     /// height: it must render fully every pass.

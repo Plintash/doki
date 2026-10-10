@@ -135,8 +135,12 @@ moment any scrollbar became visible.
   transcript viewport can reach (plus `MARKDOWN_WINDOW_MARGIN` above and
   below, and the volatile tail) with spacers sized from the same ledger, so
   the row still measures exactly as tall as the full body. Appends keep the
-  ledger; a wrap-width, metric, or rewrite change drops it, and the next
-  frame's full pass re-measures. Planning itself still walks the whole ledger
+  ledger, with one exception: an append that starts a new top-level block
+  leaves the block that just left the mended tail with its source range but no
+  height, so that commit's frame builds the whole body once and measures it
+  (a pure text append stays windowed, and the next frame windows again). A
+  wrap-width, metric, or rewrite change drops the ledger, and the next frame's
+  full pass re-measures. Planning itself still walks the whole ledger
   — two vectors and two scans a frame — so it stays proportional to the
   document, and the build is proportional to the viewport **per top-level
   block**: the planner selects whole blocks, so a body that is a single block
