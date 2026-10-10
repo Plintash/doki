@@ -695,7 +695,10 @@ impl MarkdownView {
     /// laid out this frame lands in space that already exists, and the row
     /// never reports a step. It never falls below that measured height either,
     /// so only text appended since the measurement can lie under the clip —
-    /// and the veil has not painted that yet.
+    /// and the veil has not painted that yet. That justification depends on the
+    /// veil: without animation there is nothing holding appended text
+    /// invisible, so the clip is released and the row reports the body's real
+    /// height.
     pub fn advance_clip(&self, animate: bool, now: Instant) {
         let dt = now
             .saturating_duration_since(self.clip_at.get())
@@ -706,10 +709,11 @@ impl MarkdownView {
             return;
         };
         if !animate {
-            self.clip.set(Some(height));
-            self.clip_last_height.set(Some(height));
-            self.clip_rate.set(0.0);
-            self.clip_velocity.set(0.0);
+            // A pinned clip is the height measured last frame, which every
+            // appended line has since grown past; with the veil off, those
+            // bytes are opaque, so pinning would only cut the text the reader
+            // is waiting for.
+            self.release_clip();
             return;
         }
         // The container paves the road *ahead* of the body: it grows at the
@@ -3513,7 +3517,9 @@ mod tests {
 
     /// The container height leads the streaming body: it grows at the body's
     /// smoothed rate so the row never reports a line step, and it never dips
-    /// below the body.
+    /// below the body. Without the dissolve there is no veil holding appended
+    /// text invisible, so the same call releases the clip instead of pinning
+    /// the reader's view at the previous frame's height.
     #[test]
     fn the_container_height_leads_the_body() {
         let mut view = MarkdownView::new();
@@ -3529,7 +3535,11 @@ mod tests {
         assert!(lead > px(100.0) && lead <= px(244.0), "{lead:?}");
 
         view.advance_clip(false, start + Duration::from_millis(20));
-        assert_eq!(view.clip_height(), Some(px(200.0)), "snaps to the body");
+        assert_eq!(
+            view.clip_height(),
+            None,
+            "without the veil the body reports its real height"
+        );
     }
 
     /// The clip is a height at one wrapping, and a retained one cuts a body

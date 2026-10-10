@@ -170,9 +170,13 @@ moment any scrollbar became visible.
   exists and only text appended since that measurement ever sits below the
   clip edge — and the veil has not painted that yet, because a newly appended
   grapheme is born at zero opacity. The gap under the text is the only
-  artefact, bounded by the rate lead (`CLIP_RUNWAY_MAX`). Settling, a rewrite,
-  a reflow, and a metric change all release the clip, because a height kept
-  across any of them would cut a body that has since grown past it.
+  artefact, bounded by the rate lead (`CLIP_RUNWAY_MAX`). That trade holds
+  only while the dissolve runs: with animation off — reduce motion, or a
+  reader scrolled away from the tail — nothing holds appended text
+  invisible, so the same call releases the clip and the row reports the
+  body's real height. Settling, a rewrite, a reflow, and a metric change all
+  release the clip too, because a height kept across any of them would cut a
+  body that has since grown past it.
 - `MarkdownView::set_text` derives the mended display tail only when content
   or the streaming flag changed — the derivation re-parses the final block and
   runs for every visible row every frame.
