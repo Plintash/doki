@@ -607,100 +607,16 @@ impl MarkdownView {
         *self.veil.borrow_mut() = RowVeil::seeded();
     }
 
-    /// Point the view at `text`. `mend` closes hanging inline markers, which is
-    /// wanted while a response streams and not once it has settled.
     /// Bytes of source this view retains. Parsed structures run to roughly
     /// seventeen times this, so it is the honest unit for bounding a cache.
     pub fn source_len(&self) -> usize {
         self.parser.text().len()
     }
 
+    /// Parse and point the caches at `text`, the body in full. `mend` closes
+    /// hanging inline markers, which is wanted while a response streams and not
+    /// once it has settled.
     pub fn set_text(&mut self, text: &str, mend: bool) {
-        self.apply_text(text, mend);
-    }
-
-    /// Advance the clipped height toward the body's real height.
-    ///
-    /// The row's height is what the transcript pins to, and text layout grows
-    /// it in whole-line steps; pinning that step is the vertical jolt no
-    /// amount of grapheme fading hides. This keeps the row's *reported* height
-    /// continuous instead: it leads the height measured last frame, so a line
-    /// laid out this frame lands in space that already exists, and the row
-    /// never reports a step. It never falls below that measured height either,
-    /// so only text appended since the measurement can lie under the clip —
-    /// and the veil has not painted that yet.
-    pub fn advance_clip(&self, animate: bool, now: Instant) {
-        let dt = now
-            .saturating_duration_since(self.clip_at.get())
-            .as_secs_f32();
-        self.clip_at.set(now);
-        let Some(height) = self.body_height.get() else {
-            self.clip.set(None);
-            return;
-        };
-        if !animate || !self.streaming.get() {
-            self.clip.set(Some(height));
-            self.clip_last_height.set(Some(height));
-            self.clip_rate.set(0.0);
-            self.clip_velocity.set(0.0);
-            return;
-        }
-        // The container paves the road *ahead* of the body: it grows at the
-        // body's smoothed rate so the next line lands in space that already
-        // exists, and the row's reported height never steps. It stays at or
-        // above the last measured body height and the veil holds newly
-        // appended graphemes invisible, so the gap under the text is the only
-        // artefact, bounded by the rate lead.
-        let growth = match self.clip_last_height.get() {
-            Some(previous) if height > previous => f32::from(height - previous),
-            _ => 0.0,
-        };
-        let observed = if dt > 0.0 { growth / dt } else { 0.0 };
-        let rate = if growth > 0.0 {
-            self.clip_rate.get() * 0.75 + observed * 0.25
-        } else {
-            self.clip_rate.get() * 0.9
-        };
-        self.clip_rate.set(rate);
-        self.clip_last_height.set(Some(height));
-
-        let current = self.clip.get().unwrap_or(height);
-        // Feed-forward: chase a target a short slice of growth ahead, so the
-        // spring absorbs steps instead of lagging the arrival.
-        let target = (height + px(rate * 0.10)).min(height + px(CLIP_RUNWAY_MAX));
-        // Critically damped spring on (position, velocity). A body step
-        // changes only the acceleration, so the row's motion stays smooth
-        // through it.
-        let stiffness = 220.0_f32;
-        let damping = 2.0 * (stiffness).sqrt();
-        let mut velocity = self.clip_velocity.get();
-        let accel = stiffness * f32::from(target - current) - damping * velocity;
-        velocity = (velocity + accel * dt).max(0.0);
-        self.clip_velocity.set(velocity);
-        let next = (current + px(velocity * dt)).max(height);
-        self.clip.set(Some(next.min(height + px(CLIP_RUNWAY_MAX))));
-    }
-
-    /// Drop the leading container height. `None` reports the whole body, which
-    /// is what anything that invalidates the measured height needs: a retained
-    /// clip is a height the body has since grown past, and the row would cut
-    /// off the text below it.
-    fn release_clip(&self) {
-        self.clip.set(None);
-        self.clip_last_height.set(None);
-        self.clip_rate.set(0.0);
-        self.clip_velocity.set(0.0);
-    }
-
-    /// The container height the row should report, when the controller holds
-    /// one. It is never below the height measured last frame, so it hides no
-    /// text the veil has already painted.
-    pub fn clip_height(&self) -> Option<Pixels> {
-        self.clip.get()
-    }
-
-    /// Parse and point the caches at `text`, the body in full.
-    fn apply_text(&mut self, text: &str, mend: bool) {
         let was_streaming = self.streaming.replace(mend);
         if !mend && was_streaming {
             // Settling drops the veil, so there is no invisible text left for
@@ -768,6 +684,86 @@ impl MarkdownView {
                     .set(self.blocks().any(block_has_async_content));
             }
         }
+    }
+
+    /// Advance the clipped height toward the body's real height.
+    ///
+    /// The row's height is what the transcript pins to, and text layout grows
+    /// it in whole-line steps; pinning that step is the vertical jolt no
+    /// amount of grapheme fading hides. This keeps the row's *reported* height
+    /// continuous instead: it leads the height measured last frame, so a line
+    /// laid out this frame lands in space that already exists, and the row
+    /// never reports a step. It never falls below that measured height either,
+    /// so only text appended since the measurement can lie under the clip —
+    /// and the veil has not painted that yet.
+    pub fn advance_clip(&self, animate: bool, now: Instant) {
+        let dt = now
+            .saturating_duration_since(self.clip_at.get())
+            .as_secs_f32();
+        self.clip_at.set(now);
+        let Some(height) = self.body_height.get() else {
+            self.clip.set(None);
+            return;
+        };
+        if !animate {
+            self.clip.set(Some(height));
+            self.clip_last_height.set(Some(height));
+            self.clip_rate.set(0.0);
+            self.clip_velocity.set(0.0);
+            return;
+        }
+        // The container paves the road *ahead* of the body: it grows at the
+        // body's smoothed rate so the next line lands in space that already
+        // exists, and the row's reported height never steps. It stays at or
+        // above the last measured body height and the veil holds newly
+        // appended graphemes invisible, so the gap under the text is the only
+        // artefact, bounded by the rate lead.
+        let growth = match self.clip_last_height.get() {
+            Some(previous) if height > previous => f32::from(height - previous),
+            _ => 0.0,
+        };
+        let observed = if dt > 0.0 { growth / dt } else { 0.0 };
+        let rate = if growth > 0.0 {
+            self.clip_rate.get() * 0.75 + observed * 0.25
+        } else {
+            self.clip_rate.get() * 0.9
+        };
+        self.clip_rate.set(rate);
+        self.clip_last_height.set(Some(height));
+
+        let current = self.clip.get().unwrap_or(height);
+        // Feed-forward: chase a target a short slice of growth ahead, so the
+        // spring absorbs steps instead of lagging the arrival.
+        let target = (height + px(rate * 0.10)).min(height + px(CLIP_RUNWAY_MAX));
+        // Critically damped spring on (position, velocity). A body step
+        // changes only the acceleration, so the row's motion stays smooth
+        // through it.
+        let stiffness = 220.0_f32;
+        let damping = 2.0 * (stiffness).sqrt();
+        let mut velocity = self.clip_velocity.get();
+        let accel = stiffness * f32::from(target - current) - damping * velocity;
+        velocity = (velocity + accel * dt).max(0.0);
+        self.clip_velocity.set(velocity);
+        let next = (current + px(velocity * dt)).max(height);
+        self.clip.set(Some(next.min(height + px(CLIP_RUNWAY_MAX))));
+    }
+
+    /// Drop the leading container height. `None` reports the whole body, which
+    /// is what anything that invalidates the measured height needs: a retained
+    /// clip is a height the body has since grown past, and the row would cut
+    /// off the text below it.
+    fn release_clip(&self) {
+        self.clip.set(None);
+        self.clip_last_height.set(None);
+        self.clip_rate.set(0.0);
+        self.clip_velocity.set(0.0);
+    }
+
+    /// The container height the row should report, when the controller holds
+    /// one. It is never below the height measured last frame, so it hides no
+    /// text the veil has already painted.
+    pub fn clip_height(&self) -> Option<Pixels> {
+        self.clip.get()
     }
 
     pub fn is_fading(&self) -> bool {
@@ -896,6 +892,14 @@ impl<'a> Ctx<'a> {
     /// Annotation marks need the same registry geometry as search marks.
     pub fn has_annotations(&self) -> bool {
         self.annotations.is_some()
+    }
+
+    /// Whether a selection is live. Its spans and its drag anchor name
+    /// registry entries — a shift-click resolves against them — so a windowed
+    /// body must not omit the blocks they sit in.
+    pub fn has_selection(&self) -> bool {
+        let selection = self.selection.selection.borrow();
+        selection.anchor().is_some() || !selection.spans().is_empty()
     }
 
     pub fn with_link_handler(mut self, handler: LinkHandler) -> Self {
@@ -1719,7 +1723,7 @@ pub fn markdown_tail<'a>(
     ctx: &Ctx<'a>,
     max_blocks: usize,
 ) -> Option<AnyElement> {
-    markdown_capped(view, ctx, max_blocks.max(1))
+    markdown_capped(view, ctx, max_blocks)
 }
 
 /// Extra pixels above and below the viewport that a windowed body renders, so
@@ -1817,9 +1821,6 @@ pub fn markdown_windowed<'a>(
         }
         children.extend(render_block_range(&blocks, &ctx, group.clone(), &heights));
     }
-    if let Some(Some(spacer)) = plan.spacers.get(plan.groups.len()) {
-        children.push(spacer_element(*spacer));
-    }
 
     if animate {
         view.veil.borrow_mut().finish_frame();
@@ -1829,11 +1830,12 @@ pub fn markdown_windowed<'a>(
 }
 
 /// Which blocks one frame of a windowed body builds, and the spacers that
-/// stand in for the rest. `spacers` runs `groups.len() + 1` long: the first
-/// enters before the first group, the last after the last group. `None` marks
-/// a boundary at the body's own edge, where no block was dropped and so no
-/// gap is owed; `Some` is a dropped span's exact height, which is zero for a
-/// span of exactly one block gap and must still be built for that gap.
+/// stand in for the rest. `spacers` runs one entry per group: the spacer that
+/// enters *before* that group. `None` marks a boundary at the body's own edge,
+/// where no block was dropped and so no gap is owed; `Some` is a dropped
+/// span's exact height, which is zero for a span of exactly one block gap and
+/// must still be built for that gap. No spacer is owed after the last group:
+/// the volatile tail always closes the window at the body's last block.
 struct WindowPlan {
     groups: Vec<Range<usize>>,
     spacers: Vec<Option<Pixels>>,
@@ -1883,7 +1885,7 @@ fn window_plan(
     let Some(measured) = measured else {
         return WindowPlan {
             groups: vec![0..count],
-            spacers: vec![None, None],
+            spacers: vec![None],
         };
     };
 
@@ -1895,7 +1897,6 @@ fn window_plan(
         starts.push(cursor);
         cursor += *height + gap;
     }
-    let total = (cursor - gap).max(Pixels::ZERO);
 
     let from = visible_top - MARKDOWN_WINDOW_MARGIN;
     let to = visible_top + visible_height + MARKDOWN_WINDOW_MARGIN;
@@ -1912,6 +1913,9 @@ fn window_plan(
     if start < end {
         groups.push(start..end);
     }
+    // The volatile tail is built every frame and always reaches the body's
+    // last block, so it closes the window: no block is ever dropped below the
+    // last group, and nothing is owed after it.
     let volatile = volatile_start.min(count)..count;
     if volatile.start < volatile.end {
         match groups.last_mut() {
@@ -1920,23 +1924,20 @@ fn window_plan(
         }
     }
 
-    // Each spacer is the hidden span minus one `gap`: the flex column adds a
-    // gap on each side of it, which is exactly the boundary the hidden block
-    // would have had. The first and last spans have only one neighbour, and a
-    // boundary at the body's own edge drops no block and so owes no gap.
-    let mut spacers = Vec::with_capacity(groups.len() + 1);
+    // One spacer per group, standing in for the blocks dropped above it: the
+    // hidden span minus one `gap`, because the flex column adds a gap on each
+    // side of it, which is exactly the boundary the hidden block would have
+    // had. The first span has only one neighbour, and a boundary at the body's
+    // own edge drops no block and so owes no gap.
+    let mut spacers = Vec::with_capacity(groups.len());
     for (index, group) in groups.iter().enumerate() {
         let before = if index == 0 {
-            (group.start > 0).then(|| (starts[group.start] - gap).max(Pixels::ZERO))
+            (group.start > 0).then(|| starts[group.start] - gap)
         } else {
-            Some((starts[group.start] - starts[groups[index - 1].end] - gap).max(Pixels::ZERO))
+            Some(starts[group.start] - starts[groups[index - 1].end] - gap)
         };
         spacers.push(before);
     }
-    let after = groups.last().map_or(Some(total), |last| {
-        (last.end < count).then(|| (total - starts[last.end]).max(Pixels::ZERO))
-    });
-    spacers.push(after);
 
     WindowPlan { groups, spacers }
 }
@@ -3229,13 +3230,31 @@ mod tests {
                 window.draw(cx).clear(cx);
             });
         };
-        for blocks in [50usize, 400] {
+        let paragraphs = |count: usize| {
             let mut source = String::new();
-            for i in 0..blocks {
+            for i in 0..count {
                 source.push_str(&format!(
                     "Paragraph {i} with several words that need shaping and wrapping across the transcript column.\n\n"
                 ));
             }
+            source
+        };
+        let list_items = |count: usize| {
+            let mut source = String::new();
+            for i in 0..count {
+                source.push_str(&format!(
+                    "- Item {i} with several words that need shaping and wrapping across the transcript column.\n"
+                ));
+            }
+            source
+        };
+        // A single top-level block is one window group, so the window cannot
+        // bound its frame however tall it grows. Both shapes are timed.
+        for (label, source) in [
+            ("50 paragraph blocks", paragraphs(50)),
+            ("400 paragraph blocks", paragraphs(400)),
+            ("one list of 400 items", list_items(400)),
+        ] {
             {
                 let mut data = data.borrow_mut();
                 data.view.set_text(&source, true);
@@ -3250,10 +3269,7 @@ mod tests {
             for _ in 0..FRAMES {
                 draw(visual, &entity);
             }
-            println!(
-                "blocks={blocks} full per-frame={:?}",
-                start.elapsed() / FRAMES
-            );
+            println!("{label} full per-frame={:?}", start.elapsed() / FRAMES);
 
             let (total, gap) = {
                 let data = data.borrow();
@@ -3273,7 +3289,7 @@ mod tests {
                 draw(visual, &entity);
             }
             println!(
-                "blocks={blocks} windowed per-frame={:?} (gap={gap})",
+                "{label} windowed per-frame={:?} (gap={gap})",
                 start.elapsed() / FRAMES
             );
             data.borrow_mut().window = None;
@@ -3292,10 +3308,6 @@ mod tests {
                 height += heights[block];
                 children += 1;
             }
-        }
-        if let Some(Some(spacer)) = plan.spacers.get(plan.groups.len()) {
-            height += *spacer;
-            children += 1;
         }
         if children > 1 {
             height += gap * (children - 1) as f32;
@@ -3355,6 +3367,11 @@ mod tests {
                 "top={top} groups={:?}",
                 plan.groups
             );
+            assert_eq!(
+                plan.groups.last().map(|group| group.end),
+                Some(measured.len()),
+                "the volatile tail always closes the window"
+            );
 
             let mut cursor = Pixels::ZERO;
             for (index, block) in measured.iter().enumerate() {
@@ -3376,7 +3393,7 @@ mod tests {
         heights.borrow_mut()[7].1 = None;
         let plan = window_plan(&heights, &blocks, gap, 400.0, 200.0, measured.len() - 2);
         assert_eq!(plan.groups, vec![0..measured.len()]);
-        assert_eq!(plan.spacers, vec![None, None]);
+        assert_eq!(plan.spacers, vec![None]);
     }
 
     /// A hidden span of exactly one gap owes a zero-height spacer, not none:
@@ -3401,7 +3418,7 @@ mod tests {
         assert_eq!(plan.groups, vec![1..3], "{:?}", plan.groups);
         assert_eq!(
             plan.spacers,
-            vec![Some(Pixels::ZERO), None],
+            vec![Some(Pixels::ZERO)],
             "the boundary above block 1 dropped a zero-height block"
         );
         assert_eq!(plan_height(&plan, &measured, gap), full);
@@ -3472,6 +3489,26 @@ mod tests {
         let mut code = MarkdownView::new();
         code.set_text("```txt\n$a^2$\n```", true);
         assert!(!code.has_async_blocks(), "math in code stays literal");
+    }
+
+    /// A live selection parks spans and a drag anchor in the frame registry,
+    /// which is the same geometry a search reveal reads back: a windowed body
+    /// must keep the full walk while one exists.
+    #[test]
+    fn a_live_selection_disables_windowing() {
+        let selection = TranscriptSelection::default();
+        let palette = Palette::from_theme(&Theme::dark());
+        let ctx = Ctx::new("row", &palette, Metrics::BODY, selection.clone());
+        assert!(!ctx.has_selection(), "nothing is selected yet");
+
+        selection
+            .selection
+            .borrow_mut()
+            .begin(TextKey::new("row", 0), 3);
+        assert!(ctx.has_selection(), "a drag anchor");
+
+        selection.selection.borrow_mut().clear();
+        assert!(!ctx.has_selection(), "a cleared selection");
     }
 
     /// The container height leads the streaming body: it grows at the body's

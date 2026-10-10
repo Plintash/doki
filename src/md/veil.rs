@@ -153,7 +153,9 @@ impl ElementVeil {
             .last_append
             .map_or(VEIL_GAP_CLAMP_MS, |last| millis_between(last, now))
             .clamp(VEIL_GAP_MIN_MS, VEIL_GAP_CLAMP_MS);
-        let count = text[prefix..].graphemes(true).count().max(1) as f32;
+        // The caller appends only a non-empty tail, so the pace divides by at
+        // least one grapheme.
+        let count = text[prefix..].graphemes(true).count() as f32;
         let pace = millis((gap_ms / count).clamp(VEIL_MIN_PACE_MS, VEIL_MAX_PACE_MS));
         let cap = now + millis(gap_ms + VEIL_FADE_MS);
 
@@ -230,6 +232,10 @@ impl ElementVeil {
 #[derive(Debug, Default)]
 pub struct RowVeil {
     elements: HashMap<usize, ElementVeil>,
+    /// Elements advanced at least once. A windowed body drops the elements of
+    /// settled blocks it did not build, and this is what tells a re-entry
+    /// apart from a first sight.
+    seen: HashSet<usize>,
     seen_this_frame: HashSet<usize>,
     seeding: bool,
 }
@@ -240,6 +246,7 @@ impl RowVeil {
     pub fn seeded() -> Self {
         Self {
             elements: HashMap::new(),
+            seen: HashSet::new(),
             seen_this_frame: HashSet::new(),
             seeding: true,
         }
@@ -257,7 +264,9 @@ impl RowVeil {
         // A windowed body may not build every block a frame: a dissolve still
         // in flight in an off-screen tail block must keep its units, or the
         // fade would restart from the block's full text when the window
-        // returns to it. Settled unseen elements are droppable.
+        // returns to it. A settled unseen element is droppable — the block
+        // outside the window owes nothing to the frame — and `seen` adopts it
+        // at full opacity when the window builds it again.
         self.elements
             .retain(|element, veil| self.seen_this_frame.contains(element) || veil.is_fading());
         self.finish_seeding();
@@ -265,13 +274,23 @@ impl RowVeil {
 
     pub fn advance(&mut self, element: usize, text: &str, now: Instant) -> Vec<VeilSpan> {
         self.seen_this_frame.insert(element);
-        if self.seeding && !self.elements.contains_key(&element) {
-            let mut veil = ElementVeil::default();
-            veil.seed(text);
-            self.elements.insert(element, veil);
-            return Vec::new();
+        if let Some(veil) = self.elements.get_mut(&element) {
+            return veil.advance(text, now);
         }
-        self.elements.entry(element).or_default().advance(text, now)
+        // Only a first sight dissolves. Seeding and a re-entry both adopt the
+        // text as a full-opacity baseline instead: the first because the view
+        // attached mid-stream, the second because the window dropped a settled
+        // block the reader has already read past.
+        let first_sight = self.seen.insert(element);
+        let mut veil = ElementVeil::default();
+        let spans = if self.seeding || !first_sight {
+            veil.seed(text);
+            Vec::new()
+        } else {
+            veil.advance(text, now)
+        };
+        self.elements.insert(element, veil);
+        spans
     }
 
     pub fn is_fading(&self) -> bool {
@@ -282,7 +301,9 @@ impl RowVeil {
 /// Split runs at veil boundaries and multiply only paint colors by the
 /// current opacity. The text and total run lengths remain byte-identical.
 pub fn apply_veil(runs: Vec<TextRun>, spans: &[VeilSpan]) -> Vec<TextRun> {
-    if spans.is_empty() || spans.iter().all(|(_, opacity)| *opacity >= 1.0) {
+    // Only a fading span reaches here: `ElementVeil::advance` never emits a
+    // full-opacity one.
+    if spans.is_empty() {
         return runs;
     }
 
@@ -312,7 +333,6 @@ pub fn apply_veil(runs: Vec<TextRun>, spans: &[VeilSpan]) -> Vec<TextRun> {
                 .iter()
                 .find(|(range, _)| range.start <= piece_start && piece_end <= range.end)
                 .map(|(_, opacity)| *opacity)
-                .filter(|opacity| *opacity < 1.0)
             {
                 piece.color = piece.color.opacity(opacity);
                 piece.background_color = piece.background_color.map(|color| color.opacity(opacity));
@@ -461,6 +481,48 @@ mod tests {
             veil.advance(0, "already here plus", at(start, 100)),
             vec![(12..17, 0.0)]
         );
+    }
+
+    /// A windowed body drops the elements of the settled blocks it did not
+    /// build, so a block scrolled out of the window and back must come in at
+    /// full opacity. Re-dissolving it would hide text the reader has already
+    /// read for a whole fade.
+    #[test]
+    fn a_block_the_window_dropped_is_adopted_at_full_opacity() {
+        let start = Instant::now();
+        let mut veil = RowVeil::default();
+        assert_eq!(veil.advance(3, "already read", start), vec![(0..12, 0.0)]);
+        // The dissolve lands on a frame that still builds the element.
+        veil.finish_frame();
+        veil.begin_frame();
+        assert!(veil.advance(3, "already read", at(start, 500)).is_empty());
+        assert!(!veil.is_fading());
+        // The next frame builds other elements only, which drops this one.
+        veil.finish_frame();
+        veil.begin_frame();
+        veil.finish_frame();
+        assert!(
+            veil.advance(3, "already read", at(start, 600)).is_empty(),
+            "a block re-entering the window must not dissolve again"
+        );
+        // A genuine append to the adopted block still fades.
+        veil.begin_frame();
+        assert_eq!(
+            veil.advance(3, "already read more", at(start, 700)),
+            vec![(12..17, 0.0)]
+        );
+    }
+
+    /// A block that has never been built is still a first sight: the window
+    /// returning to an unseen block must dissolve it like any other append.
+    #[test]
+    fn a_never_built_block_still_dissolves() {
+        let start = Instant::now();
+        let mut veil = RowVeil::default();
+        veil.finish_frame();
+        veil.begin_frame();
+        veil.finish_frame();
+        assert_eq!(veil.advance(7, "fresh text", start), vec![(0..10, 0.0)]);
     }
 
     #[test]

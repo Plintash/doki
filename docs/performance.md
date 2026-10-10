@@ -138,11 +138,22 @@ moment any scrollbar became visible.
   ledger; a wrap-width, metric, or rewrite change drops it, and the next
   frame's full pass re-measures. Planning itself still walks the whole ledger
   — two vectors and two scans a frame — so it stays proportional to the
-  document, and only the build and layout are proportional to the viewport.
+  document, and the build is proportional to the viewport **per top-level
+  block**: the planner selects whole blocks, so a body that is a single block
+  — one list, one table, one fenced code block, one wall-of-text paragraph —
+  is one group covering the whole body and rebuilds in full every frame,
+  paying the planning on top. In the bench below a single 400-item list costs
+  ~14 ms a frame against ~12 ms for the plain walk, where the same payload
+  spread over 400 top-level blocks drops the windowed frame well under a
+  millisecond.
   Bodies containing an image or formula are never windowed, because those
   blocks can change height after their first frame and a spacer would freeze
-  the old value, and a body with a search or annotation mark keeps the full
-  walk because a reveal reads its geometry back from the frame's registry.
+  the old value (that holds for a formula only while math rendering is on:
+  disabled, it renders as static source text, though the body still keeps the
+  full walk), and a body with a search or annotation mark keeps the full walk
+  because a reveal reads its geometry back from the frame's registry — as does
+  a body with a live selection, whose spans and drag anchor a shift-click
+  resolves against that same registry.
   On a 400-block reply this takes the streaming frame from ~2.65 ms to ~0.21
   ms in the debug build
   (`cargo test --locked -p waku --lib bench_markdown_frame -- --ignored
@@ -199,8 +210,10 @@ original LaTeX byte ranges. The manual measurement is
 `docs/fixtures/streaming-stress.md` is the long mixed-Markdown payload used to
 exercise the streaming path by eye: roughly 200 top-level blocks, tall code
 blocks, tables and nested lists, no images or formulas so the windowed body
-stays on the windowed path. Open it in the transcript to check the dissolve and
-the container height against a worst case.
+stays on the windowed path, plus a single-giant-list section — one top-level
+block, which rebuilds in full however it is scrolled. Open it in the
+transcript to check the dissolve and the container height against a worst case,
+and to see the shape the window cannot bound.
 
 Sampling alone misled this investigation for hours; counters cracked it in one
 run. In order of usefulness:

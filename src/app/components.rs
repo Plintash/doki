@@ -564,7 +564,7 @@ fn render_markdown_message_body<'a>(
 ) -> AnyElement {
     let body = markdown
         .and_then(|markdown| match window {
-            Some(window) if !ctx.has_search() && !ctx.has_annotations() => {
+            Some(window) if !ctx.has_search() && !ctx.has_annotations() && !ctx.has_selection() => {
                 md::render::markdown_windowed(
                     markdown,
                     ctx,
