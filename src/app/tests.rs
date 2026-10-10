@@ -364,6 +364,33 @@ fn the_annotation_hover_panel_offers_edit_delete_and_jump() {
     );
 }
 
+/// Opening an archived task from search has to scroll to it, and the row it
+/// scrolls to only exists once the selection has moved: the archived section
+/// stands for the open task, so the box that holds it is empty until then.
+/// The reveal at the request acknowledges the click against the snapshot the
+/// old selection gave; the one at the end of activation is the reveal that
+/// finds the row.
+#[test]
+fn activating_a_task_reveals_its_row_once_the_selection_has_moved() {
+    let source = include_str!("sessions.rs");
+    let start = source
+        .find("    fn activate_session(")
+        .expect("activate_session must exist");
+    let body = &source[start..];
+    let body = &body[..body.find("\n    fn ").expect("the next item")];
+    let selection = body
+        .find("self.state.selected_session = Some(session_id)")
+        .expect("activation moves the selection");
+    let reveal = body
+        .find("self.reveal_sidebar_session(session_id)")
+        .expect("activation has to reveal the row it moved to");
+    assert!(
+        selection < reveal,
+        "the reveal has to run after the selection moves, or the archived \
+         section has no row to scroll to"
+    );
+}
+
 #[test]
 fn structured_user_input_preserves_question_order_and_custom_answer_precedence() {
     let questions = vec![

@@ -240,6 +240,13 @@ impl Waku {
         }
         self.refresh_composer_sources(cx);
         self.reset_transcript_rows(self.transcript_row_count());
+        // Reveal once the selection has moved, not only when it was requested.
+        // The row snapshot depends on which task is open — the archived section
+        // stands for the open task — so an archived task opened from search has
+        // no row to scroll to until this point, and the earlier reveal, which
+        // acknowledges the click against the snapshot the old selection gave,
+        // cannot find it.
+        self.reveal_sidebar_session(session_id);
         self.save(cx);
         if self
             .selected_session()

@@ -161,6 +161,7 @@ enum PaletteAction {
     ToggleRightPanel,
     OpenSettings(SettingsPage),
     SelectTask(Uuid),
+    SetTaskArchived { session_id: Uuid, archived: bool },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -401,6 +402,38 @@ impl CommandPaletteUi {
     pub(super) fn is_open(&self) -> bool {
         self.open
     }
+}
+
+/// The archive action for the task the palette is showing, or nothing when no
+/// task is selected.
+///
+/// The palette is not only a finder — it already offers commands that act on
+/// the selected task — so putting a task away is one of them rather than a
+/// second surface reaching into the palette's rows. The wording is the row
+/// menu's, so both surfaces promise the same thing: the task is put away, and
+/// nothing claims space was freed.
+fn palette_archive_command(
+    session: Option<&AgentSession>,
+    order: usize,
+) -> Option<CommandPaletteItem> {
+    let session = session?;
+    let archived = session.archived_at.is_some();
+    Some(CommandPaletteItem::command(
+        PaletteSection::Commands,
+        tr!(if archived {
+            "sidebar.bring_back"
+        } else {
+            "sidebar.put_away"
+        }),
+        "icons/package.svg",
+        None,
+        PaletteAction::SetTaskArchived {
+            session_id: session.id,
+            archived: !archived,
+        },
+        "archive unarchive put away restore bring back hide task away",
+        order,
+    ))
 }
 
 /// The tasks the palette can offer, in the client's own order.
@@ -820,6 +853,9 @@ impl Waku {
                     next(),
                 ));
             }
+        }
+        if let Some(archive) = palette_archive_command(self.selected_session(), next()) {
+            commands.push(archive);
         }
         if self.usage_meter_available() {
             commands.push(CommandPaletteItem::command(
@@ -1610,6 +1646,10 @@ impl Waku {
                 let focus = self.composer_focus(cx);
                 window.focus(&focus, cx);
             }
+            PaletteAction::SetTaskArchived {
+                session_id,
+                archived,
+            } => self.set_session_archived(session_id, archived, cx),
             PaletteAction::ChooseModel | PaletteAction::ToggleUsage => {
                 // These popovers are rendered by the composer. If the command
                 // came from Settings, reveal one normal app frame first so its
@@ -2085,6 +2125,41 @@ mod tests {
         let mut matcher = crate::composer_complete::matcher();
         let mut buf = Vec::new();
         pattern.score(Utf32Str::new(candidate, &mut buf), &mut matcher)
+    }
+
+    /// The archive action is reachable from the palette as well as from the
+    /// row menu, and it is the action for the task the palette is showing — the
+    /// shape the identifier commands already have. An archived task is offered
+    /// the way back.
+    #[test]
+    fn the_palette_offers_the_archive_action_for_the_task_it_shows() {
+        let mut task = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let put_away = palette_archive_command(Some(&task), 0).expect("the selected task's action");
+        assert_eq!(
+            put_away.action,
+            PaletteAction::SetTaskArchived {
+                session_id: task.id,
+                archived: true,
+            }
+        );
+        assert_eq!(put_away.label, tr!("sidebar.put_away"));
+
+        task.archived_at = Some(1_700_000_000);
+        let bring_back =
+            palette_archive_command(Some(&task), 0).expect("the archived task's action");
+        assert_eq!(
+            bring_back.action,
+            PaletteAction::SetTaskArchived {
+                session_id: task.id,
+                archived: false,
+            }
+        );
+        assert_eq!(bring_back.label, tr!("sidebar.bring_back"));
+
+        assert!(
+            palette_archive_command(None, 0).is_none(),
+            "no task is selected, so there is nothing to put away"
+        );
     }
 
     /// Search is the way back to a task that was put away: the sidebar hides
