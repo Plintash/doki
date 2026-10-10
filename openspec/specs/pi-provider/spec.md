@@ -4,8 +4,9 @@
 Drive Pi's RPC mode as the session transcript's single source of truth: deliver
 every prompt the user sends, settle a turn on the signal the provider actually
 emits, keep the client's view of the queue and the tree identical to the
-provider's, and give the work an extension starts — a background child waking the
-session, a status line, a question — a place to land.
+provider's, give the work an extension starts — a background child waking the
+session, a status line, a question — a place to land, and keep the session's own
+state honest about that work while it runs.
 
 ## Requirements
 
@@ -137,6 +138,37 @@ add a conversation row.
 
 - **WHEN** a background subagent child completes or fails
 - **THEN** the client shows that outcome where it shows detached work, named after the child
+
+### Requirement: Detached runs are visible while they run
+
+Waku SHALL read the level signal the extension publishes for the runs it holds —
+its RPC-mode async-status widget — and SHALL show each run on the
+background-work surface while it runs, take the outcome the snapshot reports when
+it settles, and read a run that leaves a complete snapshot without one as lost.
+The snapshot MUST NOT be shown as widget text.
+
+#### Scenario: A child still running is not a finished session
+
+- **WHEN** a background subagent is still running after the turn that launched it settled
+- **THEN** the run appears with detached work instead of as raw widget JSON
+
+### Requirement: Waiting on detached work reads as busy
+
+Pi settles a turn when the agent's reply ends, even while the child work that
+reply started still runs, and wakes the session when that work settles. A session
+in that state SHALL read as busy until the provider wakes it or the work settles,
+and a message the user sends then SHALL become the session's next prompt rather
+than wait in the follow-up queue.
+
+#### Scenario: Settled work releases the session
+
+- **WHEN** the run settles with no other work live
+- **THEN** the session stops waiting, and the wake the run produced streams as its own turn
+
+#### Scenario: A message sent while waiting goes straight in
+
+- **WHEN** the user sends a message while the session is waiting on detached work and no provider run is live
+- **THEN** the message starts a turn immediately instead of waiting in the follow-up queue
 
 ### Requirement: A message not meant for the conversation adds no row
 

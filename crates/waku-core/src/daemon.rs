@@ -24,7 +24,7 @@ use crate::settings::DaemonSettingsStore;
 use waku_protocol::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
 // The driver-event wire translation lives with the wire types it speaks, so the
 // daemon and every client encode and decode one implementation.
-use waku_protocol::{decode_enum, event_to_wire};
+use waku_protocol::{TerminalSnapshot, decode_enum, event_to_wire};
 
 /// How many fully hydrated transcripts the daemon keeps resident.
 ///
@@ -42,9 +42,20 @@ fn trim_resident_transcripts(state: &mut PersistedState, pinned: &HashSet<Uuid>)
     state.trim_idle_transcripts(pinned, RESIDENT_TRANSCRIPT_WINDOW);
 }
 
+/// A daemon-owned terminal together with the ids that scope it.
+///
+/// The envelope's session id is the terminal itself, the runtime id rejects
+/// writes from a client bound to a superseded one, and the owning task is what
+/// task removal disposes.
+struct OwnedTerminal {
+    task_id: Uuid,
+    runtime_id: Uuid,
+    terminal: crate::terminal::DaemonTerminal,
+}
+
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
-    terminals: Mutex<HashMap<Uuid, (Uuid, crate::terminal::DaemonTerminal)>>,
+    terminals: Mutex<HashMap<Uuid, OwnedTerminal>>,
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
     settings: DaemonSettingsStore,
@@ -476,6 +487,17 @@ impl Backend for WakuBackend {
                 }
                 let removed = self.sessions.lock().remove(&session_id);
                 drop(removed);
+                // The task owns its terminals: its shells end with it. A client
+                // closing only its surface never reaches this, which is what
+                // keeps a detached terminal running.
+                let disposed = {
+                    let mut terminals = self.terminals.lock();
+                    terminals
+                        .extract_if(|_, owned| owned.task_id == session_id)
+                        .map(|(_, owned)| owned)
+                        .collect::<Vec<_>>()
+                };
+                drop(disposed);
                 Ok(ResponsePayload::Ack)
             }
             Command::HydrateSession { session_id } => {
@@ -739,50 +761,91 @@ impl Backend for WakuBackend {
             Command::Workspace { operation } => Ok(ResponsePayload::Workspace {
                 result: crate::workspace::execute(operation)?,
             }),
-            Command::OpenTerminal { cwd, cols, rows } => {
+            Command::OpenTerminal {
+                task_id,
+                cwd,
+                cols,
+                rows,
+            } => {
                 let terminal = self.open_terminal(&cwd, cols, rows, events)?;
-                let previous = self
-                    .terminals
-                    .lock()
-                    .insert(session_id, (runtime_id, terminal));
+                let previous = self.terminals.lock().insert(
+                    session_id,
+                    OwnedTerminal {
+                        task_id,
+                        runtime_id,
+                        terminal,
+                    },
+                );
                 drop(previous);
                 Ok(ResponsePayload::Ack)
             }
-            Command::WriteTerminal { data } => {
+            Command::AttachTerminal { task_id } => {
                 let terminals = self.terminals.lock();
-                let (active_runtime_id, terminal) = terminals
-                    .get(&session_id)
-                    .ok_or_else(|| anyhow!("daemon terminal {session_id} is not running"))?;
-                if *active_runtime_id != runtime_id {
+                let Some(owned) = terminals.get(&session_id) else {
+                    // Nothing is running under this id: report absence rather
+                    // than an error so the client can open one without
+                    // mistaking a transport failure for the same answer.
+                    return Ok(ResponsePayload::TerminalAbsent);
+                };
+                if owned.runtime_id != runtime_id {
                     bail!(
-                        "daemon terminal {session_id} belongs to runtime {active_runtime_id}, not {runtime_id}"
+                        "daemon terminal {session_id} belongs to runtime {}, not {runtime_id}",
+                        owned.runtime_id
                     );
                 }
-                terminal.write(data)?;
+                if owned.task_id != task_id {
+                    bail!(
+                        "daemon terminal {session_id} belongs to task {}, not {task_id}",
+                        owned.task_id
+                    );
+                }
+                let (cols, rows) = owned.terminal.size();
+                let (data, sequence) = owned.terminal.retained_snapshot();
+                Ok(ResponsePayload::TerminalSnapshot(TerminalSnapshot {
+                    data,
+                    sequence,
+                    cols,
+                    rows,
+                }))
+            }
+            Command::WriteTerminal { data } => {
+                let terminals = self.terminals.lock();
+                let owned = terminals
+                    .get(&session_id)
+                    .ok_or_else(|| anyhow!("daemon terminal {session_id} is not running"))?;
+                if owned.runtime_id != runtime_id {
+                    bail!(
+                        "daemon terminal {session_id} belongs to runtime {}, not {runtime_id}",
+                        owned.runtime_id
+                    );
+                }
+                owned.terminal.write(data)?;
                 Ok(ResponsePayload::Ack)
             }
             Command::ResizeTerminal { cols, rows } => {
                 let terminals = self.terminals.lock();
-                let (active_runtime_id, terminal) = terminals
+                let owned = terminals
                     .get(&session_id)
                     .ok_or_else(|| anyhow!("daemon terminal {session_id} is not running"))?;
-                if *active_runtime_id != runtime_id {
+                if owned.runtime_id != runtime_id {
                     bail!(
-                        "daemon terminal {session_id} belongs to runtime {active_runtime_id}, not {runtime_id}"
+                        "daemon terminal {session_id} belongs to runtime {}, not {runtime_id}",
+                        owned.runtime_id
                     );
                 }
-                terminal.resize(cols, rows);
+                owned.terminal.resize(cols, rows);
                 Ok(ResponsePayload::Ack)
             }
             Command::CloseTerminal => {
                 let removed = {
                     let mut terminals = self.terminals.lock();
-                    if let Some((active_runtime_id, _)) = terminals.get(&session_id) {
-                        if *active_runtime_id != runtime_id {
-                            bail!(
-                                "daemon terminal {session_id} belongs to runtime {active_runtime_id}, not {runtime_id}"
-                            );
-                        }
+                    if let Some(owned) = terminals.get(&session_id)
+                        && owned.runtime_id != runtime_id
+                    {
+                        bail!(
+                            "daemon terminal {session_id} belongs to runtime {}, not {runtime_id}",
+                            owned.runtime_id
+                        );
                     }
                     terminals.remove(&session_id)
                 };
@@ -1823,6 +1886,7 @@ fn handle_driver_command(
         | Command::ForkProviderSession { .. }
         | Command::Workspace { .. }
         | Command::OpenTerminal { .. }
+        | Command::AttachTerminal { .. }
         | Command::WriteTerminal { .. }
         | Command::ResizeTerminal { .. }
         | Command::CloseTerminal

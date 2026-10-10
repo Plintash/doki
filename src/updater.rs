@@ -785,8 +785,13 @@ mod macos {
             let target_dir = std::env::var_os("CARGO_TARGET_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
-            let library = target_dir
-                .join("debug/Doki Debug.app/Contents/Frameworks/Sparkle.framework/Sparkle");
+            let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let library = target_dir.join(format!(
+                "debug/Doki Debug ({checkout}).app/Contents/Frameworks/Sparkle.framework/Sparkle"
+            ));
             if !library.exists() {
                 return;
             }
@@ -1341,7 +1346,7 @@ mod windows {
     fn preference_path() -> Option<PathBuf> {
         Some(
             dirs::data_local_dir()?
-                .join(waku_protocol::identity::DATA_DIRECTORY_NAME)
+                .join(waku_protocol::identity::data_directory_name())
                 .join("updater.json"),
         )
     }

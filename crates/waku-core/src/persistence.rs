@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::blob_store::BlobStore;
 use crate::computer_use::ComputerAppGrant;
 use crate::i18n::AppLanguage;
-use crate::identity::DATA_DIRECTORY_NAME;
+use crate::identity::data_directory_name;
 use crate::model::{
     AgentSession, AnnotationTarget, FavoriteModel, Message, MessageAnnotation, MessageAttachment,
     MessageRole, Project, ProviderKind, RuntimeMode, SessionWorkspace,
@@ -900,7 +900,7 @@ impl StateStore {
         } else {
             dirs::data_local_dir()
                 .unwrap_or_else(std::env::temp_dir)
-                .join(DATA_DIRECTORY_NAME)
+                .join(data_directory_name())
                 .join("app.db")
         }
     }

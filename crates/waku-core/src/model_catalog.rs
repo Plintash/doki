@@ -165,7 +165,7 @@ fn model_cache_path(provider: ProviderKind) -> PathBuf {
     } else {
         dirs::cache_dir()
             .unwrap_or_else(std::env::temp_dir)
-            .join(crate::identity::DATA_DIRECTORY_NAME)
+            .join(crate::identity::data_directory_name())
             .join("models")
     };
     directory.join(format!("{}.json", provider.id()))

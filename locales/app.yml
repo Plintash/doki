@@ -46,6 +46,8 @@ menu.window:
   en: Window
 menu.toggle_fps_counter:
   en: Toggle FPS Counter
+menu.toggle_full_screen:
+  en: Toggle Full Screen
 menu.close_window:
   en: Close Window
 window.minimize:
@@ -54,6 +56,12 @@ window.maximize:
   en: Maximize
 window.restore:
   en: Restore
+window_close.title:
+  en: Unsaved changes
+window_close.body:
+  en: This window has unsaved file edits. Closing it discards them.
+window_close.discard:
+  en: Discard and Close
 
 updater.update:
   en: Update
@@ -1123,6 +1131,8 @@ skills.disable_named:
 
 commands.fast_description:
   en: Toggle fast mode
+commands.compact_description:
+  en: Compact the context
 commands.fast_enabled:
   en: Fast mode enabled
 commands.fast_disabled:
@@ -1452,6 +1462,10 @@ errors.provider_initialize_session:
   en: "%{provider} could not initialize this session"
 errors.provider_rejected_prompt:
   en: "%{provider} rejected the prompt before it ran"
+errors.compact_turn_running:
+  en: Stop the running turn before compacting the context
+errors.compact_queued_until_settled:
+  en: compaction waits for the running turn to settle
 errors.provider_complete_turn:
   en: "%{provider} could not complete this turn"
 errors.provider_reported_error:

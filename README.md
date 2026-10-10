@@ -16,9 +16,7 @@ bun install
 ```
 
 On Linux run `./scripts/bundle-linux.sh`, and on Windows run
-`bun scripts/bundle-windows.ts`; [CONTRIBUTING.md](CONTRIBUTING.md) documents
-all three recipes and their native build prerequisites. Run `bun install` once
-before any of them.
+`bun scripts/bundle-windows.ts`. Run `bun install` once before any of them.
 
 ## Supported agents
 
@@ -92,8 +90,9 @@ replace the daemon without relaunching Doki Debug.
 Development is supported on macOS, Linux, and Windows and requires
 [Rust 1.96 or newer](https://www.rust-lang.org/tools/install) and
 [Bun](https://bun.sh/). Linux supports both Wayland and X11, and Windows needs
-the MSVC toolchain; install the native build prerequisites listed in
-[CONTRIBUTING.md](CONTRIBUTING.md) first.
+the MSVC toolchain; the native build prerequisites for each are in
+[docs/linux.md](docs/linux.md#building-from-source) and
+[docs/windows.md](docs/windows.md#building-from-source).
 
 ```sh
 bun install
@@ -104,7 +103,17 @@ The embedded browser and experimental computer-use integration currently
 remain macOS-only. Agent sessions, projects, transcripts, skills, usage,
 diffs, file editing, and the terminal run natively on Linux and Windows.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and checks.
+Run the baseline checks before opening a pull request:
+
+```sh
+cargo fmt --package waku --package waku-protocol --package waku-client --package waku-core --package waku-daemon -- --check
+cargo check
+cargo test
+bun run protocol:check
+bun run --filter @waku/client check
+bun run --filter @waku/client test
+```
+
 Release maintainers should also read [RELEASING.md](RELEASING.md).
 
 ## Credit

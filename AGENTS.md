@@ -2,15 +2,28 @@
 
 ## Development runtime
 
-- Assume `bun ./scripts/dev.ts` is already running and owns the current
-  `Waku Debug.app` process. Source changes are rebuilt, signed, and relaunched
-  automatically. Only run it yourself if not already launched.
-- During normal development and UI validation, do not run
-  `scripts/bundle.sh debug`, start a second watcher, or manually quit/relaunch
-  `Waku Debug.app`. Quitting the app also stops the watcher.
+- In the main checkout, assume `bun ./scripts/dev.ts` is already running. It
+  rebuilds, signs and relaunches automatically; start one yourself only when
+  that watcher is confirmed unavailable.
+- Every worktree runs its own watcher, and every debug app is named for what
+  it tests: `Doki Debug — <Flavor>`. The flavor is the first argument (`bun
+  ./scripts/dev.ts "Pi Compact"`), else `WAKU_DEV_FLAVOR`, else the branch or
+  worktree directory. The name, bundle identity and data directory all follow
+  the flavor, so one watcher never stops another's app and each window says
+  which build and which database it shows. `--print` reports the resolved
+  name, bundle path and database without launching.
+- Each checkout uses its own debug database at `<checkout>/temp/app.db` and
+  its own daemon; nothing is shared with another worktree or with the
+  installed app. A fresh checkout's database is constructed before launching:
+  when it has no sessions yet, the watcher inherits a copy of the primary
+  checkout's dev database, so the window opens with your existing tasks. When
+  the test needs more data, `--seed` (or `--seed=2` for volume) writes the
+  oversized mock sessions into that database and relaunches once so they
+  load.
 - After an edit, wait for the watcher to finish its successful rebuild and
-  validate the freshly relaunched debug app. Only start or recover the watcher
-  manually when it is confirmed unavailable.
+  validate the freshly relaunched debug app. Do not run `scripts/bundle.sh
+  debug` for a checkout whose watcher is running; the watcher owns that
+  bundle. Quitting the app also stops its watcher.
 - No visual test unless requested.
 
 ## Performance

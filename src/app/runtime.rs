@@ -114,6 +114,18 @@ pub(super) fn session_has_active_provider_turn(session: &AgentSession) -> bool {
             .is_some_and(|turn| turn.status == TurnStatus::Running && turn.provider_turn_started)
 }
 
+/// Whether a submission waits behind the session's live turn instead of
+/// becoming its next prompt.
+///
+/// A session can be busy without a turn: Pi settles a turn as soon as the
+/// agent's reply ends, and the detached work that reply left running keeps the
+/// session's own status busy until the provider wakes it (see
+/// `sync_background_wait_status`). A message then is the next prompt, not a
+/// follow-up for a turn that will never take it.
+pub(super) fn submission_waits_for_a_turn(status: SessionStatus, provider_turn_live: bool) -> bool {
+    status.is_busy() && !(status == SessionStatus::Background && !provider_turn_live)
+}
+
 /// Merge the daemon's list-only session projection into the desktop catalog.
 ///
 /// Existing rows may already contain a hydrated transcript, so only list
@@ -1213,7 +1225,7 @@ impl Waku {
             self.reset_visible_state();
             self.reset_transcript_rows(self.transcript_row_count());
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -1561,8 +1573,11 @@ impl Waku {
             .unwrap_or(&[])
     }
 
-    pub(super) fn save(&mut self) {
+    pub(super) fn save(&mut self, cx: &App) {
         self.last_stream_save = Instant::now();
+        // Every write of `state.json` carries the right panel's current
+        // identities, so a window rebuilt later restores them.
+        self.state.right_panel_descriptors = self.persisted_right_panel_descriptors(cx);
         let daemon_error = self
             .daemon
             .update_settings(self.state.daemon_settings())
@@ -1749,7 +1764,7 @@ impl Waku {
                         // turn's final stream save can disappear on relaunch.
                         cx.spawn(async move |waku, cx| {
                             cx.background_executor().timer(STREAM_FRAME_INTERVAL).await;
-                            let _ = waku.update(cx, |waku, _| waku.save());
+                            let _ = waku.update(cx, |waku, cx| waku.save(cx));
                         })
                         .detach();
                     }
@@ -2901,7 +2916,7 @@ impl Waku {
                 return;
             }
         }
-        self.save();
+        self.save(cx);
         self.drain_queued_message(session_id, cx);
         cx.notify();
     }
@@ -2935,6 +2950,7 @@ impl Waku {
                 last_background_refresh_at: Instant::now()
                     .checked_sub(BACKGROUND_WORK_REFRESH_INTERVAL)
                     .unwrap_or_else(Instant::now),
+                compaction_turn: None,
             },
         );
         // Startup can emit before the background task hands this receiver to
@@ -2961,9 +2977,16 @@ impl Waku {
         }
         if session.status == SessionStatus::Background {
             // The turn is parked on detached work and the provider is idle,
-            // so the message goes straight in as a steer: queued, it would
-            // wait for a settle that only the message itself could hasten.
-            self.steer_composer_submission(submission, cx);
+            // so the message goes straight in: queued, it would wait for a
+            // settle that only the message itself could hasten. A parked turn
+            // that is still open takes it as a steer; a provider that settled
+            // its turn before the detached work landed (Pi) has nothing to
+            // steer, and the message is simply that session's next prompt.
+            if session_has_active_provider_turn(session) {
+                self.steer_composer_submission(submission, cx);
+            } else {
+                self.submit_submission_for_session(session.id, submission, cx);
+            }
             return;
         }
         if session.is_busy() {
@@ -3083,7 +3106,7 @@ impl Waku {
                 .push(submission.into_queued_message());
             session.updated_at = unix_time();
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -3098,7 +3121,7 @@ impl Waku {
                 .queued_messages
                 .retain(|message| message.id != message_id);
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -3123,7 +3146,7 @@ impl Waku {
         self.restore_composer_submission(ComposerSubmission::from_queued_message(message), cx);
         let focus_handle = self.composer_focus(cx);
         window.focus(&focus_handle, cx);
-        self.save();
+        self.save(cx);
         cx.notify();
     }
 
@@ -3146,7 +3169,7 @@ impl Waku {
         }) else {
             return;
         };
-        self.save();
+        self.save(cx);
         self.steer_composer_submission(ComposerSubmission::from_queued_message(message), cx);
     }
 
@@ -3233,7 +3256,11 @@ impl Waku {
             self.defer_queue_drain(session_id);
             return;
         }
-        if session.status.is_busy() {
+        // A session whose turn ended while detached work still runs stays
+        // busy for as long as that work does (see
+        // `sync_background_wait_status`), but there is no turn for a message
+        // to wait behind: it is the session's next prompt.
+        if submission_waits_for_a_turn(session.status, session_has_active_provider_turn(session)) {
             self.enqueue_follow_up_submission(session_id, submission, cx);
             return;
         }
@@ -3489,6 +3516,17 @@ impl Waku {
             .find(|session| session.id == session_id)
             .map(submitted_prompt_identity)
             .unwrap_or((None, None));
+        // A Pi `/compact` is a provider command the transport runs itself: it
+        // settles without a model turn, so the answerless-turn fallback must
+        // skip exactly this turn. Resolution above has already let a project,
+        // user or skill command of the same name expand or redirect, so a
+        // literal invocation here is the built-in.
+        if provider == ProviderKind::Pi
+            && waku_protocol::composer::parse_compact_invocation(&driver_prompt).is_some()
+            && let Some(runtime) = self.runtimes.get_mut(&session_id)
+        {
+            runtime.compaction_turn = turn_id;
+        }
         let mut failed_to_start = false;
         match driver {
             Ok(driver) => driver.prompt(driver_prompt, turn_id, message_id),
@@ -3516,7 +3554,7 @@ impl Waku {
         // hold the final preparation frame motionless.
         cx.spawn(async move |waku, cx| {
             cx.background_executor().timer(STREAM_FRAME_INTERVAL).await;
-            let _ = waku.update(cx, |waku, _| waku.save());
+            let _ = waku.update(cx, |waku, cx| waku.save(cx));
         })
         .detach();
     }
@@ -3698,7 +3736,7 @@ impl Waku {
         if self.stream_state_dirty
             && (force_save || self.last_stream_save.elapsed() >= STREAM_SAVE_INTERVAL)
         {
-            self.save();
+            self.save(cx);
         }
         changed || selected_changed
     }

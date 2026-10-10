@@ -17,12 +17,13 @@ use uuid::Uuid;
 use crate::{Command, DaemonExposureSettings, DaemonSettings, DaemonSupervisor, ResponsePayload};
 use waku_protocol::computer_use::ComputerAppGrant;
 use waku_protocol::i18n::AppLanguage;
-use waku_protocol::identity::DATA_DIRECTORY_NAME;
+use waku_protocol::identity::data_directory_name;
 use waku_protocol::model::{
     AgentSession, FavoriteModel, Project, ProviderKind, ProviderResumeCursor,
     ProviderSessionHistory, ProviderSessionSummary, RuntimeMode,
 };
 use waku_protocol::theme::ThemePreference;
+use waku_protocol::workspace::ReviewDiffSource;
 
 pub use waku_protocol::persistence::{
     ComposerDraft, ComposerDraftAttachment, ComposerDraftChange, ComposerDraftKey,
@@ -284,6 +285,42 @@ pub struct PersistedWindowState {
     pub display: Option<Uuid>,
 }
 
+/// One right-panel surface reduced to the identity a rebuilt window can
+/// restore: a daemon terminal id, a browser tab's last observed URL, a
+/// workspace-relative file path, or a diff source. View state — scroll
+/// position, selection, editor buffers, file-tree expansion, and a browser
+/// page's in-page state — is deliberately absent; a rebuilt window restores
+/// identities, not page or caret state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RightPanelSurfaceDescriptor {
+    Terminal {
+        terminal_id: Uuid,
+    },
+    /// A browser tab. `url` is the last URL the page committed, or `None` for
+    /// a tab whose page was never observed, which a rebuilt window restores
+    /// blank.
+    Browser {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    File {
+        path: String,
+    },
+    Diff {
+        source: ReviewDiffSource,
+    },
+}
+
+/// One task's persisted right panel: its restorable surfaces and which of them
+/// was active. An empty `surfaces` means the task had nothing durable open.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct RightPanelTaskDescriptor {
+    pub surfaces: Vec<RightPanelSurfaceDescriptor>,
+    pub active: Option<usize>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -393,6 +430,10 @@ struct AppState {
     markdown_preview: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_state: Option<PersistedWindowState>,
+    /// Per-task right-panel descriptors, keyed by task id. Written only by the
+    /// desktop; a document that predates the field reads back empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    right_panel: BTreeMap<Uuid, RightPanelTaskDescriptor>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -456,6 +497,11 @@ pub struct PersistedState {
     pub markdown_preview: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_state: Option<PersistedWindowState>,
+    /// Per-task right-panel descriptors. Desktop-only: the daemon's task store
+    /// never sees them, so they are skipped in [`PersistedState`]'s own
+    /// serialization and travel to disk through `state.json`'s `AppState`.
+    #[serde(skip)]
+    pub right_panel_descriptors: BTreeMap<Uuid, RightPanelTaskDescriptor>,
     #[serde(default = "default_computer_use_enabled")]
     pub computer_use_enabled: bool,
     #[serde(default)]
@@ -519,6 +565,7 @@ impl PersistedState {
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             markdown_preview: false,
             window_state: None,
+            right_panel_descriptors: BTreeMap::new(),
             computer_use_enabled: false,
             computer_use_allowed_apps: Vec::new(),
             disabled_providers: Vec::new(),
@@ -664,6 +711,7 @@ impl PersistedState {
             right_panel_width: self.right_panel_width,
             markdown_preview: self.markdown_preview,
             window_state: self.window_state,
+            right_panel: self.right_panel_descriptors.clone(),
         }
     }
 
@@ -702,6 +750,7 @@ impl PersistedState {
         self.right_panel_width = app_state.right_panel_width;
         self.markdown_preview = app_state.markdown_preview;
         self.window_state = app_state.window_state;
+        self.right_panel_descriptors = app_state.right_panel;
     }
 
     fn persistable_selected_session(&self) -> Option<Uuid> {
@@ -884,6 +933,23 @@ pub fn load_or_create_app_settings() -> io::Result<AppSettings> {
     Ok(settings)
 }
 
+/// The app preferences hydration applies.
+///
+/// A window reads the persisted settings once before its first frame and hands
+/// that snapshot to the store; when it does, hydration uses the snapshot rather
+/// than reading the file a second time, which is what keeps the skeleton and
+/// the workspace from disagreeing about theme, language, or font size. A store
+/// with no snapshot still reads the file.
+fn hydration_app_settings(
+    preloaded: Option<&AppSettings>,
+    read_from_disk: impl FnOnce() -> io::Result<Option<AppSettings>>,
+) -> io::Result<Option<AppSettings>> {
+    match preloaded {
+        Some(settings) => Ok(Some(settings.clone())),
+        None => read_from_disk(),
+    }
+}
+
 /// Desktop state store: app files stay local, task data crosses RPC.
 pub struct StateStore {
     path: PathBuf,
@@ -892,6 +958,11 @@ pub struct StateStore {
     legacy_settings_paths: Vec<PathBuf>,
     daemon: DaemonSupervisor,
     remote_default_cwd: Mutex<Option<PathBuf>>,
+    /// The app preferences a window already read before its first frame. When
+    /// present, hydration applies them instead of reading the file again, so
+    /// the skeleton and the workspace cannot disagree about theme, language,
+    /// or font size.
+    preloaded_app_settings: Option<AppSettings>,
     /// A task snapshot may only be written after this client has successfully
     /// loaded the daemon's authoritative state. Falling back to an empty UI
     /// after a transient RPC failure must never turn the next ordinary save
@@ -911,7 +982,7 @@ impl StateStore {
         } else {
             dirs::data_local_dir()
                 .unwrap_or_else(std::env::temp_dir)
-                .join(DATA_DIRECTORY_NAME)
+                .join(data_directory_name())
                 .join("app.db")
         }
     }
@@ -924,7 +995,20 @@ impl StateStore {
             path: Self::default_path(),
             daemon,
             remote_default_cwd: Mutex::new(None),
+            preloaded_app_settings: None,
             task_state_loaded: AtomicBool::new(false),
+        }
+    }
+
+    /// A store that hydrates the app preferences a window already read.
+    ///
+    /// The window reads the persisted settings once, before its first frame,
+    /// and passes the same snapshot here so hydration applies exactly what the
+    /// skeleton painted rather than risking a second, different read.
+    pub fn remote_with_settings(daemon: DaemonSupervisor, app_settings: AppSettings) -> Self {
+        Self {
+            preloaded_app_settings: Some(app_settings),
+            ..Self::remote(daemon)
         }
     }
 
@@ -1054,7 +1138,10 @@ impl StateStore {
         state.projects = projects;
         state.sessions = sessions;
         let app_settings_missing = !self.app_settings_path.is_file();
-        if let Some(settings) = self.read_app_settings()? {
+        let settings = hydration_app_settings(self.preloaded_app_settings.as_ref(), || {
+            self.read_app_settings()
+        })?;
+        if let Some(settings) = settings {
             state.apply_app_settings(settings);
         }
         let app_state = read_app_state_file(&self.app_state_path);
@@ -1306,6 +1393,32 @@ mod tests {
     }
 
     #[test]
+    fn a_window_snapshot_replaces_the_settings_read_during_hydration() {
+        let snapshot = AppSettings {
+            theme: ThemePreference::Dark,
+            ..AppSettings::default()
+        };
+        let mut reads = 0;
+        let applied = hydration_app_settings(Some(&snapshot), || {
+            reads += 1;
+            Ok(Some(AppSettings::default()))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(reads, 0, "a window snapshot skips the file read");
+        assert_eq!(applied.theme, ThemePreference::Dark);
+
+        let applied = hydration_app_settings(None, || {
+            reads += 1;
+            Ok(Some(AppSettings::default()))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(reads, 1, "a store without a snapshot reads the file");
+        assert_eq!(applied.theme, ThemePreference::System);
+    }
+
+    #[test]
     fn legacy_app_state_defaults_sidebar_presentation() {
         let state: AppState = serde_json::from_str(r#"{"app_state_version":1}"#).unwrap();
 
@@ -1336,6 +1449,136 @@ mod tests {
 
         assert_eq!(session.runtime_mode, RuntimeMode::Ask);
         assert_eq!(state.app_state().last_runtime_mode, RuntimeMode::Ask);
+    }
+
+    /// A composer pick — model, thinking level, service tier, context window —
+    /// mutates the selected session through [`PersistedState::session_mut`],
+    /// the accessor every picker handler uses. That is what queues the choice
+    /// for the next daemon save, so a pick made and then abandoned (no
+    /// following turn) still reaches the daemon and the rebuilt window's
+    /// task-list load.
+    #[test]
+    fn a_composer_pick_is_queued_for_the_next_daemon_save() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/pick"));
+        let session_id = state.sessions[0].id;
+        state.dirty_sessions.clear();
+
+        let session = state
+            .session_mut(session_id)
+            .expect("the selected session exists");
+        session.model = Some("gpt-5".into());
+        session.reasoning_effort = Some("high".into());
+        session.service_tier = Some("fast".into());
+        session.context_window = Some("1m".into());
+
+        assert!(
+            state.dirty_sessions.contains(&session_id),
+            "the pick is queued even though no turn follows it"
+        );
+    }
+
+    #[test]
+    fn right_panel_descriptors_round_trip_through_app_state() {
+        let task = Uuid::new_v4();
+        let terminal_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let mut state = PersistedState::empty();
+        state.right_panel_descriptors.insert(
+            task,
+            RightPanelTaskDescriptor {
+                surfaces: vec![
+                    RightPanelSurfaceDescriptor::Terminal { terminal_id },
+                    RightPanelSurfaceDescriptor::Browser {
+                        url: Some("https://example.com/docs".into()),
+                    },
+                    RightPanelSurfaceDescriptor::Browser { url: None },
+                    RightPanelSurfaceDescriptor::File {
+                        path: "src/main.rs".into(),
+                    },
+                    RightPanelSurfaceDescriptor::Diff {
+                        source: ReviewDiffSource::LastTurn {
+                            session_id: task,
+                            turn_id,
+                            turn_count: 2,
+                        },
+                    },
+                ],
+                active: Some(4),
+            },
+        );
+
+        let encoded = serde_json::to_value(state.app_state()).unwrap();
+        let mut restored = PersistedState::empty();
+        restored.apply_app_state(serde_json::from_value(encoded).unwrap());
+
+        assert_eq!(
+            restored.right_panel_descriptors,
+            state.right_panel_descriptors
+        );
+    }
+
+    #[test]
+    fn a_browser_descriptor_without_a_url_reads_back_blank() {
+        // A tab whose page was never observed persists without a `url` field;
+        // reading it back must yield the blank tab, not an error.
+        let descriptor: RightPanelSurfaceDescriptor =
+            serde_json::from_str(r#"{"kind":"browser"}"#).unwrap();
+        assert_eq!(
+            descriptor,
+            RightPanelSurfaceDescriptor::Browser { url: None }
+        );
+
+        let encoded =
+            serde_json::to_value(RightPanelSurfaceDescriptor::Browser { url: None }).unwrap();
+        assert!(encoded.get("url").is_none());
+    }
+
+    /// The window snapshot a rebuilt window reads back carries the selected
+    /// task and the layout: the task, the sidebar and right panel's visibility
+    /// and widths.
+    #[test]
+    fn the_window_snapshot_restores_the_selected_task_and_layout() {
+        let project = Project::from_path(PathBuf::from("/workspace"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.begin_turn("restored turn");
+        let mut state = PersistedState::empty();
+        state.projects = vec![project.clone()];
+        state.selected_project = Some(project.id);
+        state.selected_session = Some(session.id);
+        state.sessions = vec![session];
+        state.sidebar_visible = false;
+        state.sidebar_width = 248.0;
+        state.right_panel_visible = true;
+        state.right_panel_width = 420.0;
+
+        let encoded = serde_json::to_value(state.app_state()).unwrap();
+        let mut restored = PersistedState::empty();
+        restored.apply_app_state(serde_json::from_value(encoded).unwrap());
+
+        assert_eq!(restored.selected_project, state.selected_project);
+        assert_eq!(restored.selected_session, state.selected_session);
+        assert!(!restored.sidebar_visible);
+        assert_eq!(restored.sidebar_width, 248.0);
+        assert!(restored.right_panel_visible);
+        assert_eq!(restored.right_panel_width, 420.0);
+    }
+
+    #[test]
+    fn app_state_written_before_panel_descriptors_restores_them_empty() {
+        // An older `state.json` has no `right_panel` key at all; reading it
+        // must not fail, and the panel simply has nothing to restore.
+        let state: AppState = serde_json::from_str(r#"{"app_state_version":1}"#).unwrap();
+        assert!(state.right_panel.is_empty());
+
+        let mut persisted = PersistedState::empty();
+        persisted.apply_app_state(state);
+        assert!(persisted.right_panel_descriptors.is_empty());
+    }
+
+    #[test]
+    fn app_state_skips_the_right_panel_key_when_nothing_is_open() {
+        let encoded = serde_json::to_value(PersistedState::empty().app_state()).unwrap();
+        assert!(encoded.get("right_panel").is_none());
     }
 
     #[test]

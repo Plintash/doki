@@ -372,6 +372,34 @@ fn merge_option<T>(target: &mut Option<T>, incoming: Option<T>) {
     }
 }
 
+/// The status a session takes when detached work outlives its turn, or the one
+/// it takes back once that work is settled. `None` means the session's own
+/// status already says what is happening, so nothing should move.
+///
+/// This is the whole rule behind [`Waku::sync_background_wait_status`], kept
+/// apart from the state it reads so every direction is visible at once: work
+/// the session is waiting on is busy, busy-ness that only came from that work
+/// ends with it, and a status that already says something else — a live turn, a
+/// failure, a wait for the user — is never overwritten. Only the one Pi
+/// transport both flavors speak leaves the wait to its session's status, because
+/// only it settles the turn before the detached work does and wakes the session
+/// when that work settles; a provider that does not wake itself for the work is
+/// not waiting on it.
+pub(super) fn background_wait_status(
+    provider: ProviderKind,
+    live: bool,
+    status: SessionStatus,
+) -> Option<SessionStatus> {
+    if !matches!(provider, ProviderKind::Pi | ProviderKind::OhMyPi) {
+        return None;
+    }
+    match (live, status) {
+        (true, SessionStatus::Idle) => Some(SessionStatus::Background),
+        (false, SessionStatus::Background) => Some(SessionStatus::Idle),
+        _ => None,
+    }
+}
+
 fn bound_output(item: &mut BackgroundWorkItem) {
     let Some(output) = item.output.as_mut() else {
         return;
@@ -589,6 +617,24 @@ impl Waku {
         self.background_work
             .get(&session_id)
             .is_some_and(BackgroundWorkRegistry::has_live_detached)
+    }
+
+    /// Keeps a session's own status honest about detached work that outlived
+    /// its turn. The rule is [`background_wait_status`]; this only supplies the
+    /// state it reads.
+    pub(super) fn sync_background_wait_status(&mut self, session_id: Uuid) {
+        let live = self.session_has_live_detached_work(session_id);
+        let Some(session) = self.state.session_mut(session_id) else {
+            return;
+        };
+        if session.active_turn_id().is_some() {
+            return;
+        }
+        let Some(next) = background_wait_status(session.provider, live, session.status) else {
+            return;
+        };
+        session.status = next;
+        session.updated_at = unix_time();
     }
 
     pub(super) fn background_work_counts(&self, session_id: Uuid) -> (usize, usize) {
@@ -969,7 +1015,7 @@ impl Waku {
         crate::platform::open_path_in_app(path, bundle_id);
         if self.state.open_in_app.as_deref() != Some(app_id) {
             self.state.open_in_app = Some(app_id.to_owned());
-            self.save();
+            self.save(cx);
             cx.notify();
         }
     }
@@ -2012,6 +2058,63 @@ mod tests {
                 .detail
                 .as_deref()
                 .is_some_and(|detail| detail.contains("Workflow child completed"))
+        );
+    }
+
+    /// Detached work that outlived its turn is what keeps a Pi session busy,
+    /// and its settle is what lets the session rest again. The two directions
+    /// are one rule: busy-ness that came from the work ends with the work, and
+    /// a status that already says something else — a live turn, a failure, a
+    /// wait for the user — is never overwritten by it. Another provider's
+    /// detached work is not a wait at all: only Pi wakes itself for it.
+    #[test]
+    fn detached_work_makes_a_settled_session_busy_and_its_settle_restores_it() {
+        assert_eq!(
+            background_wait_status(ProviderKind::Pi, true, SessionStatus::Idle),
+            Some(SessionStatus::Background)
+        );
+        // Oh My Pi speaks the same transport, so it waits the same way.
+        assert_eq!(
+            background_wait_status(ProviderKind::OhMyPi, true, SessionStatus::Idle),
+            Some(SessionStatus::Background)
+        );
+        assert_eq!(
+            background_wait_status(ProviderKind::Pi, false, SessionStatus::Background),
+            Some(SessionStatus::Idle)
+        );
+        for provider in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Cursor,
+        ] {
+            assert_eq!(
+                background_wait_status(provider, true, SessionStatus::Idle),
+                None
+            );
+            assert_eq!(
+                background_wait_status(provider, false, SessionStatus::Background),
+                None
+            );
+        }
+        for status in [
+            SessionStatus::Connecting,
+            SessionStatus::Working,
+            SessionStatus::Waiting,
+            SessionStatus::Failed,
+        ] {
+            assert_eq!(background_wait_status(ProviderKind::Pi, true, status), None);
+            assert_eq!(
+                background_wait_status(ProviderKind::Pi, false, status),
+                None
+            );
+        }
+        assert_eq!(
+            background_wait_status(ProviderKind::Pi, false, SessionStatus::Idle),
+            None
+        );
+        assert_eq!(
+            background_wait_status(ProviderKind::Pi, true, SessionStatus::Background),
+            None
         );
     }
 
