@@ -25,7 +25,7 @@ use crate::driver::{
     DriverControl, DriverEventSender, DriverEventSink, DriverStartOptions, SessionOptions,
 };
 use crate::model::{
-    ActivityKind, BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKind,
+    ActivityItem, ActivityKind, BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKind,
     BackgroundWorkStatus, DriverEvent, ExtensionWidgetPlacement, NotificationSeverity,
     ProviderResumeCursor, ReportedCommand, RuntimeMode, UserInputAnswer, UserInputOption,
     UserInputQuestion,
@@ -692,6 +692,7 @@ impl PiDriver {
                                 &mut next_request_id,
                                 &writer_events,
                                 &run,
+                                flavor,
                                 prompt,
                             );
                         }
@@ -1160,14 +1161,30 @@ fn write_compact(stdin: &mut impl Write, instructions: Option<String>) -> Result
 /// acknowledged as accepted too, because that is what the app needs to keep the
 /// message in the transcript — reporting it as a rejected steer would have the
 /// app submit the same text a second time.
+///
+/// A Pi `/compact` is not a steer at all: it is a command, and the transport
+/// runs it itself. Steering it would write the text into the model's context
+/// or park it across turn boundaries, so it is rejected here — the client
+/// queues the message instead, and the queue runs it through the prompt path
+/// where the command is recognised.
 fn send_steer(
     stdin: &mut impl Write,
     pending: &PendingResponses,
     next_request_id: &mut u64,
     events: &impl DriverEventSink,
     run: &RunLiveness,
+    flavor: PiFlavor,
     prompt: String,
 ) {
+    if flavor == PiFlavor::Pi
+        && waku_protocol::composer::parse_compact_invocation(&prompt).is_some()
+    {
+        let _ = events.send(DriverEvent::SteerRejected {
+            message: prompt,
+            reason: tr!("errors.compact_queued_until_settled"),
+        });
+        return;
+    }
     let delivered = if run.is_live() {
         send_request(
             stdin,
@@ -1359,6 +1376,26 @@ impl ChunkAssembly {
             .map(Some)
             .map_err(|error| format!("chunked frame was not valid JSON: {error}"))
     }
+}
+
+/// One row of Pi's compaction activity.
+fn compaction_activity(
+    id: String,
+    title: String,
+    output: Option<&Value>,
+    failed: bool,
+    complete: bool,
+) -> ActivityItem {
+    activity::tool_activity(
+        Some(id),
+        ActivityKind::Tool,
+        title,
+        None,
+        output,
+        None,
+        failed,
+        complete,
+    )
 }
 
 /// Reports the context occupancy the provider just computed. The window is
@@ -1826,16 +1863,8 @@ fn handle_pi_message(
             state.compaction_sequence += 1;
             let id = format!("pi-compaction-{}", state.compaction_sequence);
             state.open_compaction = Some(id.clone());
-            let item = activity::tool_activity(
-                Some(id),
-                ActivityKind::Tool,
-                tr!("activity.compacting_context"),
-                None,
-                None,
-                None,
-                false,
-                false,
-            );
+            let item =
+                compaction_activity(id, tr!("activity.compacting_context"), None, false, false);
             let _ = events.send(DriverEvent::RichActivity(item));
         }
         "compaction_end" => {
@@ -1856,26 +1885,14 @@ fn handle_pi_message(
                 let item = if aborted {
                     // The stop that aborted it already said what happened; the
                     // row only has to stop being live.
-                    activity::tool_activity(
-                        Some(id),
-                        ActivityKind::Tool,
-                        tr!("activity.compacting_context"),
-                        None,
-                        None,
-                        None,
-                        false,
-                        true,
-                    )
+                    compaction_activity(id, tr!("activity.compacting_context"), None, false, true)
                 } else if let Some(result) = result {
                     // The summary is the compaction's own text; the row keeps
                     // it for the detail view.
-                    activity::tool_activity(
-                        Some(id),
-                        ActivityKind::Tool,
+                    compaction_activity(
+                        id,
                         tr!("activity.compacted_context"),
-                        None,
                         result.get("summary"),
-                        None,
                         false,
                         true,
                     )
@@ -1886,13 +1903,10 @@ fn handle_pi_message(
                             provider = flavor.display_name()
                         )
                     });
-                    activity::tool_activity(
-                        Some(id),
-                        ActivityKind::Tool,
+                    compaction_activity(
+                        id,
                         tr!("activity.compaction_failed"),
-                        None,
                         Some(&Value::String(message)),
-                        None,
                         true,
                         true,
                     )
@@ -2905,6 +2919,7 @@ mod tests {
             &mut next_request_id,
             &events,
             &state.run,
+            PiFlavor::Pi,
             "stop doing that".to_owned(),
         );
 
@@ -3009,6 +3024,7 @@ mod tests {
             &mut next_request_id,
             &events,
             &state.run,
+            PiFlavor::Pi,
             "never mind".to_owned(),
         );
         let frames = wire_frames(&wire);
@@ -3050,6 +3066,7 @@ mod tests {
                 &mut next_request_id,
                 &writer_events,
                 &writer_run,
+                PiFlavor::Pi,
                 writer_prompt,
             );
         });
@@ -5084,6 +5101,34 @@ mod tests {
                 .is_some_and(|summary| summary.contains("Stop the running turn")),
             "the refusal names what to do about it"
         );
+    }
+
+    #[test]
+    fn a_compact_steer_is_rejected_so_the_client_queues_it() {
+        // A steer joins the live turn's boundary; a compaction there would
+        // reach the model or wait for a later turn. The transport rejects it
+        // as a steer, which is what has the client queue it and run it
+        // through the prompt path where the command is recognised.
+        let (pending, _commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        state.run.open();
+        let mut wire = Vec::new();
+        send_steer(
+            &mut wire,
+            &pending,
+            &mut 0,
+            &events,
+            &state.run,
+            PiFlavor::Pi,
+            "/compact".to_owned(),
+        );
+
+        assert!(wire.is_empty(), "a compact steer writes nothing");
+        let DriverEvent::SteerRejected { message, reason } = event_rx.recv().unwrap() else {
+            panic!("a compact steer is rejected so the client queues it")
+        };
+        assert_eq!(message, "/compact");
+        assert!(reason.contains("compaction waits"));
     }
 
     #[test]

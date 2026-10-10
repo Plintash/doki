@@ -12,9 +12,9 @@
 ## 3. The driver runs it instead of the model
 
 - [x] 3.1 Route a `CommandMessage::Prompt` through one function in `crates/waku-core/src/driver/pi.rs`: a Pi-flavour compact invocation with no live run writes `{"type":"compact","customInstructions"?…}` with no id to await, and any other prompt is sent as before; verified by a wire test for the bare and focused forms and a same-wire test that Oh My Pi still prompts
-- [x] 3.2 Refuse a compact prompt that arrives while a run is live: no compact RPC is written and the submission settles as undelivered with a reason, because Pi's `session.compact()` would abort the run; verified by a driver test that opens the run liveness first
+- [x] 3.2 Refuse a compact prompt that arrives while a run is live: no compact RPC is written and the submission settles as undelivered with a reason, because Pi's `session.compact()` would abort the run; a steer carrying the same command is rejected so the client queues it through the prompt path; verified by driver tests for the live-run prompt and for the steer guard (Pi rejects, Oh My Pi still steers)
 - [x] 3.3 Write the request without an id and await nothing, like `abort` and `clear_queue`: every outcome the supported RPC reports arrives as an event, so no parallel answer path is added; verified by the wire test asserting the write carries no id and registers no pending response
-- [x] 3.4 Add `errors.compact_turn_running` to the three locale catalogs; verified by the parity test
+- [x] 3.4 Add `errors.compact_turn_running` and `errors.compact_queued_until_settled` to the three locale catalogs; verified by the parity test
 
 ## 4. Compaction is visible
 
@@ -25,11 +25,11 @@
 ## 5. The settling turn gets no synthetic reply
 
 - [x] 5.1 Record the turn on the session runtime when the resolved prompt handed to the transport is a Pi compact invocation, at `finish_submission_preparation` in `src/app/runtime.rs`; verified by `cargo check` and the app tests
-- [x] 5.2 Skip the answerless-turn fallback in `TurnFinished` for exactly that recorded turn in `src/app/streaming.rs`, taking the record with it; verified by the app test suite and the manual app check (no separate stale-settlement guard is added: the recorded turn is consumed by its own settlement)
+- [x] 5.2 Skip the answerless-turn fallback in `TurnFinished` for exactly that recorded turn in `src/app/streaming.rs`, and drop a settlement whose recorded turn is no longer the active one (a stop already ended it); the decision is the named `stale_compaction_settlement` helper, verified by its stream test and the app test suite
 
 ## 6. Documentation and validation
 
 - [x] 6.1 Note the `/compact` bridge in the Pi section of `docs/providers.md`; verified by the paragraph matching the implemented behaviour
-- [x] 6.2 Run `cargo fmt --package waku --package waku-protocol --package waku-client --package waku-core --package waku-daemon -- --check` and `cargo check`; verified by both reporting no changes or errors
+- [x] 6.2 Run `cargo fmt --package waku --package waku-protocol --package waku-client --package waku-core --package waku-daemon -- --check`, `cargo check` and `bun run protocol:check`; verified by all three reporting no changes or errors
 - [x] 6.3 Run `cargo test --locked`; verified by the full suite passing with no failures
 - [ ] 6.4 Validate in the freshly rebuilt debug app against a Pi session: `/compact` completes from the palette, submitting it compacts without a model turn, the activity row shows while it runs and when it ends, the context meter moves, and a project command named `compact` still wins — **owned by the user**, who runs the app-level checks by hand in the worktree's rebuilt app; driver and catalogue tests cover the same paths headlessly

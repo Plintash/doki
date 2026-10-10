@@ -847,7 +847,7 @@ impl Waku {
                     .find(|session| session.id == session_id)
                     .and_then(AgentSession::active_turn_id);
                 let compaction_turn = runtime.compaction_turn.take();
-                if compaction_turn.is_some() && compaction_turn != active_turn {
+                if stale_compaction_settlement(compaction_turn, active_turn) {
                     return true;
                 }
                 // A prompt the provider refused before accepting it settles as
@@ -1352,6 +1352,17 @@ pub(super) fn session_accepts_turn_output(session: &mut AgentSession) -> bool {
         session.status = SessionStatus::Working;
     }
     true
+}
+
+/// Whether an arriving settlement belongs to a compaction turn the app already
+/// ended.
+///
+/// A manual compaction's settlement carries no turn id, so the recorded
+/// compaction turn is what identifies it. A different active turn means a stop
+/// ended the compaction first, and settling the current turn with that event
+/// would end a turn that never ended.
+pub(super) fn stale_compaction_settlement(recorded: Option<Uuid>, active: Option<Uuid>) -> bool {
+    recorded.is_some() && recorded != active
 }
 
 /// A completed edit or shell command is the earliest provider-neutral point at
