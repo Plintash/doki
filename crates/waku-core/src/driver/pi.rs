@@ -1708,6 +1708,10 @@ struct PiStreamState {
     message_saw_text: bool,
     message_saw_reasoning: bool,
     failed: bool,
+    /// A trigger the provider answered with something other than the `handled`
+    /// report it owes an extension command. A result that arrives while this is
+    /// set is refused: the answer was read, and it did not verify.
+    digest_trigger_unhandled: bool,
     tools: HashMap<String, (ActivityKind, String)>,
     /// The messages the provider's last queue report still held, in the order
     /// it reported them. Empty on a provider that reports no queue.
@@ -1771,6 +1775,14 @@ fn handle_pi_message(
                 // the objective it had. Neither answer is a settlement: the
                 // task's own conversation never saw the trigger, so it gains no
                 // turn, no entry, and no error from it.
+                //
+                // The spec promises this report is verified before a result is
+                // accepted, and this is the only place the report is readable.
+                // A report of anything but `handled` says the trigger did not
+                // stay an exchange — so a result arriving behind it is refused
+                // rather than stored as the objective of a generation that
+                // never ran.
+                state.digest_trigger_unhandled = !handled_locally;
                 pending.lock().remove(id);
                 return;
             }
@@ -1922,7 +1934,7 @@ fn handle_pi_message(
     match event_type {
         "entry_appended" => {
             if let Some(entry) = value.get("entry") {
-                emit_digest_entry(entry, events);
+                emit_digest_entry(entry, state.digest_trigger_unhandled, events);
             }
         }
         "queue_update" => {
@@ -2271,11 +2283,17 @@ fn emit_extension_message(message: &Value, events: &impl DriverEventSink) {
 ///
 /// Every other custom entry belongs to the extension that wrote it: Pi stores
 /// its own router state this way, and none of it is Waku's to interpret.
-fn emit_digest_entry(entry: &Value, events: &impl DriverEventSink) {
+fn emit_digest_entry(entry: &Value, trigger_unhandled: bool, events: &impl DriverEventSink) {
     if entry.get("type").and_then(Value::as_str) != Some("custom") {
         return;
     }
     if entry.get("customType").and_then(Value::as_str) != Some(crate::task_digest::DIGEST_SURFACE) {
+        return;
+    }
+    // The provider's answer to the trigger is the gate the spec names: a
+    // command it reported as started rather than handled reached the task's
+    // own conversation, and its entry is not a generation Waku accepts.
+    if trigger_unhandled {
         return;
     }
     let Some(data) = entry.get("data") else {
@@ -2762,6 +2780,88 @@ mod tests {
             })
         );
         assert!(event_rx.try_recv().is_err());
+    }
+
+    /// The spec promises the trigger's report is verified before a result is
+    /// accepted. The report is the prompt answer, and `handled` is what says
+    /// the command stayed an exchange instead of opening a run; a trigger the
+    /// provider answered any other way reached the task's own conversation, so
+    /// a result arriving behind it is refused rather than stored.
+    #[test]
+    fn a_result_is_refused_when_the_trigger_was_not_reported_handled() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let dispatch = Uuid::new_v4();
+        send_task_digest_prompt(
+            &mut Vec::new(),
+            &pending,
+            &mut 0,
+            &crate::task_digest::trigger_prompt(dispatch),
+        )
+        .unwrap();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "started"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        let entry = |dispatch: Uuid| {
+            json!({
+                "type": "entry_appended",
+                "entry": {
+                    "type": "custom",
+                    "id": "e1",
+                    "customType": "waku:digest",
+                    "data": {"v": 1, "dispatch": dispatch, "objective": "The list says why"},
+                },
+            })
+        };
+        handle_pi_message(
+            PiFlavor::Pi,
+            entry(dispatch),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the trigger started a run, so no generation ran to publish a result"
+        );
+
+        // A trigger the provider does report as handled verifies, and its
+        // result travels as it always did.
+        let dispatch = Uuid::new_v4();
+        send_task_digest_prompt(
+            &mut Vec::new(),
+            &pending,
+            &mut 1,
+            &crate::task_digest::trigger_prompt(dispatch),
+        )
+        .unwrap();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-2", "command": "prompt", "success": true, "data": {"disposition": "handled"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        handle_pi_message(
+            PiFlavor::Pi,
+            entry(dispatch),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::ExtensionMessage { .. }
+        ));
     }
 
     #[test]
