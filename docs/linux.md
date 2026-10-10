@@ -98,14 +98,30 @@ and settings stay in `~/.waku`; delete that directory to remove them too.
 
 ## Building from source
 
-Install Bun for the SDK artifact assembler, then produce the same archive
-this page installs with:
+The debug app and the release bundle need Rust 1.96 or newer and Bun (the
+bundle uses it to assemble the SDK artifact), plus the Linux compiler and GPUI
+runtime prerequisites. On Ubuntu and Debian:
+
+```sh
+sudo apt install build-essential clang cmake pkg-config libfontconfig-dev \
+  libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libvulkan1 \
+  xdg-desktop-portal
+```
+
+Equivalent packages are available on Fedora, Arch, and other desktop
+distributions. A working Vulkan driver is required at runtime; the archive
+deliberately does not bundle system graphics libraries, so distribution
+packages declare those themselves.
+
+Then produce the same archive this page installs with:
 
 ```sh
 ./scripts/bundle-linux.sh
 ```
 
-To exercise the install script against that local build:
+It is written under `target/release` with an install-prefix layout (`bin/` and
+`share/`) beneath one versioned directory. To exercise the install script
+against that local build:
 
 ```sh
 WAKU_BUNDLE_PATH=target/release/waku-<version>-<target>.tar.gz \
