@@ -54,9 +54,9 @@ rendered, except the trailing archived section defined below.
 ### Requirement: The archived section is the only home for archived tasks
 
 The status view SHALL have a trailing **Archived** section, rendered only when
-archived-task visibility is on or when the active task is archived. A task that
-is archived SHALL appear only in that section and MUST NOT be mixed into the
-three active sections, whatever its status.
+archived-task visibility is on, or — while it is off — for the active task
+alone. A task that is archived SHALL appear only in that section and MUST NOT be
+mixed into the three active sections, whatever its status.
 
 #### Scenario: An archived task is not mixed in
 
@@ -66,7 +66,12 @@ three active sections, whatever its status.
 #### Scenario: The active task is never a gap
 
 - **WHEN** the active task is archived and archived visibility is off
-- **THEN** the archived section is rendered with that task in it, so the open task is visible and marked
+- **THEN** the archived section is rendered with that task in it, so the open task is visible and marked, and it lists no other archived task
+
+#### Scenario: Visibility off keeps the archive hidden
+
+- **WHEN** archived visibility is off and several tasks are archived
+- **THEN** only the active one, if it is archived, is listed in the trailing section
 
 ### Requirement: The status view is flat
 

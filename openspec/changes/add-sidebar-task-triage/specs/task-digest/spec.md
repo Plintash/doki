@@ -76,8 +76,7 @@ row MAY name files, symbols, or tools.
 ### Requirement: Generation stays out of the task's own conversation
 
 Generating an objective MUST NOT add a message, turn, or instruction to the
-task's own conversation, and MUST NOT be routed through the live session's own
-protocol. The work SHALL be done by a separate one-shot invocation.
+task's own conversation.
 
 #### Scenario: The task's own conversation is untouched
 
