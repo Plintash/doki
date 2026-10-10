@@ -472,6 +472,21 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> bool {
         runtime.last_active_at = Instant::now();
+        // What a row reports about a task — its blockage, and the live turn's
+        // plan step — changes here, where the provider's events land. The
+        // cached row facts are refreshed at the end of this handler (and before
+        // the early returns below) so no row builder has to read the transcript
+        // while it draws.
+        let row_facts_changed = matches!(
+            &event,
+            DriverEvent::Activity { .. }
+                | DriverEvent::RichActivity(_)
+                | DriverEvent::Permission { .. }
+                | DriverEvent::UserInputRequested { .. }
+                | DriverEvent::Error(_)
+                | DriverEvent::TurnFinished { .. }
+                | DriverEvent::ProcessExited
+        );
         match event {
             DriverEvent::RuntimeEventCursorAdvanced(cursor) => {
                 if let Some(session) = self.state.session_mut(session_id) {
@@ -935,6 +950,7 @@ impl Waku {
                 // — an answer row, a checkpoint, background work — would be
                 // reporting a turn that never happened.
                 if !success && self.record_refused_prompt(session_id, runtime, summary.as_deref()) {
+                    self.refresh_sidebar_row_facts(session_id);
                     return true;
                 }
                 let (session_status, turn_status, background_status) =
@@ -1119,8 +1135,12 @@ impl Waku {
                 if let Some(previous_kinds) = previous_kinds.as_deref() {
                     self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
                 }
+                self.refresh_sidebar_row_facts(session_id);
                 return false;
             }
+        }
+        if row_facts_changed {
+            self.refresh_sidebar_row_facts(session_id);
         }
         true
     }

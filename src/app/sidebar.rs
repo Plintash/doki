@@ -443,6 +443,168 @@ fn persisted_sidebar_branch_label(workspace: &SessionWorkspace) -> Option<&str> 
     .filter(|branch| !branch.is_empty())
 }
 
+/// The identifier a row shows when its second line is not reporting the
+/// task's present state: the task's own worktree branch when the client knows
+/// it, and the project it belongs to otherwise.
+///
+/// The project's *current* branch is never substituted for the task's own.
+/// The list projection does not carry a task's workspace, so a client that
+/// just started cannot tell a task in the checkout from one in a worktree;
+/// naming the project is the honest answer instead of a branch the task may
+/// not be on.
+fn sidebar_row_identifier(
+    grouped_by_project: bool,
+    session: &AgentSession,
+    project: Option<&Project>,
+) -> (&'static str, SharedString) {
+    let branch = if grouped_by_project {
+        persisted_sidebar_branch_label(&session.workspace)
+    } else {
+        None
+    };
+    match branch {
+        Some(branch) => (
+            "icons/git-branch.svg",
+            SharedString::from(branch.to_owned()),
+        ),
+        None => ("icons/folder.svg", sidebar_project_label(project)),
+    }
+}
+
+/// A task's project as a single-line label: a projectless task shows the
+/// no-project name, and a task whose project is missing from the catalog shows
+/// the unknown-project name.
+fn sidebar_project_label(project: Option<&Project>) -> SharedString {
+    SharedString::from(
+        project
+            .map(Project::display_name)
+            .unwrap_or_else(|| tr!("sidebar.unknown_project")),
+    )
+}
+
+/// What a task row's second line says about where the task stands now, decided
+/// in the order the sidebar spec fixes, or `None` for a task to describe with
+/// the content its row already has.
+///
+/// A blocked task leads with the reason it recorded. A busy task then shows the
+/// provider's plan step for the live turn, falling back to the objective it is
+/// working toward. An idle task borrows neither: an objective there would pass
+/// off what the task was doing as what it is doing.
+pub(super) fn sidebar_row_detail(
+    session: &AgentSession,
+    facts: &SidebarSessionFacts,
+) -> Option<SidebarRowDetail> {
+    let blocked = matches!(
+        session.status,
+        SessionStatus::Waiting | SessionStatus::Failed
+    );
+    if blocked && let Some(reason) = facts.blocked_reason.clone() {
+        return Some(SidebarRowDetail::BlockedReason(reason));
+    }
+    if !session.is_busy() {
+        return None;
+    }
+    facts
+        .step
+        .clone()
+        .map(SidebarRowDetail::PlanStep)
+        .or_else(|| facts.objective.clone().map(SidebarRowDetail::Objective))
+}
+
+/// What a row reports about a task's present state. A task with none of these
+/// keeps the content it already has, so a row never falls back to a placeholder
+/// such as "working" or "unknown".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum SidebarRowDetail {
+    /// Why a blocked or failed task is blocked.
+    BlockedReason(SharedString),
+    /// The provider's plan step for the turn that is running now.
+    PlanStep(SharedString),
+    /// What a busy task is working toward.
+    Objective(SharedString),
+}
+
+impl SidebarRowDetail {
+    fn text(&self) -> &SharedString {
+        match self {
+            Self::BlockedReason(text) | Self::PlanStep(text) | Self::Objective(text) => text,
+        }
+    }
+
+    /// Paired with the text, so a reader never has to tell the three apart by
+    /// color alone.
+    fn icon(&self) -> &'static str {
+        match self {
+            Self::BlockedReason(_) => "icons/alert.svg",
+            Self::PlanStep(_) => activity_icon(ActivityKind::Plan),
+            Self::Objective(_) => "icons/target.svg",
+        }
+    }
+}
+
+/// The values a task row reads about one session.
+///
+/// The list entry already carries the objective, the blockage reason and the
+/// counters. The plan step it cannot: that lives in the transcript, so it is
+/// resolved here — once, where the session changed — and cached, because a row
+/// builder runs for every visible row on every frame and must never walk a
+/// transcript (`AGENTS.md`). `turn_count` and `changed_files` are kept beside
+/// it for the row card.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct SidebarSessionFacts {
+    pub(super) objective: Option<SharedString>,
+    pub(super) blocked_reason: Option<SharedString>,
+    pub(super) step: Option<SharedString>,
+    pub(super) turn_count: Option<u32>,
+    pub(super) changed_files: Option<u32>,
+}
+
+/// The facts one session gives a row, as of now.
+pub(super) fn sidebar_session_facts(session: &AgentSession) -> SidebarSessionFacts {
+    SidebarSessionFacts {
+        objective: session.objective.as_deref().map(SharedString::from),
+        blocked_reason: session.blocked_reason.as_deref().map(SharedString::from),
+        step: live_plan_step(session),
+        turn_count: session.turn_count,
+        changed_files: session.changed_files,
+    }
+}
+
+/// Rebuild the facts cache from the whole catalog in one pass, so a refresh of
+/// the session list (startup, a restart, another client's change) also drops
+/// the tasks that are gone.
+pub(super) fn rebuild_sidebar_session_facts(
+    facts: &mut HashMap<Uuid, SidebarSessionFacts>,
+    sessions: &[AgentSession],
+) {
+    facts.clear();
+    facts.extend(
+        sessions
+            .iter()
+            .map(|session| (session.id, sidebar_session_facts(session))),
+    );
+}
+
+/// The provider's plan step for the turn that is running now: the newest plan
+/// activity the live turn's transcript holds, named the way the transcript
+/// names it.
+///
+/// A settled turn's plan activity describes work that already happened, so it
+/// is deliberately not a current step: an idle row falls back to the content it
+/// has today rather than resurrecting the last plan of a finished turn.
+fn live_plan_step(session: &AgentSession) -> Option<SharedString> {
+    let turn_id = session.active_turn_id()?;
+    session
+        .transcript_blocks
+        .iter()
+        .rev()
+        .filter(|block| block.turn_id == Some(turn_id))
+        .flat_map(|block| block.activities.iter().rev())
+        .find(|activity| activity.kind == ActivityKind::Plan)
+        .map(|activity| SharedString::from(activity_display_title(activity)))
+        .filter(|step| !step.trim().is_empty())
+}
+
 /// Compact "how long ago" for the sidebar: "just now", then one coarse unit —
 /// "5m", "3h", "420d". Days are the largest unit so a glance still reads as a
 /// count rather than a date.
@@ -1280,6 +1442,36 @@ impl Waku {
         }
     }
 
+    /// Refresh the cached row facts for one session, wherever its data
+    /// changed: an applied activity, a recorded blockage, an attached runtime
+    /// whose transcript has just landed.
+    pub(super) fn refresh_sidebar_row_facts(&self, session_id: Uuid) {
+        let mut facts = self.sidebar_session_facts.borrow_mut();
+        match self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        {
+            Some(session) => {
+                facts.insert(session_id, sidebar_session_facts(session));
+            }
+            None => {
+                facts.remove(&session_id);
+            }
+        }
+    }
+
+    /// Rebuild the cached row facts for every session in one pass. The catalog
+    /// owns which sessions exist, so this is also what forgets the tasks that
+    /// are gone.
+    pub(super) fn rebuild_sidebar_row_facts(&self) {
+        rebuild_sidebar_session_facts(
+            &mut self.sidebar_session_facts.borrow_mut(),
+            &self.state.sessions,
+        );
+    }
+
     /// The sidebar row snapshot, rebuilt only when its inputs move.
     ///
     /// The sidebar re-renders at pulse cadence whenever one of its session
@@ -1983,33 +2175,24 @@ impl Waku {
         } else {
             8.0
         };
-        let detail_label = if grouped_by_project {
-            persisted_sidebar_branch_label(&session.workspace)
-                .map(|branch| SharedString::from(branch.to_owned()))
-                .or_else(|| {
-                    if !matches!(&session.workspace, SessionWorkspace::Local) {
-                        return None;
-                    }
-                    project.and_then(|project| {
-                        self.sidebar_branch_labels
-                            .borrow()
-                            .get(&project.path)
-                            .cloned()
-                    })
-                })
-        } else {
-            Some(SharedString::from(
-                project
-                    .map(Project::display_name)
-                    .unwrap_or_else(|| tr!("sidebar.unknown_project")),
-            ))
-        };
-        let has_detail_label = detail_label.is_some();
-        let detail_icon = if grouped_by_project {
-            "icons/git-branch.svg"
-        } else {
-            "icons/folder.svg"
-        };
+        // The row reports the task's present state whenever it has any, and
+        // otherwise names what the task is working on: its own branch when the
+        // client knows it, its project when it does not. Both come from the
+        // cached row facts, never from a transcript walk here.
+        let facts = self
+            .sidebar_session_facts
+            .borrow()
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
+        let detail = sidebar_row_detail(session, &facts);
+        // A view whose sections are not projects has to keep naming the
+        // project in the row; a project section heading already names it, so
+        // there the state stands alone. The label is resolved only when it is
+        // drawn, because this runs for every visible row on every frame.
+        let identifier = (detail.is_none() || !grouped_by_project)
+            .then(|| sidebar_row_identifier(grouped_by_project, session, project));
+        let has_detail = detail.is_some();
         let rename_input =
             (self.session_rename == Some(session_id)).then(|| self.session_rename_input.clone());
         let renaming = rename_input.is_some();
@@ -2113,19 +2296,34 @@ impl Waku {
                     .gap(px(5.0))
                     .text_size(sp(if grouped_by_project { 12.5 } else { 13.0 }))
                     .line_height(sp(15.0))
-                    .when_some(detail_label, |element, label| {
+                    .when_some(
+                        identifier,
+                        |element, (identifier_icon, identifier_label)| {
+                            element
+                                .child(icon(identifier_icon, 12.5, theme.text_tertiary))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(theme.text_tertiary)
+                                        .child(identifier_label),
+                                )
+                        },
+                    )
+                    .when_some(detail, |element, detail| {
                         element
-                            .child(icon(detail_icon, 12.5, theme.text_tertiary))
+                            .child(icon(detail.icon(), 12.5, theme.text_tertiary))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .text_color(theme.text_tertiary)
-                                    .child(label),
+                                    .child(detail.text().clone()),
                             )
                     })
-                    .when(!has_detail_label, |element| element.child(div().flex_1()))
+                    .when(!has_detail, |element| element.child(div().flex_1()))
                     .when_some(
                         session_time_label(session, unix_time()),
                         |element, label| {
@@ -3079,6 +3277,232 @@ mod tests {
             before,
             "a submitted turn does"
         );
+    }
+
+    /// A busy task whose provider reported a plan step for the live turn.
+    fn task_with_a_live_plan_step(step: &str) -> AgentSession {
+        let mut task = AgentSession::new(Uuid::new_v4(), ProviderKind::Claude);
+        task.set_status(SessionStatus::Working);
+        task.begin_turn("do the work");
+        push_transcript_activity(
+            &mut task,
+            ActivityItem::new(None, ActivityKind::Plan, step, None, false),
+            false,
+        );
+        task
+    }
+
+    /// A busy task with no provider plan step of its own.
+    fn task_without_a_live_plan_step() -> AgentSession {
+        let mut task = AgentSession::new(Uuid::new_v4(), ProviderKind::Claude);
+        task.set_status(SessionStatus::Working);
+        task.begin_turn("do the work");
+        task
+    }
+
+    #[test]
+    fn a_busy_task_row_shows_its_live_plan_step_instead_of_its_objective() {
+        let mut task = task_with_a_live_plan_step("Move the row's second line");
+        task.objective = Some("The sidebar row says where the task stands".to_owned());
+
+        let facts = sidebar_session_facts(&task);
+
+        assert_eq!(
+            sidebar_row_detail(&task, &facts),
+            Some(SidebarRowDetail::PlanStep(
+                "Move the row's second line".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_busy_task_row_without_a_plan_step_shows_its_objective() {
+        let mut task = task_without_a_live_plan_step();
+        task.objective = Some("The sidebar row says where the task stands".to_owned());
+
+        let facts = sidebar_session_facts(&task);
+
+        assert_eq!(
+            sidebar_row_detail(&task, &facts),
+            Some(SidebarRowDetail::Objective(
+                "The sidebar row says where the task stands".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_blocked_task_row_shows_the_reason_it_recorded() {
+        let mut task = task_with_a_live_plan_step("Move the row's second line");
+        task.objective = Some("The sidebar row says where the task stands".to_owned());
+        task.set_status(SessionStatus::Waiting);
+        task.set_blocked_reason("Approve the network request");
+
+        let facts = sidebar_session_facts(&task);
+
+        assert_eq!(
+            sidebar_row_detail(&task, &facts),
+            Some(SidebarRowDetail::BlockedReason(
+                "Approve the network request".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_blocked_task_row_without_a_reason_invents_nothing() {
+        let mut task = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        task.set_status(SessionStatus::Failed);
+
+        let facts = sidebar_session_facts(&task);
+
+        assert_eq!(sidebar_row_detail(&task, &facts), None);
+
+        // A task that is waiting with no recorded reason is still busy, so the
+        // row reports the turn it is in the middle of instead of a reason
+        // nobody recorded.
+        let mut waiting = task_with_a_live_plan_step("Move the row's second line");
+        waiting.set_status(SessionStatus::Waiting);
+
+        let facts = sidebar_session_facts(&waiting);
+
+        assert_eq!(
+            sidebar_row_detail(&waiting, &facts),
+            Some(SidebarRowDetail::PlanStep(
+                "Move the row's second line".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn an_idle_task_row_keeps_its_content_and_borrows_no_objective() {
+        let mut task = task_with_a_live_plan_step("Move the row's second line");
+        task.objective = Some("The sidebar row says where the task stands".to_owned());
+        task.finish_active_turn(TurnStatus::Completed);
+        task.set_status(SessionStatus::Idle);
+
+        let facts = sidebar_session_facts(&task);
+
+        assert_eq!(
+            facts.step, None,
+            "a settled turn's plan step is not the current step"
+        );
+        assert_eq!(sidebar_row_detail(&task, &facts), None);
+    }
+
+    #[test]
+    fn the_row_facts_cache_follows_the_session_it_is_refreshed_from() {
+        let mut task = task_with_a_live_plan_step("Move the row's second line");
+        task.objective = Some("The sidebar row says where the task stands".to_owned());
+        task.turn_count = Some(4);
+        task.changed_files = Some(3);
+        let mut facts = HashMap::new();
+
+        rebuild_sidebar_session_facts(&mut facts, std::slice::from_ref(&task));
+
+        assert_eq!(
+            facts.get(&task.id),
+            Some(&SidebarSessionFacts {
+                objective: Some("The sidebar row says where the task stands".into()),
+                blocked_reason: None,
+                step: Some("Move the row's second line".into()),
+                turn_count: Some(4),
+                changed_files: Some(3),
+            })
+        );
+
+        // The live turn reports a new step: the row has to follow it without
+        // ever walking the transcript itself.
+        push_transcript_activity(
+            &mut task,
+            ActivityItem::new(None, ActivityKind::Plan, "Refresh the cache", None, true),
+            true,
+        );
+        rebuild_sidebar_session_facts(&mut facts, std::slice::from_ref(&task));
+        assert_eq!(
+            facts.get(&task.id).and_then(|facts| facts.step.clone()),
+            Some("Refresh the cache".into())
+        );
+
+        // A task that is gone leaves no entry behind.
+        rebuild_sidebar_session_facts(&mut facts, &[]);
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn a_task_with_no_known_branch_names_its_project() {
+        let mut task = AgentSession::new(Uuid::new_v4(), ProviderKind::Claude);
+        task.workspace = SessionWorkspace::Worktree {
+            path: PathBuf::from("/tmp/worktree"),
+            branch: "waku/fix-the-sidebar-row".to_owned(),
+        };
+        let project = Project {
+            id: task.project_id,
+            name: "doki".to_owned(),
+            path: PathBuf::from("/tmp/dev/doki"),
+            created_at: 0,
+        };
+
+        assert_eq!(
+            sidebar_row_identifier(true, &task, Some(&project)),
+            (
+                "icons/git-branch.svg",
+                SharedString::from("waku/fix-the-sidebar-row")
+            )
+        );
+
+        // The list projection zeroes the workspace, so after a restart the
+        // client no longer knows the task's branch: the project's current
+        // branch is not the task's own and must not stand in for it.
+        task.workspace = SessionWorkspace::Local;
+        assert_eq!(
+            sidebar_row_identifier(true, &task, Some(&project)),
+            ("icons/folder.svg", SharedString::from("doki"))
+        );
+        assert_eq!(
+            sidebar_row_identifier(true, &task, None),
+            ("icons/folder.svg", SharedString::from("Unknown project"))
+        );
+
+        // The status view has no project heading, so it always names it.
+        assert_eq!(
+            sidebar_row_identifier(false, &task, Some(&project)),
+            ("icons/folder.svg", SharedString::from("doki"))
+        );
+    }
+
+    /// Row builders run for every visible row on every frame, so they may not
+    /// reach a transcript: the plan step is resolved into the facts cache where
+    /// the session changes instead. This reads the source rather than the
+    /// behavior because the cost of a regression is invisible until the
+    /// sidebar is under a long, busy transcript.
+    #[test]
+    fn the_row_builders_never_reach_the_transcript() {
+        let source = include_str!("sidebar.rs");
+        for anchor in [
+            "\n    fn sidebar_rows_cached(",
+            "\n    fn sidebar_rows(",
+            "\n    fn sidebar_row(",
+            "\n    fn render_sidebar_session_item(",
+            "\npub(super) fn sidebar_row_detail(",
+            "\nfn sidebar_row_identifier(",
+        ] {
+            let start = source
+                .find(anchor)
+                .unwrap_or_else(|| panic!("{anchor} must exist"));
+            let body = &source[start + 1..];
+            let end = ["\n    fn ", "\nfn ", "\n#[cfg(test)]"]
+                .into_iter()
+                .filter_map(|terminator| body.find(terminator))
+                .min()
+                .unwrap_or(body.len());
+            let body = &body[..end];
+            for forbidden in [".transcript_blocks", "live_plan_step("] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{anchor} must not call `{forbidden}`; resolve it into the row facts cache \
+                     where the session changes"
+                );
+            }
+        }
     }
 
     #[test]

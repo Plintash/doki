@@ -1675,6 +1675,11 @@ pub struct Waku {
     sidebar_branch_labels: RefCell<HashMap<PathBuf, SharedString>>,
     sidebar_branch_scan_fingerprint: Cell<Option<u64>>,
     sidebar_branch_scan_generation: Cell<u64>,
+    /// What the sidebar's second line reports about each started task, keyed by
+    /// session id and refreshed where the session's data changes. The plan step
+    /// lives in the transcript, so it is resolved into this cache there rather
+    /// than by a row builder on the frame path.
+    sidebar_session_facts: RefCell<HashMap<Uuid, SidebarSessionFacts>>,
     transcript_row_kinds: RefCell<Vec<TranscriptRowKind>>,
     /// Fingerprint of the transcript inputs `transcript_row_kinds` was folded
     /// from, so an unchanged transcript costs nothing on a frame. `None` until
@@ -1841,7 +1846,7 @@ pub use goal_dialog::init as init_goal_dialog_keys;
 pub use image_preview::init as init_image_preview_keys;
 pub use settings::init as init_settings_keys;
 pub use sidebar::init as init_sidebar_keys;
-use sidebar::{SidebarGroup, SidebarRow, SidebarStatusSection};
+use sidebar::{SidebarGroup, SidebarRow, SidebarSessionFacts, SidebarStatusSection};
 pub use skills_page::init as init_skills_keys;
 use streaming::*;
 use transcript::*;
@@ -3194,6 +3199,7 @@ impl Waku {
                 sidebar_branch_labels: RefCell::new(HashMap::new()),
                 sidebar_branch_scan_fingerprint: Cell::new(None),
                 sidebar_branch_scan_generation: Cell::new(0),
+                sidebar_session_facts: RefCell::new(HashMap::new()),
                 transcript_row_kinds: RefCell::new(Vec::new()),
                 transcript_row_kinds_fingerprint: Cell::new(None),
                 transcript_navigation_turns: RefCell::new(Rc::new(Vec::new())),

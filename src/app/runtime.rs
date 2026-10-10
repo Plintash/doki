@@ -1022,6 +1022,10 @@ impl Waku {
             self.task_switcher.remove(*session_id);
         }
         self.state.projects = snapshot.projects;
+        // The catalog owns which sessions exist and what their list columns
+        // hold, so one pass here refreshes every row's facts — including the
+        // tasks that arrived from another client and the ones that are gone.
+        self.rebuild_sidebar_row_facts();
 
         let attach = self
             .state
@@ -1123,6 +1127,9 @@ impl Waku {
                 };
                 if !self.runtimes.contains_key(&session_id) {
                     self.state.sessions[index] = session;
+                    // The hydrated session brought its transcript with it, so
+                    // this is where a busy task's plan step becomes known.
+                    self.refresh_sidebar_row_facts(session_id);
                     self.install_prepared_driver(session_id, prepared);
                     if self.state.selected_session == Some(session_id) {
                         self.reset_visible_state();
