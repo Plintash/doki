@@ -2,6 +2,7 @@ use super::*;
 
 use anyhow::Context as _;
 use base64::Engine as _;
+use std::borrow::Cow;
 
 use crate::ui::ActivationExt;
 
@@ -9,6 +10,11 @@ const COMPUTER_USE_PREVIEW_WIDTH: f32 = 304.0;
 const COMPUTER_USE_PREVIEW_HEIGHT: f32 = 172.0;
 const COMPUTER_USE_PREVIEW_RADIUS: f32 = 12.0;
 const COMPUTER_USE_PREVIEW_INNER_RADIUS: f32 = COMPUTER_USE_PREVIEW_RADIUS - 1.0;
+
+/// The most subagent rows the composer card shows before it summarises the
+/// rest. A fan-out is read at a glance; a workflow with a dozen children must
+/// not turn the card into a wall of rows.
+const MAX_SUBAGENT_ROWS: usize = 5;
 
 /// How long the annotation hover panel survives the pointer leaving the label
 /// and the panel, so a fast move across the seam between them does not dismiss
@@ -3202,6 +3208,80 @@ impl Waku {
         row
     }
 
+    /// The live `pi-subagents` runs against the composer's top edge.
+    ///
+    /// A fan-out's progress has no other home: the launch's transcript row
+    /// streams only its own text, and a detached run has no row at all. Each
+    /// row is one child (or a run that has none), showing what it is doing and
+    /// how long it has been going; a settled run leaves the session's set, and
+    /// the card disappears with its last live row. Everything read here is
+    /// already on the session — no provider JSON is parsed and no file is
+    /// touched on this path.
+    pub(super) fn render_subagent_runs(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let session = self.selected_session()?;
+        let (rows, live_total, hidden) =
+            subagent_card_rows(&session.subagent_runs, MAX_SUBAGENT_ROWS);
+        if rows.is_empty() {
+            return None;
+        }
+        let theme = Theme::current(cx);
+        let now_ms = unix_time_millis() as i64;
+        let title = if live_total == 1 {
+            tr!("subagent.running_count_one")
+        } else {
+            tr!("subagent.running_count", count = live_total.to_string())
+        };
+
+        let mut list = div().w_full().min_w_0().flex().flex_col().gap(px(1.0));
+        for row in &rows {
+            list = list.child(subagent_run_row(row, theme, now_ms));
+        }
+        if hidden > 0 {
+            list = list.child(
+                div()
+                    .px(px(8.0))
+                    .h(px(20.0))
+                    .flex()
+                    .items_center()
+                    .text_size(sp(11.5))
+                    .text_color(theme.text_ghost)
+                    .child(tr!("subagent.more_rows", count = hidden.to_string())),
+            );
+        }
+
+        Some(
+            div().flex_none().px(px(20.0)).pt(px(4.0)).child(
+                div().w_full().max_w(px(CONTENT_MAX_WIDTH)).mx_auto().child(
+                    div()
+                        .id("subagent-runs")
+                        .w_full()
+                        .min_w_0()
+                        .rounded(px(13.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.inset)
+                        .px(px(12.0))
+                        .py(px(9.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .text_size(sp(12.0))
+                                .line_height(sp(15.0))
+                                .text_color(theme.text_tertiary)
+                                .child(icon("icons/bot.svg", 11.0, theme.text_ghost))
+                                .child(SharedString::from(title)),
+                        )
+                        .child(list),
+                ),
+            ),
+        )
+    }
+
     /// The extension surfaces that belong against the composer.
     ///
     /// Pi's `setStatus` is a live progress line the extension keeps until it
@@ -4338,6 +4418,233 @@ impl Waku {
                     .child(div().flex_1())
                     .children(usage_meter),
             )
+    }
+}
+
+/// One row of the composer's live-subagent card: a child, or a run with no
+/// children to stand for it.
+pub(super) struct SubagentRunRow<'a> {
+    pub(super) depth: usize,
+    pub(super) label: &'a str,
+    pub(super) state: waku_protocol::subagent::SubagentState,
+    pub(super) activity: Option<&'a waku_protocol::subagent::SubagentActivity>,
+    pub(super) started_at_ms: Option<i64>,
+    pub(super) error: Option<&'a str>,
+}
+
+/// The rows the card shows for a session's runs, the live count for its
+/// header, and how many rows the cap left out.
+///
+/// A run with working children is its children: the rows are the agents a
+/// reader watches, and the run itself says nothing the children do not. A run
+/// with nothing left inside it is its own row — it is between children, or it
+/// never had any. Live work is filed first, with a settled parent staying
+/// beside its live descendants so the hierarchy never inverts, and each
+/// bucket holds only as many rows as the cap can show.
+pub(super) fn subagent_card_rows(
+    runs: &[waku_protocol::subagent::SubagentRun],
+    max: usize,
+) -> (Vec<SubagentRunRow<'_>>, usize, usize) {
+    use waku_protocol::subagent::SubagentChild;
+
+    struct Rows<'a> {
+        live: Vec<SubagentRunRow<'a>>,
+        settled: Vec<SubagentRunRow<'a>>,
+        live_total: usize,
+        total: usize,
+    }
+
+    impl<'a> Rows<'a> {
+        /// Files a row by the subtree it is part of — a settled parent with a
+        /// live descendant stays with its descendants — while only a row that
+        /// is itself live counts toward the header.
+        fn push(&mut self, row: SubagentRunRow<'a>, group_live: bool, max: usize) {
+            self.total += 1;
+            let bucket = if group_live {
+                &mut self.live
+            } else {
+                &mut self.settled
+            };
+            if row.state.is_live() {
+                self.live_total += 1;
+            }
+            if bucket.len() < max {
+                bucket.push(row);
+            }
+        }
+    }
+
+    fn collect<'a>(rows: &mut Rows<'a>, children: &'a [SubagentChild], depth: usize, max: usize) {
+        for child in children {
+            rows.push(
+                SubagentRunRow {
+                    depth,
+                    label: &child.label,
+                    state: child.state,
+                    activity: child.activity.as_ref(),
+                    started_at_ms: child.started_at_ms,
+                    error: child.error.as_deref(),
+                },
+                child.is_live(),
+                max,
+            );
+            collect(rows, &child.children, depth + 1, max);
+        }
+    }
+
+    let mut rows = Rows {
+        live: Vec::new(),
+        settled: Vec::new(),
+        live_total: 0,
+        total: 0,
+    };
+    for run in runs {
+        if !run.is_live() {
+            continue;
+        }
+        if run.children.iter().any(SubagentChild::is_live) {
+            collect(&mut rows, &run.children, 0, max);
+        } else {
+            rows.push(
+                SubagentRunRow {
+                    depth: 0,
+                    label: &run.label,
+                    state: run.state,
+                    activity: run.activity.as_ref(),
+                    started_at_ms: run.started_at_ms,
+                    error: None,
+                },
+                true,
+                max,
+            );
+        }
+    }
+    let Rows {
+        live,
+        settled,
+        live_total,
+        total,
+    } = rows;
+    let hidden = total.saturating_sub(max);
+    let rows = live.into_iter().chain(settled).take(max).collect();
+    (rows, live_total, hidden)
+}
+
+/// The row's line: the state's glyph, the child's name, what it is doing (or
+/// its failure), and how long it has been going.
+fn subagent_run_row(row: &SubagentRunRow<'_>, theme: Theme, now_ms: i64) -> AnyElement {
+    let detail = if let Some(error) = row.error {
+        Cow::Owned(error.to_owned())
+    } else if let Some(text) = row
+        .activity
+        .map(subagent_activity_text)
+        .filter(|text| !text.is_empty())
+    {
+        Cow::Owned(text)
+    } else {
+        subagent_state_label(row.state)
+    };
+    let elapsed = row
+        .started_at_ms
+        // Only a running row carries the pulse that keeps the card repainting;
+        // a queued row's counter would freeze where it stood.
+        .filter(|_| row.state == waku_protocol::subagent::SubagentState::Running)
+        .map(|start| format_working_elapsed(((now_ms - start).max(0) / 1_000) as u64));
+    div()
+        .w_full()
+        .min_w_0()
+        .h(px(24.0))
+        .pr(px(8.0))
+        .pl(px(8.0 + 14.0 * row.depth as f32))
+        .rounded(px(7.0))
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .text_size(sp(12.5))
+        .line_height(sp(16.0))
+        .child(
+            div()
+                .flex_none()
+                .child(subagent_state_glyph(row.state, theme)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .max_w(px(190.0))
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text_secondary)
+                .child(SharedString::from(row.label.to_owned())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(if row.error.is_some() {
+                    theme.danger
+                } else {
+                    theme.text_tertiary
+                })
+                .child(SharedString::from(detail)),
+        )
+        .children(elapsed.map(|elapsed| {
+            div()
+                .flex_none()
+                .text_size(sp(11.0))
+                .text_color(theme.text_ghost)
+                .child(SharedString::from(elapsed))
+        }))
+        .into_any_element()
+}
+
+/// What a run or child is doing, in one line: the open tool with what it was
+/// called on, or the newest line of the child's own output.
+fn subagent_activity_text(activity: &waku_protocol::subagent::SubagentActivity) -> String {
+    if let Some(tool) = activity.current_tool.as_deref() {
+        return match activity.current_tool_args.as_deref() {
+            Some(args) if !args.is_empty() => format!("{tool} {args}"),
+            _ => tool.to_owned(),
+        };
+    }
+    activity.last_line.clone().unwrap_or_default()
+}
+
+fn subagent_state_label(state: waku_protocol::subagent::SubagentState) -> Cow<'static, str> {
+    use waku_protocol::subagent::SubagentState;
+    match state {
+        SubagentState::Queued => tr_cow!("subagent.state.queued"),
+        SubagentState::Running => tr_cow!("subagent.state.running"),
+        SubagentState::Completed => tr_cow!("subagent.state.completed"),
+        SubagentState::Failed => tr_cow!("subagent.state.failed"),
+        SubagentState::Stopped => tr_cow!("subagent.state.stopped"),
+        SubagentState::Paused => tr_cow!("subagent.state.paused"),
+        SubagentState::Partial => tr_cow!("subagent.state.partial"),
+        SubagentState::Detached => tr_cow!("subagent.state.detached"),
+    }
+}
+
+/// The glyph for a row's state. Running pulses like every other live activity;
+/// the rest are static, so a settled row never animates.
+fn subagent_state_glyph(state: waku_protocol::subagent::SubagentState, theme: Theme) -> AnyElement {
+    use waku_protocol::subagent::SubagentState;
+    match state {
+        SubagentState::Running => pulse_dot(8.0, theme.accent),
+        SubagentState::Queued => div()
+            .size(px(8.0))
+            .flex_none()
+            .rounded_full()
+            .border_1()
+            .border_color(theme.text_ghost)
+            .into_any_element(),
+        SubagentState::Completed => icon("icons/check.svg", 9.5, theme.success).into_any_element(),
+        SubagentState::Failed => icon("icons/x.svg", 9.5, theme.danger).into_any_element(),
+        SubagentState::Stopped | SubagentState::Detached => {
+            icon("icons/stop.svg", 9.0, theme.warning).into_any_element()
+        }
+        SubagentState::Paused | SubagentState::Partial => {
+            icon("icons/alert.svg", 9.5, theme.warning).into_any_element()
+        }
     }
 }
 

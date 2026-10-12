@@ -1145,3 +1145,17 @@ annotation.reply_only: 注釈はアシスタントの返信にのみ付けられ
 annotation.select_reply: 返信の中のテキストを選択してください
 annotation.select_one_reply: 注釈は 1 つの返信にしか付けられません
 annotation.wait_for_reply: 返信が終わってから注釈を付けられます
+
+subagent.running_count: "%{count} サブエージェント実行中"
+subagent.running_count_one: 1 サブエージェント実行中
+subagent.more_rows: "他 %{count} 件"
+subagent.state.queued: 待機中
+subagent.state.running: 実行中
+subagent.state.completed: 完了
+subagent.state.failed: 失敗
+subagent.state.stopped: 停止
+subagent.state.paused: 一時停止
+subagent.state.partial: 一部完了
+subagent.state.detached: デタッチ
+
+subagent.title: サブエージェント

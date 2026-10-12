@@ -383,6 +383,7 @@ impl Render for Waku {
                                 ExtensionWidgetPlacement::AboveEditor,
                                 cx,
                             ))
+                            .children(self.render_subagent_runs(cx))
                             .children(self.render_queued_messages(cx))
                             .child(self.render_composer(window, cx))
                             .children(self.render_extension_surfaces(

@@ -653,6 +653,19 @@ impl Waku {
                 // provider is idle waiting to be woken.
                 self.sync_background_wait_status(session_id);
             }
+            DriverEvent::SubagentProgress(run) => {
+                // A subagent run is session state like background work: it
+                // can outlive the reply that started it, and it is not
+                // conversation content.
+                if let Some(session) = self.state.session_mut(session_id) {
+                    apply_subagent_progress(session, run);
+                }
+            }
+            DriverEvent::SubagentFleet(fleet) => {
+                if let Some(session) = self.state.session_mut(session_id) {
+                    apply_subagent_fleet(session, fleet);
+                }
+            }
             DriverEvent::ExtensionMessage { text, display, .. } => {
                 if let Some(session) = self.state.session_mut(session_id) {
                     record_extension_message(session, text, display);
@@ -973,6 +986,12 @@ impl Waku {
                 });
                 self.finish_streaming_assistant(session_id);
                 self.complete_turn_blocks(session_id);
+                // A turn's tool calls are over; a foreground run it reported
+                // cannot still be working. Detached runs are the async
+                // widget's and outlive the turn deliberately.
+                if let Some(session) = self.state.session_mut(session_id) {
+                    session.subagent_runs.retain(|run| run.detached);
+                }
                 runtime.stream_phase = None;
                 runtime.park_announced = false;
                 // A provider command whose transport answers without a model
@@ -1079,6 +1098,13 @@ impl Waku {
             }
             DriverEvent::ProcessExited => {
                 self.mark_background_work_lost(session_id);
+                // The provider that reported the live runs is gone; whatever
+                // still runs on its side republishes when the session
+                // connects again, and until then a live row would be a
+                // phantom.
+                if let Some(session) = self.state.session_mut(session_id) {
+                    session.subagent_runs.clear();
+                }
                 let previous_kinds = self.snapshot_selected_transcript_rows(session_id);
                 self.finish_streaming_assistant(session_id);
                 self.complete_turn_blocks(session_id);
@@ -1368,6 +1394,38 @@ pub(super) fn set_extension_widget(
 /// window then carries the platform's own title as it did before.
 pub(super) fn set_extension_window_title(session: &mut AgentSession, title: String) {
     session.extension_window_title = (!title.trim().is_empty()).then_some(title);
+}
+
+/// Folds one foreground `pi-subagents` report onto the session's runs.
+///
+/// Each report replaces the run whole — the provider streams the complete set
+/// of children every time — and a settled run leaves the set, because the
+/// composer card exists to show what is still working. A run's outcome keeps
+/// its own homes: the transcript row that streamed it and the detached-work
+/// surface when the provider posted one.
+pub(super) fn apply_subagent_progress(
+    session: &mut AgentSession,
+    run: waku_protocol::subagent::SubagentRun,
+) {
+    session
+        .subagent_runs
+        .retain(|existing| existing.id != run.id);
+    if run.is_live() {
+        session.subagent_runs.push(run);
+    }
+}
+
+/// Replaces the detached runs with the extension's latest snapshot.
+///
+/// The snapshot is a level signal: detached runs it no longer names are gone.
+/// Foreground runs are each tool call's own report, so they stay where they
+/// were.
+pub(super) fn apply_subagent_fleet(
+    session: &mut AgentSession,
+    fleet: waku_protocol::subagent::SubagentFleet,
+) {
+    session.subagent_runs.retain(|run| !run.detached);
+    session.subagent_runs.extend(fleet.runs);
 }
 
 /// The draft an extension's editor text leaves behind.
