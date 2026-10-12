@@ -65,6 +65,7 @@ impl SessionDateGroup {
 /// one set preserves each view's disclosure state when the user switches
 /// between Project and Updated grouping.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+
 pub(super) enum SidebarGroup {
     Updated(SessionDateGroup),
     Project(Uuid),
@@ -712,6 +713,8 @@ impl Waku {
         let theme = Theme::current(cx);
         div()
             .id(id)
+            .role(gpui::Role::Button)
+            .aria_label(label.clone())
             .tab_index(0)
             .w_full()
             .h(px(SIDEBAR_ACTION_ROW_HEIGHT))
@@ -1096,6 +1099,8 @@ impl Waku {
             .child(
                 div()
                     .id("sidebar-scroll")
+                    .role(gpui::Role::Group)
+                    .aria_label(tr!("sidebar.tasks"))
                     .flex_1()
                     .min_h_0()
                     .relative()
@@ -1854,6 +1859,8 @@ impl Waku {
         let keyboard_menu = menu.clone();
         let row = div()
             .id(SharedString::from(format!("session-{}", session.id)))
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(localized_session_title(session)))
             .w_full()
             .min_w_0()
             .flex()
@@ -1997,6 +2004,9 @@ impl Waku {
         };
 
         div()
+            .id(SharedString::from(format!("session-row-{}", session.id)))
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(localized_session_title(session)))
             .w_full()
             .pb(px(SIDEBAR_SESSION_ROW_GAP))
             .child(row)
@@ -2219,6 +2229,8 @@ impl Waku {
                         .child(
                             div()
                                 .id("onboarding-add-project")
+                                .role(gpui::Role::Button)
+                                .aria_label(tr!("onboarding.open_project_folder"))
                                 .track_focus(&self.onboarding_add_project_focus)
                                 .tab_index(0)
                                 .focus_visible(|style| style.border_1().border_color(theme.accent))
@@ -2246,6 +2258,8 @@ impl Waku {
                         .child(
                             div()
                                 .id("onboarding-projectless")
+                                .role(gpui::Role::Button)
+                                .aria_label(tr!("project.no_project"))
                                 .track_focus(&self.onboarding_projectless_focus)
                                 .tab_index(1)
                                 .focus_visible(|style| style.border_1().border_color(theme.accent))

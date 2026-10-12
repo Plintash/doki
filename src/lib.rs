@@ -42,6 +42,7 @@ mod md;
 mod platform;
 mod query;
 mod review_diff;
+mod rpa;
 mod startup_trace;
 mod terminal;
 mod theme;
@@ -122,10 +123,15 @@ pub fn run() {
     // The earliest point the app can measure from; every trace milestone is
     // relative to it.
     crate::startup_trace::mark_process_start();
+    // Debug builds publish the local RPA endpoint before the first window
+    // exists, so a client that starts waiting never races the listener.
+    // Release builds and `WAKU_RPA=0` runs skip it entirely.
+    crate::rpa::service::start();
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
         .with_main_window_reopen()
         .run(|cx: &mut App| {
+            crate::app::rpa::start_pump(cx);
             // Linux uses this for Wayland app_id/X11 WM_CLASS and notification
             // attribution. Other platforms also benefit from one stable
             // process identity.

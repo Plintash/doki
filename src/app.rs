@@ -1821,6 +1821,7 @@ mod goal_dialog;
 mod image_preview;
 mod render;
 mod right_panel;
+pub(crate) mod rpa;
 mod runtime;
 mod sessions;
 mod settings;

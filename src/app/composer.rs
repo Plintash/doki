@@ -3254,6 +3254,8 @@ impl Waku {
                 div().w_full().max_w(px(CONTENT_MAX_WIDTH)).mx_auto().child(
                     div()
                         .id("subagent-runs")
+                        .role(gpui::Role::Group)
+                        .aria_label(SharedString::from(title.clone()))
                         .w_full()
                         .min_w_0()
                         .rounded(px(13.0))
@@ -3680,6 +3682,8 @@ impl Waku {
                         .child(match submit_action {
                             ComposerSubmitAction::Preparing => div()
                                 .id("send-or-stop")
+                                .role(gpui::Role::Button)
+                                .aria_label(tr!("composer.preparing_task"))
                                 .w(px(26.0))
                                 .h(px(26.0))
                                 .rounded_full()
@@ -3702,6 +3706,8 @@ impl Waku {
                                 .child(
                                     div()
                                         .id("send-or-stop")
+                                        .role(gpui::Role::Button)
+                                        .aria_label(tr!("composer.stop"))
                                         .w(px(26.0))
                                         .h(px(26.0))
                                         .rounded_full()
@@ -3767,6 +3773,8 @@ impl Waku {
                                 }),
                             ComposerSubmitAction::Send => div()
                                 .id("send-or-stop")
+                                .role(gpui::Role::Button)
+                                .aria_label(tr!("common.send"))
                                 .w(px(26.0))
                                 .h(px(26.0))
                                 .rounded_full()
@@ -4424,6 +4432,9 @@ impl Waku {
 /// One row of the composer's live-subagent card: a child, or a run with no
 /// children to stand for it.
 pub(super) struct SubagentRunRow<'a> {
+    /// The provider's id for this row's run or child, used as the row's
+    /// semantic identity.
+    pub(super) id: &'a str,
     pub(super) depth: usize,
     pub(super) label: &'a str,
     pub(super) state: waku_protocol::subagent::SubagentState,
@@ -4478,6 +4489,7 @@ pub(super) fn subagent_card_rows(
         for child in children {
             rows.push(
                 SubagentRunRow {
+                    id: &child.id,
                     depth,
                     label: &child.label,
                     state: child.state,
@@ -4507,6 +4519,7 @@ pub(super) fn subagent_card_rows(
         } else {
             rows.push(
                 SubagentRunRow {
+                    id: &run.id,
                     depth: 0,
                     label: &run.label,
                     state: run.state,
@@ -4551,6 +4564,17 @@ fn subagent_run_row(row: &SubagentRunRow<'_>, theme: Theme, now_ms: i64) -> AnyE
         .filter(|_| row.state == waku_protocol::subagent::SubagentState::Running)
         .map(|start| format_working_elapsed(((now_ms - start).max(0) / 1_000) as u64));
     div()
+        .id(SharedString::from(format!("subagent-row-{}", row.id)))
+        .role(gpui::Role::ListItem)
+        .aria_label(SharedString::from(format!(
+            "{} — {}{}",
+            row.label,
+            subagent_state_label(row.state),
+            match &detail {
+                detail if detail.is_empty() => String::new(),
+                detail => format!(" · {detail}"),
+            }
+        )))
         .w_full()
         .min_w_0()
         .h(px(24.0))
