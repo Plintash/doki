@@ -152,6 +152,29 @@ The snapshot MUST NOT be shown as widget text.
 - **WHEN** a background subagent is still running after the turn that launched it settled
 - **THEN** the run appears with detached work instead of as raw widget JSON
 
+### Requirement: A fan-out's live children are visible above the composer
+
+Waku SHALL decode the subagent runs the provider reports in its structured
+progress — the `subagent` tool call's details for a run the agent waits on, and
+the async-status widget for the runs that outlive their turn — and SHALL show
+the live ones in a compact surface above the composer, bounded when a fan-out
+is wider than the surface can show, with the remainder counted. Each row SHALL
+identify a child (or a run that has none) and its current activity, SHALL
+distinguish its state — running, queued, settled, or failed — without relying
+on colour alone, and SHALL show how long a running row has been going. A
+settled run SHALL leave the surface, and nothing about a run's progress may
+require reading provider files or asking the agent for a status summary.
+
+#### Scenario: A foreground fan-out shows its children while it works
+
+- **WHEN** the agent launches a subagent run with at least two children and waits inside its turn
+- **THEN** each child is identifiable above the composer with its live state and current activity
+
+#### Scenario: A detached run's children show the same way
+
+- **WHEN** a background workflow is still running after the turn that launched it settled
+- **THEN** its live children appear above the composer with what each is doing
+
 ### Requirement: Waiting on detached work reads as busy
 
 Pi settles a turn when the agent's reply ends, even while the child work that

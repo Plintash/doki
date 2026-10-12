@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use super::ToastTone;
 use super::composer::{
     ComposerSubmitAction, annotation_comment_value, composer_submit_action, dropped_file_mention,
-    merged_submission, next_picker_highlight, visible_branch_entries,
+    merged_submission, next_picker_highlight, subagent_card_rows, visible_branch_entries,
 };
 use super::runtime::{
     merge_remote_session_catalog, session_has_active_provider_turn, submission_waits_for_a_turn,
@@ -15,11 +15,12 @@ use super::{
     ESCAPE_STOP_CONFIRMATION_TIMEOUT, EscapeStopConfirmation, EscapeStopPress, EscapeStopTarget,
     NAVIGATION_RAIL_TICK_HEIGHT, NAVIGATION_RAIL_TURN_HEIGHT, PendingUserInput, SessionNavigation,
     StreamDeltaKind, TranscriptRowKind::*, active_navigation_turn_index,
-    append_text_delta_to_session, assistant_response_footer, assistant_response_footer_index,
-    assistant_response_footer_time, begin_provider_initiated_turn, compact_driver_error,
-    disclosure_leading_space, extension_editor_text_draft, extension_notification_tone,
-    fenced_code, fitted_file_tree_width, fitted_panel_widths, folded_transcript_row_kinds,
-    format_worked_duration, format_working_elapsed, maintain_transcript_anchor, message_opens_turn,
+    append_text_delta_to_session, apply_subagent_fleet, apply_subagent_progress,
+    assistant_response_footer, assistant_response_footer_index, assistant_response_footer_time,
+    begin_provider_initiated_turn, compact_driver_error, disclosure_leading_space,
+    extension_editor_text_draft, extension_notification_tone, fenced_code, fitted_file_tree_width,
+    fitted_panel_widths, folded_transcript_row_kinds, format_worked_duration,
+    format_working_elapsed, maintain_transcript_anchor, message_opens_turn,
     message_starts_followup_turn, navigation_preview_snippet, navigation_rail_fade_visibility,
     navigation_rail_height, navigation_rail_scale, paused_toast_duration, pop_stream_batch,
     push_transcript_activity, record_extension_message, response_footer_message_index,
@@ -2860,4 +2861,131 @@ fn an_extension_notifications_severity_reaches_the_notice_surface() {
         extension_notification_tone(NotificationSeverity::Info),
         ToastTone::Info
     );
+}
+
+/// A foreground subagent run lives on the session while it works: each report
+/// replaces the run whole, and a settled run leaves — the composer card is for
+/// progress, while the outcome keeps its own homes, the transcript row that
+/// streamed it and the detached-work surface.
+#[test]
+fn a_foreground_subagent_run_stays_on_the_session_while_it_works() {
+    use waku_protocol::subagent::{SubagentRun, SubagentState};
+
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    let run = |state| SubagentRun {
+        id: "tool-1".into(),
+        label: "scout".into(),
+        state,
+        detached: false,
+        started_at_ms: Some(1_000),
+        activity: None,
+        children: Vec::new(),
+    };
+
+    apply_subagent_progress(&mut session, run(SubagentState::Running));
+    assert_eq!(session.subagent_runs.len(), 1);
+
+    // Every report carries the complete run; the next one replaces it instead
+    // of stacking another row.
+    apply_subagent_progress(&mut session, run(SubagentState::Running));
+    assert_eq!(session.subagent_runs.len(), 1);
+    assert_eq!(session.subagent_runs[0].id, "tool-1");
+
+    apply_subagent_progress(&mut session, run(SubagentState::Completed));
+    assert!(session.subagent_runs.is_empty());
+}
+
+/// The async widget's snapshot is a level signal for the detached runs it
+/// owns: a detached run it stops naming is gone, while a foreground run — its
+/// own tool call's report — stays where it is.
+#[test]
+fn the_detached_snapshot_replaces_only_the_runs_it_owns() {
+    use waku_protocol::subagent::{SubagentFleet, SubagentRun, SubagentState};
+
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    let run = |id: &str, detached: bool| SubagentRun {
+        id: id.into(),
+        label: id.into(),
+        state: SubagentState::Running,
+        detached,
+        started_at_ms: None,
+        activity: None,
+        children: Vec::new(),
+    };
+
+    apply_subagent_progress(&mut session, run("tool-1", false));
+    apply_subagent_fleet(
+        &mut session,
+        SubagentFleet {
+            // The widget's runs are detached by the decoder that built them.
+            runs: vec![run("async-1", true)],
+        },
+    );
+    assert_eq!(session.subagent_runs.len(), 2);
+
+    // The widget takes its snapshot down when it holds nothing: the detached
+    // run goes, the tool call's run does not.
+    apply_subagent_fleet(&mut session, SubagentFleet::default());
+    assert_eq!(session.subagent_runs.len(), 1);
+    assert_eq!(session.subagent_runs[0].id, "tool-1");
+}
+
+/// The card's row selection keeps live work in front, keeps a settled parent
+/// with its live descendants, counts only rows that are themselves live, and
+/// leaves the capped remainder counted.
+#[test]
+fn the_subagent_card_rows_keep_live_work_visible() {
+    use waku_protocol::subagent::{SubagentChild, SubagentRun, SubagentState};
+
+    let child = |id: &str, state: SubagentState| SubagentChild {
+        id: id.into(),
+        label: id.into(),
+        state,
+        started_at_ms: None,
+        activity: None,
+        error: None,
+        children: Vec::new(),
+    };
+    let run = |id: &str, state: SubagentState, children: Vec<SubagentChild>| SubagentRun {
+        id: id.into(),
+        label: id.into(),
+        state,
+        detached: true,
+        started_at_ms: None,
+        activity: None,
+        children,
+    };
+
+    // A settled parent whose grandchild still works stays with it, ahead of a
+    // settled sibling; only the working row counts.
+    let mut parent = child("parent", SubagentState::Completed);
+    parent.children = vec![child("grandchild", SubagentState::Running)];
+    let runs = vec![run(
+        "workflow",
+        SubagentState::Running,
+        vec![parent, child("sibling", SubagentState::Completed)],
+    )];
+    let (rows, live, hidden) = subagent_card_rows(&runs, 5);
+    assert_eq!(
+        rows.iter().map(|row| row.label).collect::<Vec<_>>(),
+        ["parent", "grandchild", "sibling"]
+    );
+    assert_eq!(
+        live, 1,
+        "the header counts what is working, not its ancestry"
+    );
+    assert_eq!(hidden, 0);
+
+    // A fan-out wider than the cap shows the cap and counts the rest.
+    let wide = [run(
+        "wide",
+        SubagentState::Running,
+        (0..7)
+            .map(|index| child(&format!("c{index}"), SubagentState::Running))
+            .collect(),
+    )];
+    let (rows, live, hidden) = subagent_card_rows(&wide, 5);
+    assert_eq!(rows.len(), 5);
+    assert_eq!(live, 7);
+    assert_eq!(hidden, 2);
 }

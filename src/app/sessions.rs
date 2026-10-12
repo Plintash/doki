@@ -918,6 +918,12 @@ impl Waku {
             runtime.driver.cancel();
             runtime.driver.close();
             self.mark_background_work_lost(session_id);
+            // The provider that reported the runs is gone, and a runtime that
+            // is no longer installed never reports its exit — a live row would
+            // stay a phantom on the card.
+            if let Some(session) = self.state.session_mut(session_id) {
+                session.subagent_runs.clear();
+            }
         }
     }
 

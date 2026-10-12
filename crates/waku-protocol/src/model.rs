@@ -1022,6 +1022,14 @@ pub struct AgentSession {
     /// The widgets this session's extensions still keep, keyed the same way.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_widgets: Vec<ExtensionWidget>,
+    /// The `pi-subagents` runs the provider last reported for this session,
+    /// live and just settled: the foreground run streaming through a tool
+    /// call and the detached runs the async widget names. Runtime-only like
+    /// background work — the provider reconciles its authoritative state when
+    /// the resident transport reconnects — because a stored live row would
+    /// otherwise outlive the run it describes.
+    #[serde(skip)]
+    pub subagent_runs: Vec<crate::subagent::SubagentRun>,
     /// The window title an extension asked for on this session's behalf
     /// (`setTitle`). Session-scoped rather than window-scoped because the
     /// session that is showing is the one whose extension titled it.
@@ -1084,6 +1092,7 @@ impl AgentSession {
             provider_session_id: None,
             extension_status: Vec::new(),
             extension_widgets: Vec::new(),
+            subagent_runs: Vec::new(),
             extension_window_title: None,
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
@@ -1128,6 +1137,7 @@ impl AgentSession {
             provider_session_id: None,
             extension_status: Vec::new(),
             extension_widgets: Vec::new(),
+            subagent_runs: Vec::new(),
             extension_window_title: None,
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
@@ -2268,6 +2278,17 @@ pub enum DriverEvent {
     /// deliberately separate from transcript activities: completing a turn
     /// must not make a detached process or subagent look complete.
     BackgroundWork(BackgroundWorkEvent),
+    /// A `pi-subagents` run's live progress, decoded from the structured
+    /// details of the `subagent` tool call that streams it. Each update
+    /// replaces the same run, so a client shows the fan-out while it works
+    /// — the children, their states, and what each is doing — instead of
+    /// only the run's outcome. The run's own transcript row keeps its text
+    /// stream; this is the glance beside the composer.
+    SubagentProgress(crate::subagent::SubagentRun),
+    /// The detached `pi-subagents` runs the extension's async widget last
+    /// reported. A level snapshot like the widget itself: it replaces the
+    /// detached runs a client holds, and a run absent from it is gone.
+    SubagentFleet(crate::subagent::SubagentFleet),
     /// An extension message the provider appended to its own session tree
     /// (`role: "custom"`). `custom_type` is the provider's kind — for
     /// pi-subagents, a child or background notification — and `display` is

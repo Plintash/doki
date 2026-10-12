@@ -20,7 +20,7 @@ use crossbeam_channel::{Sender, bounded, unbounded};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use super::{activity, computer_use as computer_use_runtime};
+use super::{activity, computer_use as computer_use_runtime, pi_subagent};
 use crate::driver::{
     DriverControl, DriverEventSender, DriverEventSink, DriverStartOptions, SessionOptions,
 };
@@ -28,8 +28,9 @@ use crate::model::{
     ActivityItem, ActivityKind, BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKind,
     BackgroundWorkStatus, DriverEvent, ExtensionWidgetPlacement, NotificationSeverity,
     ProviderResumeCursor, ReportedCommand, RuntimeMode, UserInputAnswer, UserInputOption,
-    UserInputQuestion,
+    UserInputQuestion, unix_time_millis,
 };
+use waku_protocol::subagent::{SubagentChild, SubagentFleet, SubagentRun, SubagentState};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -51,8 +52,7 @@ const MAX_REASSEMBLED_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// under in RPC mode, and the prefix of the one line it carries. The body is
 /// a JSON snapshot of the runs the extension still holds, which is what makes
 /// the widget a level signal a client can read instead of prose.
-const PI_ASYNC_STATUS_WIDGET_KEY: &str = "subagent-async";
-const PI_ASYNC_STATUS_PREFIX: &str = "PI_SUBAGENT_ASYNC_JSON:";
+const PI_ASYNC_STATUS_WIDGET_KEY: &str = pi_subagent::ASYNC_WIDGET_KEY;
 
 /// Which dialect of the Pi RPC protocol a session speaks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1725,6 +1725,14 @@ struct PiStreamState {
     /// is settled or gone — so keeping the last report is what turns its
     /// snapshots into the changes the app hears.
     async_runs: HashMap<String, PiAsyncRun>,
+    /// The decoded snapshot the app last heard. The widget refreshes every
+    /// second or so while it holds a run; a report that says nothing new must
+    /// not publish.
+    async_fleet: SubagentFleet,
+    /// The foreground pi-subagents runs the composer was told about, by the
+    /// tool call that streams them. A foreground run's report is its own tool
+    /// call, so these end with it rather than with the widget.
+    foreground_runs: HashMap<String, SubagentRun>,
 }
 
 impl PiStreamState {
@@ -1743,12 +1751,14 @@ impl PiStreamState {
         let compaction_sequence = self.compaction_sequence;
         let open_compaction = self.open_compaction.take();
         let async_runs = std::mem::take(&mut self.async_runs);
+        let async_fleet = std::mem::take(&mut self.async_fleet);
         *self = Self {
             run,
             dialogs,
             compaction_sequence,
             open_compaction,
             async_runs,
+            async_fleet,
             ..Self::default()
         };
     }
@@ -2129,6 +2139,17 @@ fn handle_pi_message(
                 complete,
             )
             .with_tool_name(tool_name);
+            // A `subagent` call's structured details are the run's own live
+            // report; everything else about the call stays its transcript row.
+            publish_subagent_progress(
+                tool_name,
+                output,
+                id.as_deref(),
+                failed,
+                complete,
+                events,
+                state,
+            );
             let _ = events.send(DriverEvent::RichActivity(item));
             if complete && let Some(id) = id {
                 state.tools.remove(&id);
@@ -2209,9 +2230,9 @@ fn handle_pi_message(
                         // becomes the detached-work surface instead of a
                         // widget line of raw JSON.
                         if key == PI_ASYNC_STATUS_WIDGET_KEY
-                            && let Some(snapshot) = pi_async_status_snapshot(lines.as_deref())
+                            && let Some(report) = pi_subagent::async_widget_report(lines.as_deref())
                         {
-                            publish_pi_async_runs(snapshot, events, state);
+                            publish_pi_async_runs(report, events, state);
                             return;
                         }
                         let _ = events.send(DriverEvent::ExtensionWidget {
@@ -2350,98 +2371,66 @@ struct PiAsyncRun {
     status: BackgroundWorkStatus,
 }
 
-/// The runs one async-status widget carries.
-///
-/// `complete` is false when the snapshot itself left runs out — `omitted.runs`
-/// is the extension's own count — because a run this report does not name is
-/// then not necessarily one that left, and only a complete list can say so.
-struct PiAsyncSnapshot {
-    runs: Vec<(String, PiAsyncRun)>,
-    complete: bool,
-}
-
-/// The runs a `subagent-async` widget reports, or `None` when its lines are
-/// not that snapshot and the widget should reach the client as an ordinary
-/// one.
-///
-/// The extension takes the widget down when it holds no run worth showing, so
-/// missing lines are its own clear: an empty, complete snapshot rather than a
-/// state the client has to guess at.
-fn pi_async_status_snapshot(lines: Option<&[String]>) -> Option<PiAsyncSnapshot> {
-    let Some(line) = lines.and_then(<[String]>::first) else {
-        return Some(PiAsyncSnapshot {
-            runs: Vec::new(),
-            complete: true,
-        });
-    };
-    let snapshot: Value = serde_json::from_str(line.strip_prefix(PI_ASYNC_STATUS_PREFIX)?).ok()?;
-    let runs = snapshot.get("runs")?.as_array()?;
-    let complete = snapshot
-        .pointer("/omitted/runs")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        == 0;
-    let runs = runs
-        .iter()
-        .filter_map(|run| {
-            let id = run
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())?;
-            let label = run
-                .get("label")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|label| !label.is_empty())
-                .unwrap_or(id);
-            Some((
-                id.to_owned(),
-                PiAsyncRun {
-                    label: label.to_owned(),
-                    status: pi_async_run_status(run.get("state").and_then(Value::as_str)),
-                },
-            ))
-        })
-        .collect();
-    Some(PiAsyncSnapshot { runs, complete })
-}
-
 /// The status a snapshot state carries onto the detached-work surface. The two
 /// the extension words as still going stay live; the ones with no outcome of
 /// their own — a partial or paused run — read as stopped rather than as a
 /// success or a failure, and anything a later version words differently keeps
 /// the run live, the way an unknown child outcome does.
-fn pi_async_run_status(state: Option<&str>) -> BackgroundWorkStatus {
+fn pi_async_run_status(state: SubagentState) -> BackgroundWorkStatus {
     match state {
-        Some("queued") => BackgroundWorkStatus::Starting,
-        Some("running") => BackgroundWorkStatus::Running,
-        Some("complete") => BackgroundWorkStatus::Completed,
-        Some("failed" | "rejected") => BackgroundWorkStatus::Failed,
-        Some("partial" | "paused" | "stopped") => BackgroundWorkStatus::Stopped,
-        _ => BackgroundWorkStatus::Running,
+        SubagentState::Queued => BackgroundWorkStatus::Starting,
+        SubagentState::Running => BackgroundWorkStatus::Running,
+        SubagentState::Completed => BackgroundWorkStatus::Completed,
+        SubagentState::Failed => BackgroundWorkStatus::Failed,
+        SubagentState::Partial
+        | SubagentState::Paused
+        | SubagentState::Stopped
+        | SubagentState::Detached => BackgroundWorkStatus::Stopped,
     }
 }
 
-/// Moves a status snapshot onto the detached-work surface.
+/// Publishes one decoded async-status widget report.
 ///
-/// The app cannot read the extension's encoding, and a line of JSON is not
-/// text a user can use, so each run becomes an item where its children's
-/// completions land: live while it runs, its outcome when the snapshot has
-/// one, and lost when it leaves a complete snapshot without any. Only changes
-/// are published — the widget republishes every second or so — and a run's own
-/// id is the item's authority, so a completion notification for a child of the
-/// same run adds its detail instead of rewriting this state.
+/// Two surfaces read it. Each run becomes an item on the detached-work surface
+/// where its children's completions land: live while it runs, its outcome when
+/// the snapshot has one, and lost when it leaves a complete snapshot without
+/// any. Only changes are published — the widget republishes every second or so
+/// — and a run's own id is the item's authority, so a completion notification
+/// for a child of the same run adds its detail instead of rewriting this
+/// state. The decoded snapshot itself reaches the composer as the run's level
+/// state, which is the only place a detached run's per-child activity exists.
 fn publish_pi_async_runs(
-    snapshot: PiAsyncSnapshot,
+    report: pi_subagent::AsyncReport,
     events: &impl DriverEventSink,
     state: &mut PiStreamState,
 ) {
-    let PiAsyncSnapshot { runs, complete } = snapshot;
+    let pi_subagent::AsyncReport {
+        fleet,
+        complete,
+        omitted_children,
+    } = report;
+    // The run list is the report's own truth: only a report that says it left
+    // runs out keeps the ones it did not name — a complete list is complete,
+    // and what it drops is lost. The child rosters are separate: any run the
+    // report does name keeps the children an earlier report named when the
+    // caps cut some now.
+    let keep_absent_runs = !complete;
+    let keep_absent_children = omitted_children > 0;
+    let fleet = if keep_absent_runs || keep_absent_children {
+        merge_async_fleet(
+            state.async_fleet.clone(),
+            fleet,
+            keep_absent_runs,
+            keep_absent_children,
+        )
+    } else {
+        fleet
+    };
     if complete {
-        let present = runs
+        let present = fleet
+            .runs
             .iter()
-            .map(|(id, _)| id.as_str())
+            .map(|run| run.id.as_str())
             .collect::<HashSet<_>>();
         let vanished = state
             .async_runs
@@ -2458,14 +2447,208 @@ fn publish_pi_async_runs(
             )));
         }
     }
-    for (id, run) in runs {
-        if state.async_runs.get(&id) == Some(&run) {
+    for run in fleet.runs.iter() {
+        let status = pi_async_run_status(run.state);
+        if state
+            .async_runs
+            .get(&run.id)
+            .is_some_and(|previous| previous.label == run.label && previous.status == status)
+        {
             continue;
         }
         let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
-            pi_async_run_item(&id, &run.label, run.status),
+            pi_async_run_item(&run.id, &run.label, status),
         )));
-        state.async_runs.insert(id, run);
+        state.async_runs.insert(
+            run.id.clone(),
+            PiAsyncRun {
+                label: run.label.clone(),
+                status,
+            },
+        );
+    }
+    if state.async_fleet != fleet {
+        state.async_fleet = fleet.clone();
+        let _ = events.send(DriverEvent::SubagentFleet(fleet));
+    }
+}
+
+/// The runs a report just named, plus — only when the report says it left
+/// runs out — the runs an earlier one named. When the report's caps cut
+/// children from a run's roster, that run also keeps the children an earlier
+/// report named and this one did not.
+fn merge_async_fleet(
+    previous: SubagentFleet,
+    incoming: SubagentFleet,
+    keep_absent_runs: bool,
+    keep_absent_children: bool,
+) -> SubagentFleet {
+    let present = incoming
+        .runs
+        .iter()
+        .map(|run| run.id.clone())
+        .collect::<HashSet<_>>();
+    let mut previous_children = HashMap::new();
+    if keep_absent_children {
+        previous_children.extend(
+            previous
+                .runs
+                .iter()
+                .map(|run| (run.id.clone(), run.children.clone())),
+        );
+    }
+    let mut runs = incoming.runs;
+    for run in &mut runs {
+        if let Some(children) = previous_children.remove(&run.id) {
+            merge_async_children(&children, &mut run.children);
+        }
+    }
+    if keep_absent_runs {
+        runs.extend(
+            previous
+                .runs
+                .into_iter()
+                .filter(|run| !present.contains(&run.id)),
+        );
+    }
+    SubagentFleet { runs }
+}
+
+/// Keeps the children an earlier report named, in that report's own order,
+/// with this report's state for the ones it still names.
+fn merge_async_children(prior: &[SubagentChild], children: &mut Vec<SubagentChild>) {
+    let mut merged = Vec::with_capacity(children.len().max(prior.len()));
+    for earlier in prior {
+        match children
+            .iter_mut()
+            .find(|candidate| candidate.id == earlier.id)
+        {
+            Some(child) => {
+                merge_async_children(&earlier.children, &mut child.children);
+                merged.push(child.clone());
+            }
+            None => merged.push(earlier.clone()),
+        }
+    }
+    merged.extend(
+        children
+            .iter()
+            .filter(|child| !prior.iter().any(|earlier| earlier.id == child.id))
+            .cloned(),
+    );
+    *children = merged;
+}
+
+/// Moves one `subagent` tool call's structured progress into the app.
+///
+/// A foreground run's report is the tool call itself: its `details` carry the
+/// children and what each is doing, and those details update far more often
+/// than the run changes. Only news is published, and a completed call settles
+/// the run so the composer cannot keep showing work that is over.
+fn publish_subagent_progress(
+    tool_name: Option<&str>,
+    output: Option<&Value>,
+    tool_call_id: Option<&str>,
+    failed: bool,
+    complete: bool,
+    events: &impl DriverEventSink,
+    state: &mut PiStreamState,
+) {
+    // The details are this tool's own report; another tool's results are not a
+    // shape this decoder has a contract for.
+    if tool_name != Some("subagent") {
+        return;
+    }
+    let Some(tool_call_id) = tool_call_id else {
+        return;
+    };
+    let now_ms = unix_time_millis() as i64;
+    let decoded = output
+        .and_then(|output| output.get("details"))
+        .and_then(|details| pi_subagent::run_from_tool_details(details, tool_call_id, now_ms));
+    if complete {
+        // The call is over, so what it last reported cannot still be running:
+        // a detached child has the async widget as its report, and a
+        // foreground one ended with the call. A call that never carried a
+        // decodable report still settles the run the composer was told about.
+        let previous = state.foreground_runs.remove(tool_call_id);
+        let run = match decoded {
+            Some(run) if !run.is_live() => run,
+            Some(run) => settled_subagent_run(run, failed),
+            None => match previous {
+                Some(run) => settled_subagent_run(run, failed),
+                None => return,
+            },
+        };
+        let _ = events.send(DriverEvent::SubagentProgress(run));
+        return;
+    }
+    let Some(mut run) = decoded else {
+        return;
+    };
+    // A live report measures `durationMs`, so decoding it against wall clock
+    // would give every otherwise-identical update a slightly different start —
+    // news that is not news. The first report's start is the run's; later
+    // reports keep it, and the surface counts from there.
+    if let Some(previous) = state.foreground_runs.get(tool_call_id) {
+        keep_subagent_starts(previous, &mut run);
+    }
+    if state
+        .foreground_runs
+        .get(tool_call_id)
+        .is_some_and(|previous| previous == &run)
+    {
+        return;
+    }
+    state
+        .foreground_runs
+        .insert(tool_call_id.to_owned(), run.clone());
+    let _ = events.send(DriverEvent::SubagentProgress(run));
+}
+
+/// Keeps the start instants a previous report already stood behind, matching
+/// children by the id the provider keeps stable across its reports.
+fn keep_subagent_starts(previous: &SubagentRun, run: &mut SubagentRun) {
+    if let Some(started_at) = previous.started_at_ms {
+        run.started_at_ms = Some(started_at);
+    }
+    keep_child_starts(&previous.children, &mut run.children);
+}
+
+fn keep_child_starts(previous: &[SubagentChild], children: &mut [SubagentChild]) {
+    for child in children.iter_mut() {
+        if let Some(previous) = previous.iter().find(|candidate| candidate.id == child.id) {
+            if let Some(started_at) = previous.started_at_ms {
+                child.started_at_ms = Some(started_at);
+            }
+            keep_child_starts(&previous.children, &mut child.children);
+        }
+    }
+}
+
+/// Settles every still-live node of a run the tool call that streamed it
+/// ended under.
+fn settled_subagent_run(mut run: SubagentRun, failed: bool) -> SubagentRun {
+    let state = if failed {
+        SubagentState::Failed
+    } else {
+        SubagentState::Completed
+    };
+    settle_subagent_children(&mut run.children, state);
+    if run.state.is_live() {
+        run.state = state;
+        run.activity = None;
+    }
+    run
+}
+
+fn settle_subagent_children(children: &mut [SubagentChild], state: SubagentState) {
+    for child in children {
+        if child.state.is_live() {
+            child.state = state;
+            child.activity = None;
+        }
+        settle_subagent_children(&mut child.children, state);
     }
 }
 
@@ -3835,6 +4018,9 @@ mod tests {
         let mut child = None;
         let mut woke = false;
         let mut reply = String::new();
+        // The composer's own report: the widget's decoded snapshot, caught
+        // while it still names the child the run is working through.
+        let mut fleet_with_children = None;
         loop {
             match next_live_event(
                 &event_rx,
@@ -3860,6 +4046,15 @@ mod tests {
                         {
                             child = Some(item);
                         }
+                    }
+                }
+                DriverEvent::SubagentFleet(fleet) => {
+                    if fleet_with_children.is_none()
+                        && fleet.runs.iter().any(|run| {
+                            run.is_live() && run.children.iter().any(SubagentChild::is_live)
+                        })
+                    {
+                        fleet_with_children = Some(fleet);
                     }
                 }
                 DriverEvent::TurnStarted => {
@@ -3918,9 +4113,134 @@ mod tests {
             "the completion says what became of the child: {:?}",
             child.detail
         );
+        // The composer reads the same snapshot as decoded runs: the live run
+        // and the child it is working through, each with a state the card can
+        // show. This is the path the issue's "看不到你的进度" report was about.
+        let fleet = fleet_with_children
+            .expect("the widget's snapshot must reach the composer with a live child");
+        let run = fleet
+            .runs
+            .iter()
+            .find(|run| run.is_live())
+            .expect("the fleet names the live run");
+        assert!(run.detached, "a widget run outlives the tool call");
+        let live_child = run
+            .children
+            .iter()
+            .find(|child| child.is_live())
+            .expect("the run names the child it is working through");
+        assert!(
+            !live_child.label.is_empty(),
+            "a child is a name, not a slot"
+        );
+        assert!(
+            live_child.started_at_ms.is_some(),
+            "the snapshot names when the child started, which is what the card counts from"
+        );
         assert!(
             !reply.trim().is_empty(),
             "the reply the wake produced must stream into the transcript"
+        );
+    }
+
+    /// A foreground run — the common case, where the agent launches a child
+    /// and waits inside its own turn — reaches the composer as a run with the
+    /// child it is working through, from the `subagent` tool's own details.
+    ///
+    /// Ignored for the same reasons as the background acceptance: it needs Pi
+    /// 1.0 authenticated with `npm:pi-subagents`, and the extension stands down
+    /// inside a session that is itself a subagent. Run it with
+    /// `env -u PI_SUBAGENT_CHILD cargo test -p waku-core --lib -- --ignored
+    /// pi_subagents`.
+    #[test]
+    #[ignore = "runs one real pi-subagents foreground child"]
+    fn pi_subagents_show_a_foreground_child_to_the_composer_against_the_real_rpc() {
+        let Some((driver, event_rx)) = real_pi_session(None) else {
+            return;
+        };
+
+        // pi-subagents detaches by default (`asyncByDefault`), and only an
+        // explicit `async: false` keeps the child inside the tool call whose
+        // details are the foreground report this test exists for.
+        driver.prompt(
+            concat!(
+                "Call the subagent tool exactly once with exactly these arguments: ",
+                "{\"agent\": \"scout\", \"task\": \"Use the bash tool to run `sleep 3`, ",
+                "then reply with exactly CHILD-OK and nothing else.\", \"async\": false}. ",
+                "Wait for it to return, then reply with exactly DONE and nothing else.",
+            )
+            .to_owned(),
+        );
+
+        let mut reported = None;
+        let mut replied = String::new();
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            match next_live_event(&event_rx, "the foreground run", LIVE_WORKFLOW_TIMEOUT) {
+                DriverEvent::SubagentProgress(run) => {
+                    seen.push(format!(
+                        "progress {} {:?} children={}",
+                        run.id,
+                        run.state,
+                        run.children.len()
+                    ));
+                    if reported.is_none() && run.children.iter().any(SubagentChild::is_live) {
+                        reported = Some(run);
+                    }
+                }
+                DriverEvent::RichActivity(item) => {
+                    seen.push(format!(
+                        "activity {} complete={} failed={} out={:?} args={:?}",
+                        item.title,
+                        item.complete,
+                        item.failed,
+                        item.output
+                            .as_deref()
+                            .map(|output| output.chars().take(120).collect::<String>()),
+                        item.arguments
+                            .as_deref()
+                            .map(|args| args.chars().take(120).collect::<String>()),
+                    ));
+                }
+                DriverEvent::SubagentFleet(fleet) => {
+                    seen.push(format!(
+                        "fleet runs={} live={}",
+                        fleet.runs.len(),
+                        fleet.runs.iter().filter(|run| run.is_live()).count()
+                    ));
+                }
+                DriverEvent::TextDelta(delta) => replied.push_str(&delta),
+                DriverEvent::Error(error) => panic!("Pi reported: {error}"),
+                DriverEvent::TurnFinished {
+                    success, summary, ..
+                } => {
+                    assert!(success, "the probe turn should finish: {summary:?}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let run = reported.unwrap_or_else(|| {
+            panic!(
+                "the foreground run's details must reach the composer while its child works; \
+                 the agent replied: {replied:?}; events: {seen:?}"
+            )
+        });
+        assert!(!run.detached, "a foreground run lives in its own tool call");
+        assert!(!run.label.is_empty());
+        let child = run
+            .children
+            .iter()
+            .find(|child| child.label == "scout")
+            .expect("the run names the child the agent launched");
+        assert!(
+            child.started_at_ms.is_some(),
+            "a live child carries when it started, so the card can count"
+        );
+        assert!(
+            replied.contains("DONE"),
+            "the agent's own reply still streams: {replied:?}"
         );
     }
 
@@ -5131,16 +5451,47 @@ mod tests {
 
     /// One line of the snapshot pi-subagents encodes its async status in.
     fn async_snapshot(runs: Value, omitted: u64) -> Vec<Value> {
+        async_snapshot_with_omissions(runs, omitted, 0)
+    }
+
+    fn async_snapshot_with_omissions(
+        runs: Value,
+        omitted_runs: u64,
+        omitted_children: u64,
+    ) -> Vec<Value> {
         vec![Value::String(format!(
-            "{PI_ASYNC_STATUS_PREFIX}{}",
+            "{}{}",
+            pi_subagent::ASYNC_WIDGET_PREFIX,
             json!({
                 "kind": "pi-subagents.async-status-snapshot",
                 "version": 1,
                 "generatedAt": 1,
-                "omitted": { "runs": omitted, "children": 0, "byteLimitExceeded": false },
+                "omitted": { "runs": omitted_runs, "children": omitted_children, "byteLimitExceeded": false },
                 "runs": runs,
             })
         ))]
+    }
+
+    /// The detached-work upserts in one batch of events, in order.
+    fn background_upserts(events: &[DriverEvent]) -> Vec<&BackgroundWorkItem> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) => Some(item),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The composer snapshots in one batch of events, in order.
+    fn fleet_events(events: &[DriverEvent]) -> Vec<&waku_protocol::subagent::SubagentFleet> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                DriverEvent::SubagentFleet(fleet) => Some(fleet),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -5163,11 +5514,7 @@ mod tests {
                 0,
             )),
         );
-        let [
-            DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(running)),
-            DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(queued)),
-        ] = first.as_slice()
-        else {
+        let [running, queued] = background_upserts(&first)[..] else {
             panic!("each run must land on the detached-work surface: {first:?}")
         };
         assert_eq!(running.key.kind, BackgroundWorkKind::Subagent);
@@ -5214,11 +5561,7 @@ mod tests {
                 0,
             )),
         );
-        let [
-            DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(completed)),
-            DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(running)),
-        ] = settled.as_slice()
-        else {
+        let [completed, running] = background_upserts(&settled)[..] else {
             panic!("the outcome and the state change are the news: {settled:?}")
         };
         assert_eq!(completed.key.provider_id, "run-1");
@@ -5230,8 +5573,7 @@ mod tests {
         // show; a run it still called live is then lost, while the settled one
         // keeps the outcome it reported.
         let cleared = async_status_update(&pending, &commands, &mut state, None);
-        let [DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(lost))] = cleared.as_slice()
-        else {
+        let [lost] = background_upserts(&cleared)[..] else {
             panic!("the clear must settle what it can no longer speak for: {cleared:?}")
         };
         assert_eq!(lost.key.provider_id, "run-2");
@@ -5292,12 +5634,395 @@ mod tests {
                 0,
             )),
         );
-        let [DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(lost))] = complete.as_slice()
-        else {
+        let [lost] = background_upserts(&complete)[..] else {
             panic!("a run missing from a complete report is lost: {complete:?}")
         };
         assert_eq!(lost.key.provider_id, "run-2");
         assert_eq!(lost.status, BackgroundWorkStatus::Lost);
+    }
+
+    #[test]
+    fn an_incomplete_snapshot_keeps_the_runs_it_left_out_on_the_composer() {
+        // The snapshot caps how many runs one report carries. A run the report
+        // left out is still running, so the composer keeps the last thing the
+        // report said about it rather than dropping the row.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let first = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot(
+                json!([
+                    {"id": "run-1", "kind": "subagent", "label": "scout", "state": "running"},
+                    {"id": "run-2", "kind": "subagent", "label": "oracle", "state": "running",
+                     "activity": {"currentTool": "Grep"}},
+                ]),
+                0,
+            )),
+        );
+        assert_eq!(fleet_events(&first)[0].runs.len(), 2);
+
+        let truncated = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot(
+                json!([
+                    {"id": "run-1", "kind": "subagent", "label": "scout", "state": "running"},
+                ]),
+                1,
+            )),
+        );
+        assert!(
+            truncated.is_empty(),
+            "a report that omitted a run says nothing new about it: {truncated:?}"
+        );
+
+        // The omitted run is not on the surface either: that report is not
+        // complete, and this one is the next state a client could read.
+        let complete = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot(
+                json!([
+                    {"id": "run-1", "kind": "subagent", "label": "scout", "state": "running"},
+                ]),
+                0,
+            )),
+        );
+        let [_lost] = background_upserts(&complete)[..] else {
+            panic!("the swallowed run is lost once the report is whole: {complete:?}")
+        };
+        let fleet = fleet_events(&complete);
+        assert_eq!(fleet.len(), 1);
+        assert_eq!(fleet[0].runs.len(), 1);
+        assert_eq!(fleet[0].runs[0].id, "run-1");
+    }
+
+    #[test]
+    fn a_snapshot_that_omitted_children_keeps_the_ones_already_shown() {
+        // The snapshot's own caps can cut children from a run's roster. A
+        // child an earlier report named — maybe the one still working — must
+        // not disappear from the card because a later report could not list
+        // it.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let first = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot(
+                json!([{
+                    "id": "run-1", "kind": "workflow", "label": "reviewers", "state": "running",
+                    "children": [
+                        {"id": "a", "label": "auditor", "state": "completed"},
+                        {"id": "b", "label": "tester", "state": "running"},
+                        {"id": "c", "label": "docs", "state": "running"}
+                    ]
+                }]),
+                0,
+            )),
+        );
+        assert_eq!(fleet_events(&first)[0].runs[0].children.len(), 3);
+
+        // The next report names one child and admits the caps cut two; a
+        // second run is news, so the fleet update that carries it carries the
+        // kept children too.
+        let truncated = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot_with_omissions(
+                json!([
+                    {
+                        "id": "run-1", "kind": "workflow", "label": "reviewers", "state": "running",
+                        "children": [
+                            {"id": "a", "label": "auditor", "state": "completed"}
+                        ]
+                    },
+                    {"id": "run-2", "kind": "subagent", "label": "oracle", "state": "queued"},
+                ]),
+                0,
+                2,
+            )),
+        );
+        let fleet = fleet_events(&truncated);
+        assert_eq!(
+            fleet.len(),
+            1,
+            "the carried children are news: {truncated:?}"
+        );
+        let workflow = fleet[0]
+            .runs
+            .iter()
+            .find(|run| run.id == "run-1")
+            .expect("the workflow stays on the fleet");
+        assert_eq!(
+            workflow
+                .children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"],
+            "the children the caps cut keep their place"
+        );
+        assert_eq!(fleet[0].runs.len(), 2);
+
+        // The run list is still the report's own truth: a run a complete
+        // report no longer names is lost even while the child caps are in
+        // play, and the kept children ride along on the fleet that says so.
+        let settled = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot_with_omissions(
+                json!([{
+                    "id": "run-1", "kind": "workflow", "label": "reviewers", "state": "running",
+                    "children": [
+                        {"id": "a", "label": "auditor", "state": "completed"}
+                    ]
+                }]),
+                0,
+                2,
+            )),
+        );
+        let [lost] = background_upserts(&settled)[..] else {
+            panic!("the run the complete report dropped is lost: {settled:?}")
+        };
+        assert_eq!(lost.key.provider_id, "run-2");
+        assert_eq!(lost.status, BackgroundWorkStatus::Lost);
+        let fleet = fleet_events(&settled);
+        assert_eq!(fleet.len(), 1);
+        assert_eq!(fleet[0].runs.len(), 1, "only the reported run remains");
+        assert_eq!(fleet[0].runs[0].children.len(), 3);
+    }
+
+    #[test]
+    fn the_async_widget_snapshot_reaches_the_composer_with_children() {
+        // The same snapshot that names a run for the detached-work surface
+        // carries what the composer card shows: each child, its state, and the
+        // tool it is in. A card that read the background item would have none
+        // of that.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let events = async_status_update(
+            &pending,
+            &commands,
+            &mut state,
+            Some(async_snapshot(
+                json!([{
+                    "id": "run-1",
+                    "kind": "workflow",
+                    "label": "reviewers",
+                    "state": "running",
+                    "startedAt": 1_000,
+                    "activity": {"currentTool": "subagent"},
+                    "children": [
+                        {"id": "child-1", "kind": "step", "label": "code-auditor", "state": "running",
+                         "activity": {"currentTool": "Edit", "toolCount": 3, "turnCount": 2}},
+                        {"id": "child-2", "kind": "step", "label": "test-runner", "state": "complete"},
+                    ],
+                }]),
+                0,
+            )),
+        );
+        let fleet = fleet_events(&events);
+        assert_eq!(
+            fleet.len(),
+            1,
+            "the snapshot reaches the composer: {events:?}"
+        );
+        let fleet = fleet[0];
+        assert_eq!(fleet.runs.len(), 1);
+        let run = &fleet.runs[0];
+        assert!(run.detached, "the widget's runs outlive the turn");
+        assert_eq!(run.label, "reviewers");
+        assert_eq!(run.started_at_ms, Some(1_000));
+        assert_eq!(run.children.len(), 2);
+        assert_eq!(run.children[0].label, "code-auditor");
+        assert_eq!(run.children[0].state, SubagentState::Running);
+        assert_eq!(
+            run.children[0]
+                .activity
+                .as_ref()
+                .and_then(|activity| activity.current_tool.as_deref()),
+            Some("Edit")
+        );
+        assert_eq!(run.children[1].state, SubagentState::Completed);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, DriverEvent::ExtensionWidget { .. })),
+            "the snapshot is the app's data, not a widget line"
+        );
+    }
+
+    /// One `subagent` tool call frame through the reader's own path.
+    fn subagent_tool_event(
+        pending: &PendingResponses,
+        commands: &Sender<CommandMessage>,
+        state: &mut PiStreamState,
+        event_type: &str,
+        details: Value,
+    ) -> Vec<DriverEvent> {
+        let (events, event_rx) = unbounded();
+        let key = if event_type == "tool_execution_end" {
+            "result"
+        } else {
+            "partialResult"
+        };
+        let mut request = json!({
+            "type": event_type,
+            "toolCallId": "tool-1",
+            "toolName": "subagent",
+        });
+        request[key] = json!({
+            "content": [{"type": "text", "text": "(running...)"}],
+            "details": details,
+        });
+        handle_pi_message(PiFlavor::Pi, request, pending, commands, &events, state);
+        event_rx.try_iter().collect()
+    }
+
+    #[test]
+    fn a_foreground_subagent_run_streams_its_children_to_the_composer() {
+        // A foreground run never reaches the async widget; its own tool call's
+        // details are the only live report it has. Each update carries the
+        // children and what each is doing.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let running = subagent_tool_event(
+            &pending,
+            &commands,
+            &mut state,
+            "tool_execution_update",
+            json!({
+                "mode": "parallel",
+                "runId": "run-9",
+                "results": [
+                    {"agent": "scout", "runId": "child-a", "exitCode": null,
+                     "progress": {"status": "running", "currentTool": "Grep",
+                                  "currentToolArgs": "\"auth\" src", "durationMs": 12_000, "toolCount": 2}},
+                    {"agent": "reviewer", "runId": "child-b", "exitCode": null,
+                     "progress": {"status": "pending"}},
+                ],
+            }),
+        );
+        let progress = running
+            .iter()
+            .filter_map(|event| match event {
+                DriverEvent::SubagentProgress(run) => Some(run),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [run] = progress[..] else {
+            panic!("the run reaches the composer: {running:?}")
+        };
+        assert_eq!(run.id, "run-9");
+        assert!(!run.detached);
+        assert_eq!(run.state, SubagentState::Running);
+        assert_eq!(run.children.len(), 2);
+        assert_eq!(run.children[0].label, "scout");
+        assert_eq!(run.children[0].state, SubagentState::Running);
+        assert_eq!(run.children[1].state, SubagentState::Queued);
+        let activity = run.children[0].activity.as_ref().expect("live activity");
+        assert_eq!(activity.current_tool.as_deref(), Some("Grep"));
+        assert_eq!(activity.current_tool_args.as_deref(), Some("\"auth\" src"));
+        assert!(
+            run.children[0].started_at_ms.is_some(),
+            "elapsed has a start"
+        );
+
+        // The provider streams updates far more often than the run changes;
+        // the composer hears only news.
+        let repeated = subagent_tool_event(
+            &pending,
+            &commands,
+            &mut state,
+            "tool_execution_update",
+            json!({
+                "mode": "parallel",
+                "runId": "run-9",
+                "results": [
+                    {"agent": "scout", "runId": "child-a", "exitCode": null,
+                     "progress": {"status": "running", "currentTool": "Grep",
+                                  "currentToolArgs": "\"auth\" src", "durationMs": 12_000, "toolCount": 2}},
+                    {"agent": "reviewer", "runId": "child-b", "exitCode": null,
+                     "progress": {"status": "pending"}},
+                ],
+            }),
+        );
+        assert!(
+            !repeated
+                .iter()
+                .any(|event| matches!(event, DriverEvent::SubagentProgress(_))),
+            "an unchanged report is not news: {repeated:?}"
+        );
+
+        // The call ending settles the run even if its last details still say
+        // running: nothing may keep showing work that is over.
+        let ended = subagent_tool_event(
+            &pending,
+            &commands,
+            &mut state,
+            "tool_execution_end",
+            json!({"mode": "parallel", "runId": "run-9", "results": []}),
+        );
+        let progress = ended
+            .iter()
+            .filter_map(|event| match event {
+                DriverEvent::SubagentProgress(run) => Some(run),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [settled] = progress[..] else {
+            panic!("a completed call settles its run: {ended:?}")
+        };
+        assert_eq!(settled.state, SubagentState::Completed);
+        assert!(settled.children.iter().all(|child| !child.is_live()));
+    }
+
+    #[test]
+    fn a_detached_launch_receipt_is_not_a_foreground_run() {
+        // A detached launch's receipt names its async run and returns at once;
+        // its live report is the widget, and showing the receipt too would
+        // double it.
+        let (pending, commands, _command_rx, mut state) = harness();
+        let receipt = subagent_tool_event(
+            &pending,
+            &commands,
+            &mut state,
+            "tool_execution_end",
+            json!({
+                "mode": "single",
+                "runId": "run-detached",
+                "asyncId": "run-detached",
+                "asyncDir": "/tmp/run-detached",
+                "results": [{"agent": "scout", "exitCode": null, "detached": true}],
+            }),
+        );
+        assert!(
+            !receipt
+                .iter()
+                .any(|event| matches!(event, DriverEvent::SubagentProgress(_))),
+            "the widget owns a detached run: {receipt:?}"
+        );
+    }
+
+    #[test]
+    fn a_management_call_is_not_a_run_to_show() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let management = subagent_tool_event(
+            &pending,
+            &commands,
+            &mut state,
+            "tool_execution_update",
+            json!({"mode": "management", "results": []}),
+        );
+        assert!(
+            !management
+                .iter()
+                .any(|event| matches!(event, DriverEvent::SubagentProgress(_))),
+            "a management action is not a child fan-out: {management:?}"
+        );
     }
 
     #[test]

@@ -2253,3 +2253,29 @@ annotation.select_one_reply:
   en: An annotation covers one reply; select within a single reply
 annotation.wait_for_reply:
   en: The reply has to finish before you can annotate it
+
+subagent.running_count:
+  en: "%{count} subagents running"
+subagent.running_count_one:
+  en: 1 subagent running
+subagent.more_rows:
+  en: "+%{count} more"
+subagent.state.queued:
+  en: queued
+subagent.state.running:
+  en: running
+subagent.state.completed:
+  en: completed
+subagent.state.failed:
+  en: failed
+subagent.state.stopped:
+  en: stopped
+subagent.state.paused:
+  en: paused
+subagent.state.partial:
+  en: partial
+subagent.state.detached:
+  en: detached
+
+subagent.title:
+  en: Subagent

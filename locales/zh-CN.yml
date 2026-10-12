@@ -1094,3 +1094,17 @@ annotation.reply_only: 标注只能指向助手的回复
 annotation.select_reply: 请在一条回复内选择要标注的文字
 annotation.select_one_reply: 一条标注只能落在同一条回复里，请重新选择
 annotation.wait_for_reply: 回复结束后才能标注
+
+subagent.running_count: "%{count} 个子代理运行中"
+subagent.running_count_one: 1 个子代理运行中
+subagent.more_rows: "另有 %{count} 个"
+subagent.state.queued: 排队中
+subagent.state.running: 运行中
+subagent.state.completed: 已完成
+subagent.state.failed: 失败
+subagent.state.stopped: 已停止
+subagent.state.paused: 已暂停
+subagent.state.partial: 部分完成
+subagent.state.detached: 已分离
+
+subagent.title: 子代理
