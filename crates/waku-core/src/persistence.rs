@@ -1541,6 +1541,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         provider_session_id: None,
         extension_status: Vec::new(),
         extension_widgets: Vec::new(),
+        subagent_runs: Vec::new(),
         extension_window_title: None,
         messages: Vec::new(),
         transcript_blocks: Vec::new(),
