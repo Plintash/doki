@@ -14,7 +14,9 @@ own records instead of by adding temporary logging and rebuilding.
 App, daemon, and provider output SHALL be recorded as structured events —
 timestamp, level, source, message, and fields — and an event that belongs to a
 task, turn, message, permission request, or provider process SHALL carry that
-identity so related records can be collected without guessing.
+identity so related records can be collected without guessing. The daemon SHALL
+aggregate the events of its instance from the app, itself, and provider
+processes into one ordered stream.
 
 #### Scenario: A turn's events are identifiable
 
@@ -25,6 +27,27 @@ identity so related records can be collected without guessing.
 
 - **WHEN** a provider process writes a diagnostic line
 - **THEN** it is recorded with the provider and process it came from
+
+#### Scenario: The app's events reach the instance stream
+
+- **WHEN** the app records an event
+- **THEN** the daemon's aggregated stream carries it in order with the daemon's own records
+
+### Requirement: Sequenced, replayable stream
+
+Every event SHALL carry a monotonic sequence number in its instance's stream,
+and a client SHALL be able to read events after a cursor, so no observation is
+lost across a dropped or resumed connection.
+
+#### Scenario: Reconnect resumes from the cursor
+
+- **WHEN** a client reconnects with its last seen sequence
+- **THEN** it receives the events recorded since, once and in order
+
+#### Scenario: An expired cursor is refused
+
+- **WHEN** a client asks for a sequence older than retention
+- **THEN** the answer says the cursor expired instead of returning a silent gap
 
 ### Requirement: Always-on bounded retention
 
@@ -93,9 +116,9 @@ event backlog, and request round-trip latency — without a rebuild.
 
 ### Requirement: One merged diagnostic view
 
-A single query SHALL return records from the app, the daemon, and provider
-output together, filtered by time, level, source, and correlation identity, so
-one call can explain a failure that spans processes.
+The daemon SHALL answer one query that returns records from the app, itself,
+and provider output together, filtered by time, level, source, and correlation
+identity, so one call can explain a failure that spans processes.
 
 #### Scenario: A cross-process failure is one query
 

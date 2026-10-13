@@ -2,278 +2,239 @@
 
 ## Context
 
-See `proposal.md` for motivation and the two specs for the behavior contract.
-What shapes the approach:
+See `proposal.md` for motivation and the three spec deltas for the behavior
+contract. What shapes the approach:
 
-- The desktop app is a GPUI client of a per-checkout daemon. The window and all
-  view state live in the app process; sessions, providers and persistence live
-  in the daemon. UI truth is app-side, so a UI surface must live there too.
-- Our GPUI fork already carries three automation taps, validated by
-  `tests/rpa_spike.rs` on this branch: a window can keep its AccessKit tree
-  built without an assistive-technology client (never sending updates to the
-  platform), read that tree back with stable `NodeId`s, bounds, focus and
-  element provenance, and dispatch an accessibility action down the same path
-  a screen reader request takes.
-- GPUI's element model already requires ids for stateful elements and its
-  accessibility layer already derives roles, labels, values, states and
-  actions from them. `div().on_click(...)` registers a `Click` action, and
-  `track_focus(...)` registers `Focus`, so dispatch reaches real handlers.
-- The agent-facing `waku_js_repl` MCP server, with a persistent QuickJS kernel,
-  is already attached to several providers by the daemon-side driver config;
-  today that attachment is tied to the Computer Use flag.
-- The app and the daemon compute the same per-instance data directory (per
-  checkout in debug builds), which is the natural place for a discovery
-  publication.
+- The app is a client of a per-checkout daemon. The daemon already owns the
+  session model, provider drivers, persistence, a versioned wire contract, and
+  the long-lived machinery the runtime needs: sequenced events, replay cursors
+  and resumption, subscriptions, and two client libraries (Rust and
+  TypeScript).
+- The app is the only place UI truth and UI execution exist: the window, its
+  frame, its accessibility tree, and the handlers behind its controls.
+- Our GPUI fork carries the automation taps validated by the spike: forced tree
+  building without a screen reader, a snapshot with stable node ids and
+  bounds, and public action dispatch. The fork is ours (`Plintash/zed`,
+  branch `waku-rpa`).
+- The spike taught three hard rules: dispatching input while holding a view
+  lease aborts the process; an occluded window has no display link, so a frame
+  must be drawn on demand; and a cached view emits no accessibility nodes, so
+  the observed frame must be a full refresh.
+- The spike also showed the cost of poor observability: every wrong assumption
+  was diagnosed by a temporary file probe and a rebuild, not by the system
+  explaining itself.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- One semantic surface for what is on screen and what can be operated, kept
-  honest by rendering: only laid-out elements, real state, real bounds.
-- One local channel that can observe and operate the app, using the same code
-  paths as real input.
-- One observability system for all processes, good enough to explain failures
-  without editing code to add logging.
-- Conventions and enforcement that keep coverage growing with the app instead
-  of drifting.
+- One runtime for observing and operating the app, hosted where long-lived
+  state belongs: the existing daemon, not a new process.
+- One protocol, reused by every client, local or remote.
+- The system explains failures from its own records before more surface is
+  built.
+- The app keeps only UI truth and execution; everything else is daemon-side.
 
 **Non-Goals:**
 
-- No release surface. Release builds expose no endpoint, no bindings, no
-  diagnostic files, no tree-for-automation mode.
-- No arbitrary code execution or state injection inside the app. The app
-  serves declarative verbs; scripting stays in the agent's REPL.
-- No remote or cross-machine access; the endpoint is loopback-only.
-- No deterministic scripted provider in this change. Waits are event-based so
-  a provider substitute can arrive later without changing the surface.
-- No change to screen-reader behavior; the accessibility tree gains roles and
-  labels because instrumentation is generally useful, but VoiceOver quality
-  tuning is separate work.
+- No new daemon and no second control plane; the daemon gains
+  responsibilities, it does not multiply.
+- No release surface. Debug builds only.
+- No daemon-side mirror of the UI tree; the executor owns it, the daemon
+  caches only what a session cursor needs.
+- No headless app harness, scripted provider, scheduling, or distributed
+  execution in P0/P1; those are P2 and later.
+- No arbitrary evaluation inside the app; the surface stays declarative.
 
 ## Decisions
 
-### D1 — Substrate: GPUI's accessibility tree, not a parallel registry
+### D1 — The runtime lives in the daemon; the app is its executor
 
-Instrument interactive elements with standard GPUI accessibility attributes
-(`id`, `role`, `aria_label`/values) and treat the per-frame AccessKit tree as
-the automation surface, dispatching actions through the accessibility action
-path.
+Automation sessions, cursors, subscriptions, waits, scenarios, instance
+targeting, and diagnostics aggregation live in the daemon. The app registers as
+the UI executor over the connection it already has.
 
-- Why: it is the only element registry GPUI already maintains; ids obey the
-  framework's stability rules; click/focus actions are derived automatically;
-  the dispatch path is the one a screen reader uses and falls back to real
-  synthesized input at the node's bounds; bounds, focus and disabled/selected
-  states come from the same frame. The instrumentation also advances the
-  accessibility work AGENTS.md already treats as a product requirement.
-- Alternatives considered: a Waku-owned map of control id → handler
-  (duplicates accessibility, and every new control needs two registrations);
-  Computer Use over pixels/AX (permissions, brittle, blind to app state);
-  coordinate scripting (rejected outright).
+- Why: the daemon is the long-lived per-checkout process; it already carries
+  the event/replay/subscription machinery and both client libraries; and it is
+  where future responsibilities (scripted providers, scheduling, distributed
+  and cross-device execution) belong. Keeping the runtime client-side would
+  duplicate all of it and strand it in one tool.
+- Alternatives: a client-side session runtime (works for one tool, loses
+  aggregation and remote reach); a new daemon (extra lifecycle, version skew,
+  a second control plane); app-only (no long-lived state, no future).
 
-### D2 — Own the fork, keep the taps minimal
+### D2 — The daemon's existing machinery is the runtime's foundation
 
-The three additions live as one commit on `Plintash/zed`, branch `waku-rpa`,
-which replaces the previously pinned `egoist/zed` branch in `Cargo.toml`.
-Future patch work happens in a local clone (`~/proj/zed-rpa`) and is pushed
-there; the branch is rebased onto upstream as needed.
+Automation events ride the sequenced, replayable event model; sessions resume
+from cursors after reconnects; clients are the existing Rust and TypeScript
+daemon clients.
 
-- Why: `egoist/zed` is not under our control; a fork we own lets us add the
-  few generic accessors without waiting, and the commit is written to be
-  upstreamable (no Waku-specific policy).
-- Fork surface: `Window::set_a11y_automation(bool)`,
-  `Window::a11y_automation_snapshot()` (stable node ids, bounds, focus,
-  provenance), `Window::dispatch_a11y_action(...)`, plus the draw-loop rule
-  that an automation-built tree is never sent to the platform adapter. A
-  debug-only offscreen `render_to_image` exposure is added for screenshots.
-- Alternatives considered: vendoring gpui into the workspace (heavy, no
-  easier to update); a Waku-maintained wrapper crate that re-implements the
-  taps (impossible — the state is inside `Window`).
+- Why: reconnection, replay, cursor expiry and subscriber limits are already
+  implemented and tested. Building a parallel stream would be the same work
+  twice, with new failure modes.
+- Alternatives: a bespoke side channel (rejected: duplicates replay and auth);
+  polling snapshots (rejected: misses transitions, costs frames).
 
-### D3 — The control endpoint lives in the app process
+### D3 — Protocol evolution: automation in `waku-protocol`, requests in both directions
 
-A debug-only server owned by the app serves the bridge. UI requests are
-applied on the UI thread; socket I/O, decoding and encoding run off it.
+Automation calls, executor requests and UI/model/diagnostic events join the
+shared wire contract; the daemon gains server-initiated requests to the app
+executor. Both client libraries gain the matching handler and APIs.
 
-- Why: only the app can read view state or run a click handler; the daemon is
-  headless and shared across windows.
-- Threading: a background accept/read thread feeds a channel; a `cx.spawn`
-  task drains it on the foreground executor and applies one request per frame
-  turn, mirroring the existing driver event pump pattern. No blocking I/O and
-  no synchronous IPC from a frame.
+- Why: one surface for native, web, mobile, local and remote clients; the
+  server→client direction is the seam later needed for remote executors and
+  daemon-to-daemon dispatch.
+- Alternatives: proxying the spike's local TCP endpoint (kept only as a
+  temporary debug fallback while P1 lands); a web-socket-free side channel
+  (rejected).
 
-### D4 — Transport: loopback TCP, bearer token, newline-delimited JSON
+### D4 — Split of responsibilities
 
-The endpoint binds `127.0.0.1` on an ephemeral port, requires a random bearer
-token on every request, and speaks one JSON object per line.
+The daemon owns long-lived state and orchestration; the app owns the frame and
+its execution. The daemon does not mirror the tree; it may cache the diffs a
+session has not yet consumed. UI frame events are pushed only while at least
+one subscription needs them.
 
-- Why: it matches the daemon's existing localhost+token convention, is trivial
-  to speak from Rust, JS and shell, and needs no dependency.
-- Alternatives considered: a Unix socket (awkward on Windows, no benefit
-  here); WebSocket (no browser client exists; the daemon's server machinery
-  lives in `waku-core`, which the app does not depend on); a deterministic
-  port (collides between checkouts).
+- Why: trees are large and frame-local; sessions are small and long-lived.
+  Pushing only on demand keeps idle frames free.
+- Alternatives: mirroring the tree daemon-side (stale by construction,
+  expensive); unbounded pushes (idle cost).
 
-### D5 — Discovery: an instance file, handed to tooling through the daemon
+### D5 — State is the serialized model plus explicit UI-only fields
 
-On startup a debug app writes `<data_dir>/rpa.json` with `{address, token,
-pid, checkout, database, build}`; it is removed on exit. The daemon passes
-`WAKU_RPA_CONFIG=<path>` (and the path may be overridden by
-`WAKU_RPA_ENDPOINT`/`WAKU_RPA_TOKEN` for tests) to every provider process it
-launches, in the same places it already passes the Computer Use server paths;
-the REPL and the CLI read it lazily, check the pid is alive, and prefer the
-explicit environment when present.
+The snapshot's state section serializes the app's model (sessions, turns,
+messages, subagent runs) and enumerates the genuinely UI-only fields (route,
+composer, panels, toasts). Requests can select a subset.
 
-- Why: no wire-protocol change; works when the daemon connection is down; the
-  file is inspectable while debugging discovery itself; the daemon already
-  knows the same data directory and the executable path.
-- Alternatives considered: registering the endpoint over the daemon protocol
-  (protocol churn and replay semantics for a debug-only concern); a fixed
-  port (see D4); requiring the agent to locate the checkout (would leak
-  setup work into every scenario).
+- Why: the fan-out trial showed a model field is already serializable; the
+  hand-written JSON was pure duplication that would rot with every feature.
+- Alternatives: hand-written per-pane JSON (rejected); scraping the tree for
+  state (rejected: loses identity and precision).
 
-### D6 — The agent surface is the existing REPL, decoupled from Computer Use
+### D6 — Execution model as a contract
 
-`waku_js_repl` registers with providers whenever a debug build launches them,
-whether or not Computer Use is enabled; the Cua bridge inside it stays
-Computer-Use-only. The bootstrap exposes `waku.rpa.*` over one native call,
-and the tool description documents the surface. `bun scripts/rpa.ts` provides
-the same verbs for humans and for providers without an MCP server (for
-example Claude sessions today).
+Input is dispatched without holding a view lease; any call that needs the
+current frame draws it on demand after a full refresh; a call never blocks the
+UI thread and never aborts the app. The executor serializes its work.
 
-- Why: the REPL already exists in the sessions where features are developed,
-  it persists across calls, and it can turn images into tool output; a second
-  mechanism would be redundant. CLI parity keeps non-MCP providers and
-  terminal-driven work first-class.
-- Alternatives considered: a new MCP server dedicated to RPA (duplicate
-  lifecycle, second kernel); shell-only tooling (higher friction inside agent
-  sessions).
+- Why: the spike crashed the app with a double lease and observed stale trees
+  from occluded windows; these are properties of driving a live app, not
+  implementation details.
+- Alternatives: catching panics (masks the bug); only acting on visible
+  windows (fails the moment the user switches away).
 
-### D7 — Protocol: few verbs, ordered batches, structured errors
+### D7 — Diagnostics: one sequenced stream per instance, files as ground truth
 
-Requests (`describe`, `snapshot`, `act`, `invoke`, `wait`, `run`, `shot`,
-`logs`, `timeline`, `counters`, `verbosity`) sit under one versioned envelope.
-`run` executes an ordered batch as a foreground state machine that yields to
-the frame loop between steps, stops at the first failure, and returns per-step
-results plus a final snapshot. Errors carry a code, the offending target, the
-nearest known ids, and the observed state.
+Every process records structured, correlated events; the daemon aggregates
+them into one ordered, bounded, parseable stream; runtime verbosity adjusts
+what is recorded; health is part of every snapshot; failures attach a bundle.
 
-- Why: one call should carry a whole interaction; agents should never need to
-  poll or sleep; a failure should be diagnosable from its own response.
-- Targets are node handles (from the last snapshot) or semantic ids resolved
-  against the current tree. Node handles are scoped to a snapshot: the client
-  sends ids and a snapshot generation, and the bridge refuses stale handles
-  rather than acting on a recycled node.
-- Alternatives considered: a generic `eval` in the app (unbounded surface,
-  untestable); one step per request (chatty, and waits would have to live
-  client-side, where they cannot see frames).
+- Why: the spike's debugging cost came from the system not explaining itself.
+  Ground-truth files also cover the case where the app or the daemon is hung.
+- Alternatives: per-process logs queried separately (the state before this
+  change); a logging framework per process with no correlation (rejected).
 
-### D8 — Snapshot composition: tree from the frame, state from the views
+### D8 — The session contract is cursors, subscriptions and async waits
 
-`snapshot` returns the frame's accessibility tree (nodes with handles, ids,
-roles, labels/values, states, bounds), an app-state section assembled from
-live view state per pane (instance, window, route, tasks, session, composer,
-panels, toasts, permissions), and a health summary. It never reads the
-database, and never invents state that is not on screen; long content is not
-embedded — the tree carries what is rendered, and message bodies are not
-duplicated into the state section.
+Clients hold a session with cursors over UI, model and diagnostic streams;
+they can ask for what changed; waits are registered and resolved by events,
+not client polls; an action answer already carries its effect.
 
-- Why: a derived snapshot cannot go stale the way a hand-maintained mirror
-  would; the tree is already honest about virtualization; keeping bodies out
-  bounds payload size during streaming.
-- Ownership: each pane owns its state section, added where the pane already
-  builds its view state, so a feature that adds observable state adds it in
-  one place.
+- Why: this is what turns isolated RPC calls into a conversation, and it is
+  also what makes waits cheap: the daemon resolves them from events it already
+  has.
+- Alternatives: polling snapshots (costly, lossy); client-side waits (each
+  tool re-implements them, and they cannot see frames).
 
-### D9 — Instrumentation conventions, enforced
+### D9 — Instance targeting and disposable scratch instances
 
-Ids follow `area.control[.<domain-id>]` (`composer.send`,
-`sidebar.task.<uuid>`, `settings.page.computer_use`); static ids used by
-scenarios are declared as constants in one module so the scenario and the view
-cannot drift apart. Shared primitives (`icon_button`, `MenuChip`,
-`toggle_switch`, list rows, the text fields, menu items) carry roles and
-labels so call sites inherit them. In debug builds the fork logs once per
-element when an interactive element with no accessibility role is built while
-automation or assistive technology is active, and the repository keeps
-`scenarios/smoke.mjs`, which fails when a pinned core id disappears.
+The runtime lists live instances and targets one per session; it can start a
+disposable instance with its own data directory and seeded database for a run
+that must not disturb a working app.
 
-- Why: coverage is cheap only if it comes from the primitives; the warning
-  makes a missing identity visible at the moment the feature runs, and the
-  smoke scenario makes an accidental removal fail a committed check.
-- Alternatives considered: a lint over source text (cannot see dynamic ids);
-  review-only (drifts).
+- Why: driving a live app mutates its tasks, drafts and window; the trial did
+  exactly that to the user's instance. Scratch instances make destructive
+  testing safe and repeatable.
+- Alternatives: always testing against the working instance (pollutes it);
+  a manual second checkout (no lifecycle, no seeding).
 
-### D10 — Diagnostics: `tracing` plus one shared recorder
+### D10 — Phases: explain, drive, automate
 
-A new `waku-diagnostics` crate owns the event schema, a bounded in-memory
-ring, a rotating NDJSON writer on a background thread, a runtime-reloadable
-level/target filter, and the query API. The app, the daemon and the driver
-layer emit `tracing` events and spans (already in the dependency graph via
-GPUI) with correlation fields; provider stderr lines are captured as events
-attributed to their process.
+**P0 — explain itself.** Diagnostic events from the app reach the daemon; the
+daemon aggregates app/daemon/provider records into one sequenced stream with
+files, cursors, queries (logs, timeline, counters, verbosity), health, and
+failure bundles. Acceptance: any failure is explainable in one command from
+cross-process records, with no rebuild and no probe.
 
-- Why: `tracing` gives spans, structured fields and a reloadable filter
-  without inventing a logging framework; a shared crate keeps app and daemon
-  records identical.
-- Queries: the app-side bridge merges its own ring with the daemon's and
-  providers' files, so no daemon protocol change is needed. If that proves
-  insufficient, a debug-only daemon command is the follow-up.
-- Verbosity: the app applies a reload handle; the daemon polls a small filter
-  file under the data directory (no protocol, survives daemon restarts).
-- Bodies: events carry ids, states and timings; prompt/message bodies are
-  recorded only at debug level, keeping default records low-volume and free of
-  user content.
+**P1 — drive it.** The automation protocol and executor routing land; sessions
+with cursors, subscriptions, async waits and act→diff; model-derived state;
+CLI and REPL on the shared protocol; instance listing and scratch instances;
+scenario runs; instrumentation by primitive and by feature under test, with the
+missing-identity warning and the smoke scenario. Acceptance: the subagent
+fan-out trial is a committed scenario with zero temporary probes; targeting a
+specific checkout is one call; release builds register nothing.
 
-### D11 — Health and failure evidence are part of the surface
+**P2 — more automatic.** Scripted providers and record/replay; a scenario
+library that runs unattended; scheduling, distributed execution and
+cross-device driving. Each is its own change when reached.
 
-Every snapshot includes the health summary. Failed waits, actions, batches and
-in-process UI tests attach a failure dump: observed state, tree diff since the
-batch began, relevant events (filtered by the session/turn/source involved)
-and counters.
+### D11 — Instrumentation strategy
 
-- Why: the answer to "something is wrong" should not require knowing which
-  query to run; it should be attached to the thing that failed.
+Shared primitives are instrumented once; each feature under test adds its own
+identity and, where the model does not already carry it, its state. Debug
+builds warn about interactive elements without identity, and a committed smoke
+scenario pins the core ids.
 
-### D12 — Gating and safety
+- Why: a full 231-site sweep would be speculative; the trial showed most
+  coverage comes free from primitives and the model, and the rest is small and
+  local.
+- Alternatives: a full sweep up front (delayed value, large diff); review-only
+  (drifts).
 
-All of it is `debug_assertions`-only and clamped the way Computer Use is: the
-endpoint is compiled out of release builds (not merely disabled), the REPL
-only exposes the bindings in debug builds, and discovery is never written by a
-release process. The token file is user-only permissions, the endpoint is
-loopback, and requests can only reach the surfaces the bridge declares.
+### D12 — Debug-only, remote-ready
+
+The executor and the queries exist only in debug builds. The surface is reached
+through the daemon's existing authentication, so an authenticated remote client
+gets the same calls as a local one with no second mechanism.
+
+- Why: the shape of cross-device support should not be a later retrofit; the
+  same messages, different connection.
+- Alternatives: loopback-only (fails the stated direction); a separate remote
+  protocol (a second surface to keep consistent).
 
 ## Risks / Trade-offs
 
-- **Instrumentation coverage drifts as features land.** → Shared primitives do
-  most of the work; the debug warning surfaces gaps the moment a feature runs;
-  the smoke scenario pins core controls; AGENTS.md makes identity a review
-  condition.
-- **Fork maintenance.** → Exactly one isolated commit, written to be
-  upstreamable, rebased onto upstream when the fork is synced; the spike test
-  fails loudly if a rebase drops a tap.
-- **Accessibility-tree cost while attached.** → The tree exists only while a
-  client is attached; expensive label computation is gated on
-  `Window::is_a11y_active`, the documented GPUI idiom; a counters check lives
-  in the smoke scenario.
-- **Snapshot payloads grow with streaming transcripts.** → The tree reports
-  rendered nodes only, and bodies stay out of the state section.
-- **Two debug app instances of one checkout.** → Discovery is last-writer-wins;
-  responses name pid, build and database, and clients verify them before
-  acting.
-- **Protocol drift between REPL and app.** → One version constant in the
-  envelope; both ends refuse a mismatched major version with the expected one
-  in the error.
-- **Diagnostics in the hot path.** → Records are enqueued to a ring and a
-  writer thread; no formatting on the UI thread beyond the enabled check.
+- **Protocol evolution in both directions.** → One versioned addition with a
+  handler in each client library and tests for reconnect/resume; the spike's
+  endpoint stays as a temporary fallback until P1's end-to-end test passes.
+- **A bridge call can abort the app.** → D6 is a contract with integration
+  tests reproducing the lease and occlusion cases.
+- **The daemon becomes a single point of failure for automation.** → Files
+  remain ground truth for diagnostics; the runtime reports an absent executor
+  instead of answering stale state.
+- **The daemon accumulates too many responsibilities.** → The runtime keeps
+  its own module and spec; P2 responsibilities are separate changes with their
+  own contracts.
+- **Snapshot payload size.** → Model-derived state plus selectable fields and
+  cursor diffs; event payloads are small and bounded.
+- **Remote surface security.** → Existing daemon auth and origin rules; the
+  surface is debug-only.
+- **Scope creep across phases.** → Each phase has an acceptance gate; P0 ships
+  alone before P1 starts.
 
 ## Migration Plan
 
-None required: the surface is new, debug-only, and nothing in the app depends
-on it at runtime. Rollback is reverting the change; the fork dependency can
-stay or be repinned independently of app behavior.
+The spike's local endpoint and discovery file are retired in P1 once the
+daemon-routed executor passes the subagent trial; until then they are a debug
+fallback behind an environment flag. The protocol version bumps once, and both
+client libraries ship the same version. Release behavior does not change.
 
 ## Open Questions
 
-None blocking. The scripted provider for fully deterministic end-to-end
-scenarios is deliberately deferred; if it arrives, it plugs into the existing
-waits and verbs without changing the specs.
+- Where scenarios are authored and run (CLI-hosted runner vs daemon-native
+  runs) — P1 starts daemon-owned runs with a thin client runner; refine after
+  the trial.
+- How a scratch instance is seeded (copied project database vs generated
+  fixtures) — deferrable; the runtime only needs "its own data directory".
+- Whether unattended CI runs need a headless app mode — revisit in P2 if the
+  live debug app is not enough.

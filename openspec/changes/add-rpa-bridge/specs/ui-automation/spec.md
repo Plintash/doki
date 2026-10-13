@@ -55,53 +55,65 @@ no accessibility cost.
 - **WHEN** automation keeps the tree built
 - **THEN** no tree update is delivered to the platform accessibility adapter
 
+### Requirement: Execution model
+
+Input SHALL be dispatched without holding a view lease, and a call that needs
+the current frame SHALL draw it on demand (after a full refresh); a bridge call
+MUST NOT abort the app or block the UI thread.
+
+#### Scenario: An occluded window still answers
+
+- **WHEN** the window is fully occluded and a snapshot is requested
+- **THEN** the executor draws a frame on demand and answers with a complete tree
+
+#### Scenario: Dispatch does not re-enter the view
+
+- **WHEN** an action dispatches input while the workspace is rendered
+- **THEN** the app stays alive and the action's effect is observable
+
 ### Requirement: Debug-only availability
 
-The control endpoint, the agent bindings, and the tree-for-automation mode
-SHALL exist only in debug builds. Release builds MUST NOT listen on the
-endpoint, publish discovery, or attach the bindings, regardless of settings or
-environment.
+The executor, the agent bindings, and the tree-for-automation mode SHALL exist
+only in debug builds. Release builds MUST NOT register an executor, publish
+discovery, or attach the bindings, regardless of settings or environment.
 
 #### Scenario: Release build exposes nothing
 
 - **WHEN** a release build starts
-- **THEN** no endpoint is opened, no discovery is published, and agents get no `waku.rpa` bindings
+- **THEN** no executor registers and agents get no `waku.rpa` bindings
 
 #### Scenario: Debug build exposes the bridge
 
 - **WHEN** a debug build starts
-- **THEN** the endpoint is available to local clients
+- **THEN** its executor is available to the daemon's clients
 
-### Requirement: Instance discovery and authentication
+### Requirement: Daemon-mediated execution
 
-A debug app SHALL publish its endpoint, a bearer token, and its instance
-identity (checkout, database, process id, build identity) under its instance
-data directory, SHALL bind the endpoint to loopback only, and SHALL require the
-token on every request. The publication MUST be removed or superseded when the
-process exits, so a client never talks to a dead instance.
+A debug app SHALL expose its UI executor to the daemon it is connected to, and
+automation calls SHALL reach it through the daemon; clients MUST NOT need a
+separate endpoint, publication file, or token to drive the app.
 
-#### Scenario: A client finds the instance that hosts it
+#### Scenario: Calls arrive through the daemon
 
-- **WHEN** several checkouts run debug apps at once
-- **THEN** a client resolves the instance that launched it and no other
+- **WHEN** any authenticated daemon client asks for a snapshot
+- **THEN** the daemon routes it to the connected app and returns the app's answer
 
-#### Scenario: Requests without the token are refused
+#### Scenario: No executor, a clear failure
 
-- **WHEN** a client connects without the published token
-- **THEN** the endpoint refuses the request and discloses no state
+- **WHEN** no app executor is connected for the target instance
+- **THEN** the call fails naming the instance and the reason
 
-#### Scenario: A dead instance is never used
+#### Scenario: A dead executor is never used
 
-- **WHEN** the app exits and a client rereads discovery
-- **THEN** the stale publication is not offered as a live instance
+- **WHEN** the app exits while a client holds a session
+- **THEN** the runtime reports the executor gone rather than answering from stale state
 
 ### Requirement: Semantic snapshot
 
 On request the bridge SHALL return the current frame's semantic tree — node
-handle, id, role, label or value, state (focused, disabled, selected, …), and
-bounds — for what is on screen, plus the app's observable state: instance and
-build identity, window, route, tasks, the active session, composer contents,
-panels, toasts, and pending permission requests. The tree MUST reflect what is
+handle, id, role, label or value, state, and bounds — for what is on screen,
+plus the app's observable state. The state SHALL be derived from the serialized
+model plus explicitly enumerated UI-only fields. The tree MUST reflect what is
 rendered; off-screen or virtualized content is not reported.
 
 #### Scenario: Snapshot answers what is shown
@@ -119,13 +131,29 @@ rendered; off-screen or virtualized content is not reported.
 - **WHEN** the composer is disabled because a turn is preparing
 - **THEN** the snapshot's state says so and the composer's control reports disabled
 
+#### Scenario: A new model field is observable
+
+- **WHEN** the model gains a field and the app serializes it into the state
+- **THEN** the snapshot carries it without any new bridge code
+
+### Requirement: Action answers carry their effect
+
+An action SHALL answer with the cursor of the frame it produced and the
+controls and state that changed, so observing an action's effect does not need
+a second call.
+
+#### Scenario: The answer names what changed
+
+- **WHEN** a client clicks a control that switches the route
+- **THEN** the answer carries the new frame cursor and names the changed route
+
 ### Requirement: Semantic actions
 
 The bridge SHALL act on a control identified by its node handle or semantic id:
 click, focus, set text or value, send a keyboard chord, and scroll. Actions
-MUST take the same path as real user input, MUST NOT require the caller to
-choose coordinates, and MUST fail with an actionable error naming the target
-when it is unknown, ambiguous, disabled, or not on screen.
+MUST take the same path as real user input, MUST NOT require coordinates, and
+MUST fail with an actionable error naming the target when it is unknown,
+ambiguous, disabled, or off screen.
 
 #### Scenario: Click by id runs the real handler
 
@@ -219,14 +247,19 @@ surface.
 The JavaScript REPL server attached to a coding-agent session SHALL expose the
 bridge as `waku.rpa` whenever the session runs in a debug build, independently
 of the Computer Use setting. A command-line client SHALL provide the same verbs
-for callers without that server. Both SHALL report the instance and build
-identity they are attached to, reconnect after an app relaunch, and offer a
-wait for a fresh build after a rebuild.
+for callers without that server. Both SHALL be clients of the same daemon
+protocol, so local and remote callers see one surface.
 
 #### Scenario: Bindings exist without Computer Use
 
 - **WHEN** an agent session runs in a debug build with Computer Use disabled
 - **THEN** its REPL exposes `waku.rpa` and can snapshot the app
+
+### Requirement: Attached clients identify and reconnect
+
+A client SHALL report the instance and build identity it is attached to,
+reconnect after an app relaunch, and offer a wait for a fresh build after a
+rebuild.
 
 #### Scenario: A relaunch is observable
 
