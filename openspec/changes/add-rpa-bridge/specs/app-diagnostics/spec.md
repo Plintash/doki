@@ -89,7 +89,7 @@ explain a session MUST still be recorded.
 
 ### Requirement: Timeline reconstruction
 
-The bridge SHALL reconstruct the ordered lifecycle of a task or turn —
+The daemon SHALL reconstruct the ordered lifecycle of a task or turn —
 submitted, provider started, streaming, tool activity, settling, settled or
 failed — with timings, from the recorded events.
 
