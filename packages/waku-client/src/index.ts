@@ -4,6 +4,8 @@ export {
   WakuRpcError,
   daemonUrl,
   type ConnectionStateListener,
+  type DiagnosticListener,
+  type DiagnosticMessage,
   type EventListener,
   type RequestOptions,
   type WakuClientOptions,

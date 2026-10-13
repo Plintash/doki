@@ -825,13 +825,14 @@ impl CodexDriver {
         let stderr_thread = thread::Builder::new()
             .name("waku-codex-stderr".into())
             .spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let error_events = stderr_events.clone();
+                super::support::read_stderr_lines(stderr, &stderr_events, move |line| {
                     if is_visible_stderr_notice(&line) {
                         let error = clean_stderr(&line);
                         *stderr_last_error.lock() = Some(error.clone());
-                        let _ = stderr_events.send(DriverEvent::Error(error));
+                        let _ = error_events.send(DriverEvent::Error(error));
                     }
-                }
+                });
             })?;
 
         thread::Builder::new()

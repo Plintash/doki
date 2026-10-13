@@ -853,13 +853,14 @@ impl PiDriver {
             thread::Builder::new()
                 .name("waku-pi-stderr".into())
                 .spawn(move || {
-                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let error_events = stderr_events.clone();
+                    super::support::read_stderr_lines(stderr, &stderr_events, move |line| {
                         if line.to_ascii_lowercase().contains("error") {
                             let error = format!("{}: {}", flavor.display_name(), line.trim());
                             *stderr_last_error.lock() = Some(error.clone());
-                            let _ = stderr_events.send(DriverEvent::Error(error));
+                            let _ = error_events.send(DriverEvent::Error(error));
                         }
-                    }
+                    });
                 })?;
 
         // Nothing signals or kills the agent process: it exits when the writer

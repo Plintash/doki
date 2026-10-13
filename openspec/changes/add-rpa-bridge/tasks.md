@@ -7,10 +7,10 @@
 
 ## 2. P0 — the instance explains itself
 
-- [ ] 2.1 Add the diagnostic event message and per-instance sequence to `waku-protocol`, bump the protocol version, and verify with encode/decode tests plus a resumed-client test that a cursor replays without gaps.
-- [ ] 2.2 Emit structured events from the app for turn lifecycle (submitted, started, streaming, tools, settled/failed), actions, and driver events, with task/turn/message correlation; verify tests assert the correlation fields and that default-level records cover a whole turn.
-- [ ] 2.3 Aggregate in the daemon: a bounded in-memory stream plus rotating NDJSON files under the instance data directory, fed by the app's events, the daemon's own records, and provider stderr attributed to its process; verify tests for bounds, ordering, attribution, and expiry of old cursors.
-- [ ] 2.4 Teach both client libraries (Rust `waku-client` and `packages/waku-client`) to consume the stream, resume from cursors after reconnect, and surface expiry; verify tests reconnect mid-stream and see each record once, in order.
+- [x] 2.1 Add the diagnostic event message and per-instance sequence to `waku-protocol`, bump the protocol version, and verify with encode/decode tests plus a resumed-client test that a cursor replays without gaps.
+- [x] 2.2 Emit structured events from the app for turn lifecycle (submitted, started, streaming, tools, settled/failed), actions, and driver events, with task/turn/message correlation; verify tests assert the correlation fields and that default-level records cover a whole turn.
+- [x] 2.3 Aggregate in the daemon: a bounded in-memory stream plus rotating NDJSON files under the instance data directory, fed by the app's events, the daemon's own records, and provider stderr attributed to its process; verify tests for bounds, ordering, attribution, and expiry of old cursors.
+- [x] 2.4 Teach both client libraries (Rust `waku-client` and `packages/waku-client`) to consume the stream, resume from cursors after reconnect, and surface expiry; verify tests reconnect mid-stream and see each record once, in order.
 - [ ] 2.5 Add the query surface over the daemon (`logs`, `timeline`, `counters`, `verbosity`) and expose it in `scripts/rpa.ts`; verify tests for filtering, merged ordering, timeline reconstruction of a settled and a stuck turn, and counters that move during a stream.
 - [ ] 2.6 Put health in every snapshot and attach a failure bundle — observed state, tree diff, relevant recent events, counters — to failed waits, actions, and calls; verify each failure path's bundle in a test.
 - [ ] 2.7 Verify against the real trial: reproduce a subagent fan-out run and explain a deliberately failed wait from one command, with no rebuild and no temporary probe; write the commands into `docs/rpa.md`.

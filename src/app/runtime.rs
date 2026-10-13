@@ -112,12 +112,7 @@ pub(super) fn submitted_prompt_identity(session: &AgentSession) -> (Option<Uuid>
     let Some(turn_id) = session.active_turn_id() else {
         return (None, None);
     };
-    let message_id = session
-        .messages
-        .iter()
-        .find(|message| message.turn_id == Some(turn_id) && message.role == MessageRole::User)
-        .map(|message| message.id);
-    (Some(turn_id), message_id)
+    (Some(turn_id), session.active_turn_user_message_id())
 }
 
 pub(super) fn session_has_active_provider_turn(session: &AgentSession) -> bool {
@@ -1253,20 +1248,43 @@ impl Waku {
     }
 
     pub(super) fn selected_session(&self) -> Option<&AgentSession> {
-        let id = self.state.selected_session?;
-        self.state.sessions.iter().find(|session| session.id == id)
+        self.session(self.state.selected_session?)
+    }
+
+    /// The session with this id, when the catalog holds it.
+    pub(super) fn session(&self, session_id: Uuid) -> Option<&AgentSession> {
+        self.state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
     }
 
     /// Completes a persisted turn exactly once. All production turn-settlement
-    /// paths go through this seam.
+    /// paths go through this seam, which also records the settlement into the
+    /// instance's diagnostic stream.
     pub(super) fn finish_active_turn(
         &mut self,
         session_id: Uuid,
         status: TurnStatus,
+        cx: &App,
     ) -> Option<(Uuid, usize)> {
-        self.state
-            .session_mut(session_id)?
-            .finish_active_turn(status)
+        let session = self.state.session_mut(session_id)?;
+        let finished = session.finish_active_turn(status)?;
+        crate::diagnostics::record(cx, || {
+            Some(crate::diagnostics::turn_settled(
+                session, finished.0, finished.1, status,
+            ))
+        });
+        Some(finished)
+    }
+
+    /// Record the first streamed output of a turn, once the delta has been
+    /// applied so the phase named is the one that is live.
+    pub(super) fn record_streaming(&self, session_id: Uuid, phase: StreamPhase, cx: &App) {
+        crate::diagnostics::record(cx, || {
+            self.session(session_id)
+                .map(|session| crate::diagnostics::turn_streaming(session, phase))
+        });
     }
 
     /// The directory every filesystem and provider operation for `session`
@@ -3336,6 +3354,10 @@ impl Waku {
         } else {
             None
         };
+        crate::diagnostics::record(cx, || {
+            self.session(session_id)
+                .map(crate::diagnostics::turn_submitted)
+        });
         self.submission_preparations.insert(session_id);
         if selected {
             self.activities_expanded.clear();
@@ -3411,6 +3433,10 @@ impl Waku {
                 } else {
                     Vec::new()
                 };
+                crate::diagnostics::record(cx, || {
+                    self.session(session_id)
+                        .map(|session| crate::diagnostics::turn_unwound(session, &error))
+                });
                 if let Some(session) = self.state.session_mut(session_id)
                     && session.status == SessionStatus::Connecting
                 {
@@ -3547,7 +3573,7 @@ impl Waku {
                     session.status = SessionStatus::Failed;
                     session.push_message(MessageRole::Assistant, message);
                 }
-                self.finish_active_turn(session_id, TurnStatus::Failed);
+                self.finish_active_turn(session_id, TurnStatus::Failed, cx);
             }
         }
         // From this point onward `cancel_turn` has either a live driver to

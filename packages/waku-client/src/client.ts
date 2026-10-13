@@ -1,7 +1,9 @@
 import {
+  MAX_DIAGNOSTIC_EVENTS,
   PROTOCOL_VERSION,
   type ClientMessage,
   type Command,
+  type DiagnosticCursor,
   type ReplayCursor,
   type ResponsePayload,
   type SequencedEvent,
@@ -13,6 +15,16 @@ const OPEN = 1;
 const MAX_BUFFERED_EVENTS_PER_RUNTIME = 4096;
 
 export type EventListener = (event: SequencedEvent) => void;
+
+/** One message from the instance's diagnostic stream. A reconnect that
+ * outran retention is named as a `diagnosticCursorExpired` before the
+ * retained records, so a consumer knows a gap exists instead of inferring
+ * one from a sequence jump. */
+export type DiagnosticMessage = Extract<
+  ServerMessage,
+  { type: "diagnostic" } | { type: "diagnosticCursorExpired" }
+>;
+export type DiagnosticListener = (message: DiagnosticMessage) => void;
 export type WakuConnectionState = "disconnected" | "connecting" | "connected";
 export type ConnectionStateListener = (state: WakuConnectionState) => void;
 
@@ -111,6 +123,9 @@ export class WakuClient {
   private subscriptions = new Map<string, Set<EventListener>>();
   private pendingEvents = new Map<string, SequencedEvent[]>();
   private taskStateListeners = new Set<(revision: number) => void>();
+  private diagnosticListeners = new Set<DiagnosticListener>();
+  private pendingDiagnostics: DiagnosticMessage[] = [];
+  private lastDiagnostic?: DiagnosticCursor;
   private connectionStateListeners = new Set<ConnectionStateListener>();
   private sequences = new Map<string, LastSequence>();
   private connectionGeneration = 0;
@@ -213,6 +228,9 @@ export class WakuClient {
           token: this.token,
           clientId: this.clientId,
           resumeFrom: this.replayCursors(),
+          // Omitted while undefined, so a client that has never read the
+          // stream asks for the retained tail.
+          diagnosticFrom: this.lastDiagnostic,
         };
         socket.send(JSON.stringify(hello));
       });
@@ -369,6 +387,26 @@ export class WakuClient {
     return () => this.taskStateListeners.delete(listener);
   }
 
+  /** Read the instance's diagnostic stream from the next record onward.
+   *
+   * A fresh client asks for the retained tail in the handshake; a reconnect
+   * passes the last cursor automatically. Records that arrive before the
+   * first subscriber are buffered, so a subscription sees the whole handshake
+   * replay. */
+  subscribeDiagnostics(listener: DiagnosticListener): () => void {
+    this.diagnosticListeners.add(listener);
+    const pending = this.pendingDiagnostics;
+    this.pendingDiagnostics = [];
+    for (const message of pending) listener(message);
+    return () => this.diagnosticListeners.delete(listener);
+  }
+
+  /** The last diagnostic record this client observed; the next connect resumes
+   * after it. */
+  lastDiagnosticCursor(): DiagnosticCursor | undefined {
+    return this.lastDiagnostic;
+  }
+
   /** Observes connection changes, including remote socket closure. */
   subscribeConnectionState(listener: ConnectionStateListener): () => void {
     this.connectionStateListeners.add(listener);
@@ -447,9 +485,41 @@ export class WakuClient {
       for (const listener of this.taskStateListeners) listener(message.revision);
       return;
     }
+    if (message.type === "diagnostic") {
+      const previous = this.lastDiagnostic;
+      if (
+        previous?.epoch === message.epoch &&
+        message.sequence <= previous.sequence
+      ) {
+        return;
+      }
+      this.lastDiagnostic = { epoch: message.epoch, sequence: message.sequence };
+      this.deliverDiagnostic(message);
+      return;
+    }
+    if (message.type === "diagnosticCursorExpired") {
+      this.deliverDiagnostic(message);
+      return;
+    }
     if (message.type === "shuttingDown") {
       this.socket?.close(1000, "daemon shutting down");
     }
+  }
+
+  private deliverDiagnostic(message: DiagnosticMessage): void {
+    if (this.diagnosticListeners.size === 0) {
+      this.pendingDiagnostics.push(message);
+      // The daemon's own retention bound, so a handshake replay is never
+      // truncated by a narrower client buffer.
+      if (this.pendingDiagnostics.length > MAX_DIAGNOSTIC_EVENTS) {
+        this.pendingDiagnostics.splice(
+          0,
+          this.pendingDiagnostics.length - MAX_DIAGNOSTIC_EVENTS,
+        );
+      }
+      return;
+    }
+    for (const listener of this.diagnosticListeners) listener(message);
   }
 
   /** Drops the socket and settles its requests before telling listeners, so a

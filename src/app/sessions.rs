@@ -1276,7 +1276,7 @@ impl Waku {
                     session.push_message(MessageRole::Assistant, tr!("session.stopped"));
                 }
             }
-            self.finish_active_turn(session_id, TurnStatus::Interrupted);
+            self.finish_active_turn(session_id, TurnStatus::Interrupted, cx);
         }
         if has_active_turn {
             self.capture_latest_turn_checkpoint_for(session_id);

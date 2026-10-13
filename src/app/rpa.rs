@@ -60,6 +60,11 @@ fn sync_automation(app: &mut App) {
 }
 
 async fn execute(cx: &mut AsyncApp, request: Request) -> Result<Value, Error> {
+    if cfg!(debug_assertions)
+        && let Some(record) = crate::diagnostics::action(&request, || selected_correlation(cx))
+    {
+        cx.update(|app| crate::diagnostics::record(app, || Some(record)));
+    }
     match request {
         Request::Wait {
             condition,
@@ -74,6 +79,19 @@ async fn execute(cx: &mut AsyncApp, request: Request) -> Result<Value, Error> {
         }
         request => query(cx, request),
     }
+}
+
+/// The task and turn the workspace currently shows, for attributing an action
+/// to the context it was taken in. Read-only: it draws nothing and holds no
+/// lease beyond the lookup.
+fn selected_correlation(cx: &mut AsyncApp) -> waku_client::DiagnosticCorrelation {
+    cx.update(|app| {
+        with_workspace(app, false, |waku, _window, _cx| {
+            waku.selected_session().map(crate::diagnostics::correlation)
+        })
+        .flatten()
+    })
+    .unwrap_or_default()
 }
 
 /// A request served against the workspace: describe, invoke, or the read side

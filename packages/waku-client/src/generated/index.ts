@@ -1,4 +1,4 @@
-export { MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION } from "./constants";
+export { MAX_DIAGNOSTIC_EVENTS, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION } from "./constants";
 export type { JsonValue } from "./serde_json/JsonValue";
 export type { ActivityFileChange } from "./ActivityFileChange";
 export type { ActivityFileChangeStatus } from "./ActivityFileChangeStatus";
@@ -33,6 +33,11 @@ export type { CreatedWorktree } from "./CreatedWorktree";
 export type { DaemonReady } from "./DaemonReady";
 export type { DaemonSettings } from "./DaemonSettings";
 export type { DaySlice } from "./DaySlice";
+export type { DiagnosticCursor } from "./DiagnosticCursor";
+export type { DiagnosticEvent } from "./DiagnosticEvent";
+export type { DiagnosticLevel } from "./DiagnosticLevel";
+export type { DiagnosticOrigin } from "./DiagnosticOrigin";
+export type { DiagnosticRecord } from "./DiagnosticRecord";
 export type { ExtensionStatusEntry } from "./ExtensionStatusEntry";
 export type { ExtensionWidget } from "./ExtensionWidget";
 export type { ExtensionWidgetPlacement } from "./ExtensionWidgetPlacement";

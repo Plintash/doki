@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -17,12 +18,15 @@ use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket, accept_hdr_with_config};
 use uuid::Uuid;
 
+use crate::diagnostics::DiagnosticLog;
 use crate::model::{AgentSession, Project, ProviderKind, SessionStatus};
 use crate::protocol::MAX_WIRE_MESSAGE_BYTES;
 use crate::protocol::{
     ClientMessage, Command, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
     ResponsePayload, RpcError, SequencedEvent, ServerMessage, WireDriverEvent,
 };
+use crate::protocol::{DiagnosticCursor, DiagnosticEvent, DiagnosticRecord, MAX_DIAGNOSTIC_EVENTS};
+use crate::protocol::{DiagnosticExpiry, DiagnosticLevel, DiagnosticOrigin};
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -59,6 +63,10 @@ pub struct ServerOptions {
     /// shutdown control message. Service-managed daemons keep running when an
     /// authenticated client disconnects.
     pub allow_shutdown: bool,
+    /// The instance data directory whose diagnostic files the daemon writes.
+    /// `None` is a release build (or a test): the stream still exists in
+    /// memory, but no records reach disk.
+    pub diagnostics_directory: Option<PathBuf>,
 }
 
 struct ConnectionPermit(Arc<AtomicUsize>);
@@ -97,6 +105,18 @@ impl EventSink {
             .emit(self.session_id, self.runtime_id, event, false);
         Ok(())
     }
+
+    /// Build and place one structured record in the instance's diagnostic
+    /// stream. The build runs only in debug builds, so a release daemon does
+    /// no diagnostic work.
+    pub fn record(&self, build: impl FnOnce() -> Option<DiagnosticRecord>) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        if let Some(record) = build() {
+            self.hub.record_diagnostic(record);
+        }
+    }
 }
 
 /// One connected client's delivery state.
@@ -123,6 +143,8 @@ struct HubState {
     active_runtimes: HashMap<Uuid, Uuid>,
     next_sequences: HashMap<(Uuid, Uuid), u64>,
     journal: HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>,
+    next_diagnostic_sequence: u64,
+    diagnostics: VecDeque<DiagnosticEvent>,
     responses: VecDeque<(Uuid, ResponseOutcome, usize)>,
     cached_response_bytes: usize,
     catalog_projects: HashMap<Uuid, ProjectCatalogEntry>,
@@ -176,13 +198,21 @@ impl From<&AgentSession> for SessionCatalogEntry {
 struct Hub {
     epoch: Uuid,
     state: Mutex<HubState>,
+    diagnostic_log: Option<DiagnosticLog>,
 }
 
 impl Default for Hub {
     fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl Hub {
+    fn new(diagnostic_log: Option<DiagnosticLog>) -> Self {
         Self {
             epoch: Uuid::new_v4(),
             state: Mutex::new(HubState::default()),
+            diagnostic_log,
         }
     }
 }
@@ -206,6 +236,13 @@ struct RequestDispatcher {
     /// lifecycle order across desktop and web clients without serializing
     /// unrelated sessions or read-only requests.
     runtime_mailboxes: Arc<Mutex<HashMap<Uuid, RuntimeMailbox>>>,
+}
+
+/// Push one replayed message into a subscriber's bounded queue. `false` means
+/// the queue is full; replay stops exactly as live delivery stops, and the
+/// client reconnects from its last cursor.
+fn try_replay(messages: &Sender<ServerMessage>, message: ServerMessage) -> bool {
+    messages.len() < MAX_QUEUED_MESSAGES_PER_SUBSCRIBER && messages.try_send(message).is_ok()
 }
 
 impl Hub {
@@ -271,7 +308,49 @@ impl Hub {
         Self::broadcast(&mut state, &ServerMessage::Event(event), None);
     }
 
-    fn subscribe(&self, resume_from: &[ReplayCursor], subscriber: Subscriber) -> u64 {
+    fn record_diagnostic(&self, record: DiagnosticRecord) {
+        // Diagnostics are debug-build behavior: a release daemon neither
+        // sequences nor broadcasts records, whatever a client sends.
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let event = {
+            let mut state = self.state.lock();
+            state.next_diagnostic_sequence = state.next_diagnostic_sequence.saturating_add(1);
+            let event = DiagnosticEvent {
+                epoch: self.epoch,
+                sequence: state.next_diagnostic_sequence,
+                record,
+            };
+            state.diagnostics.push_back(event.clone());
+            while state.diagnostics.len() > MAX_DIAGNOSTIC_EVENTS {
+                state.diagnostics.pop_front();
+            }
+            Self::broadcast(&mut state, &ServerMessage::Diagnostic(event.clone()), None);
+            event
+        };
+        // Appended after the hub lock is released: the writer never runs on
+        // the paths that sequence and deliver events.
+        if let Some(log) = &self.diagnostic_log {
+            log.append(&event);
+        }
+    }
+
+    /// Wait until every queued record is on disk. Tests read the files through
+    /// this; the daemon's live paths never wait for the writer.
+    #[cfg(test)]
+    fn flush_diagnostics(&self) {
+        if let Some(log) = &self.diagnostic_log {
+            log.flush();
+        }
+    }
+
+    fn subscribe(
+        &self,
+        resume_from: &[ReplayCursor],
+        diagnostic_from: Option<DiagnosticCursor>,
+        subscriber: Subscriber,
+    ) -> u64 {
         let mut state = self.state.lock();
         let id = state.next_subscriber_id;
         state.next_subscriber_id = state.next_subscriber_id.saturating_add(1);
@@ -284,6 +363,31 @@ impl Hub {
         // from session state.
         let messages = subscriber.messages.clone();
         state.subscribers.insert(id, subscriber);
+        // A cursor older than retention is named before the retained tail is
+        // replayed: the client then knows the gap exists instead of inferring
+        // one from a sequence jump.
+        if let Some(cursor) = diagnostic_from {
+            let next_sequence = state.next_diagnostic_sequence.saturating_add(1);
+            let oldest_sequence = state
+                .diagnostics
+                .front()
+                .map(|event| event.sequence)
+                .unwrap_or(next_sequence);
+            let expired =
+                cursor.epoch != self.epoch || cursor.sequence.saturating_add(1) < oldest_sequence;
+            if expired {
+                let notice = ServerMessage::DiagnosticCursorExpired {
+                    expiry: DiagnosticExpiry {
+                        epoch: self.epoch,
+                        requested_sequence: cursor.sequence,
+                        oldest_sequence,
+                    },
+                };
+                if !try_replay(&messages, notice) {
+                    return id;
+                }
+            }
+        }
         for (&(session_id, runtime_id), events) in &state.journal {
             let sequence = resume_from
                 .iter()
@@ -295,13 +399,22 @@ impl Hub {
                 .map(|cursor| cursor.sequence)
                 .unwrap_or_default();
             for event in events.iter().filter(|event| event.sequence > sequence) {
-                if messages.len() >= MAX_QUEUED_MESSAGES_PER_SUBSCRIBER
-                    || messages
-                        .try_send(ServerMessage::Event(event.clone()))
-                        .is_err()
-                {
+                if !try_replay(&messages, ServerMessage::Event(event.clone())) {
                     return id;
                 }
+            }
+        }
+        let sequence = diagnostic_from
+            .filter(|cursor| cursor.epoch == self.epoch)
+            .map(|cursor| cursor.sequence)
+            .unwrap_or_default();
+        for event in state
+            .diagnostics
+            .iter()
+            .filter(|event| event.sequence > sequence)
+        {
+            if !try_replay(&messages, ServerMessage::Diagnostic(event.clone())) {
+                return id;
             }
         }
         id
@@ -322,9 +435,7 @@ impl Hub {
             if Some(subscriber_id) == skip {
                 continue;
             }
-            if subscriber.messages.len() >= MAX_QUEUED_MESSAGES_PER_SUBSCRIBER
-                || subscriber.messages.try_send(message.clone()).is_err()
-            {
+            if !try_replay(&subscriber.messages, message.clone()) {
                 overwhelmed.push((subscriber_id, subscriber.kicked.clone()));
             }
         }
@@ -558,7 +669,32 @@ pub fn serve(
     listener
         .set_nonblocking(true)
         .context("could not configure Waku daemon listener")?;
-    let hub = Arc::new(Hub::default());
+    let mut files_unavailable = None;
+    let diagnostic_log = match &options.diagnostics_directory {
+        Some(directory) => match DiagnosticLog::open(directory) {
+            Ok(log) => Some(log),
+            Err(error) => {
+                // Diagnostics are development tooling; a directory that cannot
+                // hold them must not keep the daemon from starting. The loss
+                // is still recorded in the stream below.
+                eprintln!("waku-daemon: diagnostic files are unavailable: {error:#}");
+                files_unavailable = Some(format!("{error:#}"));
+                None
+            }
+        },
+        None => None,
+    };
+    let hub = Arc::new(Hub::new(diagnostic_log));
+    if let Some(reason) = files_unavailable {
+        hub.record_diagnostic(DiagnosticRecord::new(
+            DiagnosticLevel::Warn,
+            DiagnosticOrigin::Daemon {
+                pid: std::process::id(),
+            },
+            "diagnostics",
+            format!("diagnostic files are unavailable: {reason}"),
+        ));
+    }
     let dispatcher = Arc::new(RequestDispatcher::new(backend.clone(), hub.clone()));
     let options = Arc::new(options);
     let active_connections = Arc::new(AtomicUsize::new(0));
@@ -628,14 +764,15 @@ fn handle_connection(
     )
     .context("WebSocket handshake failed")?;
     let hello = read_client_message(&mut socket)?;
-    let resume_from = match hello {
+    let (resume_from, diagnostic_from) = match hello {
         ClientMessage::Hello {
             protocol_version,
             token,
             resume_from,
+            diagnostic_from,
             ..
         } if protocol_version == PROTOCOL_VERSION && token_matches(expected_token, &token) => {
-            resume_from
+            (resume_from, diagnostic_from)
         }
         ClientMessage::Hello {
             protocol_version, ..
@@ -683,7 +820,7 @@ fn handle_connection(
 
     let (outgoing, outgoing_rx) = bounded(MAX_QUEUED_MESSAGES_PER_SUBSCRIBER);
     let (subscriber, kicked) = Subscriber::new(outgoing.clone());
-    let subscriber_id = hub.subscribe(&resume_from, subscriber);
+    let subscriber_id = hub.subscribe(&resume_from, diagnostic_from, subscriber);
 
     'connection: while !shutdown.load(Ordering::Acquire) {
         if kicked.try_recv().is_ok() {
@@ -698,6 +835,9 @@ fn handle_connection(
             Ok(Message::Text(text)) => match serde_json::from_str(text.as_ref()) {
                 Ok(ClientMessage::Request(request)) => {
                     dispatcher.dispatch(request, outgoing.clone(), subscriber_id);
+                }
+                Ok(ClientMessage::Diagnostic(record)) => {
+                    hub.record_diagnostic(record);
                 }
                 Ok(ClientMessage::Shutdown) => {
                     if options.allow_shutdown {
@@ -951,9 +1091,31 @@ fn handle_request(
         }
         let outcome = match backend.handle(request, hub.event_sink(session_id, runtime_id)) {
             Ok(payload) => ResponseOutcome::Ok { payload },
-            Err(error) => ResponseOutcome::Error {
-                error: RpcError::from(error),
-            },
+            Err(error) => {
+                let error = RpcError::from(error);
+                // A failed request is the daemon's own record of the failure:
+                // it names what the daemon could not do for this task, next to
+                // the app's and the provider's records in the same stream.
+                hub.event_sink(session_id, runtime_id).record(|| {
+                    Some(
+                        DiagnosticRecord::new(
+                            DiagnosticLevel::Error,
+                            DiagnosticOrigin::Daemon {
+                                pid: std::process::id(),
+                            },
+                            "request",
+                            error.message.clone(),
+                        )
+                        .with_correlation(
+                            crate::protocol::DiagnosticCorrelation {
+                                task_id: (!session_id.is_nil()).then_some(session_id),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                });
+                ResponseOutcome::Error { error }
+            }
         };
         if !notification {
             hub.cache_response(request_id, outcome.clone());
@@ -1088,7 +1250,7 @@ mod tests {
     use crossbeam_channel::{RecvTimeoutError, bounded};
     use serde_json::json;
     use std::path::PathBuf;
-    use waku_client::{DaemonClient, DaemonSupervisor};
+    use waku_client::{DaemonClient, DaemonSupervisor, DiagnosticMessage};
 
     #[derive(Default)]
     struct TestBackend {
@@ -1131,7 +1293,6 @@ mod tests {
     struct TaskStateBackend {
         sessions: Mutex<Vec<AgentSession>>,
     }
-
     impl Backend for TaskStateBackend {
         fn handle(&self, request: Request, _events: EventSink) -> anyhow::Result<ResponsePayload> {
             match request.command {
@@ -1162,12 +1323,66 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_request_becomes_the_daemons_own_record() {
+        struct ErrorBackend;
+
+        impl Backend for ErrorBackend {
+            fn handle(
+                &self,
+                _request: Request,
+                _events: EventSink,
+            ) -> anyhow::Result<ResponsePayload> {
+                anyhow::bail!("the provider refused the turn")
+            }
+        }
+
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let (outgoing, responses) = unbounded();
+        handle_request(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id,
+                runtime_id: Uuid::new_v4(),
+                command: Command::GetSettings,
+            },
+            outgoing,
+            0,
+            Arc::new(ErrorBackend),
+            hub.clone(),
+        );
+        assert!(matches!(
+            responses.try_recv(),
+            Ok(ServerMessage::Response {
+                outcome: ResponseOutcome::Error { .. },
+                ..
+            })
+        ));
+
+        let (messages, stream) = unbounded();
+        hub.subscribe(&[], None, Subscriber::new(messages).0);
+        let ServerMessage::Diagnostic(event) = stream.recv().unwrap() else {
+            panic!("expected the daemon's own record");
+        };
+        assert_eq!(event.record.level, DiagnosticLevel::Error);
+        assert_eq!(event.record.source, "request");
+        assert_eq!(event.record.message, "the provider refused the turn");
+        assert_eq!(event.record.correlation.task_id, Some(session_id));
+        assert_eq!(
+            event.record.origin,
+            DiagnosticOrigin::Daemon {
+                pid: std::process::id(),
+            }
+        );
+    }
+
+    #[test]
     fn task_state_revisions_notify_other_clients_only() {
         let hub = Hub::default();
         let (source_tx, source_rx) = unbounded();
-        let source_id = hub.subscribe(&[], Subscriber::new(source_tx).0);
+        let source_id = hub.subscribe(&[], None, Subscriber::new(source_tx).0);
         let (observer_tx, observer_rx) = unbounded();
-        hub.subscribe(&[], Subscriber::new(observer_tx).0);
+        hub.subscribe(&[], None, Subscriber::new(observer_tx).0);
 
         hub.task_state_changed(source_id);
 
@@ -1565,6 +1780,29 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn diagnostic_record(message: &str) -> DiagnosticRecord {
+        DiagnosticRecord::new(
+            crate::protocol::DiagnosticLevel::Info,
+            crate::protocol::DiagnosticOrigin::App {
+                pid: std::process::id(),
+                version: "test".into(),
+            },
+            "turn",
+            message,
+        )
+    }
+
+    fn daemon_record(message: &str) -> DiagnosticRecord {
+        DiagnosticRecord::new(
+            crate::protocol::DiagnosticLevel::Info,
+            crate::protocol::DiagnosticOrigin::Daemon {
+                pid: std::process::id(),
+            },
+            "driver",
+            message,
+        )
+    }
+
     #[test]
     fn websocket_round_trip_sequences_provider_events() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1747,6 +1985,450 @@ mod tests {
     }
 
     #[test]
+    fn the_stream_mixes_app_and_daemon_records_in_one_sequence() {
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let sink = hub.event_sink(session_id, runtime_id);
+        hub.record_diagnostic(diagnostic_record("app first"));
+        sink.record(|| Some(daemon_record("daemon second")));
+        hub.record_diagnostic(diagnostic_record("app third"));
+
+        let (messages, stream) = unbounded();
+        hub.subscribe(&[], None, Subscriber::new(messages).0);
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let ServerMessage::Diagnostic(event) = stream.recv().unwrap() else {
+                panic!("expected a diagnostic record");
+            };
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.sequence, event.record.message.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "app first"), (2, "daemon second"), (3, "app third")]
+        );
+    }
+
+    #[test]
+    fn provider_stderr_reaches_the_stream_attributed_to_its_runtime() {
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let diagnostics = crate::diagnostics::ProviderDiagnostics::new(
+            crate::diagnostics::ProviderRuntime {
+                provider: crate::model::ProviderKind::Pi,
+                session_id,
+                runtime_id,
+            },
+            {
+                let sink = hub.event_sink(session_id, runtime_id);
+                move |record| sink.record(|| Some(record))
+            },
+        );
+        let (sender, _receiver) = crate::driver::event_channel_with_diagnostics(
+            smol::channel::unbounded().0,
+            Some(diagnostics),
+        );
+        sender.record_stderr("extension warning");
+
+        let (messages, stream) = unbounded();
+        hub.subscribe(&[], None, Subscriber::new(messages).0);
+        let ServerMessage::Diagnostic(event) = stream.recv().unwrap() else {
+            panic!("expected a diagnostic record");
+        };
+        assert_eq!(event.record.source, "stderr");
+        assert_eq!(event.record.message, "extension warning");
+        assert_eq!(event.record.correlation.task_id, Some(session_id));
+        assert_eq!(
+            event.record.origin,
+            crate::protocol::DiagnosticOrigin::Provider {
+                provider: crate::model::ProviderKind::Pi,
+                runtime_id,
+            }
+        );
+    }
+
+    #[test]
+    fn an_expired_cursor_is_named_and_the_retained_tail_still_replays() {
+        let hub = Arc::new(Hub::default());
+        let total = MAX_DIAGNOSTIC_EVENTS + 10;
+        for sequence in 1..=total {
+            hub.record_diagnostic(diagnostic_record(&format!("record {sequence}")));
+        }
+        let oldest = (total - MAX_DIAGNOSTIC_EVENTS + 1) as u64;
+
+        // A cursor older than retention is told so, then sees exactly the
+        // retained tail in order rather than a silent gap.
+        let (messages, stream) = unbounded();
+        hub.subscribe(
+            &[],
+            Some(DiagnosticCursor {
+                epoch: hub.epoch,
+                sequence: 1,
+            }),
+            Subscriber::new(messages).0,
+        );
+        let ServerMessage::DiagnosticCursorExpired { expiry } = stream.recv().unwrap() else {
+            panic!("expected the expiry notice first");
+        };
+        assert_eq!(expiry.requested_sequence, 1);
+        assert_eq!(expiry.oldest_sequence, oldest);
+        let mut replayed = Vec::new();
+        while let Ok(ServerMessage::Diagnostic(event)) = stream.try_recv() {
+            replayed.push(event.sequence);
+        }
+        assert_eq!(replayed.len(), MAX_DIAGNOSTIC_EVENTS);
+        assert_eq!(replayed.first().copied(), Some(oldest));
+        assert_eq!(replayed.last().copied(), Some(total as u64));
+        assert_eq!(replayed, (oldest..=total as u64).collect::<Vec<_>>());
+
+        // A cursor still inside retention is not expired and replays the
+        // records after it, once each.
+        let (messages, stream) = unbounded();
+        hub.subscribe(
+            &[],
+            Some(DiagnosticCursor {
+                epoch: hub.epoch,
+                sequence: total as u64 - 1,
+            }),
+            Subscriber::new(messages).0,
+        );
+        let ServerMessage::Diagnostic(event) = stream.recv().unwrap() else {
+            panic!("a cursor inside retention must not expire");
+        };
+        assert_eq!(event.sequence, total as u64);
+        assert!(stream.try_recv().is_err());
+
+        // A fresh client has no cursor and reads the retained tail.
+        let (messages, stream) = unbounded();
+        hub.subscribe(&[], None, Subscriber::new(messages).0);
+        let mut count = 0u64;
+        while let Ok(ServerMessage::Diagnostic(event)) = stream.try_recv() {
+            count += 1;
+            assert_eq!(event.sequence, oldest + count - 1);
+        }
+        assert_eq!(count, MAX_DIAGNOSTIC_EVENTS as u64);
+    }
+
+    #[test]
+    fn the_daemon_writes_ordered_ndjson_records_to_files() {
+        let directory = std::env::temp_dir().join(format!("waku-hub-log-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let log = crate::diagnostics::DiagnosticLog::open(&directory).unwrap();
+        let hub = Arc::new(Hub::new(Some(log)));
+        for sequence in 1..=5 {
+            hub.record_diagnostic(diagnostic_record(&format!("record {sequence}")));
+        }
+        hub.flush_diagnostics();
+
+        let mut written = Vec::new();
+        for entry in std::fs::read_dir(directory.join("diagnostics")).unwrap() {
+            written.push(std::fs::read_to_string(entry.unwrap().path()).unwrap());
+        }
+        written.sort();
+        let lines = written
+            .join("")
+            .lines()
+            .map(|line| serde_json::from_str::<DiagnosticEvent>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|event| (event.sequence, event.record.message.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (1, "record 1"),
+                (2, "record 2"),
+                (3, "record 3"),
+                (4, "record 4"),
+                (5, "record 5"),
+            ]
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn unavailable_diagnostic_files_do_not_stop_the_daemon() {
+        let root = std::env::temp_dir().join(format!("waku-bad-diagnostics-{}", Uuid::new_v4()));
+        std::fs::write(&root, b"not a directory").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let diagnostics_directory = root.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(TestBackend::default()),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    diagnostics_directory: Some(diagnostics_directory),
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let stream = client.subscribe_diagnostics();
+        let DiagnosticMessage::Event(event) = stream.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected the unavailable-files record");
+        };
+        assert_eq!(event.record.level, DiagnosticLevel::Warn);
+        assert_eq!(event.record.source, "diagnostics");
+        assert!(event.record.message.contains("unavailable"));
+
+        client.shutdown();
+        server.join().unwrap();
+        std::fs::remove_file(&root).unwrap();
+    }
+
+    #[test]
+    fn a_resumed_client_replays_diagnostic_records_without_gaps() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(TestBackend::default()),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let producer = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        for message in ["one", "two", "three", "four"] {
+            producer
+                .record_diagnostic(diagnostic_record(message))
+                .unwrap();
+        }
+        // One request after the records: messages on one connection are
+        // handled in order, so the answer proves the daemon sequenced them.
+        producer
+            .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
+            .unwrap();
+
+        // A client with no cursor reads the retained tail from the handshake.
+        let fresh = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let fresh_stream = fresh.subscribe_diagnostics();
+        let mut seen = Vec::new();
+        for expected in ["one", "two", "three", "four"] {
+            let message = fresh_stream.recv_timeout(Duration::from_secs(1)).unwrap();
+            let DiagnosticMessage::Event(event) = message else {
+                panic!("a fresh client must not see an expiry notice")
+            };
+            assert_eq!(event.record.message, expected);
+            assert_eq!(event.sequence, seen.len() as u64 + 1);
+            seen.push(event.record.message.clone());
+        }
+        assert_eq!(seen, ["one", "two", "three", "four"]);
+        let cursor = fresh.last_diagnostic_cursor().unwrap();
+        assert_eq!(cursor.sequence, 4);
+
+        // A resumed client asks for what came after sequence two and reads
+        // the rest once, in order.
+        let resumed = DaemonClient::connect_with_cursors(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            Some(DiagnosticCursor {
+                epoch: cursor.epoch,
+                sequence: 2,
+            }),
+        )
+        .unwrap();
+        let resumed_stream = resumed.subscribe_diagnostics();
+        for (index, expected) in ["three", "four"].into_iter().enumerate() {
+            let message = resumed_stream.recv_timeout(Duration::from_secs(1)).unwrap();
+            let DiagnosticMessage::Event(event) = message else {
+                panic!("a cursor inside retention must not expire")
+            };
+            assert_eq!(event.record.message, expected);
+            assert_eq!(event.sequence, index as u64 + 3);
+        }
+        assert_eq!(resumed.last_diagnostic_cursor().unwrap().sequence, 4);
+        assert!(
+            resumed_stream
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the replay stops at the cursor's edge"
+        );
+
+        producer.shutdown();
+        fresh.shutdown();
+        resumed.shutdown();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_client_behind_retention_sees_the_expiry_notice_and_the_retained_tail() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(TestBackend::default()),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let producer = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let total = MAX_DIAGNOSTIC_EVENTS + 2;
+        for sequence in 1..=total {
+            producer
+                .record_diagnostic(diagnostic_record(&format!("record {sequence}")))
+                .unwrap();
+        }
+        // One request after the records: the answer proves the daemon
+        // sequenced all of them before the client connects.
+        producer
+            .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
+            .unwrap();
+        let cursor = producer.last_diagnostic_cursor().unwrap();
+        assert_eq!(cursor.sequence, total as u64);
+        let epoch = cursor.epoch;
+
+        let client = DaemonClient::connect_with_cursors(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            Some(DiagnosticCursor { epoch, sequence: 1 }),
+        )
+        .unwrap();
+        let stream = client.subscribe_diagnostics();
+        let DiagnosticMessage::Expired(expiry) =
+            stream.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected the expiry notice first");
+        };
+        assert_eq!(expiry.requested_sequence, 1);
+        assert_eq!(expiry.oldest_sequence, 3);
+        let DiagnosticMessage::Event(event) = stream.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected the retained tail after the notice");
+        };
+        assert_eq!(event.sequence, expiry.oldest_sequence);
+        // The reader keeps consuming the tail while the test runs, so the
+        // live cursor has advanced past the event just read; it must never
+        // move backwards from it.
+        assert!(
+            client
+                .last_diagnostic_cursor()
+                .is_some_and(|cursor| cursor.sequence >= event.sequence)
+        );
+
+        producer.shutdown();
+        client.shutdown();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_reconnecting_client_sees_each_diagnostic_record_once_in_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(TestBackend::default()),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let producer = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        for message in ["one", "two", "three"] {
+            producer
+                .record_diagnostic(diagnostic_record(message))
+                .unwrap();
+        }
+        producer
+            .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
+            .unwrap();
+
+        // The first reader consumes the stream from the beginning.
+        let reader = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let stream = reader.subscribe_diagnostics();
+        for (index, expected) in ["one", "two", "three"].into_iter().enumerate() {
+            let DiagnosticMessage::Event(event) =
+                stream.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected a diagnostic record");
+            };
+            assert_eq!(event.sequence, index as u64 + 1);
+            assert_eq!(event.record.message, expected);
+        }
+        let cursor = reader.last_diagnostic_cursor().unwrap();
+
+        // Records produced after that cursor must arrive exactly once on the
+        // replacement connection, in order, and the consumed ones must not be
+        // replayed. The old connection is left open: a replacement client is
+        // the reconnect this test exercises.
+        for message in ["four", "five"] {
+            producer
+                .record_diagnostic(diagnostic_record(message))
+                .unwrap();
+        }
+        producer
+            .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
+            .unwrap();
+        let resumed = DaemonClient::connect_with_cursors(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            Some(cursor),
+        )
+        .unwrap();
+        let resumed_stream = resumed.subscribe_diagnostics();
+        for (index, expected) in ["four", "five"].into_iter().enumerate() {
+            let DiagnosticMessage::Event(event) =
+                resumed_stream.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected a diagnostic record");
+            };
+            assert_eq!(event.sequence, cursor.sequence + index as u64 + 1);
+            assert_eq!(event.record.message, expected);
+        }
+        assert!(
+            resumed_stream
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "no record may be delivered twice"
+        );
+
+        producer.shutdown();
+        resumed.shutdown();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn remote_supervisor_reconnects_without_losing_the_daemon_runtime() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         // Keep the address reserved between servers. If the first listener is
@@ -1848,7 +2530,7 @@ mod tests {
         hub.begin_runtime(session_id, runtime_id);
         let (messages, events) = unbounded();
         let (subscriber, _kicked) = Subscriber::new(messages);
-        hub.subscribe(&[], subscriber);
+        hub.subscribe(&[], None, subscriber);
         let terminal = crate::terminal::DaemonTerminal::open_with_shell_and_retention(
             &root,
             80,
@@ -3084,7 +3766,7 @@ mod tests {
         let old_runtime_id = Uuid::new_v4();
         let new_runtime_id = Uuid::new_v4();
         let (outgoing, events) = unbounded();
-        hub.subscribe(&[], Subscriber::new(outgoing).0);
+        hub.subscribe(&[], None, Subscriber::new(outgoing).0);
 
         hub.begin_runtime(session_id, old_runtime_id);
         let old_sink = hub.event_sink(session_id, old_runtime_id);
@@ -3131,6 +3813,7 @@ mod tests {
                 epoch: Uuid::nil(),
                 sequence: u64::MAX,
             }],
+            None,
             Subscriber::new(outgoing).0,
         );
 
@@ -3149,7 +3832,7 @@ mod tests {
         // Capacity one and no drainer: the second queued message overflows.
         let (outgoing, events) = bounded(1);
         let (subscriber, kicked) = Subscriber::new(outgoing);
-        hub.subscribe(&[], subscriber);
+        hub.subscribe(&[], None, subscriber);
         hub.begin_runtime(session_id, runtime_id);
         let sink = hub.event_sink(session_id, runtime_id);
 

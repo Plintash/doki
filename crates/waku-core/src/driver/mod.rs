@@ -35,6 +35,7 @@ use crate::model::{
 pub struct DriverEventSender {
     events: Sender<DriverEvent>,
     wake: smol::channel::Sender<()>,
+    diagnostics: Option<crate::diagnostics::ProviderDiagnostics>,
 }
 
 impl DriverEventSender {
@@ -42,6 +43,14 @@ impl DriverEventSender {
         self.events.send(event)?;
         let _ = self.wake.try_send(());
         Ok(())
+    }
+
+    /// Record one raw provider stderr line into the instance's diagnostic
+    /// stream, attributed to this driver's provider and runtime.
+    pub fn record_stderr(&self, line: &str) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.stderr(line);
+        }
     }
 }
 
@@ -65,8 +74,24 @@ impl DriverEventSink for Sender<DriverEvent> {
 pub fn event_channel(
     wake: smol::channel::Sender<()>,
 ) -> (DriverEventSender, Receiver<DriverEvent>) {
+    event_channel_with_diagnostics(wake, None)
+}
+
+/// The daemon's channel: as [`event_channel`], with provider stderr and driver
+/// events attributed to the runtime that produced them.
+pub(crate) fn event_channel_with_diagnostics(
+    wake: smol::channel::Sender<()>,
+    diagnostics: Option<crate::diagnostics::ProviderDiagnostics>,
+) -> (DriverEventSender, Receiver<DriverEvent>) {
     let (events, receiver) = unbounded();
-    (DriverEventSender { events, wake }, receiver)
+    (
+        DriverEventSender {
+            events,
+            wake,
+            diagnostics,
+        },
+        receiver,
+    )
 }
 
 #[cfg(test)]

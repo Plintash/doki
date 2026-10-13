@@ -542,9 +542,12 @@ fn monitor_daemon(
             if !still_current {
                 continue;
             }
-            let Ok(replacement) =
-                DaemonClient::connect_with_resume(&address, token.clone(), resume_from)
-            else {
+            let Ok(replacement) = DaemonClient::connect_with_cursors(
+                &address,
+                token.clone(),
+                resume_from,
+                disconnected.last_diagnostic_cursor(),
+            ) else {
                 continue;
             };
             *inner.target.lock() = DaemonTarget::Remote {

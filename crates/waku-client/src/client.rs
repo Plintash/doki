@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use waku_protocol::MAX_WIRE_MESSAGE_BYTES;
 use waku_protocol::{
-    ClientMessage, Command, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
-    ResponsePayload, RpcError, SequencedEvent, ServerMessage,
+    ClientMessage, Command, DiagnosticCursor, DiagnosticEvent, DiagnosticExpiry, DiagnosticRecord,
+    PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome, ResponsePayload, RpcError,
+    SequencedEvent, ServerMessage,
 };
 
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -34,8 +35,22 @@ struct ClientInner {
     sessions: Mutex<HashMap<(Uuid, Uuid), Sender<SequencedEvent>>>,
     pending_events: Mutex<HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>>,
     task_state_subscribers: Mutex<Vec<Sender<u64>>>,
+    diagnostic_subscribers: Mutex<Vec<Sender<DiagnosticMessage>>>,
+    pending_diagnostics: Mutex<VecDeque<DiagnosticMessage>>,
     last_sequences: Mutex<HashMap<(Uuid, Uuid), LastSequence>>,
+    last_diagnostic: Mutex<Option<DiagnosticCursor>>,
     disconnected: AtomicBool,
+}
+
+/// One message from the instance's diagnostic stream.
+///
+/// A reconnect that outran retention is named as [`Self::Expired`] before
+/// the retained [`Self::Event`]s, so a consumer knows a gap exists instead of
+/// inferring one from a sequence jump.
+#[derive(Clone, Debug)]
+pub enum DiagnosticMessage {
+    Event(DiagnosticEvent),
+    Expired(DiagnosticExpiry),
 }
 
 #[derive(Clone, Copy)]
@@ -51,13 +66,18 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     pub fn connect(address: &str, token: String) -> anyhow::Result<Self> {
-        Self::connect_with_resume(address, token, Vec::new())
+        Self::connect_with_cursors(address, token, Vec::new(), None)
     }
 
-    pub fn connect_with_resume(
+    /// Connect and resume both sequenced streams: the runtime events keyed by
+    /// task/runtime, and the instance's diagnostic stream. A `None`
+    /// diagnostic cursor asks for the retained tail, which is what a client
+    /// that has never read the stream wants.
+    pub fn connect_with_cursors(
         address: &str,
         token: String,
         resume_from: Vec<ReplayCursor>,
+        diagnostic_from: Option<DiagnosticCursor>,
     ) -> anyhow::Result<Self> {
         let last_sequences = resume_from
             .iter()
@@ -86,6 +106,7 @@ impl DaemonClient {
                 token,
                 client_id: Uuid::new_v4(),
                 resume_from,
+                diagnostic_from,
             },
         )?;
         let hello = read_server_message(&mut socket)?;
@@ -110,7 +131,10 @@ impl DaemonClient {
             sessions: Mutex::new(HashMap::new()),
             pending_events: Mutex::new(HashMap::new()),
             task_state_subscribers: Mutex::new(Vec::new()),
+            diagnostic_subscribers: Mutex::new(Vec::new()),
+            pending_diagnostics: Mutex::new(VecDeque::new()),
             last_sequences: Mutex::new(last_sequences),
+            last_diagnostic: Mutex::new(diagnostic_from),
             disconnected: AtomicBool::new(false),
         });
         let thread_inner = inner.clone();
@@ -158,6 +182,45 @@ impl DaemonClient {
         let (events, receiver) = unbounded();
         self.inner.task_state_subscribers.lock().push(events);
         receiver
+    }
+
+    /// Read the instance's diagnostic stream from the next record onward.
+    ///
+    /// A fresh client asks for the retained tail in the handshake; a client
+    /// that reconnects passes [`Self::last_diagnostic_cursor`] into
+    /// [`Self::connect_with_cursors`] instead. Records that arrive before the
+    /// first subscriber are buffered, so a subscription sees the whole
+    /// handshake replay.
+    pub fn subscribe_diagnostics(&self) -> Receiver<DiagnosticMessage> {
+        let (events, receiver) = unbounded();
+        // Keep the subscriber lock while draining: the socket thread locks
+        // the same mutex before delivering, so no live record can overtake
+        // the buffered ones.
+        let mut subscribers = self.inner.diagnostic_subscribers.lock();
+        let pending = std::mem::take(&mut *self.inner.pending_diagnostics.lock());
+        for message in pending {
+            let _ = events.send(message);
+        }
+        subscribers.push(events);
+        receiver
+    }
+
+    /// The last diagnostic record this client observed. A reconnect passes
+    /// this cursor so the daemon resumes exactly where delivery stopped.
+    pub fn last_diagnostic_cursor(&self) -> Option<DiagnosticCursor> {
+        *self.inner.last_diagnostic.lock()
+    }
+
+    /// Send one structured record to the daemon, which sequences it into the
+    /// instance's stream. Fire-and-forget: the daemon does not answer.
+    pub fn record_diagnostic(&self, record: DiagnosticRecord) -> anyhow::Result<()> {
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            bail!("Waku daemon is disconnected");
+        }
+        self.inner
+            .outgoing
+            .send(Outgoing::Message(ClientMessage::Diagnostic(record)))
+            .map_err(|_| anyhow!("Waku daemon connection is closed"))
     }
 
     pub fn request(
@@ -330,6 +393,27 @@ fn run_client(
                             .lock()
                             .retain(|subscriber| subscriber.send(revision).is_ok());
                     }
+                    ServerMessage::Diagnostic(event) => {
+                        let fresh = {
+                            let mut last = inner.last_diagnostic.lock();
+                            let stale = last.is_some_and(|cursor| {
+                                cursor.epoch == event.epoch && event.sequence <= cursor.sequence
+                            });
+                            if !stale {
+                                *last = Some(DiagnosticCursor {
+                                    epoch: event.epoch,
+                                    sequence: event.sequence,
+                                });
+                            }
+                            !stale
+                        };
+                        if fresh {
+                            deliver_diagnostic(&inner, DiagnosticMessage::Event(event));
+                        }
+                    }
+                    ServerMessage::DiagnosticCursorExpired { expiry } => {
+                        deliver_diagnostic(&inner, DiagnosticMessage::Expired(expiry));
+                    }
                     ServerMessage::ShuttingDown => break,
                     ServerMessage::Hello { .. } | ServerMessage::Rejected { .. } => {}
                 }
@@ -359,6 +443,22 @@ fn run_client(
     // `processExited` event emitted by the daemon.
     drop(std::mem::take(&mut *inner.sessions.lock()));
     inner.task_state_subscribers.lock().clear();
+    inner.diagnostic_subscribers.lock().clear();
+}
+
+fn deliver_diagnostic(inner: &ClientInner, message: DiagnosticMessage) {
+    let mut subscribers = inner.diagnostic_subscribers.lock();
+    if subscribers.is_empty() {
+        let mut pending = inner.pending_diagnostics.lock();
+        pending.push_back(message);
+        // The daemon's own retention bound, so a handshake replay is never
+        // truncated by a narrower client buffer.
+        while pending.len() > waku_protocol::MAX_DIAGNOSTIC_EVENTS {
+            pending.pop_front();
+        }
+        return;
+    }
+    subscribers.retain(|subscriber| subscriber.send(message.clone()).is_ok());
 }
 
 fn set_client_read_timeout(

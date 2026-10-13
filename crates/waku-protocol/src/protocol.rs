@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::attachments::{AttachmentUpload, StoredAttachment};
 use crate::computer_use::ComputerPermissions;
+use crate::diagnostics::{DiagnosticCursor, DiagnosticEvent, DiagnosticExpiry, DiagnosticRecord};
 use crate::model::{
     AgentSession, GoalOperation, Project, ProviderKind, ProviderProbe, ProviderResumeCursor,
     ProviderSessionHistory, ProviderSessionSummary, UserInputAnswer,
@@ -19,7 +20,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -46,8 +47,15 @@ pub enum ClientMessage {
         client_id: Uuid,
         #[serde(default)]
         resume_from: Vec<ReplayCursor>,
+        /// Where this client left the instance's diagnostic stream. A client
+        /// that has never read it asks for the retained tail instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostic_from: Option<DiagnosticCursor>,
     },
     Request(Request),
+    /// One structured record from a client process (the app in practice). The
+    /// daemon sequences it into the instance's stream and never answers.
+    Diagnostic(DiagnosticRecord),
     Shutdown,
 }
 
@@ -375,6 +383,16 @@ pub enum ServerMessage {
         outcome: ResponseOutcome,
     },
     Event(SequencedEvent),
+    /// One sequenced record from the instance's diagnostic stream.
+    Diagnostic(DiagnosticEvent),
+    /// The client's diagnostic cursor is older than the daemon's retained
+    /// stream, so records have been dropped. Sent before the retained events
+    /// are replayed, never in place of them, so a reconnecting client knows
+    /// exactly where its gap begins.
+    DiagnosticCursorExpired {
+        #[serde(flatten)]
+        expiry: DiagnosticExpiry,
+    },
     /// The daemon-owned project/task catalog changed through another client.
     /// Clients should invalidate their lightweight task-state snapshot; live
     /// runtime events continue through [`Self::Event`].
@@ -638,7 +656,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]
@@ -647,7 +665,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]
@@ -716,6 +734,10 @@ mod tests {
                 epoch: Uuid::from_u128(3),
                 sequence: 9,
             }],
+            diagnostic_from: Some(DiagnosticCursor {
+                epoch: Uuid::from_u128(4),
+                sequence: 11,
+            }),
         };
         let json = serde_json::to_value(message).unwrap();
 
@@ -727,7 +749,70 @@ mod tests {
             json["resumeFrom"][0]["epoch"],
             Uuid::from_u128(3).to_string()
         );
+        assert_eq!(
+            json["diagnosticFrom"]["epoch"],
+            Uuid::from_u128(4).to_string()
+        );
+        assert_eq!(json["diagnosticFrom"]["sequence"], 11);
         assert!(json.get("protocol_version").is_none());
+
+        // A client that has not read the stream leaves the cursor out
+        // entirely, so the handshake keeps the older shape.
+        let message = ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            token: "secret".into(),
+            client_id: Uuid::from_u128(2),
+            resume_from: Vec::new(),
+            diagnostic_from: None,
+        };
+        let json = serde_json::to_value(message).unwrap();
+        assert!(json.get("diagnosticFrom").is_none());
+    }
+
+    #[test]
+    fn diagnostic_messages_use_stable_wire_fields() {
+        let task_id = Uuid::from_u128(5);
+        let record = DiagnosticRecord::new(
+            crate::diagnostics::DiagnosticLevel::Info,
+            crate::diagnostics::DiagnosticOrigin::App {
+                pid: 7,
+                version: "test".into(),
+            },
+            "turn",
+            "settled",
+        )
+        .with_correlation(crate::diagnostics::DiagnosticCorrelation {
+            task_id: Some(task_id),
+            ..Default::default()
+        });
+        let message = serde_json::to_value(ClientMessage::Diagnostic(record.clone())).unwrap();
+        assert_eq!(message["type"], "diagnostic");
+        assert_eq!(message["origin"]["process"], "app");
+        assert_eq!(message["taskId"], task_id.to_string());
+
+        let epoch = Uuid::from_u128(6);
+        let event = DiagnosticEvent {
+            epoch,
+            sequence: 3,
+            record,
+        };
+        let message = serde_json::to_value(ServerMessage::Diagnostic(event)).unwrap();
+        assert_eq!(message["type"], "diagnostic");
+        assert_eq!(message["epoch"], epoch.to_string());
+        assert_eq!(message["sequence"], 3);
+        assert_eq!(message["source"], "turn");
+
+        let message = serde_json::to_value(ServerMessage::DiagnosticCursorExpired {
+            expiry: DiagnosticExpiry {
+                epoch,
+                requested_sequence: 4,
+                oldest_sequence: 9,
+            },
+        })
+        .unwrap();
+        assert_eq!(message["type"], "diagnosticCursorExpired");
+        assert_eq!(message["requestedSequence"], 4);
+        assert_eq!(message["oldestSequence"], 9);
     }
 
     #[test]

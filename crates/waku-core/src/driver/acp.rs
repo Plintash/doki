@@ -156,6 +156,7 @@ impl AcpDriver {
             launch,
             computer_use.as_ref().map(|runtime| &runtime.config),
             stderr_lines.clone(),
+            Some(events.clone()),
         )?;
         let (commands, command_rx) = smol::channel::unbounded();
         let provider_name = provider.display_name();
@@ -211,6 +212,7 @@ fn sdk_agent(
     mut launch: AcpLaunch,
     computer_use: Option<&super::support::HeadlessComputerUseConfig>,
     stderr_lines: Arc<Mutex<Vec<String>>>,
+    events: Option<DriverEventSender>,
 ) -> anyhow::Result<AcpAgent> {
     let binary = binary
         .to_str()
@@ -245,6 +247,9 @@ fn sdk_agent(
         if direction != LineDirection::Stderr || line.trim().is_empty() {
             return;
         }
+        if let Some(events) = &events {
+            events.record_stderr(line);
+        }
         let mut lines = stderr_lines.lock();
         if lines.len() == 128 {
             lines.remove(0);
@@ -265,7 +270,14 @@ pub(crate) fn catalog_agent(
     cwd: &Path,
 ) -> anyhow::Result<AcpAgent> {
     let launch = launch_for(provider, None)?;
-    sdk_agent(binary, cwd, launch, None, Arc::new(Mutex::new(Vec::new())))
+    sdk_agent(
+        binary,
+        cwd,
+        launch,
+        None,
+        Arc::new(Mutex::new(Vec::new())),
+        None,
+    )
 }
 
 type PermissionResponder = Responder<RequestPermissionResponse>;

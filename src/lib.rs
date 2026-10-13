@@ -33,6 +33,7 @@ mod assets;
 mod browser;
 mod computer_use;
 pub mod daemon;
+mod diagnostics;
 mod driver;
 mod input;
 mod instance;

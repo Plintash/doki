@@ -1507,6 +1507,21 @@ impl AgentSession {
             .map(|turn| turn.id)
     }
 
+    /// The user message that opened one of the session's turns, when the
+    /// transcript holds it.
+    pub fn user_message_id_for_turn(&self, turn_id: Uuid) -> Option<Uuid> {
+        self.messages
+            .iter()
+            .find(|message| message.turn_id == Some(turn_id) && message.role == MessageRole::User)
+            .map(|message| message.id)
+    }
+
+    /// The user message that opened the session's active turn, when one is
+    /// open and carries a prompt.
+    pub fn active_turn_user_message_id(&self) -> Option<Uuid> {
+        self.user_message_id_for_turn(self.active_turn_id()?)
+    }
+
     /// Undo [`Self::begin_turn`] for a turn whose provider never started —
     /// the submission-preparation failure path, where the prompt returns to
     /// the composer. The turn and its messages leave the transcript, and a

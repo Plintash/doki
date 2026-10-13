@@ -31,6 +31,7 @@ pub mod blob;
 pub mod checkpoint;
 pub mod composer;
 pub mod computer_use;
+pub mod diagnostics;
 mod driver_wire;
 pub mod git;
 pub mod i18n;
@@ -50,6 +51,10 @@ pub mod workspace;
 
 mod protocol;
 
+pub use diagnostics::{
+    DiagnosticCorrelation, DiagnosticCursor, DiagnosticEvent, DiagnosticExpiry, DiagnosticLevel,
+    DiagnosticOrigin, DiagnosticRecord, DriverMilestone, MAX_DIAGNOSTIC_EVENTS, driver_milestone,
+};
 pub use driver_wire::{decode_enum, encode_enum, event_from_wire, event_to_wire};
 pub use protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,

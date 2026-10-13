@@ -51,10 +51,12 @@ lost across a dropped or resumed connection.
 
 ### Requirement: Always-on bounded retention
 
-Each process SHALL retain recent events in bounded memory and append them to
-rotating NDJSON files under the instance data directory. Retention MUST be
-bounded by size or count, older records SHALL be dropped, and records SHALL be
-written by a background writer so a slow disk does not delay a frame.
+The daemon SHALL retain the instance's recent events in bounded memory and
+append them to rotating NDJSON files under the instance data directory; every
+other process's records reach that stream by being sent to the daemon.
+Retention MUST be bounded by size or count, older records SHALL be dropped, and
+records SHALL be written by a background writer so a slow disk does not delay a
+frame.
 
 #### Scenario: Retention is bounded
 
@@ -69,7 +71,7 @@ written by a background writer so a slow disk does not delay a frame.
 #### Scenario: Files are the ground truth
 
 - **WHEN** the app is hung or not answering
-- **THEN** its records are still readable directly from its files
+- **THEN** the records it had sent are still readable directly from the instance's files
 
 ### Requirement: Runtime verbosity
 

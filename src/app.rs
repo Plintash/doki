@@ -184,7 +184,7 @@ const LIVE_REASONING_WINDOW_TARGET: usize = 6 * 1024;
 const LIVE_REASONING_WINDOW_MAX: usize = 18 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StreamPhase {
+pub(crate) enum StreamPhase {
     Text,
     Reasoning,
     Activity,

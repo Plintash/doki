@@ -177,6 +177,97 @@ describe("WakuClient", () => {
     await secondConnection;
   });
 
+  test("reconnect resumes the diagnostic stream without replaying what was seen", async () => {
+    const { client, sockets } = fixture();
+    const received: Array<[number, string]> = [];
+    const origins: string[] = [];
+    let expired: { requestedSequence: number; oldestSequence: number } | undefined;
+    client.subscribeDiagnostics((message) => {
+      if (message.type === "diagnostic") {
+        received.push([message.sequence, message.message]);
+        origins.push(message.origin.process);
+      } else {
+        expired = {
+          requestedSequence: message.requestedSequence,
+          oldestSequence: message.oldestSequence,
+        };
+      }
+    });
+
+    const firstConnection = client.connect();
+    const first = sockets[0]!;
+    first.open();
+    first.receive({ type: "hello", protocolVersion: PROTOCOL_VERSION, daemonVersion: "test" });
+    await firstConnection;
+
+    const record = (sequence: number, message: string) => ({
+      type: "diagnostic",
+      epoch: "epoch-one",
+      sequence,
+      timestampMs: sequence,
+      level: "info",
+      origin: { process: "app", pid: 1, version: "test" },
+      source: "turn",
+      message,
+    });
+    first.receive(record(1, "one"));
+    first.receive(record(2, "two"));
+    first.receive(record(2, "two"));
+    expect(received).toEqual([
+      [1, "one"],
+      [2, "two"],
+    ]);
+    expect(client.lastDiagnosticCursor()).toEqual({ epoch: "epoch-one", sequence: 2 });
+
+    client.disconnect();
+    const secondConnection = client.connect();
+    const second = sockets[1]!;
+    second.open();
+    expect(JSON.parse(second.sent[0]!).diagnosticFrom).toEqual({
+      epoch: "epoch-one",
+      sequence: 2,
+    });
+    second.receive({ type: "hello", protocolVersion: PROTOCOL_VERSION, daemonVersion: "test" });
+    await secondConnection;
+
+    // Only the records produced while the client was away arrive, in order.
+    second.receive(record(3, "three"));
+    second.receive({
+      type: "diagnosticCursorExpired",
+      epoch: "epoch-one",
+      requestedSequence: 1,
+      oldestSequence: 5,
+    });
+    expect(received).toEqual([
+      [1, "one"],
+      [2, "two"],
+      [3, "three"],
+    ]);
+    expect(origins).toEqual(["app", "app", "app"]);
+    expect(expired).toEqual({ requestedSequence: 1, oldestSequence: 5 });
+  });
+
+  test("buffers diagnostic records that arrive before the first subscriber", async () => {
+    const { client, sockets } = fixture();
+    const socket = await connect(client, sockets);
+    socket.receive({
+      type: "diagnostic",
+      epoch: "epoch-one",
+      sequence: 1,
+      timestampMs: 1,
+      level: "info",
+      origin: { process: "daemon", pid: 2 },
+      source: "request",
+      message: "buffered",
+    });
+
+    const messages: string[] = [];
+    client.subscribeDiagnostics((message) => {
+      if (message.type === "diagnostic") messages.push(message.message);
+    });
+    expect(messages).toEqual(["buffered"]);
+  });
+
   test("disconnect rejects an in-flight handshake and permits reconnecting", async () => {
     const { client, sockets } = fixture();
     const firstConnection = client.connect();

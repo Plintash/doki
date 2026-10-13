@@ -128,6 +128,9 @@ UI thread and never aborts the app. The executor serializes its work.
 Every process records structured, correlated events; the daemon aggregates
 them into one ordered, bounded, parseable stream; runtime verbosity adjusts
 what is recorded; health is part of every snapshot; failures attach a bundle.
+The daemon is also the instance's file owner: an emitter's records reach the
+rotating NDJSON files by being sent to the daemon, so no second per-process
+copy of the stream exists to keep consistent.
 
 - Why: the spike's debugging cost came from the system not explaining itself.
   Ground-truth files also cover the case where the app or the daemon is hung.

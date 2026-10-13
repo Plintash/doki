@@ -873,13 +873,30 @@ impl Backend for WakuBackend {
                         .context("daemon received an invalid provider cursor")?,
                 };
                 let (wake, _wake_events) = smol::channel::bounded(1);
-                let (event_sender, event_receiver) = driver::event_channel(wake);
+                let runtime = crate::diagnostics::ProviderRuntime {
+                    provider,
+                    session_id,
+                    runtime_id,
+                };
+                let diagnostics = crate::diagnostics::ProviderDiagnostics::new(runtime, {
+                    let events = events.clone();
+                    move |record| events.record(|| Some(record))
+                });
+                let tracker = diagnostics.clone();
+                let (event_sender, event_receiver) =
+                    driver::event_channel_with_diagnostics(wake, Some(diagnostics));
                 let handle = driver::start_local(provider, options, event_sender)?;
                 let supports_steer = handle.supports_steer();
                 std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
                     .spawn(move || {
+                        let mut active_turn = crate::diagnostics::ActiveTurn::default();
                         while let Ok(event) = event_receiver.recv() {
+                            events.record(|| {
+                                let turn_id = active_turn.turn_for(&event);
+                                tracker.set_turn(turn_id);
+                                crate::diagnostics::driver_record(runtime, turn_id, &event)
+                            });
                             let wire = event_to_wire(event).unwrap_or_else(|error| {
                                 WireDriverEvent::new(
                                     "error",

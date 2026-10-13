@@ -1,3 +1,4 @@
 // Generated from waku-protocol. Do not edit.
-export const PROTOCOL_VERSION = 12 as const;
+export const PROTOCOL_VERSION = 13 as const;
 export const MAX_WIRE_MESSAGE_BYTES = 50331648 as const;
+export const MAX_DIAGNOSTIC_EVENTS = 2048 as const;
