@@ -1146,6 +1146,51 @@ annotation.select_reply: 返信の中のテキストを選択してください
 annotation.select_one_reply: 注釈は 1 つの返信にしか付けられません
 annotation.wait_for_reply: 返信が終わってから注釈を付けられます
 
+sidebar.board: ボード
+sidebar.grouping_task: タスク
+board.title: ボード
+board.backlog: 未着手
+board.doing: 進行中
+board.done: 完了
+board.new_task: 新規タスク
+board.new_task_placeholder: このタスクは何をしますか？
+board.new_task_hint: 名前だけで十分です。プロジェクト、ワークスペース、会話は後で決められます。
+board.needs_you: "%{count} 件が対応待ち"
+board.needs_you_short: 対応待ち
+board.running: 実行中
+board.conversations_one: 1 件の会話
+board.conversations_many: "%{count} 件の会話"
+board.open_latest: 最新の会話を開く
+board.move_backlog: 未着手に移動
+board.move_doing: 進行中に移動
+board.complete: 完了にする
+board.reopen: 再開
+board.completed_toast: タスクを完了しました。会話はサイドバーから片付きました
+board.complete_confirm_title: 「%{title}」を完了しますか？
+board.complete_confirm_body: "%{count} 件の会話が実行中です。完了すると停止し、会話をサイドバーから片付けます。"
+board.archive_not_delete: アーカイブは削除ではありません。
+board.complete_and_stop: 完了して停止
+board.untitled_task: 無題のタスク
+task.bind: タスクに割り当て
+task.new_from_session: この会話で新しいタスクを作成
+task.unbind: タスクから外す
+settings.archive: アーカイブ
+settings.archive_keywords: 設定 環境設定 アーカイブ 完了 タスク 会話 復元
+archive.empty: 完了したタスクはまだありません
+archive.restore: 復元
+archive.completed_at: "%{time} に完了"
+board.reopened_toast: タスクを再開しました。会話がサイドバーに戻ります
+
+activity.background_shell: バックグラウンドシェル
+activity.provider_retrying: リクエストを再試行しています
+computer_use.desktop_access: デスクトップアクセス
+computer_use.linux_access_description: 現在の Linux デスクトップセッションのアプリを操作します。キャプチャと入力の対応はコンポジタとアクセシビリティサービスに依存します。
+computer_use.windows_access_description: 現在の Windows デスクトップセッションのアプリを操作します。Windows は昇格したアプリとセキュアデスクトップへのアクセスを制限する場合があります。
+errors.provider_catalogue_unavailable: "%{provider} は %{catalogue} カタログを読み取れませんでした: %{error}"
+command_palette.show_board: ボードを開く
+command_palette.hide_board: ボードを閉じる
+board.completion_waiting_for_setup: 準備中の会話があります。落ち着いてから完了してください
+
 subagent.running_count: "%{count} サブエージェント実行中"
 subagent.running_count_one: 1 サブエージェント実行中
 subagent.more_rows: "他 %{count} 件"

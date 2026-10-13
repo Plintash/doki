@@ -2254,6 +2254,82 @@ annotation.select_one_reply:
 annotation.wait_for_reply:
   en: The reply has to finish before you can annotate it
 
+# ── Task board ──────────────────────────────────────────────────────────────
+sidebar.board:
+  en: Board
+sidebar.grouping_task:
+  en: Task
+board.title:
+  en: Board
+board.backlog:
+  en: To do
+board.doing:
+  en: In progress
+board.done:
+  en: Done
+board.new_task:
+  en: New task
+board.new_task_placeholder:
+  en: What is this task about?
+board.new_task_hint:
+  en: The name is enough; project, workspace, and conversations come later.
+board.needs_you:
+  en: "%{count} waiting on you"
+board.needs_you_short:
+  en: Needs you
+board.running:
+  en: Running
+board.conversations_one:
+  en: "1 conversation"
+board.conversations_many:
+  en: "%{count} conversations"
+board.open_latest:
+  en: Open latest conversation
+board.move_backlog:
+  en: Move to To do
+board.move_doing:
+  en: Move to In progress
+board.complete:
+  en: Complete
+board.reopen:
+  en: Reopen
+board.completed_toast:
+  en: Task completed — its conversations left the sidebar
+board.complete_confirm_title:
+  en: "Complete “%{title}”?"
+board.complete_confirm_body:
+  en: "%{count} conversations are still running. Completing stops them and archives their conversations out of the sidebar."
+board.archive_not_delete:
+  en: Archiving is not deleting; nothing is removed.
+board.complete_and_stop:
+  en: Complete and stop
+board.untitled_task:
+  en: Untitled task
+task.bind:
+  en: File under task
+task.new_from_session:
+  en: New task from this conversation
+task.unbind:
+  en: Remove from task
+settings.archive:
+  en: Archive
+settings.archive_keywords:
+  en: settings preferences archive completed done tasks conversations restore
+archive.empty:
+  en: No completed tasks yet
+archive.restore:
+  en: Restore
+archive.completed_at:
+  en: "Completed %{time}"
+board.reopened_toast:
+  en: Task reopened — its conversations are back in the sidebar
+command_palette.show_board:
+  en: Open the task board
+command_palette.hide_board:
+  en: Close the task board
+board.completion_waiting_for_setup:
+  en: A conversation is still setting up; complete the task once it settles
+
 subagent.running_count:
   en: "%{count} subagents running"
 subagent.running_count_one:

@@ -50,6 +50,9 @@ impl Waku {
         transition: SessionActivationTransition,
         cx: &mut Context<Self>,
     ) {
+        // Selecting a conversation always closes the board: the chat column
+        // shows the session the user asked for.
+        self.board_open = false;
         if !self
             .state
             .sessions
@@ -810,6 +813,15 @@ impl Waku {
             cx.notify();
             return;
         }
+        // The board covers the chat column, so Escape's job there is to close
+        // it — never to stop the conversation it is hiding.
+        if self.board_open {
+            self.board_open = false;
+            let focus_handle = self.composer_focus(cx);
+            window.focus(&focus_handle, cx);
+            cx.notify();
+            return;
+        }
         if self.message_edit.is_some() {
             self.cancel_message_edit(window, cx);
             return;
@@ -1197,6 +1209,15 @@ impl Waku {
         let Some(session_id) = self.state.selected_session else {
             return;
         };
+        self.stop_session_turn(session_id, cx);
+    }
+
+    /// Stops one session's running turn through the app's full stop sequence:
+    /// clear the provider's queue, take back the messages it held, settle the
+    /// turn as interrupted, and leave the session idle. Task completion uses
+    /// this too, so a conversation archived by a Done task is genuinely
+    /// stopped rather than only asked to stop.
+    pub(super) fn stop_session_turn(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         // Worktree/checkpoint preparation has no safe interrupt contract. The
         // composer deliberately shows a spinner rather than Stop until the
         // provider runtime exists, and the keyboard action follows the same

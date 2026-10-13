@@ -17,7 +17,7 @@ use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket, accept_hdr_with_config};
 use uuid::Uuid;
 
-use crate::model::{AgentSession, Project, ProviderKind, SessionStatus};
+use crate::model::{AgentSession, Project, ProviderKind, SessionStatus, Task};
 use crate::protocol::MAX_WIRE_MESSAGE_BYTES;
 use crate::protocol::{
     ClientMessage, Command, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
@@ -127,6 +127,7 @@ struct HubState {
     cached_response_bytes: usize,
     catalog_projects: HashMap<Uuid, ProjectCatalogEntry>,
     catalog_sessions: HashMap<Uuid, SessionCatalogEntry>,
+    catalog_tasks: HashMap<Uuid, Task>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +152,7 @@ struct SessionCatalogEntry {
     title: String,
     auto_title: Option<String>,
     project_id: Uuid,
+    task_id: Option<Uuid>,
     provider: ProviderKind,
     model: Option<String>,
     status: SessionStatus,
@@ -164,6 +166,7 @@ impl From<&AgentSession> for SessionCatalogEntry {
             title: session.title.clone(),
             auto_title: session.auto_title.clone(),
             project_id: session.project_id,
+            task_id: session.task_id,
             provider: session.provider,
             model: session.model.clone(),
             status: session.status,
@@ -339,7 +342,12 @@ impl Hub {
         Self::broadcast_task_state_changed(&mut state, source_subscriber_id);
     }
 
-    fn replace_task_catalog(&self, projects: &[Project], sessions: &[AgentSession]) {
+    fn replace_task_catalog(
+        &self,
+        projects: &[Project],
+        sessions: &[AgentSession],
+        tasks: &[Task],
+    ) {
         let mut state = self.state.lock();
         state.catalog_projects = projects
             .iter()
@@ -349,6 +357,7 @@ impl Hub {
             .iter()
             .map(|session| (session.id, SessionCatalogEntry::from(session)))
             .collect();
+        state.catalog_tasks = tasks.iter().map(|task| (task.id, task.clone())).collect();
     }
 
     fn task_state_saved(
@@ -356,6 +365,7 @@ impl Hub {
         source_subscriber_id: u64,
         projects: &[Project],
         sessions: &[AgentSession],
+        tasks: &[Task],
     ) {
         let mut state = self.state.lock();
         let mut changed = false;
@@ -372,6 +382,12 @@ impl Hub {
                 .catalog_sessions
                 .insert(session.id, next.clone())
                 .is_none_or(|previous| previous != next);
+        }
+        for task in tasks {
+            changed |= state
+                .catalog_tasks
+                .insert(task.id, task.clone())
+                .is_none_or(|previous| previous != *task);
         }
         if changed {
             Self::broadcast_task_state_changed(&mut state, source_subscriber_id);
@@ -922,7 +938,10 @@ struct HandledRequest {
 enum TaskCatalogAction {
     None,
     Load,
-    Save { projects: Vec<Project> },
+    Save {
+        projects: Vec<Project>,
+        tasks: Vec<Task>,
+    },
     Changed,
 }
 
@@ -970,16 +989,19 @@ fn handle_request(
                 ResponseOutcome::Ok {
                     payload:
                         ResponsePayload::TaskState {
-                            projects, sessions, ..
+                            projects,
+                            sessions,
+                            tasks,
+                            ..
                         },
                 },
-            ) => hub.replace_task_catalog(projects, sessions),
+            ) => hub.replace_task_catalog(projects, sessions, tasks),
             (
-                TaskCatalogAction::Save { projects },
+                TaskCatalogAction::Save { projects, tasks },
                 ResponseOutcome::Ok {
                     payload: ResponsePayload::TaskStateSaved { sessions },
                 },
-            ) => hub.task_state_saved(source_subscriber_id, projects, sessions),
+            ) => hub.task_state_saved(source_subscriber_id, projects, sessions, tasks),
             (TaskCatalogAction::Changed, ResponseOutcome::Ok { .. }) => {
                 hub.task_state_changed(source_subscriber_id);
             }
@@ -998,8 +1020,11 @@ fn handle_request(
 fn task_catalog_action(command: &Command) -> TaskCatalogAction {
     match command {
         Command::LoadTaskState => TaskCatalogAction::Load,
-        Command::SaveTaskState { projects, .. } => TaskCatalogAction::Save {
+        Command::SaveTaskState {
+            projects, tasks, ..
+        } => TaskCatalogAction::Save {
             projects: projects.clone(),
+            tasks: tasks.clone(),
         },
         Command::RemoveSession
         | Command::ForkSessionFromResponse { .. }
@@ -1078,6 +1103,7 @@ mod tests {
     #[cfg(unix)]
     use crate::model::Project;
     use crate::model::{AgentSession, ProviderKind, RuntimeMode};
+    use crate::model::{Task, TaskState, TaskWorkspace};
     #[cfg(unix)]
     use crate::persistence::StateStore;
     #[cfg(unix)]
@@ -1152,6 +1178,7 @@ mod tests {
                 }
                 Command::LoadTaskState => Ok(ResponsePayload::TaskState {
                     projects: Vec::new(),
+                    tasks: Vec::new(),
                     sessions: self.sessions.lock().clone(),
                     default_cwd: PathBuf::from("/tmp"),
                     projectless_root: Some(PathBuf::from("/tmp/.waku/projects")),
@@ -1220,6 +1247,7 @@ mod tests {
                     Uuid::nil(),
                     Command::SaveTaskState {
                         projects: Vec::new(),
+                        tasks: Vec::new(),
                         live_session_ids: vec![session_id],
                         skeleton_session_ids: Vec::new(),
                         sessions: vec![session],
@@ -1253,6 +1281,7 @@ mod tests {
                 Uuid::nil(),
                 Command::SaveTaskState {
                     projects: Vec::new(),
+                    tasks: Vec::new(),
                     live_session_ids: vec![session_id],
                     skeleton_session_ids: Vec::new(),
                     sessions: vec![checkpoint],
@@ -1276,6 +1305,7 @@ mod tests {
                 Uuid::nil(),
                 Command::SaveTaskState {
                     projects: Vec::new(),
+                    tasks: Vec::new(),
                     live_session_ids: vec![session_id, second_id],
                     skeleton_session_ids: Vec::new(),
                     sessions: vec![second],
@@ -1336,6 +1366,7 @@ mod tests {
                 Uuid::nil(),
                 Command::SaveTaskState {
                     projects: vec![project.clone()],
+                    tasks: Vec::new(),
                     live_session_ids: vec![session.id],
                     skeleton_session_ids: Vec::new(),
                     sessions: vec![session.clone()],
@@ -1351,6 +1382,7 @@ mod tests {
                 Uuid::nil(),
                 Command::SaveTaskState {
                     projects: vec![project],
+                    tasks: Vec::new(),
                     live_session_ids: vec![session.id],
                     skeleton_session_ids: Vec::new(),
                     sessions: vec![session],
@@ -1410,6 +1442,7 @@ mod tests {
                         runtime_id: Uuid::nil(),
                         command: Command::SaveTaskState {
                             projects: vec![project.clone()],
+                            tasks: Vec::new(),
                             live_session_ids: vec![session_id],
                             skeleton_session_ids,
                             sessions,
@@ -1477,6 +1510,74 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A declared task is daemon-owned: the save must persist it, and the
+    /// task-state projection must carry it back with the conversation filed
+    /// under it.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_task_survives_the_save_and_returns_in_the_task_state_projection() {
+        let root = std::env::temp_dir().join(format!("waku-task-roundtrip-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("app.db");
+        let hub = Arc::new(Hub::default());
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(database.clone()),
+        )
+        .unwrap();
+        let sink = || hub.event_sink(Uuid::nil(), Uuid::nil());
+        let request = |command: Command| Request {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            runtime_id: Uuid::nil(),
+            command,
+        };
+
+        let project = Project::from_path(root.join("repo"));
+        let mut task = Task::new("Fix the thing", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Worktree {
+            project_id: project.id,
+            path: root.join("worktree"),
+            branch: "feat/fix".into(),
+        });
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.begin_turn("ask once");
+        session.task_id = Some(task.id);
+        let task_id = task.id;
+        let session_id = session.id;
+
+        backend
+            .handle(
+                request(Command::SaveTaskState {
+                    projects: vec![project.clone()],
+                    tasks: vec![task.clone()],
+                    live_session_ids: vec![session_id],
+                    skeleton_session_ids: Vec::new(),
+                    sessions: vec![session.clone()],
+                }),
+                sink(),
+            )
+            .unwrap();
+
+        let ResponsePayload::TaskState {
+            sessions, tasks, ..
+        } = backend
+            .handle(request(Command::LoadTaskState), sink())
+            .unwrap()
+        else {
+            panic!("expected daemon task state");
+        };
+        assert_eq!(tasks, vec![task.clone()]);
+        assert_eq!(sessions[0].task_id, Some(task_id));
+
+        // A rebuilt process reads the task back out of SQLite.
+        let stored = StateStore::daemon(database).load().unwrap();
+        assert_eq!(stored.tasks, vec![task]);
+        assert_eq!(stored.sessions.len(), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// A composer pick made without a following turn must reach a rebuilt
     /// window. Both the pick and the rebuild's task-list load cross the daemon,
     /// so the pick is saved by id and the list projection has to carry the
@@ -1513,6 +1614,7 @@ mod tests {
                 .handle(
                     request(Command::SaveTaskState {
                         projects: vec![project.clone()],
+                        tasks: Vec::new(),
                         live_session_ids: vec![session_id],
                         skeleton_session_ids: skeletons,
                         sessions: vec![session],

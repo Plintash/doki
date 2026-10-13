@@ -31,7 +31,8 @@ use crate::i18n::AppLanguage;
 use crate::identity::data_directory_name;
 use crate::model::{
     AgentSession, AnnotationTarget, FavoriteModel, Message, MessageAnnotation, MessageAttachment,
-    MessageRole, Project, ProviderKind, RuntimeMode, SessionWorkspace,
+    MessageRole, Project, ProviderKind, RuntimeMode, SessionWorkspace, Task, TaskState,
+    TaskWorkspace,
 };
 use crate::theme::ThemePreference;
 pub use waku_protocol::persistence::{
@@ -234,6 +235,10 @@ pub struct PersistedState {
     pub version: u32,
     pub projects: Vec<Project>,
     pub sessions: Vec<AgentSession>,
+    /// User-declared tasks. Daemon-owned like projects and sessions; the board
+    /// and the sidebar's task view read this without touching the database.
+    #[serde(default)]
+    pub tasks: Vec<Task>,
     pub selected_project: Option<Uuid>,
     pub selected_session: Option<Uuid>,
     pub last_provider: ProviderKind,
@@ -355,6 +360,7 @@ impl PersistedState {
             version: STATE_VERSION,
             projects: Vec::new(),
             sessions: Vec::new(),
+            tasks: Vec::new(),
             selected_project: None,
             selected_session: None,
             last_provider: ProviderKind::Codex,
@@ -863,6 +869,7 @@ struct Storage {
     /// See [`write_messages`].
     written_messages: HashMap<Uuid, HashMap<Uuid, u64>>,
     saved_projects: u64,
+    saved_tasks: u64,
     saved_app_settings: u64,
     saved_app_state: u64,
 }
@@ -1121,13 +1128,42 @@ impl StateStore {
             .collect();
         drop(projects);
 
+        let mut tasks = connection
+            .prepare(
+                "SELECT id, title, state, position, project_id, path, branch, worktree,
+                        created_at, updated_at, completed_at
+                 FROM tasks ORDER BY state, position, created_at",
+            )
+            .map_err(to_io_error)?;
+        state.tasks = tasks
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                ))
+            })
+            .map_err(to_io_error)?
+            .filter_map(Result::ok)
+            .filter_map(task_from_row)
+            .collect();
+        drop(tasks);
+
         // Only the columns the session list needs. Transcripts and messages are
         // fetched per session by `hydrate`, so startup cost does not grow with
         // how much history exists.
         let mut sessions = connection
             .prepare(
                 "SELECT id, project_id, title, auto_title, provider, model, status,
-                        created_at, updated_at, last_reply_at
+                        task_id, created_at, updated_at, last_reply_at
                  FROM sessions ORDER BY updated_at",
             )
             .map_err(to_io_error)?;
@@ -1142,9 +1178,10 @@ impl StateStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(7)?,
                     row.get::<_, i64>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
                 ))
             })
             .map_err(to_io_error)?
@@ -1181,6 +1218,7 @@ impl StateStore {
             // are skeletons anyway, so the first save of one is a full write.
             written_messages: HashMap::new(),
             saved_projects: 0,
+            saved_tasks: 0,
             saved_app_settings: if app_settings_are_saved {
                 fingerprint(&serde_json::to_string(&app_settings).map_err(to_io_error)?)
             } else {
@@ -1211,6 +1249,7 @@ impl StateStore {
                 persisted_sessions: HashSet::new(),
                 written_messages: HashMap::new(),
                 saved_projects: 0,
+                saved_tasks: 0,
                 saved_app_settings: 0,
                 saved_app_state: 0,
             });
@@ -1298,6 +1337,7 @@ impl StateStore {
                 persisted_sessions: HashSet::new(),
                 written_messages: HashMap::new(),
                 saved_projects: 0,
+                saved_tasks: 0,
                 saved_app_settings: 0,
                 saved_app_state: 0,
             });
@@ -1348,6 +1388,51 @@ impl StateStore {
                     .map_err(to_io_error)?;
             }
             storage.saved_projects = projects_fingerprint;
+        }
+
+        let tasks = serde_json::to_string(&state.tasks).map_err(to_io_error)?;
+        let tasks_fingerprint = fingerprint(&tasks);
+        if tasks_fingerprint != storage.saved_tasks {
+            transaction
+                .execute("DELETE FROM tasks", [])
+                .map_err(to_io_error)?;
+            for task in &state.tasks {
+                let (project_id, path, branch, worktree) = match &task.workspace {
+                    Some(TaskWorkspace::Local { project_id }) => {
+                        (Some(project_id.to_string()), None, None, false)
+                    }
+                    Some(TaskWorkspace::Worktree {
+                        project_id,
+                        path,
+                        branch,
+                    }) => (
+                        Some(project_id.to_string()),
+                        Some(path.to_string_lossy().into_owned()),
+                        Some(branch.clone()),
+                        true,
+                    ),
+                    None => (None, None, None, false),
+                };
+                transaction
+                    .execute(
+                        INSERT_TASK,
+                        params![
+                            task.id.to_string(),
+                            task.title,
+                            tag_of(task.state),
+                            task.position,
+                            project_id,
+                            path,
+                            branch,
+                            worktree as i64,
+                            task.created_at as i64,
+                            task.updated_at as i64,
+                            task.completed_at.map(|at| at as i64)
+                        ],
+                    )
+                    .map_err(to_io_error)?;
+            }
+            storage.saved_tasks = tasks_fingerprint;
         }
 
         // Only sessions the app reported as changed are written. A draft that
@@ -1492,6 +1577,7 @@ type SessionColumns = (
     String,
     Option<String>,
     String,
+    Option<String>,
     i64,
     i64,
     Option<i64>,
@@ -1511,6 +1597,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         provider,
         model,
         status,
+        task_id,
         created_at,
         updated_at,
         last_reply_at,
@@ -1520,6 +1607,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         title,
         auto_title,
         project_id: Uuid::parse_str(&project_id).ok()?,
+        task_id: task_id.and_then(|id| Uuid::parse_str(&id).ok()),
         workspace: SessionWorkspace::Local,
         provider: serde_json::from_value(serde_json::Value::String(provider)).ok()?,
         model,
@@ -1548,6 +1636,59 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         turns: Vec::new(),
         queued_messages: Vec::new(),
         detail_loaded: false,
+    })
+}
+
+type TaskColumns = (
+    String,
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+);
+
+/// Builds a task from its row. A workspace is recovered only when the row
+/// names the project; a worktree row missing its path or branch degrades to
+/// "no workspace" rather than inventing one.
+fn task_from_row(row: TaskColumns) -> Option<Task> {
+    let (
+        id,
+        title,
+        state,
+        position,
+        project_id,
+        path,
+        branch,
+        worktree,
+        created_at,
+        updated_at,
+        completed_at,
+    ) = row;
+    let project_id = project_id.and_then(|id| Uuid::parse_str(&id).ok());
+    let workspace = match (project_id, path, branch, worktree != 0) {
+        (Some(project_id), Some(path), Some(branch), true) => Some(TaskWorkspace::Worktree {
+            project_id,
+            path: PathBuf::from(path),
+            branch,
+        }),
+        (Some(project_id), _, _, false) => Some(TaskWorkspace::Local { project_id }),
+        _ => None,
+    };
+    Some(Task {
+        id: Uuid::parse_str(&id).ok()?,
+        title,
+        state: serde_json::from_value(serde_json::Value::String(state)).ok()?,
+        position,
+        workspace,
+        created_at: created_at as u64,
+        updated_at: updated_at as u64,
+        completed_at: completed_at.map(|at| at as u64),
     })
 }
 
@@ -1807,9 +1948,9 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
 /// Columns the sidebar sorts and filters on are stored alongside the JSON so
 /// listing sessions never has to deserialize a transcript.
 const UPSERT_SESSION: &str = "INSERT INTO sessions(
-         id, project_id, title, auto_title, provider, model, status,
+         id, project_id, title, auto_title, provider, model, status, task_id,
          created_at, updated_at, last_reply_at
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
      ON CONFLICT(id) DO UPDATE SET
          project_id    = excluded.project_id,
          title         = excluded.title,
@@ -1817,6 +1958,7 @@ const UPSERT_SESSION: &str = "INSERT INTO sessions(
          provider      = excluded.provider,
          model         = excluded.model,
          status        = excluded.status,
+         task_id       = excluded.task_id,
          created_at    = excluded.created_at,
          updated_at    = excluded.updated_at,
          last_reply_at = excluded.last_reply_at";
@@ -1828,6 +1970,22 @@ const INSERT_PROJECT: &str = "INSERT INTO projects(id, name, path, position, cre
          path       = excluded.path,
          position   = excluded.position,
          created_at = excluded.created_at";
+
+const INSERT_TASK: &str = "INSERT INTO tasks(
+         id, title, state, position, project_id, path, branch, worktree,
+         created_at, updated_at, completed_at
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+     ON CONFLICT(id) DO UPDATE SET
+         title        = excluded.title,
+         state        = excluded.state,
+         position     = excluded.position,
+         project_id   = excluded.project_id,
+         path         = excluded.path,
+         branch       = excluded.branch,
+         worktree     = excluded.worktree,
+         created_at   = excluded.created_at,
+         updated_at   = excluded.updated_at,
+         completed_at = excluded.completed_at";
 
 /// The transcript, written alongside the list row it belongs to.
 const UPSERT_SESSION_DETAIL: &str = "INSERT INTO session_details(session_id, data)
@@ -1853,6 +2011,9 @@ fn session_params(session: &AgentSession) -> Vec<rusqlite::types::Value> {
         Value::Text(tag_of(session.provider)),
         session.model.clone().map_or(Value::Null, Value::Text),
         Value::Text(tag_of(session.status)),
+        session
+            .task_id
+            .map_or(Value::Null, |id| Value::Text(id.to_string())),
         Value::Integer(session.created_at as i64),
         Value::Integer(session.updated_at as i64),
         session
@@ -3383,13 +3544,11 @@ mod tests {
         // Rewind the file to the release before annotations: the column is gone
         // and the migration is no longer recorded, which is what an upgrade
         // from that build finds. Every other column and row stays in place.
-        let (annotation_migration, annotation_sql) =
-            *MIGRATIONS.last().expect("at least one migration");
-        assert!(
-            annotation_sql.contains("annotations"),
-            "this fixture rewinds the newest migration, which must be the one adding the \
-             annotations column: {annotation_sql}"
-        );
+        let (annotation_migration, _) = MIGRATIONS
+            .iter()
+            .find(|(_, sql)| sql.contains("annotations"))
+            .copied()
+            .expect("a migration adds the annotations column");
         let connection = Connection::open(directory.join("app.db")).unwrap();
         connection
             .execute(

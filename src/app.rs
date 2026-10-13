@@ -37,8 +37,8 @@ use crate::model::{
     MessageAnnotation, MessageAttachment, MessageRole, NotificationSeverity, PendingPermission,
     Project, ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor,
     ProviderSessionHistory, ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode,
-    SessionStatus, SessionWorkspace, TextSpan, TranscriptBlock, TurnStatus, UserInputAnswer,
-    UserInputQuestion, compact_path, unix_time, unix_time_millis,
+    SessionStatus, SessionWorkspace, Task, TaskState, TaskWorkspace, TextSpan, TranscriptBlock,
+    TurnStatus, UserInputAnswer, UserInputQuestion, compact_path, unix_time, unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -224,6 +224,7 @@ enum SettingsPage {
     Daemon,
     ComputerUse,
     Appearance,
+    Archive,
 }
 
 impl SettingsPage {
@@ -599,6 +600,7 @@ struct PreparedDriver {
 struct RemoteTaskStateSnapshot {
     projects: Vec<Project>,
     sessions: Vec<AgentSession>,
+    tasks: Vec<Task>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1493,12 +1495,38 @@ pub struct Waku {
     /// diff rows. Recreating a handle on every row build would drop keyboard
     /// focus whenever GPUI re-renders the list.
     transcript_control_focuses: RefCell<HashMap<String, FocusHandle>>,
+    /// Stable focus identities for the Settings archive's rows and their
+    /// Restore controls.
+    archive_control_focuses: RefCell<HashMap<String, FocusHandle>>,
     session_navigation: SessionNavigation,
     /// Sidebar task currently showing its inline rename field.
     session_rename: Option<Uuid>,
     /// One stable field reused across sidebar rows so virtualization never
     /// replaces the focused editor while a rename is in progress.
     session_rename_input: Entity<TextInput>,
+    /// Task currently showing its inline rename field on its board card.
+    task_rename: Option<Uuid>,
+    task_rename_input: Entity<TextInput>,
+    /// Whether the task board is covering the chat column.
+    board_open: bool,
+    /// Stable focus for the sidebar's board entry row, plus one handle per
+    /// task-creation button (see `render_task_create_button`).
+    board_focus: FocusHandle,
+    task_create_focuses: RefCell<HashMap<&'static str, FocusHandle>>,
+    /// The task-creation dialog, opened from the sidebar or the board.
+    new_task_dialog: Option<board::NewTaskDialog>,
+    /// A move to Done that is waiting on the running-session confirmation.
+    pending_task_completion: Option<board::TaskCompletionConfirm>,
+    /// The frame's memoized task facts. Render clears it before any board or
+    /// sidebar row can read it.
+    task_stats_cache: RefCell<Option<Rc<board::TaskStats>>>,
+    /// The board's per-column card lists, so long columns stay virtualized.
+    board_column_lists: RefCell<[board::BoardColumnList; 3]>,
+    /// The Settings archive's virtualized row list.
+    archive_rows: RefCell<settings::ArchiveRows>,
+    /// Stable focus for the archive surface itself, so restoring a row (which
+    /// removes it) leaves the keyboard somewhere visible.
+    archive_focus: FocusHandle,
     /// Groups the user has folded in either sidebar view. This is
     /// intentionally runtime-only, like transcript disclosure state.
     sidebar_collapsed_groups: HashSet<SidebarGroup>,
@@ -1810,6 +1838,7 @@ mod annotation_projection;
 mod annotation_resolution;
 mod autocomplete;
 mod background_work;
+mod board;
 mod branches;
 mod command_palette;
 mod commit_dialog;
@@ -1840,6 +1869,7 @@ pub use autocomplete::init as init_composer_autocomplete;
 use background_work::{
     BackgroundWorkRegistry, work_kind_icon, work_status_color, work_status_label,
 };
+pub use board::init as init_board_keys;
 pub use command_palette::init as init_command_palette;
 pub use commit_dialog::init as init_commit_dialog_keys;
 use components::*;
@@ -1854,6 +1884,34 @@ use transcript::*;
 use transcript_view::ConversationNavigationRail;
 use window_close::UnsavedEditsGuard;
 pub use window_close::init as init_window_close_keys;
+
+/// Keep a virtualized list of ids in sync across frames: only the changed
+/// suffix is spliced, which keeps the logical scroll anchor, and a uniform
+/// height hint keeps the scrollbar honest until the rows are measured again.
+fn sync_virtual_ids<T: PartialEq + Clone>(
+    state: &ListState,
+    cached: &mut Vec<T>,
+    ids: &[T],
+    height: Pixels,
+) {
+    if cached.as_slice() == ids {
+        return;
+    }
+    let prefix = cached
+        .iter()
+        .zip(ids.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_count = cached.len();
+    *cached = ids.to_vec();
+    if old_count == 0 {
+        state.reset_with_uniform_height(ids.len(), height);
+    } else {
+        state.splice(prefix..old_count, ids.len() - prefix);
+        // The method mutates the shared list state and returns itself.
+        state.clone().with_uniform_item_height(height);
+    }
+}
 
 /// Collapse provider- or page-supplied text into a label that cannot contain
 /// hard line breaks. GPUI's `truncate()` prevents wrapping, but explicit
@@ -2217,6 +2275,7 @@ impl Waku {
                 .placeholder(tr!("skills.search"))
         });
         let session_rename_input = cx.new(|cx| TextInput::new(window, cx));
+        let task_rename_input = cx.new(|cx| TextInput::new(window, cx));
         let provider_path_input = cx.new(|cx| {
             TextInput::new(window, cx)
                 .select_all_on_focus_click()
@@ -2488,6 +2547,8 @@ impl Waku {
             let onboarding_projectless_focus = cx.focus_handle();
             let updater_button_focus = cx.focus_handle();
             let model_picker_empty_focus = cx.focus_handle();
+            let board_focus = cx.focus_handle();
+            let archive_focus = cx.focus_handle();
             let task_switcher_focus = cx.focus_handle();
             cx.on_focus_out(
                 &task_switcher_focus,
@@ -2782,6 +2843,15 @@ impl Waku {
                 |this: &mut Self, _, event: &InputEvent, cx| match event {
                     InputEvent::Submit(_) => this.commit_session_rename(cx),
                     InputEvent::Edited if this.session_rename.is_some() => cx.notify(),
+                    _ => {}
+                },
+            )
+            .detach();
+            cx.subscribe(
+                &task_rename_input,
+                |this: &mut Self, _, event: &InputEvent, cx| match event {
+                    InputEvent::Submit(_) => this.commit_task_rename(cx),
+                    InputEvent::Edited if this.task_rename.is_some() => cx.notify(),
                     _ => {}
                 },
             )
@@ -3082,9 +3152,25 @@ impl Waku {
                 expanded_turns: HashSet::new(),
                 expanded_changed_files: HashSet::new(),
                 transcript_control_focuses: RefCell::new(HashMap::new()),
+                archive_control_focuses: RefCell::new(HashMap::new()),
                 session_navigation,
                 session_rename: None,
                 session_rename_input,
+                task_rename: None,
+                task_rename_input,
+                board_open: false,
+                board_focus,
+                task_create_focuses: RefCell::new(HashMap::new()),
+                new_task_dialog: None,
+                pending_task_completion: None,
+                task_stats_cache: RefCell::new(None),
+                board_column_lists: RefCell::new([
+                    board::BoardColumnList::new(),
+                    board::BoardColumnList::new(),
+                    board::BoardColumnList::new(),
+                ]),
+                archive_rows: RefCell::new(settings::ArchiveRows::new()),
+                archive_focus,
                 sidebar_collapsed_groups: HashSet::new(),
                 sidebar_project_reveal_counts: HashMap::new(),
                 sidebar_group_header_focuses: RefCell::new(HashMap::new()),

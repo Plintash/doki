@@ -688,6 +688,118 @@ impl Project {
     }
 }
 
+/// Where a task sits on the board.
+///
+/// The three columns are fixed for now; user-defined columns come later. The
+/// state is the user's own declaration — runtime activity never moves a task
+/// on its own.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskState {
+    #[default]
+    Backlog,
+    Doing,
+    Done,
+}
+
+impl TaskState {
+    /// Stable name for element ids.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Doing => "doing",
+            Self::Done => "done",
+        }
+    }
+
+    /// Stable ordinal for fingerprints and column order.
+    pub fn ordinal(self) -> u64 {
+        match self {
+            Self::Backlog => 1,
+            Self::Doing => 2,
+            Self::Done => 3,
+        }
+    }
+
+    pub fn is_done(self) -> bool {
+        self == Self::Done
+    }
+}
+
+/// A user-declared unit of work that groups conversations.
+///
+/// A task exists on its own: it may have no conversations yet, and several
+/// conversations (attempts, follow-ups, reviews) can belong to the same task.
+/// It is the unit the board arranges and the unit that survives archiving.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct Task {
+    pub id: Uuid,
+    pub title: String,
+    pub state: TaskState,
+    /// Order within its column, ascending. Ties fall back to recency.
+    pub position: i64,
+    /// Where this task's work happens by default, inferred from the first
+    /// conversation filed under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<TaskWorkspace>,
+    pub created_at: u64,
+    /// Any mutation, including state moves and title edits.
+    pub updated_at: u64,
+    /// When the user moved the task to [`TaskState::Done`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+}
+
+/// A materialized workspace a task works in.
+///
+/// Unlike [`SessionWorkspace`], which may still be a draft intent, this is
+/// always a concrete place: the project checkout or a created worktree.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+pub enum TaskWorkspace {
+    /// Work in the project's ordinary checkout.
+    Local { project_id: Uuid },
+    /// Work in an isolated Git worktree.
+    Worktree {
+        project_id: Uuid,
+        path: PathBuf,
+        branch: String,
+    },
+}
+
+impl Task {
+    pub fn new(title: impl Into<String>, state: TaskState, position: i64) -> Self {
+        let now = unix_time();
+        Self {
+            id: Uuid::new_v4(),
+            title: title.into(),
+            state,
+            position,
+            workspace: None,
+            created_at: now,
+            updated_at: now,
+            completed_at: state.is_done().then(unix_time),
+        }
+    }
+
+    /// Applies a user-driven state change, stamping the times it implies.
+    pub fn set_state(&mut self, state: TaskState) {
+        self.state = state;
+        self.updated_at = unix_time();
+        self.completed_at = (state == TaskState::Done).then(unix_time);
+    }
+
+    /// Marks any other user-driven mutation (a rename, an inferred workspace)
+    /// so the daemon and every other client agree this copy is the newest.
+    pub fn touch(&mut self) {
+        self.updated_at = unix_time();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionStatus {
@@ -966,6 +1078,9 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_title: Option<String>,
     pub project_id: Uuid,
+    /// The task this conversation is filed under, when the user has filed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     /// Local project checkout or an isolated Git worktree for this task.
     #[serde(default, skip_serializing_if = "SessionWorkspace::is_local")]
     pub workspace: SessionWorkspace,
@@ -1071,6 +1186,7 @@ impl AgentSession {
             title: Self::DEFAULT_TITLE.to_owned(),
             auto_title: None,
             project_id,
+            task_id: None,
             workspace: SessionWorkspace::Local,
             provider,
             model: None,
@@ -1117,6 +1233,7 @@ impl AgentSession {
             title: self.title.clone(),
             auto_title: self.auto_title.clone(),
             project_id: self.project_id,
+            task_id: self.task_id,
             workspace: SessionWorkspace::Local,
             provider: self.provider,
             model: self.model.clone(),

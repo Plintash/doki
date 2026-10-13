@@ -27,6 +27,10 @@ title: string,
  */
 auto_title?: string | null, project_id: string,
 /**
+ * The task this conversation is filed under, when the user has filed it.
+ */
+task_id?: string | null,
+/**
  * Local project checkout or an isolated Git worktree for this task.
  */
 workspace?: SessionWorkspace, provider: ProviderKind, model?: string | null, runtime_mode: RuntimeMode, reasoning_effort?: string | null, service_tier?: string | null,
