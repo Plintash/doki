@@ -149,11 +149,11 @@ a second call.
 
 ### Requirement: Semantic actions
 
-The bridge SHALL act on a control identified by its node handle or semantic id:
-click, focus, set text or value, send a keyboard chord, and scroll. Actions
-MUST take the same path as real user input, MUST NOT require coordinates, and
-MUST fail with an actionable error naming the target when it is unknown,
-ambiguous, disabled, or off screen.
+The bridge SHALL operate a control identified by its node handle or semantic
+id: activating it, focusing it, entering text, sending a keyboard chord, and
+scrolling it. Operations MUST take the same path as real user input, MUST NOT
+require coordinates, and MUST fail with an actionable error naming the target
+when it is unknown, ambiguous, disabled, or off screen.
 
 #### Scenario: Click by id runs the real handler
 
@@ -224,24 +224,6 @@ results of the steps that ran.
 - **WHEN** a step in the middle of a batch fails
 - **THEN** the result names that step and carries its evidence, and later steps do not run
 
-### Requirement: Screenshots on demand
-
-The bridge SHALL capture the window's current frame as a PNG on request,
-rendered from the app's own frame rather than the screen, so it requires no
-screen-recording permission. Content composited by native child views MAY be
-absent, and the response SHALL disclose it when the window contains such a
-surface.
-
-#### Scenario: A screenshot matches the frame
-
-- **WHEN** a client requests a screenshot
-- **THEN** it receives the current frame's pixels without any desktop capture permission
-
-#### Scenario: The native-view limitation is disclosed
-
-- **WHEN** the window contains an embedded browser surface
-- **THEN** the response marks that the capture does not include it
-
 ### Requirement: Agent-facing bindings and CLI
 
 The JavaScript REPL server attached to a coding-agent session SHALL expose the
@@ -259,12 +241,17 @@ protocol, so local and remote callers see one surface.
 
 A client SHALL report the instance and build identity it is attached to,
 reconnect after an app relaunch, and offer a wait for a fresh build after a
-rebuild.
+rebuild. The build identity SHALL change when the checkout is rebuilt.
 
 #### Scenario: A relaunch is observable
 
 - **WHEN** the dev watcher rebuilds and relaunches the app
 - **THEN** a waiting client reconnects to the new instance and reports its new build identity
+
+#### Scenario: Two builds are distinguishable
+
+- **WHEN** the same checkout is rebuilt and relaunched
+- **THEN** the build identity a client reports is different from the one it reported before
 
 ### Requirement: Identity conventions and coverage
 

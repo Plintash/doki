@@ -100,14 +100,14 @@ failed — with timings, from the recorded events.
 
 ### Requirement: Live counters
 
-The bridge SHALL expose live per-process counters and gauges that answer
+The runtime SHALL expose live per-process counters and gauges that answer
 performance questions — frames drawn, render and pump commits, queue depths,
 event backlog, and request round-trip latency — without a rebuild.
 
 #### Scenario: Counters move while streaming
 
-- **WHEN** a reply is streaming
-- **THEN** the frame, commit, and queue counters reflect the streaming cadence
+- **WHEN** a reply is streaming and the client reads the counters twice
+- **THEN** the frame and commit counters are higher on the second read
 
 #### Scenario: Perf questions are answerable in place
 
@@ -127,10 +127,10 @@ identity, so one call can explain a failure that spans processes.
 
 ### Requirement: Health in every snapshot
 
-Every semantic snapshot SHALL include a small health summary — daemon
-connection state, last error, provider and session state, pending permission
-requests, and backlog or frame counters — so a first look answers whether
-anything is wrong.
+Every semantic snapshot SHALL include a health summary — daemon connection
+state, last error, provider and session state, pending permission requests, and
+backlog or frame counters — that names state rather than dumping records, so a
+first look answers whether anything is wrong.
 
 #### Scenario: A broken connection is visible immediately
 
@@ -144,13 +144,13 @@ anything is wrong.
 
 ### Requirement: Failure dumps
 
-A failed wait, action, batch, or test SHALL carry the evidence needed to
-diagnose it: the observed state, the semantic tree diff, the relevant recent
-events, and the counters at failure time.
+A failed wait, action, or test SHALL carry the evidence needed to diagnose it:
+the observed state, the semantic tree diff, the relevant recent events, and the
+counters at failure time.
 
-#### Scenario: A failed batch step carries its evidence
+#### Scenario: A failed step carries its evidence
 
-- **WHEN** a batch step fails
+- **WHEN** a step fails
 - **THEN** the result includes the state, relevant events, and counters captured at that moment
 
 #### Scenario: A failing test dumps the same evidence

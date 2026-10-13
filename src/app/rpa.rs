@@ -13,15 +13,13 @@ use serde_json::{Value, json};
 
 use super::Waku;
 use crate::main_window::MainWindow;
-use crate::rpa::protocol::{self, Action, Condition, Error, Reply, Request, Step, Target};
+use crate::rpa::protocol::{self, Action, Condition, Error, Reply, Request, Target};
 use crate::rpa::service::Inbound;
 
 /// Start consuming bridge calls. Called once from `run` after the endpoint is
 /// published; a no-op when this build has no endpoint.
 pub(crate) fn start_pump(cx: &mut App) {
-    let Some(receiver) = crate::rpa::service::take_inbound() else {
-        return;
-    };
+    let receiver = crate::rpa::service::inbound();
     // Drop the automation tree once the last client leaves; the per-second
     // cadence keeps a frame from paying for an accessibility tree nobody is
     // reading.
@@ -49,7 +47,7 @@ pub(crate) fn start_pump(cx: &mut App) {
 /// clients. Called per request and once a second, so both the first request
 /// and the last disconnect are observed promptly.
 fn sync_automation(app: &mut App) {
-    let attached = crate::rpa::service::attached() > 0 || crate::rpa::service::idle_ms() < 30_000;
+    let attached = crate::rpa::service::attached() > 0;
     for handle in app.windows() {
         let _ = handle.update(app, |_root, window, _app| {
             if window.is_a11y_automation_enabled() != attached {
@@ -60,81 +58,11 @@ fn sync_automation(app: &mut App) {
 }
 
 async fn execute(cx: &mut AsyncApp, request: Request) -> Result<Value, Error> {
-    crate::rpa::service::mark_call();
     match request {
         Request::Wait {
             condition,
             timeout_ms,
         } => wait_for(cx, &condition, timeout_ms).await,
-        Request::Run {
-            steps,
-            final_snapshot,
-        } => {
-            let mut results = Vec::with_capacity(steps.len());
-            for (index, step) in steps.iter().enumerate() {
-                let outcome = match step {
-                    Step::Wait {
-                        condition,
-                        timeout_ms,
-                    } => wait_for(cx, condition, *timeout_ms).await,
-                    Step::Click { target } => dispatch(
-                        cx,
-                        Request::Act {
-                            action: Action::Click,
-                            target: target.clone(),
-                        },
-                    ),
-                    Step::Focus { target } => dispatch(
-                        cx,
-                        Request::Act {
-                            action: Action::Focus,
-                            target: target.clone(),
-                        },
-                    ),
-                    Step::Type { text, target } => dispatch(
-                        cx,
-                        Request::Type {
-                            text: text.clone(),
-                            target: target.clone(),
-                        },
-                    ),
-                    Step::Key { chord } => dispatch(
-                        cx,
-                        Request::Key {
-                            chord: chord.clone(),
-                        },
-                    ),
-                    Step::Invoke { verb, args } => query(
-                        cx,
-                        Request::Invoke {
-                            verb: verb.clone(),
-                            args: args.clone(),
-                        },
-                    ),
-                };
-                match outcome {
-                    Ok(value) => results.push(json!({
-                        "step": index,
-                        "op": step.label(),
-                        "ok": true,
-                        "result": value,
-                    })),
-                    Err(mut error) => {
-                        error.message =
-                            format!("step {index} ({}) failed: {}", step.label(), error.message);
-                        if error.state.is_none() {
-                            error.state = current_state(cx);
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            let mut result = json!({ "steps": results });
-            if final_snapshot {
-                result["snapshot"] = take_snapshot(cx).unwrap_or(Value::Null);
-            }
-            Ok(result)
-        }
         // Input reaches the window without an entity lease held: dispatching
         // a keystroke or a click can draw synchronously, and a draw renders
         // the workspace, which must not happen while the workspace is already
@@ -173,6 +101,12 @@ fn dispatch(cx: &mut AsyncApp, request: Request) -> Result<Value, Error> {
             None => Err(app_not_ready()),
         }
     })
+}
+
+/// Serialize model data into a snapshot. These are plain serializable values;
+/// a failure would be a bug, not a state to quietly fall back from.
+fn json_of<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).expect("snapshot data serializes")
 }
 
 fn app_not_ready() -> Error {
@@ -372,7 +306,7 @@ impl Waku {
         match request {
             Request::Describe => Ok(json!({
                 "instance": crate::rpa::service::discovery()
-                    .map(|discovery| serde_json::to_value(discovery).unwrap_or(Value::Null)),
+                    .map(|discovery| json_of(discovery)),
                 "attachedClients": crate::rpa::service::attached(),
                 "automation": window.is_a11y_automation_enabled(),
                 "treeReady": window.a11y_automation_snapshot().is_some(),
@@ -383,8 +317,7 @@ impl Waku {
             Request::Act { .. }
             | Request::Type { .. }
             | Request::Key { .. }
-            | Request::Wait { .. }
-            | Request::Run { .. } => Err(Error::new(
+            | Request::Wait { .. } => Err(Error::new(
                 "internal",
                 "input and waits are driven outside the workspace lease",
             )),
@@ -439,7 +372,7 @@ impl Waku {
             .unwrap_or(Value::Null);
         json!({
             "instance": crate::rpa::service::discovery()
-                .map(|discovery| serde_json::to_value(discovery).unwrap_or(Value::Null)),
+                .map(|discovery| json_of(discovery)),
             "window": {
                 "title": crate::instance::window_title(),
                 "width": f32::from(window.viewport_size().width),
@@ -464,8 +397,8 @@ impl Waku {
                     "id": session.id,
                     "title": session.title,
                     "autoTitle": session.auto_title,
-                    "status": serde_json::to_value(&session.status).unwrap_or(Value::Null),
-                    "provider": serde_json::to_value(&session.provider).unwrap_or(Value::Null),
+                    "status": json_of(&session.status),
+                    "provider": json_of(&session.provider),
                     "projectId": session.project_id,
                     "updatedAt": session.updated_at,
                     "active": Some(session.id) == selected,
@@ -476,34 +409,34 @@ impl Waku {
             json!({
                 "id": session.id,
                 "title": session.title,
-                "status": serde_json::to_value(&session.status).unwrap_or(Value::Null),
-                "provider": serde_json::to_value(&session.provider).unwrap_or(Value::Null),
+                "status": json_of(&session.status),
+                "provider": json_of(&session.provider),
                 "model": session.model,
                 "detailLoaded": session.detail_loaded,
                 "messages": session.messages.iter().rev().take(20).collect::<Vec<_>>().into_iter().rev().map(|message| json!({
                     "id": message.id,
                     "turnId": message.turn_id,
-                    "role": serde_json::to_value(&message.role).unwrap_or(Value::Null),
+                    "role": json_of(&message.role),
                     "text": message.display_content.as_deref().unwrap_or(&message.content),
                 })).collect::<Vec<_>>(),
                 "subagentRuns": session.subagent_runs.iter().map(|run| json!({
                     "id": run.id,
                     "label": run.label,
-                    "state": serde_json::to_value(&run.state).unwrap_or(Value::Null),
+                    "state": json_of(&run.state),
                     "detached": run.detached,
                     "startedAtMs": run.started_at_ms,
-                    "activity": run.activity.as_ref().map(|activity| serde_json::to_value(activity).unwrap_or(Value::Null)),
+                    "activity": run.activity.as_ref().map(json_of),
                     "children": run.children.iter().map(|child| json!({
                         "id": child.id,
                         "label": child.label,
-                        "state": serde_json::to_value(&child.state).unwrap_or(Value::Null),
+                        "state": json_of(&child.state),
                         "error": child.error,
                         "children": child.children.len(),
                     })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
                 "turns": session.turns.iter().rev().take(4).collect::<Vec<_>>().into_iter().rev().map(|turn| json!({
                     "id": turn.id,
-                    "status": serde_json::to_value(&turn.status).unwrap_or(Value::Null),
+                    "status": json_of(&turn.status),
                     "startedAt": turn.started_at,
                     "completedAt": turn.completed_at,
                 })).collect::<Vec<_>>(),
@@ -622,15 +555,10 @@ fn resolve_target(window: &Window, target: &Target) -> Result<gpui::accesskit::N
     let description = match target {
         Target::Node(node) => format!("node {node}"),
         Target::Id(id) => format!("id `{id}`"),
-        Target::Label(label) => format!("label `{label}`"),
     };
     let matches = |node: &Value| match target {
         Target::Node(wanted) => node["node"].as_str() == Some(wanted.as_str()),
         Target::Id(wanted) => node["element_id"].as_str() == Some(wanted.as_str()),
-        Target::Label(wanted) => {
-            node["label"].as_str() == Some(wanted.as_str())
-                || node["value"].as_str() == Some(wanted.as_str())
-        }
     };
     let found: Vec<&Value> = nodes.iter().filter(|node| matches(node)).collect();
     let selected = match found.len() {
@@ -670,7 +598,6 @@ fn nearest_ids(nodes: &[Value], target: &Target) -> Vec<String> {
     let wanted = match target {
         Target::Node(node) => node.as_str(),
         Target::Id(id) => id.as_str(),
-        Target::Label(label) => label.as_str(),
     };
     let tokens: Vec<&str> = wanted
         .split(['.', '-', '_', ' '])

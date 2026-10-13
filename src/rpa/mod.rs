@@ -6,8 +6,7 @@
 //! explain. It exists so feature work can be verified programmatically
 //! instead of through pixels or the system accessibility tree.
 //!
-//! See `openspec/changes/add-rpa-bridge/` for the behavior contract and
-//! `docs/rpa.md` for the operating instructions.
+//! See `openspec/changes/add-rpa-bridge/` for the behavior contract.
 
 pub mod protocol;
 pub mod service;

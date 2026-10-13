@@ -224,10 +224,15 @@ gets the same calls as a local one with no second mechanism.
 
 ## Migration Plan
 
-The spike's local endpoint and discovery file are retired in P1 once the
-daemon-routed executor passes the subagent trial; until then they are a debug
-fallback behind an environment flag. The protocol version bumps once, and both
-client libraries ship the same version. Release behavior does not change.
+The landed spike (task 1.2) is a transitional implementation: it drives the app
+through an app-local endpoint and a hand-built state section, and its verbs
+(`act`, `type`, `key`) are not the final protocol shape. The daemon-mediated
+execution and model-derived state requirements take effect in P1, when the
+executor moves onto the daemon connection, the endpoint is retired behind an
+environment flag, and the protocol version bumps once for both client
+libraries. Until then, a review that compares this code against the P1
+requirements is comparing a working foundation against its target. Release
+behavior does not change.
 
 ## Open Questions
 

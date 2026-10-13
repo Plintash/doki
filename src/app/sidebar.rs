@@ -65,7 +65,6 @@ impl SessionDateGroup {
 /// one set preserves each view's disclosure state when the user switches
 /// between Project and Updated grouping.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-
 pub(super) enum SidebarGroup {
     Updated(SessionDateGroup),
     Project(Uuid),

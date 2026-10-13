@@ -60,14 +60,6 @@ pub enum Request {
         #[serde(default = "default_wait_timeout")]
         timeout_ms: u64,
     },
-    /// An ordered batch of steps, stopping at the first failure.
-    Run {
-        steps: Vec<Step>,
-        /// Include a final snapshot in the result. Defaults to true because
-        /// the caller almost always wants to assert on where it ended up.
-        #[serde(default = "default_true")]
-        final_snapshot: bool,
-    },
 }
 
 fn default_wait_timeout() -> u64 {
@@ -86,56 +78,10 @@ pub enum Action {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum Step {
-    Click {
-        target: Target,
-    },
-    Focus {
-        target: Target,
-    },
-    Type {
-        text: String,
-        #[serde(default)]
-        target: Option<Target>,
-    },
-    Key {
-        chord: String,
-    },
-    Invoke {
-        verb: String,
-        #[serde(default)]
-        args: Value,
-    },
-    Wait {
-        condition: Condition,
-        #[serde(default = "default_wait_timeout")]
-        timeout_ms: u64,
-    },
-}
-
-impl Step {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Step::Click { .. } => "click",
-            Step::Focus { .. } => "focus",
-            Step::Type { .. } => "type",
-            Step::Key { .. } => "key",
-            Step::Invoke { .. } => "invoke",
-            Step::Wait { .. } => "wait",
-        }
-    }
-}
-
-/// How to name the control an action applies to. `node` is the handle from a
-/// snapshot; `id` is the stable semantic id; `label` matches the accessible
-/// label, for callers that have nothing better.
-#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Target {
     Node(String),
     Id(String),
-    Label(String),
 }
 
 #[derive(Clone, Debug, Deserialize)]

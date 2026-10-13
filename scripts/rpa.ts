@@ -43,7 +43,6 @@ Commands:
   key <chord>                    send a chord (e.g. secondary-l)
   invoke <verb> [args-json]      run a workspace verb (openTask, selectProject, newTask)
   wait [--id ID [--gone]] [--text ID=SUBSTR] [--state PTR=VALUE] [--state-contains PTR=SUBSTR] [--timeout MS]
-  run <file.json>                ordered steps: [{op:"click",id:"..."}, ...]
   raw '<json>'                   send one raw request object
 
 Discovery: --config <path>, else WAKU_RPA_CONFIG, else ./temp/rpa.json.`);
@@ -72,12 +71,6 @@ async function call(discovery: Discovery, request: Record<string, unknown>): Pro
   const [host, port] = discovery.address.split(":");
   return await new Promise<Reply>((resolveReply, rejectReply) => {
     let buffer = "";
-    let settled = false;
-    const finish = (reply: Reply) => {
-      if (settled) return;
-      settled = true;
-      resolveReply(reply);
-    };
     Bun.connect({
       hostname: host,
       port: Number(port),
@@ -96,39 +89,19 @@ async function call(discovery: Discovery, request: Record<string, unknown>): Pro
           buffer += data.toString();
           const newline = buffer.indexOf("\n");
           if (newline >= 0) {
-            let reply: Reply;
-            try {
-              reply = JSON.parse(buffer.slice(0, newline)) as Reply;
-            } catch (error) {
-              settled = true;
-              rejectReply(error);
-              socket.end();
-              return;
-            }
             // Resolve before closing: `end()` can emit `close` synchronously.
-            finish(reply);
+            resolveReply(JSON.parse(buffer.slice(0, newline)) as Reply);
             socket.end();
           }
         },
         error(_socket, error) {
-          if (!settled) {
-            settled = true;
-            rejectReply(error);
-          }
+          rejectReply(error);
         },
         close() {
-          if (!settled) {
-            settled = true;
-            rejectReply(new Error("the endpoint closed before answering"));
-          }
+          rejectReply(new Error("the endpoint closed before answering"));
         },
       },
-    }).catch((error) => {
-      if (!settled) {
-        settled = true;
-        rejectReply(error);
-      }
-    });
+    }).catch(rejectReply);
   });
 }
 
@@ -248,20 +221,6 @@ async function main() {
       const timeout = Number(argument("--timeout") ?? 10000);
       const result = await send({ type: "wait", condition, timeout_ms: timeout });
       console.log(asJson ? JSON.stringify(result) : `ok waited ${result.elapsedMs}ms`);
-      break;
-    }
-    case "run": {
-      const file = process.argv[3];
-      if (!file) usage();
-      const steps = JSON.parse(readFileSync(resolve(file), "utf8"));
-      const result = await send({ type: "run", steps, final_snapshot: true });
-      if (asJson) console.log(JSON.stringify(result, null, 2));
-      else {
-        for (const step of result.steps ?? []) {
-          console.log(`ok ${step.step} ${step.op}`);
-        }
-        console.log(`done (${result.steps?.length ?? 0} steps)`);
-      }
       break;
     }
     case "raw": {
