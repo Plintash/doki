@@ -112,7 +112,7 @@ event backlog, and request round-trip latency — without a rebuild.
 #### Scenario: Counters move while streaming
 
 - **WHEN** a reply is streaming and the client reads the counters twice
-- **THEN** the frame and commit counters are higher on the second read
+- **THEN** it receives a current value for every named counter, and the frame and commit counters are higher on the second read
 
 #### Scenario: Perf questions are answerable in place
 
@@ -145,7 +145,7 @@ first look answers whether anything is wrong.
 #### Scenario: Health stays a summary
 
 - **WHEN** health is included
-- **THEN** it summarizes state rather than dumping records
+- **THEN** it names the daemon link, the last error, session and provider state, pending permissions, and counters as state, not records
 
 ### Requirement: Failure dumps
 

@@ -66,17 +66,18 @@ pub fn start() -> Option<&'static Discovery> {
     if !cfg!(debug_assertions) {
         return None;
     }
-    if SERVICE.get().is_none() {
-        match launch() {
-            Ok(discovery) => {
-                let _ = SERVICE.set(discovery);
-            }
-            // The bridge is development tooling; a port or filesystem problem
-            // must not take the app down with it.
-            Err(error) => eprintln!("waku-rpa: could not start the endpoint: {error:#}"),
+    match launch() {
+        Ok(discovery) => {
+            let _ = SERVICE.set(discovery);
+            SERVICE.get()
+        }
+        // The bridge is development tooling; a port or filesystem problem
+        // must not take the app down with it.
+        Err(error) => {
+            eprintln!("waku-rpa: could not start the endpoint: {error:#}");
+            None
         }
     }
-    SERVICE.get()
 }
 
 /// The live publication. The pump only runs after [`start`] has published it.
@@ -173,8 +174,12 @@ fn write_discovery(path: &Path, discovery: &Discovery) -> anyhow::Result<()> {
 
 fn accept_loop(listener: TcpListener, sender: smol::channel::Sender<Inbound>, token: String) {
     for stream in listener.incoming() {
-        let Ok(stream) = stream else {
-            continue;
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("waku-rpa: could not accept a connection: {error}");
+                continue;
+            }
         };
         let sender = sender.clone();
         let token = token.clone();
@@ -189,8 +194,12 @@ fn accept_loop(listener: TcpListener, sender: smol::channel::Sender<Inbound>, to
 
 fn serve_connection(stream: TcpStream, sender: smol::channel::Sender<Inbound>, token: &str) {
     let _attached = AttachGuard::new();
-    let Ok(reader_stream) = stream.try_clone() else {
-        return;
+    let reader_stream = match stream.try_clone() {
+        Ok(reader) => reader,
+        Err(error) => {
+            eprintln!("waku-rpa: could not read a connection: {error}");
+            return;
+        }
     };
     let mut writer = stream;
     let mut lines = BufReader::new(reader_stream).lines();

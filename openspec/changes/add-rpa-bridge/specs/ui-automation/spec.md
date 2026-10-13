@@ -74,8 +74,8 @@ MUST NOT abort the app or block the UI thread.
 ### Requirement: Debug-only availability
 
 The executor, the agent bindings, and the tree-for-automation mode SHALL exist
-only in debug builds. Release builds MUST NOT register an executor, publish
-discovery, or attach the bindings, regardless of settings or environment.
+only in debug builds. Release builds MUST NOT register an executor or attach
+the bindings, regardless of settings or environment.
 
 #### Scenario: Release build exposes nothing
 
@@ -222,9 +222,9 @@ protocol, so local and remote callers see one surface.
 
 ### Requirement: Attached clients identify and reconnect
 
-A client SHALL report the instance and build identity it is attached to,
-reconnect after an app relaunch, and offer a wait for a fresh build after a
-rebuild. The build identity SHALL change when the checkout is rebuilt.
+A client SHALL report the instance and a build identity that distinguishes two
+builds of one checkout, reconnect after an app relaunch, and offer a wait for a
+fresh build after a rebuild.
 
 #### Scenario: A relaunch is observable
 

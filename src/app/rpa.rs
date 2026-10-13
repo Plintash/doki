@@ -72,7 +72,6 @@ async fn execute(cx: &mut AsyncApp, request: Request) -> Result<Value, Error> {
         request @ (Request::Act { .. } | Request::Type { .. } | Request::Key { .. }) => {
             dispatch(cx, request)
         }
-        Request::Snapshot => take_snapshot(cx),
         request => query(cx, request),
     }
 }
@@ -118,13 +117,6 @@ fn app_not_ready() -> Error {
     )
 }
 
-fn take_snapshot(cx: &mut AsyncApp) -> Result<Value, Error> {
-    cx.update(|app| {
-        with_workspace(app, true, |waku, window, cx| waku.rpa_snapshot(window, cx))
-            .unwrap_or_else(|| Err(app_not_ready()))
-    })
-}
-
 fn current_state(cx: &mut AsyncApp) -> Option<Value> {
     cx.update(|app| with_workspace(app, false, |waku, _window, cx| waku.rpa_state(cx)))
 }
@@ -135,7 +127,7 @@ async fn wait_for(
     timeout_ms: u64,
 ) -> Result<Value, Error> {
     let started = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms.max(1));
+    let timeout = Duration::from_millis(timeout_ms);
     let needs_frame = matches!(condition, Condition::Node { .. } | Condition::Text { .. });
     loop {
         let observed = cx.update(|app| {
@@ -294,8 +286,8 @@ fn value_contains(value: &Value, contains: &str) -> bool {
 fn snapshot_tree_nodes(snapshot: &Value) -> &[Value] {
     snapshot["tree"]["nodes"]
         .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+        .expect("snapshots always carry a tree with a nodes array")
+        .as_slice()
 }
 
 impl Waku {
@@ -370,15 +362,22 @@ impl Waku {
 
     /// The current frame's tree plus the app's observable state.
     pub(crate) fn rpa_snapshot(&self, window: &Window, cx: &App) -> Result<Value, Error> {
-        let tree = match window.a11y_automation_snapshot() {
-            Some(text) => serde_json::from_str::<Value>(&text).map_err(|error| {
+        let tree = window
+            .a11y_automation_snapshot()
+            .ok_or_else(|| {
                 Error::new(
-                    "invalid_tree",
-                    format!("the frame's tree is not valid JSON: {error}"),
+                    "no_frame",
+                    "the window has not drawn an automation frame yet",
                 )
-            })?,
-            None => Value::Null,
-        };
+            })
+            .and_then(|text| {
+                serde_json::from_str::<Value>(&text).map_err(|error| {
+                    Error::new(
+                        "invalid_tree",
+                        format!("the frame's tree is not valid JSON: {error}"),
+                    )
+                })
+            })?;
         Ok(json!({
             "instance": json_of(crate::rpa::service::discovery()),
             "window": {
