@@ -20,7 +20,7 @@ use waku_protocol::i18n::AppLanguage;
 use waku_protocol::identity::data_directory_name;
 use waku_protocol::model::{
     AgentSession, FavoriteModel, Project, ProviderKind, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, RuntimeMode,
+    ProviderSessionHistory, ProviderSessionSummary, RuntimeMode, Task,
 };
 use waku_protocol::theme::ThemePreference;
 use waku_protocol::workspace::ReviewDiffSource;
@@ -48,6 +48,9 @@ pub enum SidebarGrouping {
     #[default]
     Project,
     Updated,
+    /// Tasks and the conversations filed under them. The new view: only
+    /// sessions bound to a task appear, and Done tasks drop out of the list.
+    Task,
 }
 
 /// Direction of task history inside the sidebar's current grouping.
@@ -441,6 +444,9 @@ pub struct PersistedState {
     pub version: u32,
     pub projects: Vec<Project>,
     pub sessions: Vec<AgentSession>,
+    /// User-declared tasks, daemon-owned like projects and sessions.
+    #[serde(default)]
+    pub tasks: Vec<Task>,
     pub selected_project: Option<Uuid>,
     pub selected_session: Option<Uuid>,
     pub last_provider: ProviderKind,
@@ -537,6 +543,7 @@ impl PersistedState {
             version: STATE_VERSION,
             projects: Vec::new(),
             sessions: Vec::new(),
+            tasks: Vec::new(),
             selected_project: None,
             selected_session: None,
             last_provider: ProviderKind::Codex,
@@ -744,6 +751,7 @@ impl PersistedState {
         self.sidebar_grouping = sidebar_grouping_for(
             app_state.sidebar_grouping_chosen,
             app_state.sidebar_grouping,
+            !self.tasks.is_empty(),
         );
         self.sidebar_grouping_chosen = app_state.sidebar_grouping_chosen;
         self.sidebar_ordering = app_state.sidebar_ordering;
@@ -838,9 +846,14 @@ impl PersistedState {
 /// An unchosen grouping is whatever the default was in the build that wrote
 /// the document, so this build's default replaces it; a chosen one is the
 /// user's and survives every launch, including a switch back to date headings.
-fn sidebar_grouping_for(chosen: bool, stored: SidebarGrouping) -> SidebarGrouping {
+/// Once any task exists, the task view is the home an unchosen document opens
+/// in — otherwise a user who declared tasks would relaunch into a list that
+/// no longer shows them.
+fn sidebar_grouping_for(chosen: bool, stored: SidebarGrouping, has_tasks: bool) -> SidebarGrouping {
     if chosen {
         stored
+    } else if has_tasks {
+        SidebarGrouping::Task
     } else {
         SidebarGrouping::default()
     }
@@ -1111,7 +1124,7 @@ impl StateStore {
     }
 
     pub fn load(&self) -> io::Result<PersistedState> {
-        let (projects, mut sessions, default_cwd) = match self
+        let (projects, mut sessions, tasks, default_cwd) = match self
             .daemon
             .client()
             .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
@@ -1120,11 +1133,12 @@ impl StateStore {
             ResponsePayload::TaskState {
                 projects,
                 sessions,
+                tasks,
                 default_cwd,
                 projectless_root,
             } => {
                 waku_protocol::projectless::set_workspace_root(projectless_root);
-                (projects, sessions, default_cwd)
+                (projects, sessions, tasks, default_cwd)
             }
             _ => {
                 return Err(io::Error::other(
@@ -1137,6 +1151,7 @@ impl StateStore {
         let mut state = PersistedState::empty();
         state.projects = projects;
         state.sessions = sessions;
+        state.tasks = tasks;
         let app_settings_missing = !self.app_settings_path.is_file();
         let settings = hydration_app_settings(self.preloaded_app_settings.as_ref(), || {
             self.read_app_settings()
@@ -1148,6 +1163,11 @@ impl StateStore {
         let app_state_missing = app_state.is_none();
         if let Some(app_state) = app_state {
             state.apply_app_state(app_state);
+        } else {
+            // No navigation document yet: the task view is still the default
+            // for a history that already has tasks.
+            state.sidebar_grouping =
+                sidebar_grouping_for(false, state.sidebar_grouping, !state.tasks.is_empty());
         }
         state.migrate_loaded();
         if app_settings_missing {
@@ -1208,6 +1228,7 @@ impl StateStore {
                 Uuid::nil(),
                 Command::SaveTaskState {
                     projects: state.projects.clone(),
+                    tasks: state.tasks.clone(),
                     live_session_ids,
                     skeleton_session_ids,
                     sessions,
@@ -1430,13 +1451,23 @@ mod tests {
     #[test]
     fn date_grouping_stored_before_the_default_changed_adopts_project_grouping() {
         assert_eq!(
-            sidebar_grouping_for(false, SidebarGrouping::Updated),
+            sidebar_grouping_for(false, SidebarGrouping::Updated, false),
             SidebarGrouping::Project
         );
         assert_eq!(
-            sidebar_grouping_for(true, SidebarGrouping::Updated),
+            sidebar_grouping_for(true, SidebarGrouping::Updated, false),
             SidebarGrouping::Updated,
             "a switch back to date headings survives the next launch"
+        );
+        assert_eq!(
+            sidebar_grouping_for(false, SidebarGrouping::Updated, true),
+            SidebarGrouping::Task,
+            "an unchosen grouping opens in the task view once tasks exist"
+        );
+        assert_eq!(
+            sidebar_grouping_for(true, SidebarGrouping::Project, true),
+            SidebarGrouping::Project,
+            "an explicit project grouping still wins over the task view"
         );
     }
 
@@ -1593,6 +1624,7 @@ mod tests {
         let encoded = serde_json::to_vec(&ResponsePayload::TaskState {
             projects: Vec::new(),
             sessions: vec![session],
+            tasks: Vec::new(),
             default_cwd: PathBuf::from("/daemon/project"),
             projectless_root: None,
         })

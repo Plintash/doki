@@ -9,7 +9,7 @@ use crate::attachments::{AttachmentUpload, StoredAttachment};
 use crate::computer_use::ComputerPermissions;
 use crate::model::{
     AgentSession, GoalOperation, Project, ProviderKind, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, UserInputAnswer,
+    ProviderSessionHistory, ProviderSessionSummary, Task, UserInputAnswer,
 };
 use crate::persistence::{ComposerDraftChange, ComposerDrafts, SessionMessageMatch};
 use crate::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
@@ -177,6 +177,10 @@ pub enum Command {
     LoadTaskState,
     SaveTaskState {
         projects: Vec<Project>,
+        /// Tasks in `tasks` are merged by id, newest `updated_at` winning;
+        /// a save never deletes another client's task.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tasks: Vec<Task>,
         live_session_ids: Vec<Uuid>,
         /// Sessions in `sessions` whose transcript detail was never loaded.
         ///
@@ -438,6 +442,8 @@ pub enum ResponsePayload {
     TaskState {
         projects: Vec<Project>,
         sessions: Vec<AgentSession>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tasks: Vec<Task>,
         default_cwd: PathBuf,
         projectless_root: Option<PathBuf>,
     },
@@ -655,6 +661,7 @@ mod tests {
         let skeleton_id = Uuid::from_u128(1);
         let command = Command::SaveTaskState {
             projects: Vec::new(),
+            tasks: Vec::new(),
             live_session_ids: vec![skeleton_id],
             skeleton_session_ids: vec![skeleton_id],
             sessions: Vec::new(),
@@ -667,6 +674,7 @@ mod tests {
         // never mentions skeletons stays compatible.
         let command = Command::SaveTaskState {
             projects: Vec::new(),
+            tasks: Vec::new(),
             live_session_ids: Vec::new(),
             skeleton_session_ids: Vec::new(),
             sessions: Vec::new(),

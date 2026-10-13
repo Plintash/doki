@@ -357,12 +357,14 @@ impl Backend for WakuBackend {
                         .iter()
                         .map(AgentSession::list_projection)
                         .collect(),
+                    tasks: state.tasks.clone(),
                     default_cwd: self.default_cwd.clone(),
                     projectless_root: crate::projectless::workspace_root(),
                 })
             }
             Command::SaveTaskState {
                 projects,
+                tasks,
                 live_session_ids: _,
                 skeleton_session_ids,
                 sessions,
@@ -384,6 +386,22 @@ impl Backend for WakuBackend {
                         *existing = project;
                     } else {
                         state.projects.push(project);
+                    }
+                }
+                // Tasks merge the way projects do: a save is additive, and an
+                // older snapshot never overwrites a newer one. Deleting a task
+                // is an explicit client action, not a side effect of saving.
+                for task in tasks {
+                    if let Some(existing) = state
+                        .tasks
+                        .iter_mut()
+                        .find(|existing| existing.id == task.id)
+                    {
+                        if task.updated_at >= existing.updated_at {
+                            *existing = task;
+                        }
+                    } else {
+                        state.tasks.push(task);
                     }
                 }
                 let sessions = sessions
@@ -987,6 +1005,7 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
     if incoming.updated_at >= existing.updated_at {
         existing.title = incoming.title;
         existing.project_id = incoming.project_id;
+        existing.task_id = incoming.task_id;
         existing.workspace = incoming.workspace;
         existing.provider = incoming.provider;
         existing.model = incoming.model;

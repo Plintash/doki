@@ -3,19 +3,24 @@ use gpui::{KeyBinding, actions};
 
 use super::*;
 
-actions!(waku_sidebar, [CancelSessionRename]);
+actions!(waku_sidebar, [CancelSessionRename, CancelTaskRename]);
 
 const SESSION_RENAME_PARENT_CONTEXT: &str = "SessionRename";
 const SESSION_RENAME_FIELD_CONTEXT: &str = "SessionRename > TextInput";
+pub(super) const TASK_RENAME_PARENT_CONTEXT: &str = "TaskRename";
+const TASK_RENAME_FIELD_CONTEXT: &str = "TaskRename > TextInput";
 
 /// Keep Escape inside the focused inline editor so it cancels the rename,
 /// rather than falling through to the window-wide Stop action.
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "escape",
-        CancelSessionRename,
-        Some(SESSION_RENAME_FIELD_CONTEXT),
-    )]);
+    cx.bind_keys([
+        KeyBinding::new(
+            "escape",
+            CancelSessionRename,
+            Some(SESSION_RENAME_FIELD_CONTEXT),
+        ),
+        KeyBinding::new("escape", CancelTaskRename, Some(TASK_RENAME_FIELD_CONTEXT)),
+    ]);
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -69,6 +74,8 @@ pub(super) enum SidebarGroup {
     Updated(SessionDateGroup),
     Project(Uuid),
     Projectless,
+    /// One user-declared task and the conversations filed under it.
+    Task(Uuid),
 }
 
 impl SidebarGroup {
@@ -77,6 +84,7 @@ impl SidebarGroup {
             Self::Updated(group) => format!("updated-{}", group.index()).into(),
             Self::Project(project_id) => format!("project-{project_id}").into(),
             Self::Projectless => "projectless".into(),
+            Self::Task(task_id) => format!("task-{task_id}").into(),
         }
     }
 
@@ -85,6 +93,7 @@ impl SidebarGroup {
             Self::Updated(group) => mix(fingerprint, group.index() as u64 + 1),
             Self::Project(project_id) => mix_uuid(mix(fingerprint, 0x100), project_id),
             Self::Projectless => mix(fingerprint, 0x200),
+            Self::Task(task_id) => mix_uuid(mix(fingerprint, 0x300), task_id),
         }
     }
 }
@@ -93,6 +102,7 @@ fn sidebar_grouping_label(grouping: SidebarGrouping) -> String {
     match grouping {
         SidebarGrouping::Project => tr!("sidebar.grouping_project"),
         SidebarGrouping::Updated => tr!("sidebar.grouping_updated"),
+        SidebarGrouping::Task => tr!("sidebar.grouping_task"),
     }
 }
 
@@ -626,6 +636,7 @@ impl Waku {
                         move |_| {
                             let project_weak = grouping_weak.clone();
                             let updated_weak = grouping_weak.clone();
+                            let task_weak = grouping_weak.clone();
                             vec![
                                 MenuItem::new(tr!("sidebar.grouping_project"), move |_, cx| {
                                     let _ = project_weak.update(cx, |this, cx| {
@@ -639,6 +650,12 @@ impl Waku {
                                     });
                                 })
                                 .selected(grouping == SidebarGrouping::Updated),
+                                MenuItem::new(tr!("sidebar.grouping_task"), move |_, cx| {
+                                    let _ = task_weak.update(cx, |this, cx| {
+                                        this.set_sidebar_grouping(SidebarGrouping::Task, cx);
+                                    });
+                                })
+                                .selected(grouping == SidebarGrouping::Task),
                             ]
                         },
                     ),
@@ -760,6 +777,83 @@ impl Waku {
                 cx.stop_propagation();
             }
         }))
+    }
+
+    /// The board entry, fixed above the list beside New Task and Search — not
+    /// a section of the history below. It toggles the kanban, counts what
+    /// waits on the user, and declares tasks.
+    fn render_sidebar_board_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::current(cx);
+        let attention = self.task_stats().attention_total;
+        let show_actions = self.state.sidebar_grouping == SidebarGrouping::Task;
+        let row = div()
+            .id("sidebar-board")
+            .w_full()
+            .h(px(SIDEBAR_ACTION_ROW_HEIGHT))
+            .px(px(4.0))
+            .rounded(px(7.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .cursor_default()
+            .when(self.board_open, |element| {
+                element.bg(theme.sidebar_item_background)
+            })
+            .hover(|element| element.bg(theme.sidebar_item_background))
+            .active(|element| element.bg(theme.overlay_strong))
+            .track_focus(&self.board_focus)
+            .tab_index(0)
+            .tab_stop(true)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .child(
+                div()
+                    .size(px(20.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon("icons/columns.svg", 14.0, theme.text_secondary)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(sp(13.0))
+                    .text_color(theme.text_secondary)
+                    .child(tr!("sidebar.board")),
+            )
+            .when(attention > 0, |element| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .px(px(6.0))
+                        .h(px(18.0))
+                        .rounded(px(9.0))
+                        .bg(theme.warning.opacity(0.14))
+                        .flex()
+                        .items_center()
+                        .text_size(sp(11.0))
+                        .text_color(theme.warning)
+                        .child(attention.to_string()),
+                )
+            })
+            .child(self.render_task_create_button("sidebar-new-task", TaskState::Backlog, cx))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_board(cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.toggle_board(cx);
+                    cx.stop_propagation();
+                }
+            }));
+        let row = if show_actions {
+            row.child(self.render_sidebar_header_actions(cx))
+        } else {
+            row
+        };
+        row.into_any_element()
     }
 
     fn render_sidebar_search(&self, cx: &mut Context<Self>) -> Div {
@@ -946,7 +1040,10 @@ impl Waku {
     /// The render path only computes an allocation-free source fingerprint;
     /// collection building and daemon requests happen once when that moves.
     fn ensure_sidebar_branch_labels(&self, cx: &mut Context<Self>) {
-        if self.state.sidebar_grouping != SidebarGrouping::Project {
+        if !matches!(
+            self.state.sidebar_grouping,
+            SidebarGrouping::Project | SidebarGrouping::Task
+        ) {
             return;
         }
 
@@ -1095,6 +1192,12 @@ impl Waku {
             )
             .child(
                 div()
+                    .flex_none()
+                    .px(px(10.0))
+                    .child(self.render_sidebar_board_row(cx)),
+            )
+            .child(
+                div()
                     .id("sidebar-scroll")
                     .flex_1()
                     .min_h_0()
@@ -1163,6 +1266,7 @@ impl Waku {
             match self.state.sidebar_grouping {
                 SidebarGrouping::Project => 1,
                 SidebarGrouping::Updated => 2,
+                SidebarGrouping::Task => 3,
             },
         );
         fingerprint = mix(
@@ -1178,6 +1282,7 @@ impl Waku {
             }
             fingerprint = mix_uuid(fingerprint, session.id);
             fingerprint = mix_uuid(fingerprint, session.project_id);
+            fingerprint = mix_uuid(fingerprint, session.task_id.unwrap_or(Uuid::nil()));
             fingerprint = mix(fingerprint, sidebar_session_timestamp(session));
             if self.state.sidebar_grouping == SidebarGrouping::Project {
                 fingerprint = mix(
@@ -1204,6 +1309,13 @@ impl Waku {
                 mix(fingerprint, self.sidebar_project_reveal_counts.len() as u64),
                 revealed,
             );
+        }
+        // Task state drives the archived filter in every view, so task facts
+        // join the fingerprint no matter which view is showing.
+        for task in &self.state.tasks {
+            fingerprint = mix_uuid(fingerprint, task.id);
+            fingerprint = mix(fingerprint, task.updated_at);
+            fingerprint = mix(fingerprint, task.state.ordinal());
         }
         // A set has no stable iteration order; combine order-independently.
         let collapsed = self
@@ -1234,8 +1346,70 @@ impl Waku {
             .collect::<Vec<_>>();
         sort_sidebar_sessions(&mut sorted_sessions, self.state.sidebar_ordering);
 
+        // A completed task's conversations leave the sidebar in every view:
+        // the board's Done column and Settings > Archive are where they stay
+        // reachable. This is what "archive" means — never deletion.
+        let archived_tasks = self
+            .state
+            .tasks
+            .iter()
+            .filter(|task| task.state.is_done())
+            .map(|task| task.id)
+            .collect::<HashSet<_>>();
+        sorted_sessions.retain(|session| {
+            session
+                .task_id
+                .is_none_or(|task_id| !archived_tasks.contains(&task_id))
+        });
+
         let mut rows = vec![SidebarRow::Search];
         match self.state.sidebar_grouping {
+            SidebarGrouping::Task => {
+                // Only conversations filed under a task appear in this view;
+                // everything else stays in the project and updated views.
+                let mut tasks = self
+                    .state
+                    .tasks
+                    .iter()
+                    .filter(|task| !task.state.is_done())
+                    .collect::<Vec<_>>();
+                tasks.sort_by(|a, b| {
+                    b.updated_at
+                        .cmp(&a.updated_at)
+                        .then_with(|| a.position.cmp(&b.position))
+                        .then_with(|| a.created_at.cmp(&b.created_at))
+                });
+                if self.state.sidebar_ordering == SidebarOrdering::Oldest {
+                    tasks.reverse();
+                }
+                let mut sessions_by_task: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+                for session in &sorted_sessions {
+                    if let Some(task_id) = session.task_id {
+                        sessions_by_task
+                            .entry(task_id)
+                            .or_default()
+                            .push(session.id);
+                    }
+                }
+                for task in tasks {
+                    let group = SidebarGroup::Task(task.id);
+                    let sessions = sessions_by_task.remove(&task.id).unwrap_or_default();
+                    if sessions.is_empty() {
+                        // A task exists before its first conversation; its
+                        // header still stands for it in the list.
+                        rows.push(SidebarRow::Header(group));
+                        rows.push(SidebarRow::GroupSpacer);
+                        continue;
+                    }
+                    append_sidebar_group_rows(
+                        &mut rows,
+                        group,
+                        &sessions,
+                        self.sidebar_collapsed_groups.contains(&group),
+                        false,
+                    );
+                }
+            }
             SidebarGrouping::Updated => {
                 let mut grouped_sessions: [Vec<Uuid>; 6] = std::array::from_fn(|_| Vec::new());
                 for session in sorted_sessions {
@@ -1299,32 +1473,41 @@ impl Waku {
             }
         }
         if rows.len() == 1 {
-            // Keep the header actions visible while there is no history.
+            // Keep the header actions visible while there is no history. The
+            // task view carries them on the board entry instead, so an empty
+            // task list needs no placeholder section.
             let group = match self.state.sidebar_grouping {
-                SidebarGrouping::Updated => SidebarGroup::Updated(SessionDateGroup::Today),
+                SidebarGrouping::Task => None,
+                SidebarGrouping::Updated => Some(SidebarGroup::Updated(SessionDateGroup::Today)),
                 SidebarGrouping::Project => {
                     let projectless_root = crate::projectless::workspace_root();
-                    self.state
-                        .selected_project
-                        .and_then(|project_id| {
-                            self.state
-                                .projects
-                                .iter()
-                                .find(|project| project.id == project_id)
-                        })
-                        .or_else(|| self.state.projects.first())
-                        .map(|project| {
-                            if sidebar_project_is_projectless(project, projectless_root.as_deref())
-                            {
-                                SidebarGroup::Projectless
-                            } else {
-                                SidebarGroup::Project(project.id)
-                            }
-                        })
-                        .unwrap_or(SidebarGroup::Projectless)
+                    Some(
+                        self.state
+                            .selected_project
+                            .and_then(|project_id| {
+                                self.state
+                                    .projects
+                                    .iter()
+                                    .find(|project| project.id == project_id)
+                            })
+                            .or_else(|| self.state.projects.first())
+                            .map(|project| {
+                                if sidebar_project_is_projectless(
+                                    project,
+                                    projectless_root.as_deref(),
+                                ) {
+                                    SidebarGroup::Projectless
+                                } else {
+                                    SidebarGroup::Project(project.id)
+                                }
+                            })
+                            .unwrap_or(SidebarGroup::Projectless),
+                    )
                 }
             };
-            rows.push(SidebarRow::Header(group));
+            if let Some(group) = group {
+                rows.push(SidebarRow::Header(group));
+            }
         }
         rows
     }
@@ -1335,28 +1518,12 @@ impl Waku {
     /// (e.g. the active session's `updated_at` bumping on every stream tick).
     fn sync_sidebar_rows(&self, rows: &[SidebarRow]) {
         let mut cached = self.sidebar_row_cache.borrow_mut();
-        if cached.as_slice() == rows {
-            return;
-        }
-        let prefix = cached
-            .iter()
-            .zip(rows.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-        let old_count = cached.len();
-        *cached = rows.to_vec();
-        if old_count == 0 {
-            self.sidebar_list_state
-                .reset_with_uniform_height(rows.len(), px(SIDEBAR_SESSION_ROW_HEIGHT));
-        } else {
-            self.sidebar_list_state
-                .splice(prefix..old_count, rows.len() - prefix);
-            // Newly inserted rows have no measured height yet; give them the
-            // uniform hint so the scrollbar keeps a correct total height.
-            self.sidebar_list_state
-                .clone()
-                .with_uniform_item_height(px(SIDEBAR_SESSION_ROW_HEIGHT));
-        }
+        sync_virtual_ids(
+            &self.sidebar_list_state,
+            &mut cached,
+            rows,
+            px(SIDEBAR_SESSION_ROW_HEIGHT),
+        );
     }
 
     fn sidebar_row(&self, index: usize, rows: &[SidebarRow], cx: &mut Context<Self>) -> AnyElement {
@@ -1366,7 +1533,11 @@ impl Waku {
         match *row {
             SidebarRow::Search => self.render_sidebar_search(cx).into_any_element(),
             SidebarRow::Header(group) => self
-                .render_sidebar_group_header(group, index == 1, cx)
+                .render_sidebar_group_header(
+                    group,
+                    index == 1 && self.state.sidebar_grouping != SidebarGrouping::Task,
+                    cx,
+                )
                 .into_any_element(),
             SidebarRow::Session(session_id) => self
                 .render_sidebar_session_item(session_id, cx)
@@ -1414,15 +1585,34 @@ impl Waku {
                 .map(Project::display_name)
                 .unwrap_or_else(|| tr!("project.no_project_name")),
             SidebarGroup::Projectless => tr!("project.no_project_name"),
+            SidebarGroup::Task(task_id) => self
+                .state
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .map(|task| task.title.clone())
+                .unwrap_or_else(|| tr!("board.untitled_task")),
         };
-        let updated_chevron = matches!(group, SidebarGroup::Updated(_)).then(|| {
-            icon("icons/chevron-down.svg", 14.0, theme.text_secondary)
-                .when(collapsed, |icon| {
-                    icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.75)))
-                })
-                .invisible()
-                .group_hover(group_name.clone(), |icon| icon.visible())
-        });
+        let disclosure_chevron = matches!(group, SidebarGroup::Updated(_) | SidebarGroup::Task(_))
+            .then(|| {
+                icon("icons/chevron-down.svg", 14.0, theme.text_secondary)
+                    .when(collapsed, |icon| {
+                        icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(
+                            0.75,
+                        )))
+                    })
+                    .invisible()
+                    .group_hover(group_name.clone(), |icon| icon.visible())
+            });
+        let task_attention = match group {
+            SidebarGroup::Task(task_id) => self
+                .task_stats()
+                .attention
+                .get(&task_id)
+                .copied()
+                .unwrap_or(0),
+            _ => 0,
+        };
         let compose = show_folder_icon.then(|| {
             let compose_focus = self
                 .sidebar_group_compose_focuses
@@ -1513,10 +1703,27 @@ impl Waku {
                             .items_center()
                             .gap(px(2.0))
                             .child(div().min_w_0().truncate().child(label))
-                            .when_some(updated_chevron, |element, chevron| element.child(chevron)),
+                            .when_some(disclosure_chevron, |element, chevron| {
+                                element.child(chevron)
+                            }),
                     )
                     .child(div().flex_1()),
             )
+            .when(task_attention > 0, |element| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .px(px(6.0))
+                        .h(px(16.0))
+                        .rounded(px(8.0))
+                        .bg(theme.warning.opacity(0.14))
+                        .flex()
+                        .items_center()
+                        .text_size(sp(11.0))
+                        .text_color(theme.warning)
+                        .child(task_attention.to_string()),
+                )
+            })
             .when_some(compose, |element, compose| element.child(compose))
             .when(first, |element| {
                 element.child(self.render_sidebar_header_actions(cx))
@@ -1558,7 +1765,7 @@ impl Waku {
         match group {
             SidebarGroup::Project(project_id) => self.select_project(project_id, cx),
             SidebarGroup::Projectless => self.create_projectless_session(cx),
-            SidebarGroup::Updated(_) => return,
+            SidebarGroup::Updated(_) | SidebarGroup::Task(_) => return,
         }
         let focus = self.composer_focus(cx);
         window.focus(&focus, cx);
@@ -1752,6 +1959,31 @@ impl Waku {
         cx.notify();
     }
 
+    /// The tasks the file-under-task submenu offers: most recently touched
+    /// first, with a fixed row budget, plus the title of the task the session
+    /// is already filed under. Resolved only when the menu opens.
+    fn filing_menu_tasks(
+        &self,
+        bound_task_id: Option<Uuid>,
+    ) -> (Option<String>, Vec<(Uuid, String)>) {
+        let bound_title = bound_task_id
+            .and_then(|task_id| self.state.tasks.iter().find(|task| task.id == task_id))
+            .map(|task| task.title.clone());
+        let mut listed = self
+            .state
+            .tasks
+            .iter()
+            .filter(|task| Some(task.id) != bound_task_id)
+            .collect::<Vec<_>>();
+        listed.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let listed = listed
+            .into_iter()
+            .take(12)
+            .map(|task| (task.id, task.title.clone()))
+            .collect();
+        (bound_title, listed)
+    }
+
     fn render_sidebar_session_item(&self, session_id: Uuid, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
         let Some(session) = self
@@ -1777,13 +2009,16 @@ impl Waku {
             .projects
             .iter()
             .find(|project| project.id == session.project_id);
-        let grouped_by_project = self.state.sidebar_grouping == SidebarGrouping::Project;
-        let left_padding = if grouped_by_project {
+        let grouped = matches!(
+            self.state.sidebar_grouping,
+            SidebarGrouping::Project | SidebarGrouping::Task
+        );
+        let left_padding = if grouped {
             SIDEBAR_GROUP_CHILD_PADDING
         } else {
             8.0
         };
-        let detail_label = if grouped_by_project {
+        let detail_label = if grouped {
             persisted_sidebar_branch_label(&session.workspace)
                 .map(|branch| SharedString::from(branch.to_owned()))
                 .or_else(|| {
@@ -1805,7 +2040,7 @@ impl Waku {
             ))
         };
         let has_detail_label = detail_label.is_some();
-        let detail_icon = if grouped_by_project {
+        let detail_icon = if grouped {
             "icons/git-branch.svg"
         } else {
             "icons/folder.svg"
@@ -1911,7 +2146,7 @@ impl Waku {
                     .flex()
                     .items_center()
                     .gap(px(5.0))
-                    .text_size(sp(if grouped_by_project { 12.5 } else { 13.0 }))
+                    .text_size(sp(if grouped { 12.5 } else { 13.0 }))
                     .line_height(sp(15.0))
                     .when_some(detail_label, |element, label| {
                         element
@@ -1962,6 +2197,7 @@ impl Waku {
                         this.select_session(session_id, cx);
                     }))
             });
+        let bound_task_id = session.task_id;
         let row = if renaming {
             div()
                 .w_full()
@@ -1977,21 +2213,65 @@ impl Waku {
                 div().w_full().child(row),
                 SharedString::from(format!("session-menu-{session_id}")),
                 &menu,
-                move |_| {
+                move |cx| {
+                    // Built when the menu opens, not on every frame the row
+                    // renders.
+                    let (bound_title, listed_tasks) = waku
+                        .update(cx, |this, _| this.filing_menu_tasks(bound_task_id))
+                        .unwrap_or_default();
                     let rename_waku = waku.clone();
                     let remove_waku = waku.clone();
-                    vec![
+                    let create_waku = waku.clone();
+                    let unbind_waku = waku.clone();
+                    let mut items = vec![
                         MenuItem::new(tr!("common.rename"), move |window, cx| {
                             let _ = rename_waku.update(cx, |waku, cx| {
                                 waku.begin_session_rename(session_id, window, cx);
                             });
                         }),
                         MenuItem::Separator,
-                        MenuItem::new(tr!("common.remove"), move |_, cx| {
-                            let _ = remove_waku
-                                .update(cx, |waku, cx| waku.remove_session(session_id, cx));
-                        }),
-                    ]
+                    ];
+                    items.push(MenuItem::new(tr!("task.new_from_session"), move |_, cx| {
+                        let _ = create_waku.update(cx, |waku, cx| {
+                            waku.create_task_from_session(session_id, cx);
+                        });
+                    }));
+                    if !listed_tasks.is_empty() {
+                        let submenu_tasks = listed_tasks.clone();
+                        let submenu_waku = waku.clone();
+                        items.push(MenuItem::submenu_with_value(
+                            tr!("task.bind"),
+                            bound_title.clone().unwrap_or_default(),
+                            move |_| {
+                                submenu_tasks
+                                    .iter()
+                                    .map(|(task_id, title)| {
+                                        let task_id = *task_id;
+                                        let title = title.clone();
+                                        let weak = submenu_waku.clone();
+                                        MenuItem::new(title, move |_, cx| {
+                                            let _ = weak.update(cx, |waku, cx| {
+                                                waku.bind_session_to_task(session_id, task_id, cx);
+                                            });
+                                        })
+                                    })
+                                    .collect()
+                            },
+                        ));
+                    }
+                    if bound_task_id.is_some() {
+                        items.push(MenuItem::new(tr!("task.unbind"), move |_, cx| {
+                            let _ = unbind_waku.update(cx, |waku, cx| {
+                                waku.unbind_session_from_task(session_id, cx);
+                            });
+                        }));
+                    }
+                    items.push(MenuItem::Separator);
+                    items.push(MenuItem::new(tr!("common.remove"), move |_, cx| {
+                        let _ =
+                            remove_waku.update(cx, |waku, cx| waku.remove_session(session_id, cx));
+                    }));
+                    items
                 },
             )
         };

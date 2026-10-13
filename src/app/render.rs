@@ -184,6 +184,12 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The board is a view over the same tasks the sidebar lists; it takes
+        // the chat column while it is open and gives it straight back when a
+        // conversation is selected.
+        if self.board_open {
+            return self.render_board(cx);
+        }
         let chat_viewport_width = self.chat_viewport_width(window);
         // The transcript's own element sizes itself with `flex_1`, which only
         // stretches inside a flex parent. A cached pane lays its content out
@@ -225,6 +231,9 @@ impl Waku {
 
 impl Render for Waku {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // One task-facts pass per frame: the board and the sidebar's task rows
+        // both read it, and nothing may carry the previous frame's counts on.
+        self.task_stats_cache.borrow_mut().take();
         // Panel geometry first: the browser sync right below reads whether a
         // panel is mid-slide, and settling here rather than at the point of
         // use keeps the pane islands and the transcript on one set of widths.
@@ -272,6 +281,8 @@ impl Render for Waku {
                 .children(image_preview)
                 .children(task_switcher)
                 .children(close_confirmation)
+                .children(self.render_new_task_dialog(cx))
+                .children(self.render_task_completion_confirm(cx))
                 .into_any_element();
             return content;
         }
@@ -368,7 +379,7 @@ impl Render for Waku {
                         element.border_l_1().border_color(theme.sidebar_border)
                     })
                     .child(self.render_header(window, cx))
-                    .child(if empty {
+                    .child(if empty && !self.board_open {
                         self.render_empty_state(cx).into_any_element()
                     } else {
                         self.transcript_pane
@@ -377,20 +388,23 @@ impl Render for Waku {
                             .into_any_element()
                     })
                     .children(permission)
-                    .when(self.selected_project().is_some(), |element| {
-                        element
-                            .children(self.render_extension_surfaces(
-                                ExtensionWidgetPlacement::AboveEditor,
-                                cx,
-                            ))
-                            .children(self.render_queued_messages(cx))
-                            .child(self.render_composer(window, cx))
-                            .children(self.render_extension_surfaces(
-                                ExtensionWidgetPlacement::BelowEditor,
-                                cx,
-                            ))
-                            .child(self.render_workspace_footer(cx))
-                    })
+                    .when(
+                        !self.board_open && self.selected_project().is_some(),
+                        |element| {
+                            element
+                                .children(self.render_extension_surfaces(
+                                    ExtensionWidgetPlacement::AboveEditor,
+                                    cx,
+                                ))
+                                .children(self.render_queued_messages(cx))
+                                .child(self.render_composer(window, cx))
+                                .children(self.render_extension_surfaces(
+                                    ExtensionWidgetPlacement::BelowEditor,
+                                    cx,
+                                ))
+                                .child(self.render_workspace_footer(cx))
+                        },
+                    )
                     .relative()
                     .children(toast)
                     .when(self.sidebar_visible, |element| {
@@ -434,6 +448,8 @@ impl Render for Waku {
             .children(image_preview)
             .children(task_switcher)
             .children(close_confirmation)
+            .children(self.render_new_task_dialog(cx))
+            .children(self.render_task_completion_confirm(cx))
             .into_any_element();
 
         content

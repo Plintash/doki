@@ -70,6 +70,20 @@ fn attach_driver(
     Ok(Some((session, PreparedDriver { handle, events })))
 }
 
+/// Merge the daemon's task catalog into desktop state the way the daemon
+/// merges saves: by id, newest `updated_at` wins. A local edit that has not
+/// reached the daemon yet is newer than the broadcast that raced it, so it
+/// survives the reload.
+fn merge_remote_tasks(local: &mut Vec<Task>, remote: Vec<Task>) {
+    for task in remote {
+        match local.iter_mut().find(|candidate| candidate.id == task.id) {
+            Some(candidate) if candidate.updated_at > task.updated_at => {}
+            Some(candidate) => *candidate = task,
+            None => local.push(task),
+        }
+    }
+}
+
 fn load_remote_task_state(
     client: &waku_client::DaemonClient,
 ) -> anyhow::Result<RemoteTaskStateSnapshot> {
@@ -81,6 +95,7 @@ fn load_remote_task_state(
     let waku_client::ResponsePayload::TaskState {
         projects,
         mut sessions,
+        tasks,
         ..
     } = response
     else {
@@ -89,7 +104,11 @@ fn load_remote_task_state(
     for session in &mut sessions {
         session.detail_loaded = false;
     }
-    Ok(RemoteTaskStateSnapshot { projects, sessions })
+    Ok(RemoteTaskStateSnapshot {
+        projects,
+        sessions,
+        tasks,
+    })
 }
 
 /// The running turn and the user message that opened it — the identity other
@@ -153,6 +172,10 @@ pub(super) fn merge_remote_session_catalog(
             local.title = remote.title;
             local.auto_title = remote.auto_title;
             local.project_id = remote.project_id;
+            // A locally newer binding survives a snapshot that raced its save.
+            if remote.updated_at >= local.updated_at {
+                local.task_id = remote.task_id;
+            }
             local.provider = remote.provider;
             local.model = remote.model;
             local.created_at = remote.created_at;
@@ -1022,6 +1045,7 @@ impl Waku {
             self.task_switcher.remove(*session_id);
         }
         self.state.projects = snapshot.projects;
+        merge_remote_tasks(&mut self.state.tasks, snapshot.tasks);
 
         let attach = self
             .state
@@ -3307,6 +3331,7 @@ impl Waku {
         } else {
             Vec::new()
         };
+        let mut continued_task = None;
         let transcript_anchor = if let Some(session) = self.state.session_mut(session_id) {
             session.set_title_from_prompt(&human_prompt);
             let turn_id = session.begin_turn_with_presentation(
@@ -3317,6 +3342,7 @@ impl Waku {
             );
             session.status = SessionStatus::Connecting;
             session.updated_at = unix_time();
+            continued_task = session.task_id;
             selected.then_some(TranscriptAnchor {
                 session_id,
                 turn_id,
@@ -3324,6 +3350,11 @@ impl Waku {
         } else {
             None
         };
+        // A prompt is work: sending one to a finished task reopens it, so the
+        // task's state never lags behind the conversation it owns.
+        if let Some(task_id) = continued_task {
+            self.reopen_task_for_continued_work(task_id, cx);
+        }
         self.submission_preparations.insert(session_id);
         if selected {
             self.activities_expanded.clear();

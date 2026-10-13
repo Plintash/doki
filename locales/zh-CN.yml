@@ -1094,3 +1094,48 @@ annotation.reply_only: 标注只能指向助手的回复
 annotation.select_reply: 请在一条回复内选择要标注的文字
 annotation.select_one_reply: 一条标注只能落在同一条回复里，请重新选择
 annotation.wait_for_reply: 回复结束后才能标注
+
+sidebar.board: 任务板
+sidebar.grouping_task: 任务
+board.title: 任务板
+board.backlog: 待办
+board.doing: 进行中
+board.done: 完成
+board.new_task: 新任务
+board.new_task_placeholder: 这件任务要做什么？
+board.new_task_hint: 只写名字就行；项目、工作区和对话都之后再定。
+board.needs_you: "%{count} 条需要你"
+board.needs_you_short: 需要你
+board.running: 运行中
+board.conversations_one: 1 条对话
+board.conversations_many: "%{count} 条对话"
+board.open_latest: 打开最近对话
+board.move_backlog: 移到待办
+board.move_doing: 移到进行中
+board.complete: 完成
+board.reopen: 重新打开
+board.completed_toast: 任务已完成，对话已从左侧收起
+board.complete_confirm_title: 完成「%{title}」？
+board.complete_confirm_body: 还有 %{count} 条对话在运行。完成后会先停止它们，再把对话从左侧收起。
+board.archive_not_delete: 归档不是删除，内容都在。
+board.complete_and_stop: 完成并停止
+board.untitled_task: 未命名任务
+task.bind: 归入任务
+task.new_from_session: 用这条对话新建任务
+task.unbind: 移出任务
+settings.archive: 归档
+settings.archive_keywords: 设置 偏好 归档 完成 任务 对话 恢复
+archive.empty: 还没有完成的任务
+archive.restore: 恢复
+archive.completed_at: 完成于 %{time}
+board.reopened_toast: 任务已重新打开，对话回到左侧
+
+activity.background_shell: 后台 Shell
+activity.provider_retrying: 正在重试请求
+computer_use.desktop_access: 桌面访问
+computer_use.linux_access_description: 控制当前 Linux 桌面会话中的应用。截图与输入支持取决于你的合成器与无障碍服务。
+computer_use.windows_access_description: 控制当前 Windows 桌面会话中的应用。Windows 可能限制对提权应用和安全桌面的访问。
+errors.provider_catalogue_unavailable: "%{provider} 无法读取它的 %{catalogue} 目录：%{error}"
+command_palette.show_board: 打开任务板
+command_palette.hide_board: 收起任务板
+board.completion_waiting_for_setup: 还有对话正在准备中，稳定后再完成任务
