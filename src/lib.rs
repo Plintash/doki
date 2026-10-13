@@ -125,12 +125,12 @@ pub fn run() {
     crate::startup_trace::mark_process_start();
     // Debug builds publish the local RPA endpoint before the first window
     // exists, so a client that starts waiting never races the listener.
-    crate::rpa::service::start();
+    let rpa = crate::rpa::service::start();
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
         .with_main_window_reopen()
-        .run(|cx: &mut App| {
-            if crate::rpa::service::discovery().is_some() {
+        .run(move |cx: &mut App| {
+            if rpa.is_some() {
                 crate::app::rpa::start_pump(cx);
             }
             // Linux uses this for Wayland app_id/X11 WM_CLASS and notification

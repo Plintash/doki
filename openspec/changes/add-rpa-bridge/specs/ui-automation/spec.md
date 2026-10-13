@@ -207,23 +207,6 @@ than only reporting the timeout.
 - **WHEN** a wait times out
 - **THEN** the failure carries the current state, the tree diff observed during the wait, and the relevant recent events
 
-### Requirement: Batch runs
-
-The bridge SHALL accept an ordered batch of steps and execute them against the
-app, reporting each step's outcome. A batch SHALL stop at the first failing
-step by default and SHALL return that step's failure evidence together with the
-results of the steps that ran.
-
-#### Scenario: One call drives a whole interaction
-
-- **WHEN** a client submits a batch that opens a task, types a prompt, sends it, and waits for a reply
-- **THEN** the batch runs the steps in order and returns their results
-
-#### Scenario: A failing step is identifiable
-
-- **WHEN** a step in the middle of a batch fails
-- **THEN** the result names that step and carries its evidence, and later steps do not run
-
 ### Requirement: Agent-facing bindings and CLI
 
 The JavaScript REPL server attached to a coding-agent session SHALL expose the

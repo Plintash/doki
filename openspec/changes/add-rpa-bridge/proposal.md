@@ -61,8 +61,8 @@ The previous `egoist/zed` dependency already moved to our fork
   scenario runs, and debug-only, remote-ready availability.
 - `ui-automation`: the app side of the surface — semantic identity for
   controls, the on-demand accessibility tree and execution model, the semantic
-  snapshot and actions, high-level verbs, waits, screenshots, the agent
-  bindings and CLI, and the conventions that keep coverage growing.
+  snapshot and actions, high-level verbs, waits, the agent bindings and CLI,
+  and the conventions that keep coverage growing.
 - `app-diagnostics`: structured correlated events from app, daemon, and
   providers; one sequenced, replayable stream per instance; bounded retention
   and runtime verbosity; timeline, counters, merged queries; health; failure

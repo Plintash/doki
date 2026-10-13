@@ -2,10 +2,9 @@
 //!
 //! One JSON object per line over a loopback TCP connection. Every call
 //! carries the protocol version and the instance token the app published;
-//! every reply is correlated by the call's id. The surface is deliberately
-//! small — observation, semantic action, waiting, and ordered batches — so a
-//! client can close a whole interaction in one call without guessing
-//! coordinates or sleeping.
+//! every reply is correlated by the call's id. The surface stays deliberately
+//! small — observation, semantic action, and waiting — so a client closes an
+//! interaction without guessing coordinates or sleeping.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

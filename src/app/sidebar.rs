@@ -1817,6 +1817,7 @@ impl Waku {
         let rename_input =
             (self.session_rename == Some(session_id)).then(|| self.session_rename_input.clone());
         let renaming = rename_input.is_some();
+        let display_title = SharedString::from(localized_session_title(session));
         let title = if let Some(rename_input) = rename_input {
             div()
                 .id(SharedString::from(format!(
@@ -1849,7 +1850,7 @@ impl Waku {
                 .text_overflow(gpui::TextOverflow::Truncate("...".into()))
                 .text_size(sp(13.5))
                 .text_color(theme.text)
-                .child(SharedString::from(localized_session_title(session)))
+                .child(display_title.clone())
                 .into_any_element()
         };
         let waku = cx.entity().downgrade();
@@ -1859,7 +1860,7 @@ impl Waku {
         let row = div()
             .id(SharedString::from(format!("session-{}", session.id)))
             .role(gpui::Role::Button)
-            .aria_label(SharedString::from(localized_session_title(session)))
+            .aria_label(display_title.clone())
             .w_full()
             .min_w_0()
             .flex()
@@ -2003,9 +2004,6 @@ impl Waku {
         };
 
         div()
-            .id(SharedString::from(format!("session-row-{}", session.id)))
-            .role(gpui::Role::Button)
-            .aria_label(SharedString::from(localized_session_title(session)))
             .w_full()
             .pb(px(SIDEBAR_SESSION_ROW_GAP))
             .child(row)

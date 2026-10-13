@@ -53,13 +53,18 @@ lost across a dropped or resumed connection.
 
 Each process SHALL retain recent events in bounded memory and append them to
 rotating NDJSON files under the instance data directory. Retention MUST be
-bounded by size or count, older records SHALL be dropped, and recording MUST
-NOT block the UI thread.
+bounded by size or count, older records SHALL be dropped, and records SHALL be
+written by a background writer so a slow disk does not delay a frame.
 
 #### Scenario: Retention is bounded
 
 - **WHEN** a session produces far more events than the retention bound
 - **THEN** older records are dropped and memory and disk use stay within the bound
+
+#### Scenario: A slow disk does not stall frames
+
+- **WHEN** records are being written while the app is drawing frames
+- **THEN** frames continue to be drawn
 
 #### Scenario: Files are the ground truth
 
@@ -134,8 +139,8 @@ first look answers whether anything is wrong.
 
 #### Scenario: A broken connection is visible immediately
 
-- **WHEN** the daemon is unreachable
-- **THEN** the snapshot's health names the failure without any extra probing query
+- **WHEN** the app's link to the daemon has dropped
+- **THEN** the health summary names the failure without any extra probing query
 
 #### Scenario: Health stays a summary
 

@@ -79,9 +79,11 @@ pub fn start() -> Option<&'static Discovery> {
     SERVICE.get()
 }
 
-/// The live publication, once [`start`] has run.
-pub fn discovery() -> Option<&'static Discovery> {
-    SERVICE.get()
+/// The live publication. The pump only runs after [`start`] has published it.
+pub fn discovery() -> &'static Discovery {
+    SERVICE
+        .get()
+        .expect("the RPA pump runs only after the endpoint is published")
 }
 
 /// The calls the UI pump consumes.
@@ -176,10 +178,12 @@ fn accept_loop(listener: TcpListener, sender: smol::channel::Sender<Inbound>, to
         };
         let sender = sender.clone();
         let token = token.clone();
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("waku-rpa-conn".to_owned())
             .spawn(move || serve_connection(stream, sender, &token))
-            .ok();
+        {
+            eprintln!("waku-rpa: could not serve a connection: {error}");
+        }
     }
 }
 

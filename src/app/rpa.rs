@@ -43,17 +43,19 @@ pub(crate) fn start_pump(cx: &mut App) {
     .detach();
 }
 
-/// Keep every window's automation tree in step with the number of attached
-/// clients. Called per request and once a second, so both the first request
-/// and the last disconnect are observed promptly.
+/// Keep a window's automation tree in step with the attached clients.
+fn set_automation(window: &mut Window, attached: bool) {
+    if window.is_a11y_automation_enabled() != attached {
+        window.set_a11y_automation(attached);
+    }
+}
+
+/// Drop the tree once the last client leaves. Polled once a second so the
+/// disconnect is observed without a second control channel.
 fn sync_automation(app: &mut App) {
     let attached = crate::rpa::service::attached() > 0;
     for handle in app.windows() {
-        let _ = handle.update(app, |_root, window, _app| {
-            if window.is_a11y_automation_enabled() != attached {
-                window.set_a11y_automation(attached);
-            }
-        });
+        let _ = handle.update(app, |_root, window, _app| set_automation(window, attached));
     }
 }
 
@@ -70,7 +72,7 @@ async fn execute(cx: &mut AsyncApp, request: Request) -> Result<Value, Error> {
         request @ (Request::Act { .. } | Request::Type { .. } | Request::Key { .. }) => {
             dispatch(cx, request)
         }
-        Request::Snapshot => take_snapshot(cx).ok_or_else(app_not_ready),
+        Request::Snapshot => take_snapshot(cx),
         request => query(cx, request),
     }
 }
@@ -116,8 +118,11 @@ fn app_not_ready() -> Error {
     )
 }
 
-fn take_snapshot(cx: &mut AsyncApp) -> Option<Value> {
-    cx.update(|app| with_workspace(app, true, |waku, window, cx| waku.rpa_snapshot(window, cx)))
+fn take_snapshot(cx: &mut AsyncApp) -> Result<Value, Error> {
+    cx.update(|app| {
+        with_workspace(app, true, |waku, window, cx| waku.rpa_snapshot(window, cx))
+            .unwrap_or_else(|| Err(app_not_ready()))
+    })
 }
 
 fn current_state(cx: &mut AsyncApp) -> Option<Value> {
@@ -133,13 +138,16 @@ async fn wait_for(
     let timeout = Duration::from_millis(timeout_ms.max(1));
     let needs_frame = matches!(condition, Condition::Node { .. } | Condition::Text { .. });
     loop {
-        let held = cx.update(|app| {
+        let observed = cx.update(|app| {
             with_workspace(app, needs_frame, |waku, window, cx| {
-                let snapshot = waku.rpa_snapshot(window, cx);
-                condition_holds(condition, &snapshot)
+                let snapshot = waku.rpa_snapshot(window, cx)?;
+                Ok(condition_holds(condition, &snapshot))
             })
-            .unwrap_or(false)
         });
+        let held = match observed {
+            Some(result) => result?,
+            None => return Err(app_not_ready()),
+        };
         if held {
             return Ok(json!({
                 "held": true,
@@ -237,9 +245,7 @@ fn with_workspace<R>(
 /// nodes, which would leave the tree a fragment of the UI.
 fn prepare_window(window: &mut Window, app: &mut App, draw: bool) {
     let attached = crate::rpa::service::attached() > 0;
-    if window.is_a11y_automation_enabled() != attached {
-        window.set_a11y_automation(attached);
-    }
+    set_automation(window, attached);
     if attached && draw {
         window.refresh();
         let _ = window.draw(app);
@@ -305,22 +311,20 @@ impl Waku {
     ) -> Result<Value, Error> {
         match request {
             Request::Describe => Ok(json!({
-                "instance": crate::rpa::service::discovery()
-                    .map(|discovery| json_of(discovery)),
+                "instance": json_of(crate::rpa::service::discovery()),
                 "attachedClients": crate::rpa::service::attached(),
                 "automation": window.is_a11y_automation_enabled(),
                 "treeReady": window.a11y_automation_snapshot().is_some(),
                 "state": self.rpa_state(cx),
             })),
-            Request::Snapshot => Ok(self.rpa_snapshot(window, cx)),
+            Request::Snapshot => self.rpa_snapshot(window, cx),
             Request::Invoke { verb, args } => self.rpa_invoke(&verb, &args, window, cx),
             Request::Act { .. }
             | Request::Type { .. }
             | Request::Key { .. }
-            | Request::Wait { .. } => Err(Error::new(
-                "internal",
-                "input and waits are driven outside the workspace lease",
-            )),
+            | Request::Wait { .. } => {
+                unreachable!("input and waits are dispatched outside the workspace lease")
+            }
         }
     }
 
@@ -365,14 +369,18 @@ impl Waku {
     }
 
     /// The current frame's tree plus the app's observable state.
-    pub(crate) fn rpa_snapshot(&self, window: &Window, cx: &App) -> Value {
-        let tree = window
-            .a11y_automation_snapshot()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .unwrap_or(Value::Null);
-        json!({
-            "instance": crate::rpa::service::discovery()
-                .map(|discovery| json_of(discovery)),
+    pub(crate) fn rpa_snapshot(&self, window: &Window, cx: &App) -> Result<Value, Error> {
+        let tree = match window.a11y_automation_snapshot() {
+            Some(text) => serde_json::from_str::<Value>(&text).map_err(|error| {
+                Error::new(
+                    "invalid_tree",
+                    format!("the frame's tree is not valid JSON: {error}"),
+                )
+            })?,
+            None => Value::Null,
+        };
+        Ok(json!({
+            "instance": json_of(crate::rpa::service::discovery()),
             "window": {
                 "title": crate::instance::window_title(),
                 "width": f32::from(window.viewport_size().width),
@@ -381,7 +389,7 @@ impl Waku {
             },
             "state": self.rpa_state(cx),
             "tree": tree,
-        })
+        }))
     }
 
     /// The app-level state section of a snapshot, derived from live view
@@ -508,10 +516,14 @@ fn dispatch_rpa_input(
                     '\t' => "tab".to_owned(),
                     _ => character.to_string(),
                 };
-                if let Ok(keystroke) = gpui::Keystroke::parse(&source) {
-                    window.dispatch_keystroke(keystroke, app);
-                    typed += 1;
-                }
+                let keystroke = gpui::Keystroke::parse(&source).map_err(|error| {
+                    Error::new(
+                        "invalid_type",
+                        format!("`{character}` cannot be typed: {error}"),
+                    )
+                })?;
+                window.dispatch_keystroke(keystroke, app);
+                typed += 1;
             }
             Ok(json!({ "typed": typed }))
         }
@@ -541,13 +553,20 @@ fn dispatch_rpa_input(
 /// refuses ambiguity and unknown targets with the closest ids, so a typo
 /// costs one call instead of a guessing loop.
 fn resolve_target(window: &Window, target: &Target) -> Result<gpui::accesskit::NodeId, Error> {
-    let raw = window.a11y_automation_snapshot();
     // The window hands back the tree itself (`{ frame, nodes, ... }`), not a
     // full snapshot; read it directly rather than looking for a `tree` field.
-    let tree = raw
-        .as_deref()
-        .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .unwrap_or(Value::Null);
+    let raw = window.a11y_automation_snapshot().ok_or_else(|| {
+        Error::new(
+            "no_frame",
+            "the window has not drawn an automation frame yet",
+        )
+    })?;
+    let tree = serde_json::from_str::<Value>(&raw).map_err(|error| {
+        Error::new(
+            "invalid_tree",
+            format!("the frame's tree is not valid JSON: {error}"),
+        )
+    })?;
     let nodes: &[Value] = tree["nodes"]
         .as_array()
         .map(Vec::as_slice)
