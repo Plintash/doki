@@ -29,6 +29,20 @@
       "when": 1789720053549,
       "tag": "0003_amazing_paibok",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1791542004615,
+      "tag": "0004_abandoned_malcolm_colcord",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1791621056602,
+      "tag": "0005_dusty_vivisector",
+      "breakpoints": true
     }
   ]
 }

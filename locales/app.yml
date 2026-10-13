@@ -497,6 +497,24 @@ sidebar.grouping_project:
   en: Project
 sidebar.grouping_updated:
   en: Updated
+sidebar.grouping_status:
+  en: Status
+sidebar.view_switch:
+  en: Switch grouping
+sidebar.section_needs_you:
+  en: Needs you
+sidebar.section_running:
+  en: Running
+sidebar.section_recent:
+  en: Recent
+sidebar.section_archived:
+  en: Archived
+sidebar.show_archived:
+  en: Show archived tasks
+sidebar.put_away:
+  en: Put away
+sidebar.bring_back:
+  en: Bring back
 sidebar.ordering:
   en: Ordering
 sidebar.ordering_newest:
@@ -547,6 +565,14 @@ sidebar.status_background:
   en: Waiting for background tasks
 sidebar.status_failed:
   en: Failed
+sidebar.card_turn_one:
+  en: "%{count} turn"
+sidebar.card_turn_many:
+  en: "%{count} turns"
+sidebar.card_file_one:
+  en: "%{count} file"
+sidebar.card_file_many:
+  en: "%{count} files"
 
 project.new_project:
   en: New project…

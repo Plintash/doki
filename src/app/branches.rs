@@ -35,12 +35,10 @@ impl Waku {
             Query::Ready(result) => match result.as_ref() {
                 Ok(Some(snapshot)) => {
                     let snapshot = snapshot.clone();
-                    self.cache_sidebar_branch_label(&workspace_path, snapshot.display_branch());
                     self.visible_branch_snapshot = Some((workspace_path, snapshot.clone()));
                     Some(snapshot)
                 }
                 Ok(None) => {
-                    self.cache_sidebar_branch_label(&workspace_path, None);
                     if self
                         .visible_branch_snapshot
                         .as_ref()
@@ -82,12 +80,6 @@ impl Waku {
                     let _ = waku.update(cx, |waku, cx| {
                         if !waku.branch_snapshots.fulfill(token, result.clone()) {
                             return;
-                        }
-                        match &result {
-                            Ok(Some(snapshot)) => waku
-                                .cache_sidebar_branch_label(&fetch_path, snapshot.display_branch()),
-                            Ok(None) => waku.cache_sidebar_branch_label(&fetch_path, None),
-                            Err(_) => {}
                         }
                         let selected = waku
                             .selected_workspace_path()
@@ -348,7 +340,6 @@ impl Waku {
                 match result {
                     Ok(snapshot) => {
                         let current = snapshot.current.clone();
-                        waku.cache_sidebar_branch_label(&path, snapshot.display_branch());
                         waku.visible_branch_snapshot = Some((path.clone(), snapshot));
                         waku.branch_snapshots.invalidate(&path);
                         let selected_path = waku

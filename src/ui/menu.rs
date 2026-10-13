@@ -27,11 +27,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, Bounds, Display, Element, ElementId, FocusHandle, FontWeight, GlobalElementId,
-    InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Point, Position, RenderOnce, SharedString, Size,
-    StatefulInteractiveElement, Style, Styled, Window, actions, anchored, canvas, deferred, div,
-    img, prelude::FluentBuilder, px,
+    AnyElement, App, Bounds, Display, Div, Element, ElementId, FocusHandle, FontWeight,
+    GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Position, RenderOnce, SharedString,
+    Size, StatefulInteractiveElement, Style, Styled, Window, actions, anchored, canvas, deferred,
+    div, img, prelude::FluentBuilder, px,
 };
 
 actions!(
@@ -772,6 +772,38 @@ pub fn toggle_popover(
         window.refresh();
         return;
     }
+    open_at_trigger(handle, align, true, window, cx);
+}
+
+/// Open a [`popover`] at its trigger's last recorded bounds, without the
+/// trigger toggling it back.
+///
+/// [`toggle_popover`] belongs to a trigger that opens the card itself: it
+/// exempts a click on that trigger from the open card's dismiss-on-down-out, so
+/// the trigger's own handler gets to close it. An anchor driven by the owner —
+/// a row showing its card for keyboard focus — has no such handler and takes
+/// the ordinary dismissal instead: any click outside the card closes it,
+/// including one on the anchor, which is how a mouse leaves a card the keyboard
+/// opened.
+///
+/// The handle's toggle observers, if any, may update the entity that owns the
+/// handle, so a caller holding that entity's lease must defer this.
+pub fn open_popover(
+    handle: &ContextMenuHandle,
+    align: MenuAlign,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    open_at_trigger(handle, align, false, window, cx);
+}
+
+fn open_at_trigger(
+    handle: &ContextMenuHandle,
+    align: MenuAlign,
+    trigger_click_toggles: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let Some(anchor) = handle
         .trigger_bounds
         .get()
@@ -779,7 +811,78 @@ pub fn toggle_popover(
     else {
         return;
     };
-    open_menu(handle, anchor, SurfaceFocus::Content, true, window, cx);
+    open_menu(
+        handle,
+        anchor,
+        SurfaceFocus::Content,
+        trigger_click_toggles,
+        window,
+        cx,
+    );
+}
+
+/// An anchored card whose trigger only says where the card belongs.
+///
+/// [`popover`] makes its trigger toggle the card — a left click, or Enter/Space
+/// while it has focus — and gives that trigger the handle's focus identity. A
+/// card revealed by a focused row wants neither: the row already owns
+/// Enter/Space to select the task, and the row's own focus is what opens the
+/// card. This contributes the anchor and the deferred layer, and leaves the
+/// open state to the owner, which opens it with [`open_popover`] and closes it
+/// with [`ContextMenuHandle::close`].
+pub fn anchor_popover<E>(
+    trigger: E,
+    handle: &ContextMenuHandle,
+    align: MenuAlign,
+    content: impl Fn(&ContextMenuHandle, &mut Window, &mut App) -> AnyElement + 'static,
+) -> Div
+where
+    E: ParentElement + Styled + InteractiveElement + IntoElement + 'static,
+{
+    let card = anchored_card(
+        handle,
+        align,
+        PopoverCard {
+            handle: handle.clone(),
+            content: Rc::new(content),
+        }
+        .into_any_element(),
+    );
+    let surface = div()
+        .relative()
+        .w_full()
+        .child(trigger)
+        .child(trigger_bounds_probe(handle));
+    match card {
+        Some(card) => surface.child(card),
+        None => surface,
+    }
+}
+
+/// The open half of an anchored surface: the card, deferred so it escapes its
+/// row's clipping, placed against the trigger's last recorded bounds. `None`
+/// while the surface is closed.
+fn anchored_card(
+    handle: &ContextMenuHandle,
+    align: MenuAlign,
+    card: AnyElement,
+) -> Option<AnyElement> {
+    let position = handle.state.borrow().open?;
+    let trigger_bounds = handle
+        .trigger_bounds
+        .get()
+        .unwrap_or_else(|| Bounds::new(position, Size::default()));
+    Some(
+        deferred(FloatingSurface::new(
+            card,
+            trigger_bounds,
+            align,
+            px(TRIGGER_GAP),
+            px(8.0),
+        ))
+        .with_priority(1)
+        .into_any_element(),
+    )
 }
 
 /// The shared half of both dropdown surfaces: a trigger that records its bounds
@@ -794,11 +897,10 @@ fn anchored_surface<E>(
 where
     E: ParentElement + Styled + InteractiveElement + IntoElement + 'static,
 {
-    let open_at = handle.state.borrow().open;
     let toggle_handle = handle.clone();
     let key_handle = handle.clone();
 
-    let trigger = trigger
+    let mut trigger = trigger
         .relative()
         .track_focus(&handle.trigger_focus)
         .tab_index(0)
@@ -816,26 +918,10 @@ where
             }
         });
 
-    let Some(position) = open_at else {
-        return trigger.into_any_element();
-    };
-    let trigger_bounds = handle
-        .trigger_bounds
-        .get()
-        .unwrap_or_else(|| Bounds::new(position, Size::default()));
-
-    trigger
-        .child(
-            deferred(FloatingSurface::new(
-                card(handle),
-                trigger_bounds,
-                align,
-                px(TRIGGER_GAP),
-                px(8.0),
-            ))
-            .with_priority(1),
-        )
-        .into_any_element()
+    if let Some(card) = anchored_card(handle, align, card(handle)) {
+        trigger = trigger.child(card);
+    }
+    trigger.into_any_element()
 }
 
 fn toggle_anchored_surface(
@@ -1703,6 +1789,50 @@ mod tests {
     #[gpui::test]
     fn dropdown_trigger_is_keyboard_operable(cx: &mut TestAppContext) {
         assert_trigger_opens_from_keyboard(Surface::Dropdown, cx);
+    }
+
+    struct AnchoredCardHarness {
+        handle: ContextMenuHandle,
+    }
+
+    impl Render for AnchoredCardHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            anchor_popover(
+                div().w(px(120.0)).h(px(32.0)),
+                &self.handle,
+                MenuAlign::BelowLeft,
+                |_, _, _| div().w(px(200.0)).h(px(100.0)).into_any_element(),
+            )
+        }
+    }
+
+    /// An anchor whose owner decides when the card stands: clicking the anchor
+    /// is an ordinary outside click, not a toggle, so the owner's own keys and
+    /// clicks on the row are left alone.
+    #[gpui::test]
+    fn an_anchored_card_opens_only_where_its_owner_says(cx: &mut TestAppContext) {
+        let handle = cx.update(ContextMenuHandle::new);
+        let harness = AnchoredCardHarness {
+            handle: handle.clone(),
+        };
+        let (_view, cx) = cx.add_window_view(|_, _| harness);
+        let on_anchor = point(px(10.0), px(10.0));
+
+        cx.simulate_mouse_down(on_anchor, MouseButton::Left, Modifiers::none());
+        assert!(!handle.is_open(), "the anchor is not a trigger");
+        assert!(
+            handle.trigger_bounds.get().is_some(),
+            "the anchor records where the card belongs"
+        );
+
+        cx.update(|window, cx| open_popover(&handle, MenuAlign::BelowLeft, window, cx));
+        assert!(handle.is_open());
+
+        cx.simulate_mouse_down(on_anchor, MouseButton::Left, Modifiers::none());
+        assert!(
+            !handle.is_open(),
+            "a click on the anchor counts as a click outside the open card"
+        );
     }
 
     #[gpui::test]

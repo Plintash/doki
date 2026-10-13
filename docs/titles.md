@@ -39,6 +39,110 @@ from the user's side, indistinguishable from no title at all: they stare at
 truncated prompt text for the entire run. Every path below is judged on how
 fast it replaces that placeholder, not merely on whether it eventually does.
 
+## The objective beside the title
+
+A task also carries [`AgentSession::objective`](../crates/waku-protocol/src/model.rs):
+one sentence describing what will be true when the task is done. It is a field
+of its own on purpose. `title` is the anchor a user recognizes a task by, so it
+has to hold still; the objective is allowed to change as the work changes, and a
+field that changed could not do the title's job. Nothing about the objective
+writes a title, and nothing about a title writes the objective.
+
+The sidebar row and the card show it (`task-digest` spec). The value that
+reaches a client is resolved in one place — a goal the user set wins over the
+generated text (`AgentSession::resolved_objective`) — while the row's second
+line prefers the provider's own plan step whenever the live turn has one, so a
+sentence about the turn that just ended never passes itself off as progress.
+
+Waku generates the objective for **Pi only**. Codex, Claude, and the rest have
+no plan visible to Waku and no title they need help with; a task there renders
+with no objective, which is a gap in a second line, not a missing task.
+
+### The mechanism: the task's own provider process
+
+The objective is generated *inside* the Pi process that already serves the task,
+not by a second one. Waku ships a Pi extension
+([`resources/pi-extensions/task-digest.ts`](../resources/pi-extensions/task-digest.ts),
+bundled into `Resources/pi-extensions/task-digest.ts` by
+[`scripts/bundle.sh`](../scripts/bundle.sh) and handed to Pi with the same
+`--extension` argument the Computer Use bridge uses), and the daemon asks it a
+question over the RPC pipe it already owns.
+
+The trigger is a **command**, and the shape of it is the whole trick:
+
+```
+-> {"type":"prompt","message":"/waku:digest <dispatch-uuid>"}
+<- {"type":"response","success":true,"data":{"disposition":"handled"}}
+```
+
+- Pi dispatches an extension command immediately, *even while the task's turn is
+  still streaming*, and answers `disposition: "handled"` — no run starts, so the
+  task gains no turn, no message, and no instruction in its own conversation.
+  Verified against Pi 1.0.0: a live test
+  ([`pi_answers_the_digest_trigger_without_a_run_against_the_real_rpc`](../crates/waku-core/src/driver/pi.rs))
+  asserts a trigger that opens no turn, settles none, writes nothing to the
+  transcript and adds nothing to the context, and a trigger sent into a
+  streaming run was answered `{"disposition":"handled"}` with the entry right
+  behind it.
+- The dispatch id in the message is what makes the trigger internal. Only the
+  daemon writes a prompt that names one, so the driver can tell its own question
+  from a submission (`task_digest::trigger_dispatch`): a person typing
+  `/waku:digest` takes the ordinary prompt path, and a session whose provider
+  never reported the command is never sent a trigger at all — there it would be
+  an ordinary prompt, and a real turn.
+- The extension reads the live branch with `ctx.sessionManager.getBranch()`, cuts
+  a bounded slice of it, and makes one nested call through
+  `ctx.modelRegistry.complete(...)` — provider-neutral, on the session's own
+  model with the instance's own credentials, with a 60-second abort. It does not
+  touch the task's model, session, or transcript.
+- The result is published with `pi.appendEntry("waku:digest", {v: 1, dispatch,
+  objective})`: a `custom` session entry, which Pi **does not send to the
+  model**, and which arrives on the RPC stream as `entry_appended`. That event is
+  how the sentence gets back to Waku; the entry never joins the conversation.
+
+Everything Waku decides about the sentence happens on the Rust side
+([`crates/waku-core/src/task_digest.rs`](../crates/waku-core/src/task_digest.rs)),
+not in the extension: the extension returns raw text, and the parser is the one
+copy of the rules.
+
+### When it runs
+
+The daemon triggers on **settlement**, not on activity, not on a timer, and not
+when a task is opened or resumed — only a turn that announced itself can settle
+(a refusal and a handled command answer a prompt with no run behind them, and
+neither is work to describe). On top of that:
+
+| Rule | Value |
+| --- | --- |
+| Quiet period after a settle | 15 s, replaced by a newer settle |
+| Generations per task per hour | 6 |
+| Timeout per generation | 60 s |
+| Back-fill over stored history | none, ever |
+
+A failure is silent: a generation that errors, times out, or produces something
+the parser rejects leaves the previous objective in place and shows nothing — no
+error, no transcript row, no idle task that looks busy.
+
+### What the parser rejects
+
+The objective states an outcome, so a sentence that names the means is not
+stored. Against Pi's own generated text and a hostile fixture alike, these keep
+the objective the task already had:
+
+- a path separator (`src/app/sidebar.rs`), a file extension (`schema.ts`), or a
+  symbol (`render_sidebar_session_item`, `RenderSidebarSessionItem`);
+- a sentence that restates the title, and one that says what the stored text
+  already says — the same significant-word overlap decides both, because an
+  objective that churns between two wordings of the same thing is worse than a
+  stale one;
+- a task whose goal the user set: the goal owns the field while it is set, and
+  the generated value is what a cleared goal falls back to.
+
+Only a changed objective is written, and only a write publishes a task-catalog
+revision, so a regeneration that decides nothing costs no client a reload. The
+update never touches `updated_at`, so a task does not jump to the top of the
+list because it was described.
+
 ## The three delivery shapes
 
 Every provider funnels into `DriverEvent::AutoTitleUpdated(Option<String>)`,

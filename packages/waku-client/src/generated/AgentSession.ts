@@ -49,7 +49,41 @@ updated_at: number,
  * Activity time of the newest turn. Set as soon as the user submits it,
  * then refreshed when the turn settles, whatever its outcome.
  */
-last_reply_at?: number | null, provider_cursor: ProviderResumeCursor | null,
+last_reply_at?: number | null,
+/**
+ * What will be true when this task is done, as one sentence. Waku owns
+ * this field: a goal the user set outranks a generated objective, and the
+ * title is never rewritten from it (see `docs/titles.md`).
+ */
+objective?: string | null,
+/**
+ * When the task entered `Waiting` or `Failed`, unix seconds. The task list
+ * orders blocked tasks by it, so it has to outlive the runtime that
+ * noticed the transition.
+ */
+blocked_since?: number | null,
+/**
+ * Why the task is blocked — the permission or question it is waiting on,
+ * or the failure that ended its turn. Kept on the task because neither the
+ * pending request nor the driver error survives a restart.
+ */
+blocked_reason?: string | null,
+/**
+ * Settled turns so far, kept as a narrow counter because the list
+ * projection leaves `turns` empty. `None` is "not known yet", which is not
+ * the same as a task that has settled no turns.
+ */
+turn_count?: number | null,
+/**
+ * Files the task's checkpoints touched, as of the newest settled turn.
+ * Narrow for the same reason as [`Self::turn_count`].
+ */
+changed_files?: number | null,
+/**
+ * When the task was put away, unix seconds. Only the archive action sets
+ * it: an ordinary task-state save never sets or clears it.
+ */
+archived_at?: number | null, provider_cursor: ProviderResumeCursor | null,
 /**
  * Slash commands the provider reported for this session's live process,
  * kept so a resumed session still completes them before its next

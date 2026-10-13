@@ -3,6 +3,12 @@
 //! GPUI already owns tooltip *behaviour* — hover timing, placement, dismissal —
 //! through `InteractiveElement::tooltip`, which asks only for a view to render.
 //! This is that view, and nothing more.
+//!
+//! A tooltip that is more than a hint is a view of its own, living with what it
+//! describes and rendered through the same builder: the sidebar's task card
+//! (`app::sidebar`) draws a task's title, objective, state, project, branch and
+//! facts, and the sidebar's rows serve it both as a tooltip for the pointer and
+//! as a card anchored to the row for keyboard focus.
 
 use gpui::{
     AnyView, App, AppContext, IntoElement, ParentElement, Render, SharedString, Styled, Window,

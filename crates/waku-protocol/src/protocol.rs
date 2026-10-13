@@ -193,6 +193,14 @@ pub enum Command {
     /// merge-only so a stale client snapshot cannot delete tasks another
     /// client just created.
     RemoveSession,
+    /// Explicitly archive or unarchive one daemon-owned task.
+    ///
+    /// Archiving is an action rather than a field an ordinary state save
+    /// carries, so a stale client snapshot can neither archive nor unarchive a
+    /// task, and an older build that does not know the field cannot clear it.
+    SetTaskArchived {
+        archived: bool,
+    },
     HydrateSession {
         session_id: Uuid,
     },
