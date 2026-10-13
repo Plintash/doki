@@ -226,9 +226,10 @@ gets the same calls as a local one with no second mechanism.
 
 The landed spike (task 1.2) is a transitional implementation: it drives the app
 through an app-local endpoint and a hand-built state section; its verbs
-(`act`, `type`, `key`), its high-level verbs, and its in-app wait polling are
-not the final shape (the runtime's event-driven waits and scenario runs
-replace the polling in P0/P1). The daemon-mediated
+(`act`, `type`, `key`), its high-level verbs (`openTask`, `selectProject`,
+`newTask`), and its in-app wait polling (id/text/state conditions) are not the
+final shape (the runtime's event-driven waits and scenario runs replace the
+polling in P0/P1). The daemon-mediated
 execution and model-derived state requirements take effect in P1, when the
 executor moves onto the daemon connection, the endpoint is retired behind an
 environment flag, and the protocol version bumps once for both client

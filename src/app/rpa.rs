@@ -238,7 +238,7 @@ fn with_workspace<R>(
 fn prepare_window(window: &mut Window, app: &mut App, draw: bool) {
     let attached = crate::rpa::service::attached() > 0;
     set_automation(window, attached);
-    if attached && draw {
+    if draw {
         window.refresh();
         let _ = window.draw(app);
     }
@@ -568,8 +568,8 @@ fn resolve_target(window: &Window, target: &Target) -> Result<gpui::accesskit::N
     })?;
     let nodes: &[Value] = tree["nodes"]
         .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+        .expect("the frame tree always carries a nodes array")
+        .as_slice();
     let description = match target {
         Target::Node(node) => format!("node {node}"),
         Target::Id(id) => format!("id `{id}`"),
