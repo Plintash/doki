@@ -60,6 +60,8 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         ),
         DriverEvent::RichActivity(activity) => ("richActivity", serde_json::to_value(activity)?),
         DriverEvent::BackgroundWork(work) => ("backgroundWork", serde_json::to_value(work)?),
+        DriverEvent::SubagentProgress(run) => ("subagentProgress", serde_json::to_value(run)?),
+        DriverEvent::SubagentFleet(fleet) => ("subagentFleet", serde_json::to_value(fleet)?),
         DriverEvent::ExtensionMessage {
             custom_type,
             text,
@@ -205,6 +207,8 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         }
         "richActivity" => DriverEvent::RichActivity(serde_json::from_value(payload)?),
         "backgroundWork" => DriverEvent::BackgroundWork(serde_json::from_value(payload)?),
+        "subagentProgress" => DriverEvent::SubagentProgress(serde_json::from_value(payload)?),
+        "subagentFleet" => DriverEvent::SubagentFleet(serde_json::from_value(payload)?),
         "extensionMessage" => {
             let message: ExtensionMessageWire = serde_json::from_value(payload)?;
             DriverEvent::ExtensionMessage {

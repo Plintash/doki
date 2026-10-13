@@ -18,6 +18,7 @@ the original feature bullet instead of adding separate entries for them.
 
 - Declare tasks and arrange them on a board: cards move between To do, In progress, and Done, and each task groups the conversations working on it
 - Finishing a task stops whatever is still running and takes its conversations out of the sidebar; the Done column and Settings → Archive keep them — archiving is not deleting, and restoring returns them
+- Pi: a subagent fan-out's live children show above the composer — each child's name, what it is doing, and how long it has been going, for both a run the agent waits on and a background workflow
 - A long streamed reply grows with the dissolve instead of jumping a line at a time, and a reply that spans many blocks now rebuilds only the blocks on screen, so streaming such a reply keeps its frame pacing at 120 fps on a long transcript
 - Closing the window leaves the app running in the Dock: in-flight turns and terminals keep going, reopening restores the last task, layout, terminal, and browser tabs by URL, and unsaved file edits ask before the window closes — with a right-panel tab open, ⌘W closes that tab first
 

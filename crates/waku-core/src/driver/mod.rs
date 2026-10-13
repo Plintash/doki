@@ -10,6 +10,7 @@ mod deepseek;
 mod opencode;
 mod opencode_computer_use;
 mod pi;
+mod pi_subagent;
 mod support;
 mod title_refresh;
 

@@ -42,6 +42,7 @@ pub mod projectless;
 pub mod provider_session;
 pub mod settings;
 pub mod skills;
+pub mod subagent;
 pub mod theme;
 pub mod usage;
 pub mod usage_history;

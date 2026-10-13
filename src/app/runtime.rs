@@ -1,5 +1,19 @@
 use super::*;
 
+/// Whether a driver event only changes live provider state.
+///
+/// Such events repaint the surfaces they feed and never dirty a session save:
+/// the providers reconcile this state — background work, subagent runs — when
+/// the resident transport reconnects.
+fn is_runtime_only_event(event: &DriverEvent) -> bool {
+    matches!(
+        event,
+        DriverEvent::BackgroundWork(_)
+            | DriverEvent::SubagentProgress(_)
+            | DriverEvent::SubagentFleet(_)
+    )
+}
+
 fn workspace_ack(
     workspace: &waku_client::WorkspaceClient,
     operation: waku_client::WorkspaceOperation,
@@ -2541,9 +2555,7 @@ impl Waku {
             }
             self.mark_background_work_lost(session_id);
         } else if let Some(runtime) = self.runtimes.get_mut(&session_id) {
-            runtime
-                .pending_events
-                .retain(|event| matches!(event, DriverEvent::BackgroundWork(_)));
+            runtime.pending_events.retain(is_runtime_only_event);
             runtime.stream_remeasure_pending = false;
             runtime.stream_phase = None;
             runtime.pending_permission = None;
@@ -3505,9 +3517,7 @@ impl Waku {
         };
         self.invalidate_checkpoint_refs();
         if let Some(runtime) = self.runtimes.get_mut(&session_id) {
-            runtime
-                .pending_events
-                .retain(|event| matches!(event, DriverEvent::BackgroundWork(_)));
+            runtime.pending_events.retain(is_runtime_only_event);
             runtime.pending_steers.clear();
             runtime.delivered_steers.clear();
             runtime.stream_remeasure_pending = false;
@@ -3691,7 +3701,9 @@ impl Waku {
                 let Some(event) = event else {
                     break;
                 };
-                let background_event = matches!(event, DriverEvent::BackgroundWork(_));
+                // Live provider state that no save needs: background work and
+                // the subagent runs beside it are reconciled on reconnect.
+                let background_event = is_runtime_only_event(&event);
                 let background_output_delta = matches!(
                     event,
                     DriverEvent::BackgroundWork(BackgroundWorkEvent::OutputDelta { .. })

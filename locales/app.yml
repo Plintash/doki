@@ -2329,3 +2329,29 @@ command_palette.hide_board:
   en: Close the task board
 board.completion_waiting_for_setup:
   en: A conversation is still setting up; complete the task once it settles
+
+subagent.running_count:
+  en: "%{count} subagents running"
+subagent.running_count_one:
+  en: 1 subagent running
+subagent.more_rows:
+  en: "+%{count} more"
+subagent.state.queued:
+  en: queued
+subagent.state.running:
+  en: running
+subagent.state.completed:
+  en: completed
+subagent.state.failed:
+  en: failed
+subagent.state.stopped:
+  en: stopped
+subagent.state.paused:
+  en: paused
+subagent.state.partial:
+  en: partial
+subagent.state.detached:
+  en: detached
+
+subagent.title:
+  en: Subagent

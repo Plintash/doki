@@ -1190,3 +1190,17 @@ errors.provider_catalogue_unavailable: "%{provider} は %{catalogue} カタロ�
 command_palette.show_board: ボードを開く
 command_palette.hide_board: ボードを閉じる
 board.completion_waiting_for_setup: 準備中の会話があります。落ち着いてから完了してください
+
+subagent.running_count: "%{count} サブエージェント実行中"
+subagent.running_count_one: 1 サブエージェント実行中
+subagent.more_rows: "他 %{count} 件"
+subagent.state.queued: 待機中
+subagent.state.running: 実行中
+subagent.state.completed: 完了
+subagent.state.failed: 失敗
+subagent.state.stopped: 停止
+subagent.state.paused: 一時停止
+subagent.state.partial: 一部完了
+subagent.state.detached: デタッチ
+
+subagent.title: サブエージェント

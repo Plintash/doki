@@ -366,14 +366,14 @@ been verified to take the command.
 | `message_update` → `text_delta` / `thinking_delta` | `TextDelta` / `ReasoningDelta` |
 | `message_end` | fallback text/thinking when no delta was streamed |
 | `message_end` with `role: "custom"` | `BackgroundWork` (kind subagent) for pi-subagents' child and background notifications, which the work surface shows whatever their `display` flag says; `ExtensionMessage` for any other extension message, which the transcript renders only when `display` is true |
-| `tool_execution_start` / `_update` / `_end` | `RichActivity` |
+| `tool_execution_start` / `_update` / `_end` | `RichActivity`; a `subagent` call's structured details also become `SubagentProgress`, the foreground run the composer's live-run card shows |
 | `auto_retry_end` | clears or sets the failure flag |
 | `compaction_start` / `compaction_end` | `RichActivity` — one row per compaction: started, completed with its summary kept, or failed with the provider's own reason; the end's `estimatedTokensAfter` refreshes the context meter, and a manual compaction settles its own turn |
 | `agent_settled` (Pi) / `agent_end` (Oh My Pi) | `TurnFinished`, then resets stream state |
 | `queue_update` | `ProviderQueue` — the provider's complete steering and follow-up queues, which are the client's pending list |
 | `extension_ui_request` → `select`, `confirm`, `input`, `editor` | `UserInputRequested`, answered through `respond_user_input` |
 | `extension_ui_request` → `notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text` | the app's notification, session-status, widget, window-title and composer surfaces |
-| `extension_ui_request` → `setWidget` on pi-subagents' `subagent-async` key | `BackgroundWork` (kind subagent) per run: live while it runs, its outcome when the snapshot reports one, and lost when it leaves a complete snapshot without one. The snapshot is a level signal read as changes, and it is not also forwarded as widget text |
+| `extension_ui_request` → `setWidget` on pi-subagents' `subagent-async` key | `BackgroundWork` (kind subagent) per run: live while it runs, its outcome when the snapshot reports one, and lost when it leaves a complete snapshot without one. The decoded snapshot also reaches the composer's live-run card as `SubagentFleet`, which is where a detached run's per-child activity is shown. The snapshot is a level signal read as changes, and it is not also forwarded as widget text |
 | `extension_ui_request`, any other method | answered with a cancellation at once, so an unknown dialog does not block the extension until its timeout |
 
 **Extension surfaces** — Pi's extension UI subprotocol reaches the app instead
@@ -396,9 +396,10 @@ it and no surface can present it. What Pi's RPC mode cannot carry at all
 (`ctx.ui.custom()`, `onTerminalInput`, `setToolsExpanded`) is a no-op on the
 provider's side, so there is nothing to receive. pi-subagents is the reference
 user: the runs its `subagent-async` widget reports (live ones included, on the
-detached-work surface rather than as raw JSON), its fleet strip, its
-`subagent-notify` and `subagent-incremental-child-notify` messages, and the
-questions its inspector asks all arrive through these records.
+detached-work surface and in the composer's live-run card rather than as raw
+JSON), its fleet strip, its `subagent-notify` and
+`subagent-incremental-child-notify` messages, and the questions its inspector
+asks all arrive through these records.
 
 **Access modes** — Full access only, enforced at driver start rather than
 degraded silently: any other selection fails with "currently supports Full
