@@ -218,6 +218,12 @@ fn a_run_that_failed_after_it_started_is_not_a_refused_prompt() {
 fn a_blank_comment_field_stores_no_comment() {
     assert_eq!(annotation_comment_value("   "), None);
     assert_eq!(annotation_comment_value(""), None);
+    assert_eq!(annotation_comment_value(" \n\n  "), None);
+    let paragraphs = "  第一段\n\nSecond paragraph  \n";
+    assert_eq!(
+        annotation_comment_value(paragraphs),
+        Some(paragraphs.to_owned())
+    );
     assert_eq!(
         annotation_comment_value("keep the error, drop the retry"),
         Some("keep the error, drop the retry".to_owned())
@@ -376,7 +382,7 @@ fn opening_annotation_editor_dismisses_the_preview_before_showing_the_editor() {
     let end = body.find("\n    fn annotation_mark_anchor(").unwrap();
     let body = &body[..end];
     let dismiss = body.find("self.reset_annotation_preview_hover();").unwrap();
-    let open = body.find("Some(AnnotationEditor { id, anchor })").unwrap();
+    let open = body.find("Some(AnnotationEditor {").unwrap();
     assert!(
         dismiss < open,
         "the preview's outside-click handler must not close the editor before Save"
@@ -394,6 +400,39 @@ fn opening_annotation_editor_dismisses_the_preview_before_showing_the_editor() {
             "hovering or activating the chip must not reopen the preview while editing"
         );
     }
+}
+
+#[test]
+fn annotation_editor_uses_the_multiline_submit_field_and_keeps_a_fixed_footer() {
+    let source = include_str!("transcript_view.rs");
+    let start = source.find("fn annotation_editor_input(").unwrap();
+    let end = source[start..]
+        .find("fn render_annotation_editor(")
+        .unwrap()
+        + start;
+    let input = &source[start..end];
+    for required in [
+        ".multi_line()",
+        ".submit_on_enter()",
+        ".auto_height()",
+        "InputEvent::Submit",
+        "this.save_annotation_comment(cx)",
+    ] {
+        assert!(
+            input.contains(required),
+            "missing annotation editor behavior: {required}"
+        );
+    }
+    let body = &source[end..];
+    let input = body
+        .find(".child(div().min_h(px(26.0)).child(input))")
+        .unwrap();
+    let footer = body.find(".id(\"annotation-editor-save\")").unwrap();
+    assert!(
+        input < footer,
+        "the footer stays outside the scrolling input"
+    );
+    assert!(body.contains("set_auto_height_max(input_max_height, cx)"));
 }
 
 #[test]

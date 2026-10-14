@@ -29,7 +29,16 @@ const ANNOTATION_FLASH_ALPHA: f32 = 0.42;
 /// Sizes of the floating annotation editor, used to keep it inside the safe
 /// region before it has been measured.
 const EDITOR_WIDTH: f32 = 340.0;
-const EDITOR_HEIGHT: f32 = 96.0;
+const EDITOR_INPUT_MAX_HEIGHT: f32 = 240.0;
+const EDITOR_PADDING: f32 = 10.0;
+const EDITOR_GAP: f32 = 8.0;
+const EDITOR_FOOTER_HEIGHT: f32 = 26.0;
+const EDITOR_MARGIN: f32 = 8.0;
+const EDITOR_BOTTOM_CLEARANCE: f32 = 48.0;
+// Both the budget and the rendered chrome use these dimensions. The 2px
+// border comes from border_1; the footer never wraps into the input viewport.
+const EDITOR_CHROME_HEIGHT: f32 = 2.0 + 2.0 * EDITOR_PADDING + EDITOR_GAP + EDITOR_FOOTER_HEIGHT;
+const EDITOR_HEIGHT: f32 = 26.0 + EDITOR_CHROME_HEIGHT;
 
 #[derive(Clone, Debug)]
 struct ConversationNavigationRailSnapshot {
@@ -797,7 +806,11 @@ impl Waku {
         let input = self.annotation_editor_input(window, cx);
         input.update(cx, |input, cx| input.set_content(comment, cx));
         self.active_annotation.set(Some(id));
-        *self.annotation_editor.borrow_mut() = Some(AnnotationEditor { id, anchor });
+        *self.annotation_editor.borrow_mut() = Some(AnnotationEditor {
+            id,
+            anchor,
+            size: Rc::new(Cell::new(size(px(EDITOR_WIDTH), px(EDITOR_HEIGHT)))),
+        });
         self.reveal_annotation_from_card(id, cx);
         let focus = input.read(cx).focus();
         window.focus(&focus, cx);
@@ -831,20 +844,24 @@ impl Waku {
 
     /// Keep the annotation editor fully inside the safe region, clearing the
     /// scroll-to-bottom button that sits at the bottom centre of the list.
-    pub(super) fn clamp_annotation_editor(&self, anchor: Point<Pixels>) -> Point<Pixels> {
+    pub(super) fn clamp_annotation_editor(
+        &self,
+        anchor: Point<Pixels>,
+        editor_size: Size<Pixels>,
+    ) -> Point<Pixels> {
         let Some(safe) = self.annotation_safe_bounds() else {
             return anchor;
         };
-        let margin = px(8.0);
+        let margin = px(EDITOR_MARGIN);
         let x = anchor
             .x
-            .min(safe.right() - px(EDITOR_WIDTH) - margin)
+            .min(safe.right() - editor_size.width - margin)
             .max(safe.left() + margin);
-        // The editor is about this tall, and the bottom lip keeps it above the
-        // 32px scroll-to-bottom button and its 8px inset.
+        // Use its measured height as the field grows. The bottom lip clears
+        // the 32px scroll-to-bottom button and its 8px inset.
         let y = anchor
             .y
-            .min(safe.bottom() - px(EDITOR_HEIGHT) - px(48.0))
+            .min(safe.bottom() - editor_size.height - px(EDITOR_BOTTOM_CLEARANCE))
             .max(safe.top() + margin);
         point(x, y)
     }
@@ -963,11 +980,20 @@ impl Waku {
         let input = cx.new(|cx| {
             TextInput::new(window, cx)
                 .semantic_id("annotation-editor-input")
+                .multi_line()
+                .submit_on_enter()
+                .auto_height()
                 .placeholder(tr!("annotation.comment_placeholder"))
         });
         self.annotation_editor_input
             .borrow_mut()
             .replace(input.clone());
+        cx.subscribe(&input, |this, _, event, cx| {
+            if matches!(event, InputEvent::Submit(_)) {
+                this.save_annotation_comment(cx);
+            }
+        })
+        .detach();
         input
     }
 
@@ -982,17 +1008,33 @@ impl Waku {
         // Follow the mark each frame, so an off-screen editor lands on its span
         // once the reveal scroll has mounted it; the stored point is only the
         // fallback until then.
-        let anchor =
-            self.clamp_annotation_editor(self.annotation_mark_anchor(id).unwrap_or(editor.anchor));
+        let input_max_height = self
+            .annotation_safe_bounds()
+            .map(|safe| {
+                safe.size.height
+                    - px(EDITOR_BOTTOM_CLEARANCE + EDITOR_MARGIN + EDITOR_CHROME_HEIGHT)
+            })
+            .unwrap_or(px(EDITOR_INPUT_MAX_HEIGHT))
+            .min(px(EDITOR_INPUT_MAX_HEIGHT));
+        input.update(cx, |input, cx| {
+            input.set_auto_height_max(input_max_height, cx)
+        });
+        let anchor = self.clamp_annotation_editor(
+            self.annotation_mark_anchor(id).unwrap_or(editor.anchor),
+            editor.size.get(),
+        );
+        let editor_size = editor.size.clone();
+        let entity_id = cx.entity_id();
         let body = div()
             .id("annotation-editor")
             .role(gpui::Role::Group)
             .aria_label(tr!("annotation.comment_placeholder"))
-            .w(px(340.0))
+            .w(px(EDITOR_WIDTH))
+            .relative()
             .flex()
             .flex_col()
-            .gap(px(8.0))
-            .p(px(10.0))
+            .gap(px(EDITOR_GAP))
+            .p(px(EDITOR_PADDING))
             .rounded(px(12.0))
             .border_1()
             .border_color(theme.border_strong)
@@ -1006,12 +1048,26 @@ impl Waku {
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.dismiss_annotation_overlays(cx);
             }))
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        if editor_size.replace(bounds.size) != bounds.size {
+                            cx.notify(entity_id);
+                        }
+                    },
+                    |_, _, _, _| (),
+                )
+                .absolute()
+                .inset_0(),
+            )
             .child(div().min_h(px(26.0)).child(input))
             .child({
                 let delete_focus = self.annotation_control_focus("editor-delete", cx);
                 let cancel_focus = self.annotation_control_focus("editor-cancel", cx);
                 let save_focus = self.annotation_control_focus("editor-save", cx);
                 div()
+                    .h(px(EDITOR_FOOTER_HEIGHT))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -1025,13 +1081,22 @@ impl Waku {
                                 this.delete_annotation(id, cx);
                             }),
                     )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_size(sp(11.0))
+                            .text_color(theme.text_secondary)
+                            .child(tr!("annotation.newline_hint")),
+                    )
                     .child(div().flex_1())
                     .child(
                         div()
                             .id("annotation-editor-cancel")
                             .semantic_control(gpui::Role::Button, false)
                             .aria_label(tr!("common.cancel"))
-                            .h(px(26.0))
+                            .h(px(EDITOR_FOOTER_HEIGHT))
                             .px(px(10.0))
                             .flex()
                             .items_center()
@@ -1055,7 +1120,7 @@ impl Waku {
                             .id("annotation-editor-save")
                             .semantic_control(gpui::Role::Button, false)
                             .aria_label(tr!("common.save"))
-                            .h(px(26.0))
+                            .h(px(EDITOR_FOOTER_HEIGHT))
                             .px(px(12.0))
                             .flex()
                             .items_center()
@@ -1085,7 +1150,7 @@ impl Waku {
             gpui::deferred(
                 gpui::anchored()
                     .position(anchor)
-                    .snap_to_window_with_margin(px(8.0))
+                    .snap_to_window_with_margin(px(EDITOR_MARGIN))
                     .child(body),
             )
             .into_any_element(),

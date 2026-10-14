@@ -645,9 +645,10 @@ pub struct TextInput {
     /// Shift+Enter still breaks the line. (One-line fields always submit.)
     submit_on_enter: bool,
     /// The field owns its height and text metrics, growing with its content
-    /// up to [`AUTO_HEIGHT_MAX`] before it scrolls; otherwise a
+    /// up to its configured maximum before it scrolls; otherwise a
     /// multi-line field inherits the embedding view's metrics.
     auto_height: bool,
+    auto_height_max: Pixels,
     /// Image and file pastes surface as [`MediaPaste`] instead of being
     /// swallowed by the text path.
     accepts_media_paste: bool,
@@ -683,7 +684,7 @@ pub struct TextInput {
     /// address bar's page echo shows the start of the URL.
     scroll_offset: Pixels,
     /// Vertical scroll state for an auto-height field, whose height is
-    /// capped at [`AUTO_HEIGHT_MAX`].
+    /// capped at its configured maximum.
     scroll_handle: ScrollHandle,
     scrollbar_state: Rc<ScrollbarState>,
     /// Horizontal inset an auto-height embedder moves inside the field, so
@@ -750,6 +751,7 @@ impl TextInput {
             read_only: false,
             submit_on_enter: false,
             auto_height: false,
+            auto_height_max: AUTO_HEIGHT_MAX,
             accepts_media_paste: false,
             clear_on_escape: false,
             select_all_on_focus_click: false,
@@ -901,6 +903,17 @@ impl TextInput {
     pub fn auto_height(mut self) -> Self {
         self.auto_height = true;
         self
+    }
+
+    /// Fit an auto-height field into its host's available space. Keep a full
+    /// line visible and let the existing scroll viewport follow the caret.
+    pub fn set_auto_height_max(&mut self, height: Pixels, cx: &mut Context<Self>) {
+        let height = height.max(px(24.0));
+        if self.auto_height_max != height {
+            self.auto_height_max = height;
+            self.caret_reconciled = None;
+            cx.notify();
+        }
     }
 
     /// Surface image and file pastes as a [`MediaPaste`] event instead of
@@ -1701,6 +1714,11 @@ impl TextInput {
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        // The IME owns Enter until its marked text is committed. In particular,
+        // accepting a candidate must never submit or close the hosting editor.
+        if self.marked_range.is_some() {
+            return;
+        }
         if self.mode == FieldMode::MultiLine && !self.submit_on_enter {
             self.replace_text_in_range(None, "\n", window, cx);
             return;
@@ -2872,7 +2890,7 @@ impl Render for TextInput {
             .when(self.auto_height, |field| {
                 field
                     .min_h(px(24.0))
-                    .max_h(AUTO_HEIGHT_MAX)
+                    .max_h(self.auto_height_max)
                     .overflow_y_scroll()
                     .track_scroll(&scroll_handle)
                     .px(padding_x)
@@ -3331,6 +3349,78 @@ mod tests {
         cx.read_entity(&composer, |composer, cx| {
             assert_eq!(composer.content(cx), "hold on")
         });
+    }
+
+    #[gpui::test]
+    fn submitting_multiline_field_preserves_paragraphs_and_shift_enter(cx: &mut TestAppContext) {
+        let (input, cx) = setup_input(cx, "  第一段\n\nSecond paragraph  ", px(300.));
+        let submitted: Rc<RefCell<Vec<String>>> = Rc::default();
+        let sink = submitted.clone();
+        cx.update(|_, cx| {
+            input.update(cx, |input, _| input.submit_on_enter = true);
+            cx.subscribe(&input, move |_, event: &super::InputEvent, _| {
+                if let super::InputEvent::Submit(text) = event {
+                    sink.borrow_mut().push(text.clone());
+                }
+            })
+            .detach();
+        });
+        cx.simulate_keystrokes("shift-enter");
+        assert!(submitted.borrow().is_empty());
+        let expected = "  第一段\n\nSecond paragraph  \n";
+        cx.read_entity(&input, |input, _| assert_eq!(input.content(), expected));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(&*submitted.borrow(), &[expected.to_owned()]);
+        cx.read_entity(&input, |input, _| assert_eq!(input.content(), expected));
+    }
+
+    #[gpui::test]
+    fn composition_enter_never_submits_multiline_field(cx: &mut TestAppContext) {
+        let (input, cx) = setup_input(cx, "note: ", px(300.));
+        let submitted: Rc<RefCell<Vec<String>>> = Rc::default();
+        let sink = submitted.clone();
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.submit_on_enter = true;
+                input.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+            });
+            cx.subscribe(&input, move |_, event: &super::InputEvent, _| {
+                if let super::InputEvent::Submit(text) = event {
+                    sink.borrow_mut().push(text.clone());
+                }
+            })
+            .detach();
+        });
+        cx.simulate_keystrokes("enter");
+        assert!(submitted.borrow().is_empty());
+        cx.read_entity(&input, |input, _| {
+            assert_eq!(input.content(), "note: ni");
+            assert!(input.marked_range.is_some());
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.replace_text_in_range(None, "你", window, cx);
+            })
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(&*submitted.borrow(), &["note: 你".to_owned()]);
+    }
+
+    #[gpui::test]
+    fn auto_height_limit_scrolls_long_notes_and_tracks_resize(cx: &mut TestAppContext) {
+        let text = "a long annotation line\n".repeat(40);
+        let (input, cx) = setup_input(cx, &text, px(300.));
+        for height in [88.0, 132.0, 44.0] {
+            cx.update(|_, cx| {
+                input.update(cx, |input, cx| input.set_auto_height_max(px(height), cx))
+            });
+            cx.run_until_parked();
+            cx.read_entity(&input, |input, _| {
+                assert_eq!(input.scroll_handle.bounds().size.height, px(height));
+                assert!(input.scroll_handle.max_offset().y > px(0.0));
+                assert_eq!(input.content(), text);
+            });
+        }
     }
 
     #[gpui::test]
