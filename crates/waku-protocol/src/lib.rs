@@ -28,6 +28,9 @@ macro_rules! tr {
 
 pub mod attachments;
 pub mod automation;
+pub mod automation_jobs;
+pub mod automation_recording;
+pub mod automation_schedule;
 pub mod blob;
 pub mod checkpoint;
 pub mod composer;
@@ -54,6 +57,9 @@ pub mod workspace;
 mod protocol;
 
 pub use automation::*;
+pub use automation_jobs::*;
+pub use automation_recording::*;
+pub use automation_schedule::*;
 pub use diagnostics::*;
 pub use driver_wire::{decode_enum, encode_enum, event_from_wire, event_to_wire};
 pub use protocol::{

@@ -8,7 +8,9 @@ which acceptance gates are still open. The P0 checkpoint is historical verified
 evidence; P1 infrastructure now has native provider-free verification and
 independent review. Full phase acceptance still has the live-model gate below.
 See [the verification record](rpa-p1-qa.md) for the historical P1 checkpoint,
-and [agent-information QA](agent-observability-qa.md) for the later compact
+[local recording and unattended automation](local-automation.md) for the daemon-only
+executor, portable replay, suites and durable local schedules, and
+[agent-information QA](agent-observability-qa.md) for the later compact
 context, bounded history reads and native annotation evidence.
 
 ## Where this branch stands
@@ -44,7 +46,7 @@ context, bounded history reads and native annotation evidence.
 
 - **Protocol** (`crates/waku-protocol/src/automation.rs`, `diagnostics.rs`)
   owns the shared automation and diagnostic shapes. The daemon wire version
-  is `PROTOCOL_VERSION = 17`.
+  is `PROTOCOL_VERSION = 18`.
 - **App** (`src/app/rpa.rs`, `src/app/rpa/daemon.rs`) registers its instance
   and build identity over its existing daemon connection. It owns UI truth,
   on-demand full-refresh observations, semantic input and action effects;
@@ -803,4 +805,6 @@ and deliberately settled; do not re-litigate them without new evidence:
   failed-wait explanation with no temporary probes. Keep these acceptance
   gates open until the actual run and its evidence have been reviewed.
 - Archive only after the project's review and acceptance requirements are
-  satisfied. P2 scheduling/scripted-provider/headless work remains separate.
+  satisfied. Local recording/headless/scheduling is the separate
+  `add-local-automation-jobs` change; scripted-provider and cross-device work
+  remain deferred.

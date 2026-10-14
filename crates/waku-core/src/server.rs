@@ -93,6 +93,18 @@ pub trait Backend: Send + Sync + 'static {
         bail!("scratch instances are unavailable on this backend")
     }
 
+    fn handle_automation_jobs(
+        &self,
+        _command: &waku_protocol::AutomationCommand,
+    ) -> waku_protocol::AutomationResult {
+        waku_protocol::AutomationResult::Error {
+            error: waku_protocol::AutomationError::new(
+                "unavailable",
+                "jobs are unavailable on this backend",
+            ),
+        }
+    }
+
     fn forward_automation(
         &self,
         _command: &waku_protocol::AutomationCommand,

@@ -1,0 +1,28 @@
+{
+  "name": "Backend-only smoke",
+  "headless": true,
+  "timeoutMs": 30000,
+  "seed": { "projects": [], "sessions": [] },
+  "programs": [
+    {
+      "type": "scenario",
+      "scenario": {
+        "name": "Create an isolated draft",
+        "steps": [
+          { "name": "Create draft", "type": "call", "call": { "type": "invoke", "verb": "newSession", "args": {} } },
+          { "name": "Check process-local selection", "type": "wait", "condition": { "on": "state", "pointer": "/selection/persistent", "equals": false }, "timeoutMs": 1000 },
+          { "name": "Inspect draft", "type": "call", "call": { "type": "snapshot", "sections": ["sessions", "selection", "draft"] } }
+        ]
+      }
+    },
+    {
+      "type": "scenario",
+      "scenario": {
+        "name": "Fresh executor capabilities",
+        "steps": [
+          { "name": "Describe", "type": "call", "call": { "type": "describe" } }
+        ]
+      }
+    }
+  ]
+}

@@ -538,6 +538,7 @@ fn instance() -> AutomationInstance {
         executor_connected: true,
         scratch: std::env::var_os("WAKU_RPA_INSTANCE_ID").is_some()
             && std::env::var_os("WAKU_RPA_SCRATCH_NAME").is_some(),
+        headless: false,
     }
 }
 
