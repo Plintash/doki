@@ -1,5 +1,7 @@
 //! Provider backend and driver-event wire translation for `waku-daemon`.
 
+mod automation_headless;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,7 +95,11 @@ impl RuntimeExit {
 }
 
 pub struct WakuBackend {
-    scratch: crate::automation_scratch::ScratchManager,
+    headless_identity: OnceLock<waku_protocol::AutomationInstance>,
+    scratch: Arc<crate::automation_scratch::ScratchManager>,
+    automation_jobs: Option<
+        Result<crate::automation_jobs::AutomationJobManager, waku_protocol::AutomationError>,
+    >,
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
     runtime_exits: Mutex<HashMap<(Uuid, Uuid), Arc<RuntimeExit>>>,
     terminals: Mutex<HashMap<Uuid, OwnedTerminal>>,
@@ -130,8 +136,15 @@ impl WakuBackend {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .to_owned();
-        let scratch = crate::automation_scratch::ScratchManager::new(&usage_rates_dir);
+        let scratch = Arc::new(crate::automation_scratch::ScratchManager::new(
+            &usage_rates_dir,
+        ));
+        let automation_jobs = cfg!(debug_assertions).then(|| {
+            crate::automation_jobs::AutomationJobManager::new(scratch.clone(), &usage_rates_dir)
+        });
         Ok(Self {
+            headless_identity: OnceLock::new(),
+            automation_jobs,
             scratch,
             sessions: Mutex::new(HashMap::new()),
             runtime_exits: Mutex::new(HashMap::new()),
@@ -377,6 +390,26 @@ fn migrate_projectless_state(
 }
 
 impl Backend for WakuBackend {
+    fn handle_automation_jobs(
+        &self,
+        command: &waku_protocol::AutomationCommand,
+    ) -> waku_protocol::AutomationResult {
+        match &self.automation_jobs {
+            Some(Ok(jobs)) => jobs
+                .command(command)
+                .unwrap_or_else(|error| waku_protocol::AutomationResult::Error { error }),
+            Some(Err(error)) => waku_protocol::AutomationResult::Error {
+                error: error.clone(),
+            },
+            None => waku_protocol::AutomationResult::Error {
+                error: waku_protocol::AutomationError::new(
+                    "unavailable",
+                    "automation jobs require a debug build",
+                ),
+            },
+        }
+    }
+
     fn handle_automation_scratch(
         &self,
         command: &waku_protocol::AutomationCommand,
@@ -1225,6 +1258,9 @@ impl Backend for WakuBackend {
     }
 
     fn shutdown(&self) {
+        if let Some(Ok(jobs)) = &self.automation_jobs {
+            jobs.shutdown();
+        }
         self.scratch.shutdown();
         let sessions = std::mem::take(&mut *self.sessions.lock());
         drop(sessions);

@@ -668,7 +668,7 @@ test("a delayed verbosity query response cannot overwrite a newer broadcast", as
 
 const automationInstance = {
   instanceId: "instance", checkout: "/test/checkout", database: "/test/checkout/temp/app.db",
-  pid: 42, build: "build-one", version: "test", executorConnected: true, scratch: false,
+  pid: 42, build: "build-one", version: "test", executorConnected: true, scratch: false, headless: false,
 };
 const automationCursor = (sequence: number) => ({ epoch: "automation-epoch", sequence });
 const automationEvent = (sequence: number) => ({

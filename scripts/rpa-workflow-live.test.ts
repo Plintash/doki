@@ -68,7 +68,7 @@ liveTest("native scratch actions, pushed waits, independent resume and failed sc
     workingSession = (await client.attachAutomation(working.instanceId)).sessionId;
     const before = await client.automationCall(workingSession, { type: "snapshot", sections: ["model", "composer", "route"] });
 
-    const created = await client.automation({ type: "scratchCreate", name: "Native isolated draft acceptance", seed: { projects: [], sessions: [] } }, { timeoutMs: 40_000 });
+    const created = await client.automation({ type: "scratchCreate", headless: false, name: "Native isolated draft acceptance", seed: { projects: [], sessions: [] } }, { timeoutMs: 40_000 });
     if (created.type !== "scratchCreated") throw new Error("unexpected scratch response");
     scratchId = created.instance.instanceId;
     expect(created.instance.scratch).toBe(true);
@@ -197,7 +197,7 @@ liveTest("native Board issues and conversations keep distinct identities and iso
       messages: [{ id: crypto.randomUUID(), turn_id: null, role: "assistant", content: "Synthetic fixture history", created_at: now, streaming: false }],
       transcript_blocks: [], turns: [],
     }));
-    const created = await client.automation({ type: "scratchCreate", name: "Board issue identity acceptance", seed: {
+    const created = await client.automation({ type: "scratchCreate", headless: false, name: "Board issue identity acceptance", seed: {
       projects: [{ id: projectId, name: "RPA isolated project", path: "/synthetic/rpa-project", created_at: now }],
       tasks: [issue], sessions,
     } }, { timeoutMs: 40_000 });

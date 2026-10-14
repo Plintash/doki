@@ -3,8 +3,12 @@ import type { AutomationCallResult } from "./AutomationCallResult";
 import type { AutomationDiff } from "./AutomationDiff";
 import type { AutomationError } from "./AutomationError";
 import type { AutomationInstance } from "./AutomationInstance";
+import type { AutomationJobRun } from "./AutomationJobRun";
+import type { AutomationRecording } from "./AutomationRecording";
+import type { AutomationReplay } from "./AutomationReplay";
 import type { AutomationRun } from "./AutomationRun";
+import type { AutomationSchedule } from "./AutomationSchedule";
 import type { AutomationSession } from "./AutomationSession";
 import type { AutomationWait } from "./AutomationWait";
 
-export type AutomationResult = { "type": "registered", instance: AutomationInstance, } | { "type": "instances", instances: Array<AutomationInstance>, } | { "type": "attached", session: AutomationSession, replay: AutomationDiff, } | { "type": "detached" } | { "type": "scratchCreated", instance: AutomationInstance, } | { "type": "scratchRemoved", instanceId: string, } | { "type": "called", result: AutomationCallResult, } | { "type": "diff", diff: AutomationDiff, } | { "type": "subscribed", session: AutomationSession, } | { "type": "wait", wait: AutomationWait, } | { "type": "scenario", run: AutomationRun, } | { "type": "error", error: AutomationError, };
+export type AutomationResult = { "type": "registered", instance: AutomationInstance, } | { "type": "instances", instances: Array<AutomationInstance>, } | { "type": "attached", session: AutomationSession, replay: AutomationDiff, } | { "type": "detached" } | { "type": "scratchCreated", instance: AutomationInstance, } | { "type": "scratchRemoved", instanceId: string, } | { "type": "called", result: AutomationCallResult, } | { "type": "diff", diff: AutomationDiff, } | { "type": "subscribed", session: AutomationSession, } | { "type": "wait", wait: AutomationWait, } | { "type": "scenario", run: AutomationRun, } | { "type": "recording", recording: AutomationRecording, } | { "type": "job", run: AutomationJobRun, } | { "type": "schedule", schedule: AutomationSchedule, } | { "type": "schedules", schedules: Array<AutomationSchedule>, } | { "type": "scheduleRemoved", scheduleId: string, } | { "type": "replay", replay: AutomationReplay, } | { "type": "error", error: AutomationError, };

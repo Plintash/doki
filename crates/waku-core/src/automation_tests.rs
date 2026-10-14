@@ -21,6 +21,7 @@ fn instance() -> AutomationInstance {
         version: "test".into(),
         executor_connected: false,
         scratch: false,
+        headless: false,
     }
 }
 fn observation(frame: u64, label: &str) -> AutomationObservation {
@@ -2124,3 +2125,6 @@ fn websocket_large_model_delta_preserves_unrelated_wait_and_names_subscriber_rep
         other => panic!("{other:?}"),
     }
 }
+
+#[path = "automation_recording_runtime_tests.rs"]
+mod recording_tests;

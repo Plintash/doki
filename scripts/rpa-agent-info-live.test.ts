@@ -43,7 +43,7 @@ nativeTest("native agent diagnosis stays bounded and reads unselected history wi
       id:activityId, source_id:"fixture-tool", kind:"command", title:"Synthetic command output", detail:null, arguments:'{"command":"echo fixture"}', output:unicode,
       complete:true, failed:false,
     }]}}];
-    const created = await client.automation({type:"scratchCreate", name:"Agent information acceptance", seed:{
+    const created = await client.automation({type:"scratchCreate", headless:false, name:"Agent information acceptance", seed:{
       projects:[{id:projectId,name:"Information fixture",path:"/synthetic/agent-information",created_at:now}], sessions:[large,stored],
     }}, {timeoutMs:40_000});
     if (created.type !== "scratchCreated") throw new Error("scratch did not start");

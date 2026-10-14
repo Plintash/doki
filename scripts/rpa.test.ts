@@ -99,7 +99,7 @@ import { conditionFromArguments, redact, selectInstance } from "./rpa";
 
 const instance = {
   instanceId: "11111111-1111-4111-8111-111111111111", checkout: "/checkouts/rpa", database: "/checkouts/rpa/temp/app.db",
-  pid: 123, build: "build-one", version: "test", executorConnected: true, scratch: false,
+  pid: 123, build: "build-one", version: "test", executorConnected: true, scratch: false, headless: false,
 };
 const cursor = { epoch: "22222222-2222-4222-8222-222222222222", sequence: 1 };
 const sessionId = "33333333-3333-4333-8333-333333333333";
@@ -340,7 +340,7 @@ test("fresh-build verification rejects a stale executor behind a new registry en
 
 test("scratch lifecycle uses typed daemon commands without attaching a working instance", async () => {
   const created = await runDaemonCli(["scratch", "create", "--name", "cli-test", "--json"], command => {
-    expect(command).toEqual({ type: "automation", command: { type: "scratchCreate", name: "cli-test", seed: { projects: [], sessions: [] } } });
+    expect(command).toEqual({ type: "automation", command: { type: "scratchCreate", name: "cli-test", seed: { projects: [], sessions: [] }, headless: false } });
     return automation({ type: "scratchCreated", instance: { ...instance, scratch: true } });
   });
   expect(created.code).toBe(0);
@@ -367,7 +367,7 @@ test("scratch creation forwards an explicit seed file without reading a working 
   const seed = { projects: [], sessions: [] };
   writeFileSync(path, JSON.stringify(seed));
   const result = await runDaemonCli(["scratch", "create", "--seed", path, "--json"], command => {
-    expect(command.command).toEqual({ type: "scratchCreate", name: null, seed });
+    expect(command.command).toEqual({ type: "scratchCreate", name: null, seed, headless: false });
     return automation({ type: "scratchCreated", instance: { ...instance, scratch: true } });
   });
   expect(result.code).toBe(0);
@@ -518,4 +518,74 @@ test("ordinary describe exposes the discoverable argument contracts", async () =
   });
   expect(result.code).toBe(0);
   expect(JSON.parse(result.stdout)).toEqual(manifest);
+});
+
+
+test("record start uses a durable session and stop prints only the replay document", async () => {
+  const start = await runDaemonCli(["record", "start", "portable", "--json"], command => {
+    if (command.command?.type !== "recordingStart") return;
+    expect(command.command).toEqual({ type: "recordingStart", sessionId, name: "portable" });
+    return automation({ type: "recording", recording: { status: "recording", completedSteps: 0, pending: false, requiredInputs: [], error: null } });
+  });
+  expect(start.code).toBe(0);
+  expect(JSON.parse(start.stdout).sessionId).toBe(sessionId);
+  const replay = { formatVersion: 1, name: "portable", steps: [] };
+  const stopped = await runDaemonCli(["--session", sessionId, "record", "stop", "--json"], command => {
+    if (command.command?.type === "recordingStop") return automation({ type: "replay", replay });
+  });
+  expect(stopped.code).toBe(0);
+  expect(JSON.parse(stopped.stdout)).toEqual(replay);
+});
+
+test("headless scratch creation is explicit and needs no app selector", async () => {
+  const result = await runDaemonCli(["scratch", "create", "--headless", "--json"], command => {
+    expect(command.command).toEqual({ type: "scratchCreate", name: null, seed: { projects: [], sessions: [] }, headless: true });
+    return automation({ type: "scratchCreated", instance: { ...instance, headless: true, scratch: true } });
+  });
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout).instance.headless).toBe(true);
+});
+
+test("job status returns nonzero for terminal failure and cancellation with evidence", async () => {
+  for (const status of ["failed", "aborted"]) {
+    const run = { runId, name: "suite", status, startedAtMs: 1, finishedAtMs: 2, programs: [], error: { code: status, message: "stopped", bundle: { observed: { state: { fixture: true } } } } };
+    const result = await runDaemonCli(["job", "status", runId, "--json"], command => {
+      expect(command.command).toEqual({ type: "jobResult", runId });
+      return automation({ type: "job", run });
+    });
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.stderr).error.run.status).toBe(status);
+    expect(result.stderr).toContain("fixture");
+  }
+});
+
+test("job wait is bounded without cancelling the daemon-owned run", async () => {
+  const result = await runDaemonCli(["job", "wait", runId, "--timeout", "0", "--json"], command => {
+    expect(command.command.type).toBe("jobResult");
+    return automation({ type: "job", run: { runId, name: "suite", status: "pending", programs: [], startedAtMs: 1, finishedAtMs: null, error: null } });
+  });
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("client_wait_timeout");
+  expect(result.requests.some(request => request.command.command.type === "jobAbort")).toBe(false);
+});
+
+test("schedule controls use the daemon without attaching an executor", async () => {
+  for (const [operation, type] of [["disable", "scheduleSetEnabled"], ["cancel", "scheduleCancel"], ["remove", "scheduleRemove"]]) {
+    const result = await runDaemonCli(["schedule", operation!, runId, "--json"], command => {
+      expect(command.command.type).toBe(type);
+      expect(command.command.scheduleId).toBe(runId);
+      if (operation === "disable") expect(command.command.enabled).toBe(false);
+      return automation({ type: "scheduleRemoved", scheduleId: runId });
+    });
+    expect(result.code).toBe(0);
+    expect(result.requests.length).toBe(1);
+  }
+});
+
+
+test("job run rejects an invalid wait timeout before submitting background work", async () => {
+  const result = await runDaemonCli(["job", "run", "unread-job.json", "--timeout", "nope", "--json"]);
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("non-negative integer");
+  expect(result.requests).toHaveLength(0);
 });

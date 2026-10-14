@@ -20,6 +20,10 @@ macro_rules! tr {
 pub mod acp_session;
 pub mod amp_session;
 pub mod attachments;
+pub mod automation_headless_host;
+mod automation_jobs;
+mod automation_recording;
+mod automation_schedule;
 mod automation_scratch;
 pub mod blob_store;
 pub mod checkpoint;

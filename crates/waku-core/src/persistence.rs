@@ -150,16 +150,33 @@ impl ComposerDraftStore {
         if changes.is_empty() {
             return Ok(());
         }
+        self.update(|drafts| {
+            let mut changed = false;
+            for change in changes {
+                let key = ComposerDraftKey::from(change.target);
+                changed |= match change.draft {
+                    Some(draft) => drafts.set(key, draft),
+                    None => drafts.remove(key),
+                };
+            }
+            changed
+        })
+    }
+
+    /// Change text without replacing concurrently written attachments or
+    /// annotations. Read-modify-write shares the normal draft write lock.
+    pub(crate) fn set_text(&self, key: ComposerDraftKey, text: String) -> io::Result<()> {
+        self.update(|drafts| {
+            let mut draft = drafts.get(key).cloned().unwrap_or_default();
+            draft.text = text;
+            drafts.set(key, draft)
+        })
+    }
+
+    fn update(&self, change: impl FnOnce(&mut ComposerDrafts) -> bool) -> io::Result<()> {
         let mut latest_write = self.latest_write.lock();
         let mut drafts = self.load()?;
-        let mut changed = false;
-        for change in changes {
-            let key = ComposerDraftKey::from(change.target);
-            changed |= match change.draft {
-                Some(draft) => drafts.set(key, draft),
-                None => drafts.remove(key),
-            };
-        }
+        let changed = change(&mut drafts);
         if !changed {
             return Ok(());
         }
@@ -2325,6 +2342,50 @@ mod tests {
             restored.get(ComposerDraftKey::NewSession(project_id)),
             Some(&draft)
         );
+    }
+
+    #[test]
+    fn composer_text_update_reads_after_a_concurrent_annotation_write() {
+        let directory = temporary_directory();
+        let store = ComposerDraftStore::for_state_path(&directory.join("app.db"));
+        let key = ComposerDraftKey::Session(Uuid::new_v4());
+        let mut drafts = ComposerDrafts::default();
+        drafts.set(
+            key,
+            ComposerDraft {
+                text: "old".into(),
+                ..Default::default()
+            },
+        );
+        store.save(drafts.clone(), 1).unwrap();
+        let annotation = sample_annotation(Uuid::new_v4(), Some("latest annotation"));
+        let write_guard = store.latest_write.lock();
+        let writer_store = store.clone();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            writer_store.set_text(key, "new text".into()).unwrap();
+            done.send(()).unwrap();
+        });
+        ready.recv().unwrap();
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_err()
+        );
+        // Model a prior writer committing while it still owns the shared lock.
+        let mut latest = drafts.get(key).unwrap().clone();
+        latest.annotations.push(annotation.clone());
+        drafts.set(key, latest);
+        fs::write(&store.path, serde_json::to_vec(&drafts).unwrap()).unwrap();
+        drop(write_guard);
+        worker.join().unwrap();
+        let loaded = store.load().unwrap();
+        let result = loaded.get(key).unwrap();
+        assert_eq!(result.text, "new text");
+        assert_eq!(result.annotations, vec![annotation]);
+        fs::remove_dir_all(directory).ok();
     }
 
     #[test]

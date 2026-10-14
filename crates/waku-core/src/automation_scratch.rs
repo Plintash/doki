@@ -16,9 +16,9 @@ use uuid::Uuid;
 use waku_client::{AutomationMessage, DaemonAutomationError, DaemonClient};
 use waku_protocol::{
     APP_EXECUTABLE_ENV, AutomationCommand, AutomationDiff, AutomationError, AutomationExpiry,
-    AutomationInstance, AutomationResult, AutomationRun, AutomationScratchSeed, AutomationSession,
-    AutomationStatus, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_VERSION,
-    ServerMessage,
+    AutomationInstance, AutomationProgram, AutomationResult, AutomationRun, AutomationScratchSeed,
+    AutomationSession, AutomationStatus, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
+    PROTOCOL_VERSION, ServerMessage,
 };
 
 use crate::model::TaskWorkspace;
@@ -340,10 +340,11 @@ impl Instance {
     fn identity(&self) -> AutomationInstance {
         let mut identity = self.identity.clone();
         identity.executor_connected = self.owned.lock().as_mut().is_some_and(|owned| {
-            owned
-                .app
-                .as_mut()
-                .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+            (self.identity.headless
+                || owned
+                    .app
+                    .as_mut()
+                    .is_some_and(|child| matches!(child.try_wait(), Ok(None))))
                 && owned
                     .daemon
                     .as_mut()
@@ -393,7 +394,11 @@ impl ScratchManager {
             ));
         }
         match command {
-            AutomationCommand::ScratchCreate { name, seed } => self.create(name.as_deref(), seed),
+            AutomationCommand::ScratchCreate {
+                name,
+                seed,
+                headless,
+            } => self.create(name.as_deref(), seed, *headless),
             AutomationCommand::ScratchRemove { instance_id } => {
                 remove_instance(&self.inner, *instance_id);
                 Ok(AutomationResult::ScratchRemoved {
@@ -408,6 +413,17 @@ impl ScratchManager {
         &self,
         name: Option<&str>,
         seed: &AutomationScratchSeed,
+        headless: bool,
+    ) -> anyhow::Result<AutomationResult> {
+        self.create_program(name, seed, headless, None)
+    }
+
+    fn create_program(
+        &self,
+        name: Option<&str>,
+        seed: &AutomationScratchSeed,
+        headless: bool,
+        cancellation: Option<(&AtomicBool, Instant)>,
     ) -> anyhow::Result<AutomationResult> {
         {
             let mut state = self.inner.state.lock();
@@ -419,11 +435,23 @@ impl ScratchManager {
             state.creating += 1;
         }
         let result = (|| {
-            let app = std::env::var_os(APP_EXECUTABLE_ENV)
-                .map(PathBuf::from)
-                .context("the daemon has no owning app executable")?;
+            let app = if headless {
+                PathBuf::new()
+            } else {
+                std::env::var_os(APP_EXECUTABLE_ENV)
+                    .map(PathBuf::from)
+                    .context("the daemon has no owning app executable")?
+            };
             let daemon = std::env::current_exe().context("could not locate owning daemon")?;
-            launch(&self.inner.root, &daemon, &app, name, seed)
+            launch_mode(
+                &self.inner.root,
+                &daemon,
+                &app,
+                name,
+                seed,
+                headless,
+                cancellation,
+            )
         })();
         let mut state = self.inner.state.lock();
         state.creating -= 1;
@@ -662,7 +690,10 @@ impl ScratchManager {
                 }
             }
         };
-        let starting = matches!(command, AutomationCommand::ScenarioStart { .. });
+        let starting = matches!(
+            command,
+            AutomationCommand::ScenarioStart { .. } | AutomationCommand::ReplayStart { .. }
+        );
         if starting {
             let mut run = route.instance.run.lock();
             if run.is_some() {
@@ -684,7 +715,8 @@ impl ScratchManager {
             if let Some(entry) = state.results.iter().rev().find(|entry| {
                 entry.session.session_id == session_id
                     && match command {
-                        AutomationCommand::ScenarioStart { .. } => true,
+                        AutomationCommand::ScenarioStart { .. }
+                        | AutomationCommand::ReplayStart { .. } => true,
                         AutomationCommand::ScenarioResult { run_id, .. }
                         | AutomationCommand::ScenarioAbort { run_id, .. } => {
                             entry.run.run_id == *run_id
@@ -798,6 +830,136 @@ impl ScratchManager {
         }
     }
 
+    /// Execute one program on a fresh owned target. The guard removes only
+    /// this instance on every return, including cancellation and transport error.
+    pub(crate) fn run_program(
+        &self,
+        program: &AutomationProgram,
+        seed: &AutomationScratchSeed,
+        headless: bool,
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> std::result::Result<AutomationRun, AutomationError> {
+        let cancellation = Some((cancel, deadline));
+        check_program_deadline(cancellation).map_err(program_error)?;
+        if let AutomationProgram::Replay { replay, parameters } = program {
+            crate::automation_recording::preflight(replay, parameters)?;
+        }
+        let created = self
+            .create_program(Some("unattended job"), seed, headless, cancellation)
+            .map_err(program_error)?;
+        let identity = match created {
+            AutomationResult::ScratchCreated { instance } => instance,
+            AutomationResult::Error { error } => return Err(error),
+            _ => {
+                return Err(AutomationError::new(
+                    "job_failed",
+                    "unexpected scratch creation response",
+                ));
+            }
+        };
+        struct OwnedProgram {
+            inner: Arc<Inner>,
+            instance_id: Uuid,
+        }
+        impl Drop for OwnedProgram {
+            fn drop(&mut self) {
+                remove_instance(&self.inner, self.instance_id);
+            }
+        }
+        let _owned = OwnedProgram {
+            inner: self.inner.clone(),
+            instance_id: identity.instance_id,
+        };
+        let instance = self
+            .inner
+            .state
+            .lock()
+            .instances
+            .get(&identity.instance_id)
+            .cloned()
+            .ok_or_else(|| AutomationError::new("job_aborted", "owned scratch was removed"))?;
+        let request = |command| -> std::result::Result<AutomationResult, AutomationError> {
+            check_program_deadline(cancellation).map_err(program_error)?;
+            instance
+                .control
+                .automation_with_timeout(
+                    command,
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(REQUEST_TIMEOUT),
+                )
+                .map_err(program_error)
+        };
+        let session_id = match request(AutomationCommand::Attach {
+            instance_id: identity.instance_id,
+        })? {
+            AutomationResult::Attached { session, .. } => session.session_id,
+            _ => return Err(AutomationError::new("job_failed", "scratch did not attach")),
+        };
+        let command = match program {
+            AutomationProgram::Scenario { scenario } => AutomationCommand::ScenarioStart {
+                session_id,
+                scenario: scenario.clone(),
+            },
+            AutomationProgram::Replay { replay, parameters } => AutomationCommand::ReplayStart {
+                session_id,
+                replay: replay.clone(),
+                parameters: parameters.clone(),
+            },
+        };
+        let mut run = match request(command)? {
+            AutomationResult::Scenario { run } => run,
+            _ => {
+                return Err(AutomationError::new(
+                    "job_failed",
+                    "scratch did not start its program",
+                ));
+            }
+        };
+        while matches!(run.status, AutomationStatus::Pending) {
+            if let Err(error) = check_program_deadline(cancellation) {
+                return Ok(interrupt_program(
+                    &instance,
+                    session_id,
+                    run,
+                    program_error(error),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            match request(AutomationCommand::ScenarioResult {
+                session_id,
+                run_id: run.run_id,
+            }) {
+                Ok(AutomationResult::Scenario { run: latest }) => run = latest,
+                Err(error) => {
+                    // Cancellation can arrive during the sleep or an RPC. Keep
+                    // the active program's evidence on both interruption paths.
+                    if let Err(interruption) = check_program_deadline(cancellation) {
+                        return Ok(interrupt_program(
+                            &instance,
+                            session_id,
+                            run,
+                            program_error(interruption),
+                        ));
+                    }
+                    run.status = AutomationStatus::Failed;
+                    run.error = Some(error);
+                    return Ok(run);
+                }
+                _ => {
+                    run.status = AutomationStatus::Failed;
+                    run.error = Some(AutomationError::new(
+                        "job_failed",
+                        "scratch lost its program result",
+                    ));
+                    return Ok(run);
+                }
+            }
+        }
+        Ok(run)
+    }
+
     pub(crate) fn shutdown(&self) {
         let instances = {
             let mut state = self.inner.state.lock();
@@ -828,6 +990,66 @@ impl Drop for ScratchManager {
     }
 }
 
+fn interrupt_program(
+    instance: &Instance,
+    session_id: Uuid,
+    mut run: AutomationRun,
+    failure: AutomationError,
+) -> AutomationRun {
+    // Fetch the executor's latest first-failure/step evidence before owned
+    // cleanup. A stalled executor still leaves the most recently observed run.
+    if let Ok(AutomationResult::Scenario { run: aborted }) =
+        instance.control.automation_with_timeout(
+            AutomationCommand::ScenarioAbort {
+                session_id,
+                run_id: run.run_id,
+            },
+            Duration::from_secs(1),
+        )
+    {
+        run = aborted;
+    }
+    run.status = if failure.code == "job_aborted" {
+        AutomationStatus::Aborted
+    } else {
+        AutomationStatus::Failed
+    };
+    run.error = Some(failure);
+    run
+}
+
+fn startup_slice_deadline(
+    deadline: Instant,
+    cancellation: Option<(&AtomicBool, Instant)>,
+) -> Instant {
+    // Poll even a stalled handshake/daemon so cancellation remains observable.
+    let deadline = deadline.min(Instant::now() + Duration::from_millis(250));
+    cancellation.map_or(deadline, |(_, job_deadline)| deadline.min(job_deadline))
+}
+
+fn check_program_deadline(cancellation: Option<(&AtomicBool, Instant)>) -> anyhow::Result<()> {
+    if let Some((cancel, deadline)) = cancellation {
+        if cancel.load(Ordering::Acquire) {
+            return Err(anyhow::anyhow!(DaemonAutomationError {
+                error: AutomationError::new("job_aborted", "job was cancelled")
+            }));
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(DaemonAutomationError {
+                error: AutomationError::new("job_timeout", "job exceeded its overall deadline")
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn program_error(error: anyhow::Error) -> AutomationError {
+    match error.downcast::<DaemonAutomationError>() {
+        Ok(error) => error.error,
+        Err(error) => AutomationError::new("job_failed", error.to_string()),
+    }
+}
+
 fn command_session(command: &AutomationCommand) -> Option<Uuid> {
     match command {
         AutomationCommand::Resume { session_id, .. }
@@ -837,6 +1059,11 @@ fn command_session(command: &AutomationCommand) -> Option<Uuid> {
         | AutomationCommand::Subscribe { session_id, .. }
         | AutomationCommand::Wait { session_id, .. }
         | AutomationCommand::WaitResult { session_id, .. }
+        | AutomationCommand::RecordingStart { session_id, .. }
+        | AutomationCommand::RecordingStatus { session_id }
+        | AutomationCommand::RecordingStop { session_id }
+        | AutomationCommand::RecordingCancel { session_id }
+        | AutomationCommand::ReplayStart { session_id, .. }
         | AutomationCommand::ScenarioStart { session_id, .. }
         | AutomationCommand::ScenarioResult { session_id, .. }
         | AutomationCommand::ScenarioAbort { session_id, .. } => Some(*session_id),
@@ -1103,6 +1330,27 @@ fn launch(
     name: Option<&str>,
     seed: &AutomationScratchSeed,
 ) -> anyhow::Result<Instance> {
+    launch_mode(
+        root,
+        daemon_executable,
+        app_executable,
+        name,
+        seed,
+        false,
+        None,
+    )
+}
+
+fn launch_mode(
+    root: &Path,
+    daemon_executable: &Path,
+    app_executable: &Path,
+    name: Option<&str>,
+    seed: &AutomationScratchSeed,
+    headless: bool,
+    cancellation: Option<(&AtomicBool, Instant)>,
+) -> anyhow::Result<Instance> {
+    check_program_deadline(cancellation)?;
     let id = Uuid::new_v4();
     std::fs::create_dir_all(root)?;
     let directory = root.canonicalize()?.join(id.to_string());
@@ -1119,7 +1367,13 @@ fn launch(
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&owned.directory, std::fs::Permissions::from_mode(0o700))?;
     }
-    seed_database(&owned.directory, seed)?;
+    let mut seed = seed.clone();
+    if headless && seed.projects.is_empty() {
+        seed.projects.push(crate::model::Project::from_path(
+            owned.directory.join("project"),
+        ));
+    }
+    seed_database(&owned.directory, &seed)?;
     for child in ["home", "config", "data", "cache", "state", "runtime", "tmp"] {
         std::fs::create_dir_all(owned.directory.join(child))?;
     }
@@ -1141,6 +1395,14 @@ fn launch(
         .env(DAEMON_TOKEN_ENV, &token)
         .env(APP_EXECUTABLE_ENV, app_executable)
         .stdout(Stdio::piped());
+    if headless {
+        daemon
+            .arg("--automation-headless")
+            .env("WAKU_RPA_INSTANCE_ID", id.to_string())
+            .env("WAKU_RPA_SCRATCH_NAME", name.unwrap_or("automation"))
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY");
+    }
     owned.daemon = Some(daemon.spawn().context("could not start scratch daemon")?);
     owned.daemon_stderr = StartupStderr::capture(owned.daemon.as_mut().unwrap(), &token)?;
     let stdout = owned
@@ -1169,10 +1431,22 @@ fn launch(
             })();
             let _ = ready_tx.send(result);
         })?;
-    let ready = match ready_rx.recv_timeout(START_TIMEOUT) {
-        Ok(Ok(ready)) => ready,
-        Ok(Err(_)) => return Err(owned.startup_failure("scratch daemon did not report readiness")),
-        Err(_) => return Err(owned.startup_failure("scratch daemon did not become ready")),
+    let startup_deadline = Instant::now() + START_TIMEOUT;
+    let ready = loop {
+        check_program_deadline(cancellation)?;
+        match ready_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(result) => {
+                break result.map_err(|_| {
+                    owned.startup_failure("scratch daemon did not report readiness")
+                })?;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                if Instant::now() < startup_deadline =>
+            {
+                continue;
+            }
+            Err(_) => return Err(owned.startup_failure("scratch daemon did not become ready")),
+        }
     };
     let address: std::net::SocketAddr = ready
         .address
@@ -1184,21 +1458,41 @@ fn launch(
     {
         bail!("scratch daemon reported an incompatible identity or address");
     }
-    let control = DaemonClient::connect(&ready.address, token.clone())?;
-    let mut app = isolated_command(app_executable, &owned.directory);
-    app.env(DAEMON_ADDRESS_ENV, &ready.address)
-        .env(DAEMON_TOKEN_ENV, &token)
-        .env("WAKU_RPA_INSTANCE_ID", id.to_string())
-        .env(
-            "WAKU_RPA_SCRATCH_NAME",
-            name.filter(|name| !name.trim().is_empty())
-                .unwrap_or("automation"),
-        );
-    owned.app = Some(app.spawn().context("could not start scratch app")?);
-    owned.app_stderr = StartupStderr::capture(owned.app.as_mut().unwrap(), &token)?;
+    let connect_deadline = Instant::now() + START_TIMEOUT;
+    let control = loop {
+        check_program_deadline(cancellation)?;
+        let slice_deadline = startup_slice_deadline(connect_deadline, cancellation);
+        match DaemonClient::connect_with_deadline(&ready.address, token.clone(), slice_deadline) {
+            Ok(control) => break control,
+            Err(_) if Instant::now() < connect_deadline => {
+                if owned.daemon.as_mut().unwrap().try_wait()?.is_some() {
+                    return Err(owned.startup_failure("scratch daemon exited during connection"));
+                }
+            }
+            Err(_) => return Err(owned.startup_failure("scratch control connection timed out")),
+        }
+    };
+    if !headless {
+        let mut app = isolated_command(app_executable, &owned.directory);
+        app.env(DAEMON_ADDRESS_ENV, &ready.address)
+            .env(DAEMON_TOKEN_ENV, &token)
+            .env("WAKU_RPA_INSTANCE_ID", id.to_string())
+            .env(
+                "WAKU_RPA_SCRATCH_NAME",
+                name.filter(|name| !name.trim().is_empty())
+                    .unwrap_or("automation"),
+            );
+        owned.app = Some(app.spawn().context("could not start scratch app")?);
+        owned.app_stderr = StartupStderr::capture(owned.app.as_mut().unwrap(), &token)?;
+    }
     let deadline = Instant::now() + START_TIMEOUT;
     let identity = loop {
-        if let Ok(instances) = control.automation_instances() {
+        check_program_deadline(cancellation)?;
+        if let Ok(AutomationResult::Instances { instances }) = control.automation_with_timeout(
+            AutomationCommand::Instances,
+            startup_slice_deadline(deadline, cancellation)
+                .saturating_duration_since(Instant::now()),
+        ) {
             if let Some(identity) = instances
                 .into_iter()
                 .find(|instance| instance.instance_id == id && instance.executor_connected)
@@ -1206,7 +1500,13 @@ fn launch(
                 break identity;
             }
         }
-        if owned.app.as_mut().unwrap().try_wait()?.is_some()
+        if owned
+            .app
+            .as_mut()
+            .map(|app| app.try_wait())
+            .transpose()?
+            .flatten()
+            .is_some()
             || owned.daemon.as_mut().unwrap().try_wait()?.is_some()
         {
             control.disconnect();
@@ -1222,7 +1522,13 @@ fn launch(
     };
     if identity.database != owned.directory.join("app.db").display().to_string()
         || !identity.scratch
-        || identity.pid != owned.app.as_ref().unwrap().id()
+        || identity.headless != headless
+        || identity.pid
+            != if headless {
+                ready.pid
+            } else {
+                owned.app.as_ref().unwrap().id()
+            }
     {
         control.disconnect();
         bail!("scratch app registered without the isolated database or process identity");
@@ -1494,7 +1800,7 @@ mod tests {
             std::io::stderr().flush().unwrap();
             std::process::exit(27);
         }
-        if role == "daemon" || role == "stubborn-daemon" {
+        if role == "daemon" || role == "stubborn-daemon" || role == "stalled-daemon" {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let ready = DaemonReady {
                 address: listener.local_addr().unwrap().to_string(),
@@ -1503,6 +1809,11 @@ mod tests {
             };
             println!("\n{}", serde_json::to_string(&ready).unwrap());
             std::io::stdout().flush().unwrap();
+            if role == "stalled-daemon" {
+                let _socket = listener.accept().unwrap();
+                std::thread::sleep(Duration::from_secs(60));
+                return;
+            }
             crate::serve(
                 listener,
                 std::env::var(DAEMON_TOKEN_ENV).unwrap(),
@@ -1536,6 +1847,7 @@ mod tests {
             version: "test".into(),
             executor_connected: false,
             scratch: true,
+            headless: false,
         };
         client
             .automation(AutomationCommand::RegisterExecutor { instance: identity })
@@ -1677,6 +1989,56 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
         assert!(owned.app.as_mut().unwrap().try_wait().unwrap().is_none());
         // OwnedScratch's ordinary drop still stops the child and its group.
+    }
+
+    #[test]
+    fn managed_startup_bounds_a_stalled_handshake_and_observes_cancellation() {
+        for cancel_early in [false, true] {
+            let directory =
+                std::env::temp_dir().join(format!("waku-scratch-stalled-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let root = directory.join("rpa-scratch");
+            let cancel = Arc::new(AtomicBool::new(false));
+            let canceller = cancel_early.then(|| {
+                let cancel = cancel.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    cancel.store(true, Ordering::Release);
+                })
+            });
+            let started = Instant::now();
+            let deadline = started
+                + if cancel_early {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::from_millis(300)
+                };
+            let error = launch_mode(
+                &root,
+                &launcher(&directory, "stalled-daemon"),
+                &launcher(&directory, "app"),
+                None,
+                &AutomationScratchSeed::default(),
+                false,
+                Some((&cancel, deadline)),
+            )
+            .err()
+            .expect("stalled startup must stop");
+            assert_eq!(
+                program_error(error).code,
+                if cancel_early {
+                    "job_aborted"
+                } else {
+                    "job_timeout"
+                }
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+            if let Some(canceller) = canceller {
+                canceller.join().unwrap();
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

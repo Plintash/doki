@@ -1,6 +1,7 @@
 //! Daemon-owned debug automation. Uses the server's authenticated connections,
 //! bounded delivery queues and epoch. No instance-wide UI snapshot is retained.
-use std::collections::{HashMap, VecDeque};
+use crate::automation_recording::{self, Recorder, RecordingTicket};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,6 +59,7 @@ struct Wait {
     baseline: Value,
     observation: AutomationObservation,
     initial_observation_pending: bool,
+    recording_ticket: Option<RecordingTicket>,
 }
 
 struct Run {
@@ -73,6 +75,9 @@ struct State {
     calls: HashMap<Uuid, PendingCall>,
     waits: HashMap<Uuid, Wait>,
     runs: HashMap<Uuid, Run>,
+    recordings: HashMap<Uuid, Recorder>,
+    // Covers admission before a call/wait enters its own pending registry.
+    recording_admissions: HashMap<Uuid, usize>,
 }
 
 #[derive(Default)]
@@ -239,6 +244,7 @@ impl Runtime {
                     Some(session) => {
                         state.waits.retain(|_, wait| wait.session_id != session_id);
                         state.runs.retain(|_, run| run.session_id != session_id);
+                        state.recordings.remove(&session_id);
                         self.changed.notify_all();
                         Self::interest(&mut state, hub, session.instance_id);
                         Ok(AutomationResult::Detached)
@@ -246,9 +252,19 @@ impl Runtime {
                     None => Err(expired(session_id)),
                 }
             }
-            AutomationCommand::Call { session_id, call } => self
-                .call(hub, session_id, call)
-                .map(|result| AutomationResult::Called { result }),
+            AutomationCommand::Call { session_id, call } => (|| {
+                let ticket = self.record_begin(
+                    session_id,
+                    &AutomationStepOperation::Call { call: call.clone() },
+                )?;
+                let outcome = self.call(hub, session_id, call);
+                self.record_complete(
+                    session_id,
+                    ticket,
+                    outcome.as_ref().map(call_step_value).map_err(Clone::clone),
+                );
+                outcome.map(|result| AutomationResult::Called { result })
+            })(),
             AutomationCommand::Diff {
                 session_id,
                 after,
@@ -288,9 +304,32 @@ impl Runtime {
                 session_id,
                 condition,
                 timeout_ms,
-            } => self
-                .start_wait(hub, session_id, condition, timeout_ms)
-                .map(|wait| AutomationResult::Wait { wait }),
+            } => (|| {
+                let ticket = self.record_begin(
+                    session_id,
+                    &AutomationStepOperation::Wait {
+                        condition: condition.clone(),
+                        timeout_ms,
+                    },
+                )?;
+                match self.start_wait(hub, session_id, condition, timeout_ms) {
+                    Ok(wait) => {
+                        if let Some(ticket) = ticket {
+                            let mut state = self.state.lock();
+                            if let Some(pending) = state.waits.get_mut(&wait.wait_id) {
+                                pending.recording_ticket = Some(ticket);
+                            }
+                            finish_recorded_wait(&mut state, wait.wait_id);
+                        }
+                        self.record_admission_finished(session_id);
+                        Ok(AutomationResult::Wait { wait })
+                    }
+                    Err(error) => {
+                        self.record_complete(session_id, ticket, Err(error.clone()));
+                        Err(error)
+                    }
+                }
+            })(),
             AutomationCommand::WaitResult {
                 session_id,
                 wait_id,
@@ -310,6 +349,91 @@ impl Runtime {
                         )
                     })
             }
+            command @ (AutomationCommand::JobStart { .. }
+            | AutomationCommand::JobResult { .. }
+            | AutomationCommand::JobAbort { .. }
+            | AutomationCommand::ScheduleCreate { .. }
+            | AutomationCommand::ScheduleList
+            | AutomationCommand::ScheduleGet { .. }
+            | AutomationCommand::ScheduleSetEnabled { .. }
+            | AutomationCommand::ScheduleCancel { .. }
+            | AutomationCommand::ScheduleRemove { .. }) => {
+                Ok(backend.handle_automation_jobs(&command))
+            }
+            AutomationCommand::RecordingStart { session_id, name } => {
+                let mut state = self.state.lock();
+                if !state.sessions.contains_key(&session_id) {
+                    Err(expired(session_id))
+                } else if state
+                    .recordings
+                    .get(&session_id)
+                    .is_some_and(|recorder| recorder.blocks_session())
+                    || state
+                        .recording_admissions
+                        .get(&session_id)
+                        .is_some_and(|count| *count > 0)
+                    || state
+                        .calls
+                        .values()
+                        .any(|call| call.session_id == session_id)
+                    || state
+                        .runs
+                        .values()
+                        .any(|run| run.session_id == session_id && is_pending(&run.result.status))
+                    || state.waits.values().any(|wait| {
+                        wait.session_id == session_id && is_pending(&wait.result.status)
+                    })
+                {
+                    Err(AutomationError::new(
+                        "recording_busy",
+                        "finish or cancel existing session work before recording",
+                    ))
+                } else {
+                    Recorder::new(name).map(|recorder| {
+                        let recording = recorder.status();
+                        state.recordings.insert(session_id, recorder);
+                        AutomationResult::Recording { recording }
+                    })
+                }
+            }
+            AutomationCommand::RecordingStatus { session_id }
+            | AutomationCommand::RecordingStop { session_id }
+            | AutomationCommand::RecordingCancel { session_id } => {
+                let mut state = self.state.lock();
+                match state.recordings.get_mut(&session_id) {
+                    None => Err(AutomationError::new(
+                        "recording_missing",
+                        "this session has no recording",
+                    )),
+                    Some(recorder) => match command {
+                        AutomationCommand::RecordingStop { .. } => recorder
+                            .stop()
+                            .map(|replay| AutomationResult::Replay { replay }),
+                        AutomationCommand::RecordingCancel { .. } => {
+                            recorder.cancel();
+                            Ok(AutomationResult::Recording {
+                                recording: recorder.status(),
+                            })
+                        }
+                        _ => Ok(AutomationResult::Recording {
+                            recording: recorder.status(),
+                        }),
+                    },
+                }
+            }
+            AutomationCommand::ReplayStart {
+                session_id,
+                replay,
+                parameters,
+            } => (|| {
+                automation_recording::preflight(&replay, &parameters)?;
+                let scenario = AutomationScenario {
+                    name: replay.name.clone(),
+                    steps: replay.steps.iter().map(|step| step.step.clone()).collect(),
+                };
+                self.start_run_plan(hub, session_id, scenario, Some((replay, parameters)))
+                    .map(|run| AutomationResult::Scenario { run })
+            })(),
             AutomationCommand::ScenarioStart {
                 session_id,
                 scenario,
@@ -340,6 +464,39 @@ impl Runtime {
             self.disconnected(hub, subscriber);
         }
         result.unwrap_or_else(|error| AutomationResult::Error { error })
+    }
+
+    fn record_begin(
+        &self,
+        session_id: Uuid,
+        operation: &AutomationStepOperation,
+    ) -> Result<Option<RecordingTicket>> {
+        let mut state = self.state.lock();
+        let ticket = match state.recordings.get_mut(&session_id) {
+            Some(recorder) if recorder.blocks_session() => Some(recorder.begin(operation)?),
+            _ => None,
+        };
+        *state.recording_admissions.entry(session_id).or_default() += 1;
+        Ok(ticket)
+    }
+
+    fn record_admission_finished(&self, session_id: Uuid) {
+        finish_record_admission(&mut self.state.lock(), session_id);
+    }
+
+    fn record_complete(
+        &self,
+        session_id: Uuid,
+        ticket: Option<RecordingTicket>,
+        outcome: Result<Value>,
+    ) {
+        let mut state = self.state.lock();
+        finish_record_admission(&mut state, session_id);
+        if let Some(ticket) = ticket
+            && let Some(recorder) = state.recordings.get_mut(&session_id)
+        {
+            let _ = recorder.complete(ticket, outcome);
+        }
     }
 
     fn attach(&self, hub: &Hub, instance_id: Uuid, subscriber: u64) -> Result<AutomationResult> {
@@ -706,7 +863,15 @@ impl Runtime {
                     state,
                     hub,
                     session_id,
-                    AutomationStream::Ui,
+                    if state
+                        .executors
+                        .get(&instance_id)
+                        .is_some_and(|executor| executor.instance.headless)
+                    {
+                        AutomationStream::Model
+                    } else {
+                        AutomationStream::Ui
+                    },
                     delta(&execution.observation),
                 );
                 self.observe_waits(state, hub, instance_id, &execution.observation, None, None);
@@ -967,6 +1132,22 @@ impl Runtime {
                 .get(&session_id)
                 .ok_or_else(|| expired(session_id))?;
             let instance_id = session.instance_id;
+            if state
+                .executors
+                .get(&instance_id)
+                .is_some_and(|executor| executor.instance.headless)
+                && !matches!(
+                    condition,
+                    AutomationCondition::State { .. }
+                        | AutomationCondition::StateContains { .. }
+                        | AutomationCondition::Diagnostic { .. }
+                )
+            {
+                return Err(AutomationError::new(
+                    "unsupported_headless",
+                    "headless executors support backend state and diagnostic waits, not UI conditions",
+                ));
+            }
             let cursor = AutomationCursor {
                 epoch: hub.epoch,
                 sequence: session.sequence,
@@ -1012,6 +1193,7 @@ impl Runtime {
                     baseline: Value::Null,
                     observation: AutomationObservation::default(),
                     initial_observation_pending: true,
+                    recording_ticket: None,
                 },
             );
             Self::interest(&mut state, hub, instance_id);
@@ -1020,7 +1202,19 @@ impl Runtime {
         // Every wait needs an initial state/tree for failure evidence, even
         // when only a diagnostic event can satisfy its condition. Register
         // first; subsequent observations are driven by events, never polls.
-        let sections = wait_sections(&condition);
+        let headless = {
+            let state = self.state.lock();
+            state
+                .sessions
+                .get(&session_id)
+                .and_then(|session| state.executors.get(&session.instance_id))
+                .is_some_and(|executor| executor.instance.headless)
+        };
+        let sections = if headless {
+            vec![wait_model_section(&condition).unwrap_or_else(|| "state".into())]
+        } else {
+            wait_sections(&condition)
+        };
         let runtime = self.clone();
         let worker_hub = hub.clone();
         let wait_id = wait.wait_id;
@@ -1197,6 +1391,10 @@ impl Runtime {
             }
         }
         if completed {
+            let ids: Vec<_> = state.waits.keys().copied().collect();
+            for id in ids {
+                finish_recorded_wait(state, id);
+            }
             Self::interest(state, hub, instance_id);
             self.changed.notify_all();
         }
@@ -1240,6 +1438,7 @@ impl Runtime {
         if let Some(instance_id) = instance_id {
             Self::interest(state, hub, instance_id);
         }
+        finish_recorded_wait(state, wait_id);
         self.changed.notify_all();
     }
 
@@ -1279,6 +1478,7 @@ impl Runtime {
             if let Some(session) = state.sessions.remove(&id) {
                 state.waits.retain(|_, w| w.session_id != id);
                 state.runs.retain(|_, r| r.session_id != id);
+                state.recordings.remove(&id);
                 Self::interest(&mut state, hub, session.instance_id);
             }
         }
@@ -1289,6 +1489,16 @@ impl Runtime {
         hub: &Arc<Hub>,
         session_id: Uuid,
         scenario: AutomationScenario,
+    ) -> Result<AutomationRun> {
+        self.start_run_plan(hub, session_id, scenario, None)
+    }
+
+    fn start_run_plan(
+        self: &Arc<Self>,
+        hub: &Arc<Hub>,
+        session_id: Uuid,
+        scenario: AutomationScenario,
+        replay: Option<(AutomationReplay, BTreeMap<String, Value>)>,
     ) -> Result<AutomationRun> {
         if scenario.steps.is_empty() || scenario.steps.len() > MAX_AUTOMATION_STEPS {
             return Err(AutomationError::new(
@@ -1304,6 +1514,16 @@ impl Runtime {
         }
         let run = {
             let mut state = self.state.lock();
+            if state
+                .recordings
+                .get(&session_id)
+                .is_some_and(Recorder::blocks_session)
+            {
+                return Err(AutomationError::new(
+                    "recording_busy",
+                    "stop or cancel recording before starting a scenario",
+                ));
+            }
             let session = state
                 .sessions
                 .get(&session_id)
@@ -1359,7 +1579,9 @@ impl Runtime {
         let run_id = run.run_id;
         if let Err(error) = std::thread::Builder::new()
             .name("waku-automation-scenario".into())
-            .spawn(move || runtime.run_steps(&worker_hub, session_id, run_id, scenario.steps))
+            .spawn(move || {
+                runtime.run_steps(&worker_hub, session_id, run_id, scenario.steps, replay)
+            })
         {
             let mut state = self.state.lock();
             if let Some(run) = state.runs.get_mut(&run_id) {
@@ -1382,8 +1604,10 @@ impl Runtime {
         session_id: Uuid,
         run_id: Uuid,
         steps: Vec<AutomationStep>,
+        replay: Option<(AutomationReplay, BTreeMap<String, Value>)>,
     ) {
-        for step in steps {
+        let mut prior_results = vec![];
+        for (index, step) in steps.into_iter().enumerate() {
             if !self
                 .state
                 .lock()
@@ -1393,7 +1617,13 @@ impl Runtime {
             {
                 return;
             }
-            let outcome: Result<Value> = match step.operation {
+            let resolved = match &replay {
+                Some((replay, parameters)) => {
+                    automation_recording::resolve_step(replay, index, parameters, &prior_results)
+                }
+                None => Ok(step.clone()),
+            };
+            let outcome: Result<Value> = resolved.and_then(|resolved| match resolved.operation {
                 AutomationStepOperation::Call { call } => self.call_for_run(hub, session_id, call, Some(run_id)).map(|result| json!({"cursor":result.cursor,"value":result.execution.value,"treeDiff":result.execution.observation.tree_diff,"stateDiff":result.execution.observation.state_diff})),
                 AutomationStepOperation::Wait { condition, timeout_ms } => {
                     match self.start_wait(hub, session_id, condition, timeout_ms) {
@@ -1406,10 +1636,10 @@ impl Runtime {
                                 if let Some(instance_id) = state.sessions.get(&session_id).map(|s| s.instance_id) {
                                     Self::interest(&mut state, hub, instance_id);
                                 }
-                                return;
+                                return Err(AutomationError::new("run_aborted", "scenario was aborted"));
                             }
                             loop {
-                                if !state.runs.get(&run_id).is_some_and(|r| is_pending(&r.result.status)) { return; }
+                                if !state.runs.get(&run_id).is_some_and(|r| is_pending(&r.result.status)) { return Err(AutomationError::new("run_aborted", "scenario was aborted")); }
                                 let Some(wait) = state.waits.get(&wait.wait_id) else { break Err(AutomationError::new("wait_expired", "scenario wait was removed")); };
                                 if !is_pending(&wait.result.status) {
                                     break match &wait.result.error {
@@ -1422,7 +1652,10 @@ impl Runtime {
                         }
                     }
                 }
-            };
+            });
+            if let Ok(value) = &outcome {
+                prior_results.push(value.clone());
+            }
             let mut state = self.state.lock();
             let cursor = state.sessions.get(&session_id).map(|s| AutomationCursor {
                 epoch: hub.epoch,
@@ -1539,6 +1772,43 @@ impl Runtime {
         Self::publish_run(&mut state, hub, run_id);
         self.changed.notify_all();
         Ok(result)
+    }
+}
+
+fn finish_record_admission(state: &mut State, session_id: Uuid) {
+    if let Some(count) = state.recording_admissions.get_mut(&session_id) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            state.recording_admissions.remove(&session_id);
+        }
+    }
+}
+
+fn call_step_value(result: &AutomationCallResult) -> Value {
+    json!({"cursor":result.cursor,"value":result.execution.value,"treeDiff":result.execution.observation.tree_diff,"stateDiff":result.execution.observation.state_diff})
+}
+
+fn finish_recorded_wait(state: &mut State, wait_id: Uuid) {
+    let Some(wait) = state
+        .waits
+        .get_mut(&wait_id)
+        .filter(|wait| !is_pending(&wait.result.status))
+    else {
+        return;
+    };
+    let Some(ticket) = wait.recording_ticket.take() else {
+        return;
+    };
+    let outcome = match &wait.result.error {
+        Some(error) => Err(error.clone()),
+        None if matches!(wait.result.status, AutomationStatus::Succeeded) => Ok(Value::Null),
+        None => Err(AutomationError::new(
+            "wait_aborted",
+            "recorded wait was aborted",
+        )),
+    };
+    if let Some(recorder) = state.recordings.get_mut(&wait.session_id) {
+        let _ = recorder.complete(ticket, outcome);
     }
 }
 

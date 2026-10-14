@@ -24,6 +24,9 @@ pub struct AutomationInstance {
     pub executor_connected: bool,
     #[serde(default)]
     pub scratch: bool,
+    /// True only for the daemon-only executor; UI operations are unavailable.
+    #[serde(default)]
+    pub headless: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, TS)]
@@ -75,6 +78,8 @@ pub enum AutomationCommand {
     ScratchCreate {
         name: Option<String>,
         seed: AutomationScratchSeed,
+        #[serde(default)]
+        headless: bool,
     },
     ScratchRemove {
         instance_id: Uuid,
@@ -110,6 +115,50 @@ pub enum AutomationCommand {
     WaitResult {
         session_id: Uuid,
         wait_id: Uuid,
+    },
+    RecordingStart {
+        session_id: Uuid,
+        name: String,
+    },
+    RecordingStatus {
+        session_id: Uuid,
+    },
+    RecordingStop {
+        session_id: Uuid,
+    },
+    RecordingCancel {
+        session_id: Uuid,
+    },
+    ReplayStart {
+        session_id: Uuid,
+        replay: crate::AutomationReplay,
+        parameters: std::collections::BTreeMap<String, Value>,
+    },
+    JobStart {
+        job: crate::AutomationJob,
+    },
+    JobResult {
+        run_id: Uuid,
+    },
+    JobAbort {
+        run_id: Uuid,
+    },
+    ScheduleCreate {
+        definition: crate::AutomationScheduleDefinition,
+    },
+    ScheduleList,
+    ScheduleGet {
+        schedule_id: Uuid,
+    },
+    ScheduleSetEnabled {
+        schedule_id: Uuid,
+        enabled: bool,
+    },
+    ScheduleCancel {
+        schedule_id: Uuid,
+    },
+    ScheduleRemove {
+        schedule_id: Uuid,
     },
     ScenarioStart {
         session_id: Uuid,
@@ -420,6 +469,24 @@ pub enum AutomationResult {
     Scenario {
         run: AutomationRun,
     },
+    Recording {
+        recording: crate::AutomationRecording,
+    },
+    Job {
+        run: crate::AutomationJobRun,
+    },
+    Schedule {
+        schedule: crate::AutomationSchedule,
+    },
+    Schedules {
+        schedules: Vec<crate::AutomationSchedule>,
+    },
+    ScheduleRemoved {
+        schedule_id: Uuid,
+    },
+    Replay {
+        replay: crate::AutomationReplay,
+    },
     Error {
         error: AutomationError,
     },
@@ -455,6 +522,7 @@ mod tests {
             version: "test".into(),
             executor_connected: true,
             scratch: false,
+            headless: false,
         };
         let commands = vec![
             AutomationCommand::RegisterExecutor { instance },
@@ -462,6 +530,7 @@ mod tests {
             AutomationCommand::ScratchCreate {
                 name: Some("isolated".into()),
                 seed: AutomationScratchSeed::default(),
+                headless: false,
             },
             AutomationCommand::ScratchRemove { instance_id },
             AutomationCommand::Attach { instance_id },

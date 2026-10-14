@@ -9,6 +9,9 @@ use waku_protocol::{DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_VERSION};
 
 fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse(std::env::args().skip(1))?;
+    if arguments.automation_headless && !cfg!(debug_assertions) {
+        bail!("headless automation requires a debug build");
+    }
     let token =
         std::env::var(DAEMON_TOKEN_ENV).context("Waku daemon authentication token is missing")?;
     // The bearer capability belongs only to this server process. Remove it
@@ -57,17 +60,34 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    waku_core::serve(
+    let backend = Arc::new(waku_core::daemon::WakuBackend::new(settings, task_store)?);
+    let executor = if arguments.automation_headless {
+        Some(waku_core::automation_headless_host::start(
+            backend.clone(),
+            address.to_string(),
+            token.clone(),
+            env!("WAKU_DAEMON_BUILD_ID").into(),
+            shutdown.clone(),
+        )?)
+    } else {
+        None
+    };
+    let result = waku_core::serve(
         listener,
         token,
-        Arc::new(waku_core::daemon::WakuBackend::new(settings, task_store)?),
-        shutdown,
+        backend,
+        shutdown.clone(),
         waku_core::ServerOptions {
             allowed_origins: arguments.allowed_origins.into_iter().collect(),
             allow_shutdown: arguments.parent_pid.is_some(),
             diagnostics_directory,
         },
-    )
+    );
+    shutdown.store(true, Ordering::Release);
+    if let Some(executor) = executor {
+        let _ = executor.join();
+    }
+    result
 }
 
 fn ensure_bind_allowed(address: SocketAddr, allow_non_loopback: bool) -> anyhow::Result<()> {
@@ -84,6 +104,7 @@ struct Arguments {
     parent_pid: Option<u32>,
     allowed_origins: Vec<String>,
     allow_non_loopback: bool,
+    automation_headless: bool,
 }
 
 impl Arguments {
@@ -92,6 +113,7 @@ impl Arguments {
         let mut parent_pid = None;
         let mut allowed_origins = Vec::new();
         let mut allow_non_loopback = false;
+        let mut automation_headless = false;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -116,12 +138,15 @@ impl Arguments {
                         .ok_or_else(|| anyhow!("--allow-origin requires an origin"))?;
                     allowed_origins.push(origin);
                 }
+                "--automation-headless" => {
+                    automation_headless = true;
+                }
                 "--allow-non-loopback" => {
                     allow_non_loopback = true;
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]...",
+                        "usage: {} [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--automation-headless]",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -134,6 +159,7 @@ impl Arguments {
             parent_pid,
             allowed_origins,
             allow_non_loopback,
+            automation_headless,
         })
     }
 }

@@ -7,7 +7,7 @@ import { parseArgs } from "node:util";
 import { WakuClient, WakuConnectionError } from "../packages/waku-client/src/client";
 import type {
   AutomationCall, AutomationCommand, AutomationCondition, AutomationCursor,
-  AutomationInstance, AutomationResult, AutomationScenario, AutomationSession, TranscriptQuery,
+  AutomationInstance, AutomationResult, AutomationScenario, AutomationSession, AutomationReplay, AutomationJob, AutomationJobRun, AutomationScheduleDefinition, TranscriptQuery,
 } from "../packages/waku-client/src/generated";
 
 type Discovery = {
@@ -56,12 +56,23 @@ Commands:
                                  resume a persistent session from a saved cursor
   detach --session ID            release a persistent session
   diff --session ID --after JSON [--streams ui,model,diagnostic]
-  scratch create [--seed seed.json] [--name NAME]
+  scratch create [--seed seed.json] [--name NAME] [--headless]
                                  start an isolated disposable app (empty by default)
   scratch remove <instanceId>     stop and remove only that scratch instance
+  record start <name>             record supported calls on the returned --session
+  record status|stop|cancel --session ID
+                                 stop prints a portable replay JSON document
+  replay <file.json> [--parameters inputs.json]
+                                 start replay with explicit required input values
   scenario start <file.json>      start a daemon-owned run; prints sessionId and runId
   scenario status <runId> --session ID
   scenario abort <runId> --session ID
+  job start|run <job.json>         daemon-owned ordered suite on fresh scratch targets
+  job status|wait|abort <runId>    inspect, await, or cancel an unattended suite
+  schedule create <schedule.json> persist one-shot or interval schedule
+  schedule list|status <id>       inspect durable next/last/active execution state
+  schedule enable|disable|cancel|remove <id>
+                                 disable affects future runs; cancel also stops active work
   raw '<json>'                   send a shared AutomationCommand (legacy: P0 request)
 
 Issue verbs: openTask {id}, newTask {title?}; no title opens the New issue dialog.
@@ -86,6 +97,7 @@ export function parseArguments(args: string[]) {
       text: { type: "string" }, state: { type: "string" }, "state-contains": { type: "string" },
       timeout: { type: "string" }, filter: { type: "string" }, conversation: { type: "string" }, turn: { type: "string" },
       frame: { type: "string" }, diagnostic: { type: "string" }, "after-build": { type: "string" },
+      headless: { type: "boolean" }, parameters: { type: "string" },
       name: { type: "string" }, seed: { type: "string" }, sections: { type: "string" }, after: { type: "string" }, streams: { type: "string" },
     },
   });
@@ -409,7 +421,7 @@ async function main() {
         if (operation === "create") {
           if (args[1]) throw new Error("scratch create takes its seed file with --seed FILE");
           const seed = options.seed ? JSON.parse(readFileSync(options.seed, "utf8")) : { projects: [], sessions: [] };
-          output(await active.execute({ type: "scratchCreate", name: options.name ?? null, seed }));
+          output(await active.execute({ type: "scratchCreate", name: options.name ?? null, seed, headless: options.headless ?? false }));
         } else if (operation === "remove") {
           output(await active.execute({ type: "scratchRemove", instanceId: required(args[1], "a scratch instanceId") }));
         } else throw new Error("scratch needs create or remove");
@@ -439,6 +451,81 @@ async function main() {
         const streams = (options.streams ?? "ui,model,diagnostic").split(",");
         if (!streams.every(stream => ["ui", "model", "diagnostic"].includes(stream))) throw new Error("--streams accepts ui,model,diagnostic");
         output(await active.execute({ type: "diff", sessionId: session.sessionId, after, streams: streams as ("ui" | "model" | "diagnostic")[] }));
+        break;
+      }
+      case "job": {
+        const active = native();
+        if (options.session || options.instance || options.checkout) throw new Error("job commands own fresh scratch targets; omit instance/session selectors");
+        const operation = required(args[0], "start, run, status, wait, or abort");
+        if (!["start", "run", "status", "wait", "abort"].includes(operation)) throw new Error("job needs start, run, status, wait, or abort");
+        // Validate local options before a start can create background work.
+        const waitTimeout = operation === "run" || operation === "wait"
+          ? numberOption(options.timeout, 1_850_000) : undefined;
+        let result: AutomationResult;
+        if (operation === "start" || operation === "run") {
+          const job: AutomationJob = JSON.parse(readFileSync(required(args[1], "a job JSON file"), "utf8"));
+          result = await active.execute({ type: "jobStart", job });
+        } else result = await active.execute({ type: operation === "abort" ? "jobAbort" : "jobResult", runId: required(args[1], "a job runId") });
+        if (result.type !== "job") throw new Error("unexpected job response");
+        let run: AutomationJobRun = result.run;
+        if (operation === "run" || operation === "wait") {
+          const deadline = Date.now() + waitTimeout!;
+          while (run.status === "pending") {
+            if (Date.now() >= deadline) throw new CliFailure({ code: "client_wait_timeout", message: "CLI wait ended; the daemon-owned job is still running", run });
+            await Bun.sleep(Math.min(100, Math.max(0, deadline - Date.now())));
+            if (Date.now() >= deadline) continue;
+            const next = await active.execute({ type: "jobResult", runId: run.runId }, deadline - Date.now());
+            if (next.type !== "job") throw new Error("unexpected job response");
+            run = next.run;
+          }
+        }
+        if (run.status === "failed" || run.status === "aborted") throw new CliFailure({ ...(run.error ?? { code: "job_failed", message: `job ${run.status}` }), run });
+        output(run);
+        break;
+      }
+      case "schedule": {
+        const active = native();
+        if (options.session || options.instance || options.checkout) throw new Error("schedule commands do not use instance/session selectors");
+        const operation = required(args[0], "create, list, status, enable, disable, cancel, or remove");
+        let request: AutomationCommand;
+        if (operation === "create") {
+          const definition: AutomationScheduleDefinition = JSON.parse(readFileSync(required(args[1], "a schedule JSON file"), "utf8"));
+          request = { type: "scheduleCreate", definition };
+        } else if (operation === "list") request = { type: "scheduleList" };
+        else {
+          const scheduleId = required(args[1], "a schedule id");
+          if (operation === "status") request = { type: "scheduleGet", scheduleId };
+          else if (operation === "enable" || operation === "disable") request = { type: "scheduleSetEnabled", scheduleId, enabled: operation === "enable" };
+          else if (operation === "cancel") request = { type: "scheduleCancel", scheduleId };
+          else if (operation === "remove") request = { type: "scheduleRemove", scheduleId };
+          else throw new Error("schedule needs create, list, status, enable, disable, cancel, or remove");
+        }
+        const result = await active.execute(request);
+        output(result.type === "schedule" ? result.schedule : result.type === "schedules" ? result.schedules : result);
+        break;
+      }
+      case "record": {
+        const active = native();
+        const operation = required(args[0], "start, status, stop, or cancel");
+        if (!["start", "status", "stop", "cancel"].includes(operation)) throw new Error("record needs start, status, stop, or cancel");
+        if (operation !== "start") required(options.session, "--session ID");
+        const session = await active.attach(true);
+        const result = await active.execute(operation === "start"
+          ? { type: "recordingStart", sessionId: session.sessionId, name: required(args[1], "a recording name") }
+          : { type: operation === "status" ? "recordingStatus" : operation === "stop" ? "recordingStop" : "recordingCancel", sessionId: session.sessionId });
+        if (result.type === "replay") output(result.replay);
+        else if (result.type === "recording") output({ sessionId: session.sessionId, ...result.recording });
+        else throw new Error("unexpected recording response");
+        break;
+      }
+      case "replay": {
+        const active = native();
+        const replay: AutomationReplay = JSON.parse(readFileSync(required(args[0], "a replay JSON file"), "utf8"));
+        const parameters = options.parameters ? JSON.parse(readFileSync(options.parameters, "utf8")) : {};
+        const session = await active.attach(true);
+        const result = await active.execute({ type: "replayStart", sessionId: session.sessionId, replay, parameters });
+        if (result.type !== "scenario") throw new Error("unexpected replay response");
+        output({ sessionId: session.sessionId, ...result.run });
         break;
       }
       case "scenario": {
@@ -472,7 +559,11 @@ async function main() {
         break;
       }
       case "tree": case "state": case "snap": case "inspect": {
-        const { value } = await perform({ type: "snapshot", sections: snapshotSections(command, args[0], options.sections) });
+        let sections = snapshotSections(command, args[0], options.sections);
+        if (daemon && !options.sections && (command === "inspect" || (command === "state" && !args[0])) && (await daemon.attach()).instance.headless) {
+          sections = ["session", "sessions", "projects", "selection", "draft"];
+        }
+        const { value } = await perform({ type: "snapshot", sections });
         if (command === "snap" || command === "inspect") { output(value); break; }
         if (command === "state") { output(pointerValue(value.state, args[0] ?? "")); break; }
         const nodes: any[] = (value?.tree?.nodes ?? []).filter((node: any) => node.element_id);
