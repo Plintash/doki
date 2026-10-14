@@ -47,34 +47,48 @@ use crate::ui::tooltip::Tooltip;
 
 mod math_text;
 
+#[cfg(test)]
+mod selection_tests;
+
 /// Selection geometry: the laid-out text handle for one painted element.
 #[derive(Clone)]
 pub enum TextGeometry {
-    Text(TextLayout),
-    Math(math_text::Geometry),
+    Text(TextLayout, Bounds<Pixels>),
+    Math(math_text::Geometry, Bounds<Pixels>),
 }
 
 impl TextGeometry {
-    /// The element's painted bounds, used to place annotation badges against
+    /// The element's laid-out bounds, used to place annotation badges against
     /// the text column's own right edge.
     pub fn bounds(&self) -> Bounds<Pixels> {
         match self {
-            Self::Text(layout) => layout.bounds(),
-            Self::Math(layout) => layout.bounds(),
+            Self::Text(layout, _) => layout.bounds(),
+            Self::Math(layout, _) => layout.bounds(),
         }
+    }
+
+    /// Only painted text can own a pointer hit. A clipped prompt still lays
+    /// out its full body; those hidden bounds can overlap the reply below it.
+    /// Keep the full geometry for ranges/copy, but honor its paint-time mask
+    /// when finding either end of a mouse selection.
+    fn hit_bounds(&self) -> Bounds<Pixels> {
+        let mask = match self {
+            Self::Text(_, mask) | Self::Math(_, mask) => mask,
+        };
+        self.bounds().intersect(mask)
     }
 
     fn index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
         match self {
-            Self::Text(layout) => layout.index_for_position(position),
-            Self::Math(layout) => layout.index_for_position(position),
+            Self::Text(layout, _) => layout.index_for_position(position),
+            Self::Math(layout, _) => layout.index_for_position(position),
         }
     }
 
     fn is_missing(&self) -> bool {
         match self {
-            Self::Text(layout) => layout_missing(layout),
-            Self::Math(layout) => layout.is_missing(),
+            Self::Text(layout, _) => layout_missing(layout),
+            Self::Math(layout, _) => layout.is_missing(),
         }
     }
 }
@@ -1155,7 +1169,7 @@ fn text_element_with_selection(
                 key: key.clone(),
                 text: Rc::from(text.as_ref()),
                 block_break,
-                geometry: TextGeometry::Text(layout.clone()),
+                geometry: TextGeometry::Text(layout.clone(), window.content_mask().bounds),
             });
         }
     })
@@ -1347,8 +1361,8 @@ fn range_rects(
 /// wrapped line rather than stopping at the top of a long message.
 pub fn text_range_bounds(layout: &TextGeometry, range: &Range<usize>) -> Vec<Bounds<Pixels>> {
     match layout {
-        TextGeometry::Text(layout) => range_rects(layout, range, 0.0, 0.0),
-        TextGeometry::Math(layout) => layout.range_rects(range),
+        TextGeometry::Text(layout, _) => range_rects(layout, range, 0.0, 0.0),
+        TextGeometry::Math(layout, _) => layout.range_rects(range),
     }
 }
 
@@ -1369,7 +1383,10 @@ fn registry_point(
         if entry.geometry.is_missing() {
             continue;
         }
-        let bounds = entry.geometry.bounds();
+        let bounds = entry.geometry.hit_bounds();
+        if bounds.is_empty() {
+            continue;
+        }
         let distance = if position.y < bounds.top() {
             f32::from(bounds.top() - position.y)
         } else if position.y > bounds.bottom() {
@@ -1385,13 +1402,60 @@ fn registry_point(
         }
     }
     let (index, _) = best?;
-    let offset = match registry.entries()[index]
-        .geometry
-        .index_for_position(position)
-    {
+    Some((index, registry_offset(&registry.entries()[index], position)))
+}
+
+/// Resolve against the visible part of one entry without changing its full
+/// range geometry. Shared by mouse-down and drag, including exact clip edges.
+fn registry_offset(entry: &RegisteredText<TextGeometry>, position: Point<Pixels>) -> usize {
+    let geometry = &entry.geometry;
+    let visible = geometry.hit_bounds();
+    let bounds = geometry.bounds();
+    // Preserve the ordinary gutter behavior: above/below a complete element
+    // means its beginning/end, independent of horizontal pointer position.
+    if position.y >= bounds.bottom() && visible.bottom() == bounds.bottom() {
+        return entry.text.len();
+    }
+    let mut position = point(
+        position.x.clamp(visible.left(), visible.right()),
+        position.y,
+    );
+    // Only a genuinely clipped edge limits the pointer to a painted row.
+    // Bottom is exclusive: at an exact wrap boundary GPUI would otherwise
+    // resolve into the first hidden row (or byte zero below the final row).
+    if position.y <= visible.top() && visible.top() > bounds.top() {
+        let x = if position.y < visible.top() {
+            visible.left()
+        } else {
+            position.x
+        };
+        position = point(
+            x,
+            visible.top() + clip_edge_inset(visible.top(), bounds.top(), visible.size.height),
+        );
+    } else if position.y >= visible.bottom() && visible.bottom() < bounds.bottom() {
+        position = point(
+            visible.right(),
+            visible.bottom() - clip_edge_inset(visible.bottom(), bounds.top(), visible.size.height),
+        );
+    }
+    match geometry.index_for_position(position) {
         Ok(offset) | Err(offset) => offset,
-    };
-    Some((index, offset))
+    }
+}
+
+/// An interior sample must survive conversion from window to layout space.
+/// A one-ULP nudge of the window coordinate can disappear when subtracting a
+/// large negative scroll origin, so account for both floating-point scales.
+fn clip_edge_inset(edge: Pixels, origin: Pixels, visible_height: Pixels) -> Pixels {
+    let edge = f32::from(edge);
+    let origin = f32::from(origin);
+    let scale = edge
+        .abs()
+        .max(origin.abs())
+        .max((edge - origin).abs())
+        .max(1.0);
+    px((4.0 * f32::EPSILON * scale).min(f32::from(visible_height) / 2.0))
 }
 
 /// One end of the current selection: where it sits in document order (registry
@@ -1440,7 +1504,9 @@ pub fn install_selection_input(window: &mut Window, state: &TranscriptSelection)
             }
             let registry = state.registry.borrow();
             let hit = registry.entries().iter().enumerate().find(|(_, entry)| {
-                !entry.geometry.is_missing() && entry.geometry.bounds().contains(&event.position)
+                !entry.geometry.is_missing()
+                    && !entry.geometry.hit_bounds().is_empty()
+                    && entry.geometry.hit_bounds().contains(&event.position)
             });
             let mut selection = state.selection.borrow_mut();
             // Shift-click grows the selection from the end the click is beyond:
@@ -1473,9 +1539,7 @@ pub fn install_selection_input(window: &mut Window, state: &TranscriptSelection)
             }
             match hit {
                 Some((_, entry)) => {
-                    let offset = match entry.geometry.index_for_position(event.position) {
-                        Ok(offset) | Err(offset) => offset,
-                    };
+                    let offset = registry_offset(entry, event.position);
                     match event.click_count {
                         2 => selection.begin_with_span(
                             entry.key.clone(),

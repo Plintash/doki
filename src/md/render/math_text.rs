@@ -597,7 +597,7 @@ impl Element for MathText {
             key: self.key.clone(),
             text: Rc::from(self.flat.text.as_ref()),
             block_break: self.block_break,
-            geometry: TextGeometry::Math(self.geometry.clone()),
+            geometry: TextGeometry::Math(self.geometry.clone(), window.content_mask().bounds),
         });
     }
 }
@@ -869,7 +869,7 @@ mod tests {
                     .borrow()
                     .entries()
                     .iter()
-                    .all(|entry| matches!(entry.geometry, TextGeometry::Text(_)))
+                    .all(|entry| matches!(entry.geometry, TextGeometry::Text(..)))
             );
             for data in view
                 .markdown
@@ -896,7 +896,7 @@ mod tests {
                     .borrow()
                     .entries()
                     .iter()
-                    .filter(|entry| matches!(entry.geometry, TextGeometry::Math(_)))
+                    .filter(|entry| matches!(entry.geometry, TextGeometry::Math(..)))
                     .count(),
                 2
             );
@@ -913,7 +913,7 @@ mod tests {
                     .borrow()
                     .entries()
                     .iter()
-                    .all(|entry| matches!(entry.geometry, TextGeometry::Text(_)))
+                    .all(|entry| matches!(entry.geometry, TextGeometry::Text(..)))
             );
         });
     }
@@ -934,7 +934,7 @@ mod tests {
         cx.run_until_parked();
         let formula_point = view.read_with(cx, |view, _| {
             let registry = view.selection.registry.borrow();
-            let TextGeometry::Math(geometry) = &registry.entries()[0].geometry else {
+            let TextGeometry::Math(geometry, _) = &registry.entries()[0].geometry else {
                 panic!()
             };
             let frame = geometry.0.borrow();
