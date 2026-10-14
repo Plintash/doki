@@ -6,8 +6,15 @@ and keeps projects, sessions, transcripts on your machine.
 
 ## Install
 
-Doki does not publish its own installers yet, so it is built from source. You
-need [Rust 1.96 or newer](https://www.rust-lang.org/tools/install) and
+Apple Silicon macOS preview builds are produced by the
+[macOS preview workflow](https://github.com/Plintash/doki/actions/workflows/preview.yml).
+Download the app zip from the newest **Main preview** in
+[Releases](https://github.com/Plintash/doki/releases), or a successful PR run's
+Artifacts section (retained for 14 days). These are ad-hoc signed, unnotarized
+previews, not stable installers. Read [installation and data-safety notes](docs/preview-install.txt).
+The first download appears after the workflow successfully runs.
+
+To build from source, you need [Rust 1.96 or newer](https://www.rust-lang.org/tools/install) and
 [Bun](https://bun.sh/):
 
 ```sh
