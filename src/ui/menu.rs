@@ -1147,16 +1147,25 @@ impl RenderOnce for MenuCard {
                             (first.min(index), last.max(index))
                         }),
                     ));
-                    render_menu_item(
-                        items[index].clone(),
-                        index,
-                        highlighted == Some(index) || active_submenu == Some(index),
-                        false,
-                        &theme,
-                        handle.clone(),
-                        window,
-                        cx,
-                    )
+                    // `list` lays out each item as a root. Give the shared
+                    // composer-menu row the same stretching column parent as
+                    // an ordinary menu; otherwise it shrinks to its label and
+                    // its root margins are lost when the list positions it.
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .child(render_menu_item(
+                            items[index].clone(),
+                            index,
+                            highlighted == Some(index) || active_submenu == Some(index),
+                            false,
+                            &theme,
+                            handle.clone(),
+                            window,
+                            cx,
+                        ))
+                        .into_any_element()
                 })
                 .w_full()
                 .h(px(collection_height.unwrap_or(0.0))),
@@ -2143,6 +2152,113 @@ mod tests {
             Some(0),
             "visible rows keep native click handlers"
         );
+        assert!(!handle.is_open());
+    }
+
+    struct CollectionGeometryHarness {
+        handle: ContextMenuHandle,
+        activated: Rc<Cell<bool>>,
+    }
+
+    impl Render for CollectionGeometryHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let activated = self.activated.clone();
+            dropdown_menu_list(
+                div().id("geometry-trigger").w(px(120.0)).h(px(32.0)),
+                "geometry-dropdown",
+                &self.handle,
+                MenuAlign::BelowLeft,
+                move |_| {
+                    let activated = activated.clone();
+                    vec![
+                        MenuItem::Header("Workspaces".into()),
+                        MenuItem::new("Local", move |_, _| activated.set(true))
+                            .semantic_id("geometry-short")
+                            .selected(true),
+                        MenuItem::Separator,
+                        MenuItem::new(
+                            "feature/a-very-long-workspace-name-that-must-truncate-without-moving-the-checkmark",
+                            |_, _| {},
+                        )
+                        .semantic_id("geometry-long")
+                        .icon("icons/git-branch.svg")
+                        .selected(true),
+                    ]
+                },
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn collection_rows_fill_the_card_with_composer_menu_insets(cx: &mut TestAppContext) {
+        let handle = cx.update(ContextMenuHandle::new);
+        let activated = Rc::new(Cell::new(false));
+        let (_, cx) = cx.add_window_view(|window, _| {
+            window.set_a11y_automation(true);
+            window.set_rem_size(px(waku_client::persistence::DEFAULT_UI_FONT_SIZE));
+            CollectionGeometryHarness {
+                handle: handle.clone(),
+                activated: activated.clone(),
+            }
+        });
+        cx.run_until_parked();
+        cx.simulate_mouse_down(
+            point(px(10.0), px(10.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        let viewport = handle
+            .state
+            .borrow()
+            .collection
+            .as_ref()
+            .unwrap()
+            .list
+            .viewport_bounds();
+        let raw = cx
+            .update(|window, _| window.a11y_automation_snapshot())
+            .unwrap();
+        let tree: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for (id, top) in [
+            ("geometry-short", 22.0),
+            ("geometry-long", 22.0 + 26.0 + 9.0),
+        ] {
+            let node = tree["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["element_id"] == id)
+                .unwrap_or_else(|| panic!("missing {id}: {raw}"));
+            let bounds = &node["bounds"];
+            assert_eq!(
+                bounds["y"].as_f64(),
+                Some(f64::from(f32::from(viewport.top()) + top)),
+                "{id}: header and separator spacing must match the ordinary menu: {raw}"
+            );
+            assert_eq!(
+                bounds["x"].as_f64(),
+                Some(f64::from(f32::from(viewport.left()) + 4.0)),
+                "{id}: {raw}"
+            );
+            assert_eq!(
+                bounds["width"].as_f64(),
+                Some(f64::from(f32::from(viewport.size.width) - 8.0)),
+                "{id}: {raw}"
+            );
+            assert_eq!(bounds["height"].as_f64(), Some(26.0), "{id}: {raw}");
+        }
+        // The full-width treatment is also the target: clicking the blank
+        // trailing area of a short row must select it, not dismiss the menu.
+        cx.simulate_mouse_down(
+            point(
+                viewport.right() - px(10.0),
+                viewport.top() + px(22.0 + 13.0),
+            ),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        assert!(activated.get());
         assert!(!handle.is_open());
     }
 
