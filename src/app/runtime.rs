@@ -2149,33 +2149,6 @@ impl Waku {
         cx.notify();
     }
 
-    /// Composer Enter clears the field after emitting its event. A response
-    /// fork temporarily owns the source provider, so restore a keyboard
-    /// submission on the next task turn instead of racing it against the fork.
-    pub(super) fn defer_restore_composer_after_fork(
-        &self,
-        session_id: Uuid,
-        prompt: String,
-        cx: &mut Context<Self>,
-    ) {
-        let composer = self.composer.clone();
-        cx.spawn(async move |waku, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(1))
-                .await;
-            let _ = waku.update(cx, |waku, cx| {
-                if waku.state.selected_session == Some(session_id) {
-                    composer.update(cx, |input, cx| {
-                        if input.content(cx).is_empty() {
-                            input.set_content(prompt, cx);
-                        }
-                    });
-                }
-            });
-        })
-        .detach();
-    }
-
     pub(super) fn begin_message_edit(
         &mut self,
         action: UserMessageAction,
@@ -2310,9 +2283,8 @@ impl Waku {
         if self.submission_preparations.contains(&edit.session_id) {
             return;
         }
-        // Keyboard submission clears ComposerInput after emitting its event.
-        // Use the event's captured value rather than rereading the field; the
-        // button path enters here with its own pre-clear content as well.
+        // Keyboard and button submission both capture the prompt before
+        // acceptance; a refused edit keeps the field intact for correction.
         let prompt = prompt.trim().to_owned();
         if prompt.is_empty() && edit.attachments.is_empty() && self.composer_annotations.is_empty()
         {

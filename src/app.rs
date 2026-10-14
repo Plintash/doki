@@ -2665,37 +2665,35 @@ impl Waku {
                 &composer,
                 |this: &mut Self, _, event: &ComposerEvent, cx| match event {
                     ComposerEvent::Submit(prompt) => {
-                        if let Some(session_id) = this.selected_session().and_then(|session| {
-                            this.response_fork_preparations
-                                .contains_key(&session.id)
-                                .then_some(session.id)
+                        if this.selected_session().is_some_and(|session| {
+                            this.response_fork_preparations.contains_key(&session.id)
                         }) {
-                            this.defer_restore_composer_after_fork(session_id, prompt.clone(), cx);
-                        } else if let Some(submission) =
-                            this.submission_with_attachments(prompt, cx)
-                        {
+                            return;
+                        }
+                        if let Some(submission) = this.submission_with_attachments(prompt, cx) {
+                            this.composer.update(cx, |input, cx| input.clear(cx));
                             this.submit_composer_submission(submission, cx);
                         }
                     }
                     ComposerEvent::SubmitOpposite(prompt) => {
-                        if let Some(session_id) = this.selected_session().and_then(|session| {
-                            this.response_fork_preparations
-                                .contains_key(&session.id)
-                                .then_some(session.id)
+                        if this.selected_session().is_some_and(|session| {
+                            this.response_fork_preparations.contains_key(&session.id)
                         }) {
-                            this.defer_restore_composer_after_fork(session_id, prompt.clone(), cx);
-                        } else if let Some(submission) =
-                            this.submission_with_attachments(prompt, cx)
-                        {
+                            return;
+                        }
+                        if let Some(submission) = this.submission_with_attachments(prompt, cx) {
+                            this.composer.update(cx, |input, cx| input.clear(cx));
                             this.submit_opposite_composer_submission(submission, cx);
                         }
                     }
                     ComposerEvent::SteerQueued => {
-                        // Staged attachments make this a real draft even when
-                        // the text field is empty. Preserve the shortcut's
-                        // previous no-op behavior until that draft is sent or
+                        // Staged attachments or annotations make this a real
+                        // draft even when the text field is empty. Keep the
+                        // queue shortcut a no-op until that draft is sent or
                         // cleared.
-                        if this.composer_attachments.is_empty() {
+                        if this.composer_attachments.is_empty()
+                            && this.composer_annotations.is_empty()
+                        {
                             this.steer_oldest_queued_message(cx);
                         }
                     }

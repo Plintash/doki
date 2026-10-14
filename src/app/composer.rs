@@ -2459,7 +2459,6 @@ impl Waku {
             .map(MessageAttachment::from)
             .collect::<Vec<_>>();
         let annotations = std::mem::take(&mut self.composer_annotations);
-        self.reset_annotation_preview_hover();
         let mentions = attachments
             .iter()
             .map(|attachment| attachment.mention.clone())
@@ -2480,6 +2479,13 @@ impl Waku {
         };
         let display_content =
             (!attachments.is_empty() || !annotations.is_empty()).then(|| prompt.trim().to_owned());
+        // Sending ends the selection interaction, including a comment field
+        // that deliberately survives ordinary selection changes. Do this only
+        // after acceptance so an unavailable provider or empty draft leaves
+        // the user's selection and annotation editors intact.
+        self.transcript_selection.selection.borrow_mut().clear();
+        self.dismiss_annotation_overlays(cx);
+        self.reset_annotation_preview_hover();
         self.discard_current_composer_draft(cx);
         Some(ComposerSubmission {
             prompt: submission,
@@ -3643,7 +3649,8 @@ impl Waku {
                 .is_armed_for(EscapeStopTarget::for_session(session), Instant::now())
         });
         let has_draft = !self.composer.read(cx).content(cx).trim().is_empty()
-            || !self.composer_attachments.is_empty();
+            || !self.composer_attachments.is_empty()
+            || !self.composer_annotations.is_empty();
         // With no provider to run it, a draft has nowhere to go. The button
         // reads as unavailable and the submission path refuses too, so
         // `enter` cannot slip past a disabled control.

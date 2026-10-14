@@ -21,8 +21,10 @@ See [the verification record](rpa-p1-qa.md) for exact results and limitations.
   sessions/cursors/diffs/subscriptions, event-driven waits, model-derived
   selectable state, isolated scratch instances, daemon-owned scenarios, and
   CLI/REPL bindings on the shared protocol. Provider-free native scratch and
-  explicit-build fixture replacement checks passed. Tasks 3.1–3.7 and
-  3.9–3.10 are complete; 3.8 still needs an actual watcher-triggered relaunch.
+  explicit-build fixture replacement checks passed. Tasks 3.1–3.10 are complete.
+  The actual `scripts/dev.ts` watcher relaunch passed on 2026-10-14 using the
+  same external daemon, with native REPL snapshots before and after; see the
+  [combined QA evidence](board-rpa-integration.md#combined-tree-results).
   The real-model phase acceptance gate also remains open.
 - The default transport is the existing authenticated daemon connection. The
   app-local TCP endpoint is an explicit legacy fallback only.
@@ -692,9 +694,6 @@ and deliberately settled; do not re-litigate them without new evidence:
 
 ## Next
 
-- Complete the remaining part of **3.8** using the actual development watcher.
-  CLI/REPL bindings and explicit-build fixture replacement are verified; the
-  latter does not establish watcher-triggered rebuild acceptance.
 - Preserve the provider-free native evidence, independent Standards/Spec
   clearance and original P0 review baseline when integrating this branch.
 - **2.7 / 3.11** — establish an explicitly approved, provider-configured
