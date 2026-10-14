@@ -2262,7 +2262,7 @@ annotation.wait_for_reply:
 sidebar.board:
   en: Board
 sidebar.grouping_task:
-  en: Task
+  en: Issue
 board.title:
   en: Board
 board.backlog:
@@ -2272,9 +2272,9 @@ board.doing:
 board.done:
   en: Done
 board.new_task:
-  en: New task
+  en: New issue
 board.new_task_placeholder:
-  en: What is this task about?
+  en: What is this issue about?
 board.needs_you:
   en: "%{count} waiting on you"
 board.needs_you_short:
@@ -2296,7 +2296,7 @@ board.complete:
 board.reopen:
   en: Reopen
 board.completed_toast:
-  en: Task completed — its conversations left the sidebar
+  en: Issue completed — its conversations left the sidebar
 board.complete_confirm_title:
   en: "Complete “%{title}”?"
 board.complete_confirm_body:
@@ -2306,31 +2306,31 @@ board.archive_not_delete:
 board.complete_and_stop:
   en: Complete and stop
 board.untitled_task:
-  en: Untitled task
+  en: Untitled issue
 task.bind:
-  en: File under task
+  en: File under issue
 task.new_from_session:
-  en: New task from this conversation
+  en: New issue from this conversation
 task.unbind:
-  en: Remove from task
+  en: Remove from issue
 settings.archive:
   en: Archive
 settings.archive_keywords:
-  en: settings preferences archive completed done tasks conversations restore
+  en: settings preferences archive completed done issues conversations restore
 archive.empty:
-  en: No completed tasks yet
+  en: No completed issues yet
 archive.restore:
   en: Restore
 archive.completed_at:
   en: "Completed %{time}"
 board.reopened_toast:
-  en: Task reopened — its conversations are back in the sidebar
+  en: Issue reopened — its conversations are back in the sidebar
 command_palette.show_board:
-  en: Open the task board
+  en: Open the board
 command_palette.hide_board:
-  en: Close the task board
+  en: Close the board
 board.completion_waiting_for_setup:
-  en: A conversation is still setting up; complete the task once it settles
+  en: A conversation is still setting up; complete the issue once it settles
 
 subagent.running_count:
   en: "%{count} subagents running"
@@ -2366,7 +2366,7 @@ session.new_session:
 sidebar.unfiled_sessions:
   en: "Unfiled sessions"
 board.open_task:
-  en: "Open task"
+  en: "Open issue"
 board.back_to_board:
   en: "← Board"
 board.description:
@@ -2410,32 +2410,32 @@ board.session_idle:
 board.loading_workspace:
   en: "Loading workspace…"
 board.archived_hint:
-  en: "Completed. Conversations are kept here and hidden from the active sidebar. Reopen the task to continue working."
+  en: "Completed. Conversations are kept here and hidden from the active sidebar. Reopen the issue to continue working."
 board.title_required:
-  en: "A task needs a title"
+  en: "An issue needs a title"
 board.no_sessions:
   en: "No conversations yet"
 board.session_context_hint:
-  en: "Start a session with this task’s description and workspace, or attach an existing conversation."
+  en: "Start a session with this issue’s description and workspace, or attach an existing conversation."
 board.session_project_mismatch:
   en: "That conversation belongs to a different project"
 board.create_task:
-  en: "Create task"
+  en: "Create issue"
 board.empty_backlog:
-  en: "Plan your next task"
+  en: "Plan your next issue"
 board.empty_doing:
   en: "Work in progress appears here"
 board.empty_done:
-  en: "Completed tasks stay here"
+  en: "Completed issues stay here"
 
 board.back_to_task:
-  en: "← Task"
+  en: "← Issue"
 board.detach_draft_hint:
-  en: "This unsent draft belongs to the task. Send it before detaching, or remove the draft if you no longer need it."
+  en: "This unsent draft belongs to the issue. Send it before detaching, or remove the draft if you no longer need it."
 board.completion_stopping:
   en: "Stopping work…"
 board.completion_cannot_stop:
-  en: "Could not stop all background work. The task is still active; stop it from the session and try again."
+  en: "Could not stop all background work. The issue is still active; stop it from the session and try again."
 board.completion_stop_failed:
   en: "Some work did not stop. The issue is still active; review the conversation and try again."
 

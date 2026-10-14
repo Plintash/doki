@@ -844,7 +844,7 @@ impl Waku {
         self.render_sidebar_action_row(
             "sidebar-new-task-action",
             "icons/plus.svg",
-            tr!("menu.new_task"),
+            tr!("board.new_issue"),
             cx,
         )
         .on_click(cx.listener(|this, _, window, cx| {
