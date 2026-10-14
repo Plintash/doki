@@ -1155,7 +1155,6 @@ board.doing: 進行中
 board.done: 完了
 board.new_task: 新規タスク
 board.new_task_placeholder: このタスクは何をしますか？
-board.new_task_hint: 名前だけで十分です。プロジェクト、ワークスペース、会話は後で決められます。
 board.needs_you: "%{count} 件が対応待ち"
 board.needs_you_short: 対応待ち
 board.running: 実行中
@@ -1271,3 +1270,9 @@ board.latest_progress: "直近: %{progress}"
 workspace.create_worktree: "ワークツリーを作成"
 workspace.create_worktree_hint: "最初のメッセージ送信時に独立したワークツリーを作成します"
 workspace.create_worktree_requires_project: "ワークツリーを作成するプロジェクトを選択してください"
+
+board.attach_search: "会話またはワークスペースを検索"
+board.attach_project_scope: "%{project} の未分類の会話"
+board.attach_all_scope: "すべてのプロジェクトの未分類の会話"
+board.attach_no_matches: "一致する会話はありません"
+board.attach_keyboard_hint: "↑↓ 選択 · Enter 関連付け · Esc 閉じる"

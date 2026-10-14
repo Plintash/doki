@@ -1528,8 +1528,8 @@ pub struct Waku {
     /// task-creation button (see `render_task_create_button`).
     board_focus: FocusHandle,
     task_create_focuses: RefCell<HashMap<&'static str, FocusHandle>>,
-    /// The task-creation dialog, opened from the sidebar or the board.
-    new_task_dialog: Option<board::NewTaskDialog>,
+    /// An unsaved issue brief, edited directly in the issue detail surface.
+    new_task_draft: Option<Task>,
     /// A move to Done that is waiting on the running-session confirmation.
     pending_task_completion: Option<board::TaskCompletionConfirm>,
     task_completion_stops: HashMap<Uuid, task_completion::TaskCompletionStop>,
@@ -3197,7 +3197,7 @@ impl Waku {
                 sidebar_action_focuses: RefCell::new(HashMap::new()),
                 board_focus,
                 task_create_focuses: RefCell::new(HashMap::new()),
-                new_task_dialog: None,
+                new_task_draft: None,
                 pending_task_completion: None,
                 task_completion_stops: HashMap::new(),
                 task_completion_preflights: HashMap::new(),

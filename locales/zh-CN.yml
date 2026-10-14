@@ -1104,7 +1104,6 @@ board.doing: 进行中
 board.done: 完成
 board.new_task: 新任务
 board.new_task_placeholder: 这件任务要做什么？
-board.new_task_hint: 只写名字就行；项目、工作区和对话都之后再定。
 board.needs_you: "%{count} 条需要你"
 board.needs_you_short: 需要你
 board.running: 运行中
@@ -1220,3 +1219,9 @@ board.latest_progress: "最近：%{progress}"
 workspace.create_worktree: "创建工作树"
 workspace.create_worktree_hint: "发送第一条消息时创建独立工作树"
 workspace.create_worktree_requires_project: "选择项目以创建工作树"
+
+board.attach_search: "搜索会话或工作区"
+board.attach_project_scope: "%{project} 中未归类的会话"
+board.attach_all_scope: "所有项目中未归类的会话"
+board.attach_no_matches: "没有匹配的会话"
+board.attach_keyboard_hint: "↑↓ 选择 · Enter 关联 · Esc 关闭"

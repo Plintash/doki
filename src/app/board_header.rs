@@ -220,7 +220,7 @@ impl Waku {
         let theme = Theme::current(cx);
         let selected_task = self
             .selected_task
-            .and_then(|id| self.state.tasks.iter().find(|task| task.id == id))
+            .and_then(|id| self.task_for_editor(id))
             .cloned();
         let left_controls = (!self.sidebar_visible)
             .then(|| {
@@ -270,7 +270,34 @@ impl Waku {
                 .when(show_save_status, |element| {
                     element.child(self.render_task_save_status(cx))
                 })
-                .child(self.render_board_detail_controls(&task, cx));
+                .child(if self.is_task_draft(task.id) {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(self.task_action_button(
+                            "new-task-cancel",
+                            tr!("common.cancel"),
+                            false,
+                            true,
+                            |this, window, cx| this.cancel_new_task(window, cx),
+                            cx,
+                        ))
+                        .child(
+                            self.task_action_button(
+                                "new-task-create",
+                                tr!("board.create_task"),
+                                true,
+                                self.task_detail_values(task.id, cx)
+                                    .is_some_and(|(title, _)| !title.trim().is_empty()),
+                                |this, _, cx| this.commit_new_task(cx),
+                                cx,
+                            ),
+                        )
+                        .into_any_element()
+                } else {
+                    self.render_board_detail_controls(&task, cx)
+                });
         } else {
             self.ensure_board_search(window, cx);
             let search = self
@@ -307,7 +334,7 @@ impl Waku {
                 tr!("board.new_issue"),
                 true,
                 true,
-                |this, window, cx| this.open_new_task_dialog(TaskState::Backlog, window, cx),
+                |this, window, cx| this.open_new_task(TaskState::Backlog, window, cx),
                 cx,
             );
             controls = controls
