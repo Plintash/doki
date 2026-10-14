@@ -232,6 +232,7 @@ pub(super) fn merge_remote_session_catalog(
                 local.project_id = remote.project_id;
                 local.workspace = remote.workspace;
                 local.review = remote.review;
+                local.stage_invocation = remote.stage_invocation;
                 local.review_correction_source_id = remote.review_correction_source_id;
                 local.task_id = remote.task_id;
                 local.provider = remote.provider;
@@ -267,6 +268,7 @@ pub(super) fn replace_hydrated_session(local: &mut AgentSession, mut hydrated: A
         hydrated.task_id = local.task_id;
         hydrated.workspace = std::mem::take(&mut local.workspace);
         hydrated.review = local.review.take();
+        hydrated.stage_invocation = local.stage_invocation.take();
         hydrated.review_correction_source_id = local.review_correction_source_id;
         hydrated.provider = local.provider;
         hydrated.model = local.model.take();
@@ -1143,6 +1145,7 @@ impl Waku {
             snapshot.projects,
             &mut self.pending_project_registrations,
         );
+        self.reconcile_task_placement_saves(&snapshot.tasks);
         merge_remote_tasks(&mut self.state.tasks, snapshot.tasks);
 
         let attach = self
@@ -3422,6 +3425,22 @@ impl Waku {
         else {
             return;
         };
+        if let Err(error) = self.validate_stage_submission(session) {
+            let source = session
+                .stage_invocation
+                .as_ref()
+                .and_then(|invocation| invocation.source.as_ref())
+                .map(|source| source.session_id);
+            if let Some(source) = source {
+                self.ensure_session_loaded(source, cx);
+            }
+            if selected {
+                self.restore_composer_submission(submission, cx);
+            }
+            self.show_toast(error);
+            cx.notify();
+            return;
+        }
         if session.review.is_some()
             && (session.provider != ProviderKind::Codex
                 || matches!(session.workspace, SessionWorkspace::NewWorktree { .. }))

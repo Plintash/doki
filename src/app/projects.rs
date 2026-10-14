@@ -37,6 +37,16 @@ pub(super) fn merge_catalog(
     mut remote: Vec<Project>,
     pending: &mut HashSet<Uuid>,
 ) {
+    for project in &mut remote {
+        if let Some(existing) = local.iter().find(|existing| existing.id == project.id)
+            && existing.board.revision > project.board.revision
+        {
+            project.board = existing.board.clone();
+        }
+        if project.board.stages.is_empty() {
+            project.board = crate::model::ProjectBoard::canonical(project.id);
+        }
+    }
     let acknowledged = remote
         .iter()
         .map(|project| project.id)

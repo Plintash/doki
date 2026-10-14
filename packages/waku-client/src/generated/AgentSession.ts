@@ -11,6 +11,7 @@ import type { ReportedCommand } from "./ReportedCommand";
 import type { RuntimeEventCursor } from "./RuntimeEventCursor";
 import type { RuntimeMode } from "./RuntimeMode";
 import type { SessionReview } from "./SessionReview";
+import type { SessionStageInvocation } from "./SessionStageInvocation";
 import type { SessionStatus } from "./SessionStatus";
 import type { SessionWorkspace } from "./SessionWorkspace";
 import type { ThreadGoal } from "./ThreadGoal";
@@ -40,7 +41,7 @@ review?: SessionReview | null,
  * the correction itself so rerunning or removing its source review never
  * turns it into an ordinary development draft.
  */
-review_correction_source_id?: string | null,
+review_correction_source_id?: string | null, stage_invocation?: SessionStageInvocation | null,
 /**
  * Local project checkout or an isolated Git worktree for this task.
  */
