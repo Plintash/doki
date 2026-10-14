@@ -1,0 +1,48 @@
+name: Terminal attach diagnostic
+
+# Temporary evidence collection for #91. Run once per diagnostic-branch push;
+# the regular Tests workflow remains unchanged and independently required.
+on:
+  push:
+    branches: [diagnostic/terminal-attach-marker]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terminal-attach-diagnostic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  terminal-attach:
+    name: Exact terminal attach test (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - name: Restore existing Cargo cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-latest-rust-1.96.0-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            macos-latest-rust-1.96.0-cargo-
+
+      # Direct core selection bypasses unrelated earlier workspace test failures.
+      # --nocapture retains the deadline and eventual-marker diagnostic output.
+      # A late marker still fails the test; there is no retry or failure override.
+      - name: Run exact attach-boundary test
+        run: cargo test --locked -p waku-core --lib server::tests::websocket_terminal_attach_boundary_has_no_duplicates_or_gaps -- --exact --nocapture
