@@ -1260,6 +1260,7 @@ impl Waku {
                     )
                     .child(
                         div()
+                            .mx(px(11.0))
                             .h(px(156.0))
                             .p(px(10.0))
                             .rounded(px(8.0))

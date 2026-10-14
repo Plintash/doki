@@ -61,3 +61,11 @@ User screenshot feedback identified inconsistent visible content insets: title/s
 - Prior full app/workspace/review/titlebar results above remain the pre-alignment checkpoint; backend tests were not unnecessarily repeated for this layout-only change
 
 Corrected screenshots: `aligned-prototype-light.jpg` and `aligned-prototype.jpg`. The fixture was stopped after verification; no real provider/model call was made.
+
+## Description border follow-up
+
+The user subsequently requested that the description box itself must not protrude beyond surrounding content. Product commit `1e6b539` adds persistent 11px horizontal margins to that field; its visible outer border now aligns with the section content edges, while its text retains natural inner padding. Hover and focused editing use the same wrapper geometry.
+
+Native verification passed at 1178×814 (outer border edges 330/1100px, text inset 341px) and 980×680 (outer edges 288/945px). The geometry check derives the wrapper edges from the measured editor bounds and the unchanged 10px padding plus 1px border. Focus/edit round-trips preserved the original description and unchanged field bounds. Light/dark screenshots, unfocused hover, and narrow focused editing were inspected. Source suite again passed 47 tests/338 assertions, native issue interaction regression passed 26 assertions, and independent focused source review cleared the one-line change. No provider/model calls were made. Prior full backend/runtime-suite checkpoints above are unchanged; this bounded layout delta did not rerun them.
+
+Evidence: `description-edge-light.jpg`, `description-edge-dark.jpg`, `description-edge-hover.jpg`, and `description-edge-narrow.jpg`. The app, watcher, and daemon were stopped after verification.
