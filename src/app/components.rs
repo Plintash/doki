@@ -2016,6 +2016,35 @@ mod message_time_tests {
     }
 
     #[test]
+    fn retry_activity_exposes_attempt_and_cause_and_clears_live_wording() {
+        let title = format!(
+            "{} (2/3) — ai: system cpu overloaded",
+            tr!("activity.provider_retrying")
+        );
+        let mut retry = ActivityItem::new(
+            Some("pi-retry-test".into()),
+            ActivityKind::Tool,
+            title.clone(),
+            None,
+            false,
+        )
+        .with_output(Some("ai: system cpu overloaded".into()));
+        assert_eq!(activity_row_detail(&retry, false), title);
+        assert_eq!(activity_header_title(&[retry.clone()], true, None), title);
+        retry.complete = true;
+        retry.title = tr!("activity.provider_retry_finished");
+        assert_eq!(activity_row_detail(&retry, false), retry.title);
+        assert_eq!(
+            activity_header_title(&[retry.clone()], true, None),
+            retry.title
+        );
+        assert!(
+            !activity_header_title(&[retry], false, None)
+                .contains(&tr!("activity.provider_retrying"))
+        );
+    }
+
+    #[test]
     fn activity_display_title_prefers_the_human_facing_tool_argument() {
         let titled = ActivityItem::new(
             Some("tool-1".into()),

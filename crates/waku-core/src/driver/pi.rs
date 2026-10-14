@@ -1831,6 +1831,10 @@ struct PiStreamState {
     message_saw_reasoning: bool,
     failed: bool,
     tools: HashMap<String, (ActivityKind, String)>,
+    /// Automatic retries update one activity until recovery or settlement.
+    open_retry: Option<ActivityItem>,
+    /// Text or reasoning after that row moved the visible activity tail.
+    retry_has_output_after: bool,
     /// The messages the provider's last queue report still held, in the order
     /// it reported them. Empty on a provider that reports no queue.
     queued: Vec<String>,
@@ -1880,6 +1884,18 @@ impl PiStreamState {
             ..Self::default()
         };
     }
+
+    fn finish_retry(&mut self, events: &impl DriverEventSink) {
+        self.retry_has_output_after = false;
+        if let Some(mut item) = self.open_retry.take() {
+            item.complete = true;
+            // A completion can mean recovery, exhaustion, or cancellation.
+            // Keep its cause in the disclosure without claiming success or
+            // leaving the live header saying that we are still retrying.
+            item.title = tr!("activity.provider_retry_finished");
+            let _ = events.send(DriverEvent::RichActivity(item));
+        }
+    }
 }
 
 /// Both ordinary settlement and failed custom-run preparation return queued
@@ -1892,6 +1908,7 @@ fn finish_pi_run(
     events: &impl DriverEventSink,
     state: &mut PiStreamState,
 ) {
+    state.finish_retry(events);
     if state.run.is_live() {
         pending.lock().retain(|_, response| {
             matches!(
@@ -2284,6 +2301,7 @@ fn handle_pi_message(
                         .filter(|delta| !delta.is_empty())
                     {
                         state.message_saw_text = true;
+                        state.retry_has_output_after = state.open_retry.is_some();
                         let _ = events.send(DriverEvent::TextDelta(delta.to_owned()));
                     }
                 }
@@ -2294,6 +2312,7 @@ fn handle_pi_message(
                         .filter(|delta| !delta.is_empty())
                     {
                         state.message_saw_reasoning = true;
+                        state.retry_has_output_after = state.open_retry.is_some();
                         let _ = events.send(DriverEvent::ReasoningDelta(delta.to_owned()));
                     }
                 }
@@ -2388,7 +2407,60 @@ fn handle_pi_message(
                 state.tools.remove(&id);
             }
         }
+        "auto_retry_start" => {
+            // Retry frames describe an existing run, never create one. A
+            // late start after settlement must not reopen its activity.
+            if !state.run.is_live() {
+                return;
+            }
+            // A retryable response can contain partial text or reasoning.
+            // Updating its earlier row would leave the current retry hidden
+            // behind that output. Finish the old activity where it occurred
+            // and begin a new one at the tail; adjacent attempts still upsert.
+            if state.retry_has_output_after {
+                state.finish_retry(events);
+            }
+            let id = if let Some(item) = state.open_retry.as_ref() {
+                item.source_id.clone()
+            } else {
+                // Activity lookup spans saved history, including earlier
+                // driver processes, so a local counter would reuse old rows.
+                Some(format!("pi-retry-{}", uuid::Uuid::new_v4()))
+            };
+            let mut title = tr!("activity.provider_retrying");
+            if let Some((attempt, maximum)) = value
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .zip(value.get("maxAttempts").and_then(Value::as_u64))
+            {
+                title.push_str(&format!(" ({attempt}/{maximum})"));
+            }
+            let mut item = activity::tool_activity(
+                id,
+                ActivityKind::Tool,
+                title,
+                None,
+                value.get("errorMessage"),
+                None,
+                false,
+                false,
+            );
+            // Both the native row and its collapsed live header use the
+            // title. An output-only cause would stay hidden in disclosure.
+            // Use the shared normalizer's bounded output, keeping multiline
+            // details there and the first nonempty line on the row.
+            if let Some(cause) = item
+                .output
+                .as_deref()
+                .and_then(|output| output.lines().map(str::trim).find(|line| !line.is_empty()))
+            {
+                item.title.push_str(&format!(" — {cause}"));
+            }
+            state.open_retry = Some(item.clone());
+            let _ = events.send(DriverEvent::RichActivity(item));
+        }
         "auto_retry_end" => {
+            state.finish_retry(events);
             if value.get("success").and_then(Value::as_bool) == Some(true) {
                 state.failed = false;
             } else {
@@ -2988,6 +3060,7 @@ fn emit_completed_message_fallback(
                     .filter(|text| !text.is_empty())
                 {
                     state.message_saw_text = true;
+                    state.retry_has_output_after = state.open_retry.is_some();
                     let _ = events.send(DriverEvent::TextDelta(text.to_owned()));
                 }
             }
@@ -2998,6 +3071,7 @@ fn emit_completed_message_fallback(
                     .filter(|thinking| !thinking.is_empty())
                 {
                     state.message_saw_reasoning = true;
+                    state.retry_has_output_after = state.open_retry.is_some();
                     let _ = events.send(DriverEvent::ReasoningDelta(thinking.to_owned()));
                 }
             }
@@ -5812,6 +5886,352 @@ mod tests {
             event_rx.recv().unwrap(),
             DriverEvent::TurnFinished { success: true, .. }
         ));
+    }
+
+    #[test]
+    fn automatic_retry_start_reports_attempt_and_cause() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for value in [
+            json!({"type": "agent_start"}),
+            json!({
+                "type": "auto_retry_start",
+                "attempt": 2,
+                "maxAttempts": 3,
+                "delayMs": 4000,
+                "errorMessage": "ai: system cpu overloaded"
+            }),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                value,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::TurnStarted
+        ));
+        let DriverEvent::RichActivity(retry) = event_rx
+            .try_recv()
+            .expect("a retry start must immediately report visible activity")
+        else {
+            panic!("expected a retry activity");
+        };
+        assert!(retry.title.contains("(2/3)"));
+        assert!(retry.title.contains("ai: system cpu overloaded"));
+        assert!(!retry.complete);
+        assert!(!retry.failed);
+        assert!(
+            event_rx.is_empty(),
+            "retry control frames are not transcript text"
+        );
+    }
+
+    #[test]
+    fn automatic_retry_attempts_update_one_row_and_end_before_settlement() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        // Both pinned Pi 1.0.4 and 1.2 emit retry starts before backoff,
+        // then the successful message_end before auto_retry_end. The end
+        // need not coincide with settlement: a run can continue with tools.
+        for value in [
+            json!({"type": "agent_start"}),
+            json!({"type": "message_update", "assistantMessageEvent": {
+                "type": "error", "error": "temporary"
+            }}),
+            json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3,
+                "delayMs": 2000, "errorMessage": "connection lost"}),
+            json!({"type": "auto_retry_start", "attempt": 2, "maxAttempts": 3,
+                "delayMs": 4000, "errorMessage": "system cpu overloaded"}),
+            json!({"type": "message_end", "message": {"role": "assistant",
+                "stopReason": "stop", "content": [{"type": "text", "text": "Recovered"}]}}),
+            json!({"type": "auto_retry_end", "success": true, "attempt": 2}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                value,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        let emitted: Vec<_> = event_rx.try_iter().collect();
+        let activities: Vec<_> = emitted
+            .iter()
+            .filter_map(|event| match event {
+                DriverEvent::RichActivity(item) => Some(item),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(activities.len(), 3);
+        assert!(
+            activities
+                .iter()
+                .all(|item| item.source_id == activities[0].source_id)
+        );
+        assert!(activities[0].title.contains("(1/3) — connection lost"));
+        assert!(
+            activities[1]
+                .title
+                .contains("(2/3) — system cpu overloaded")
+        );
+        assert!(!activities[0].complete && !activities[1].complete);
+        assert!(activities[2].complete);
+        assert_eq!(activities[2].title, tr!("activity.provider_retry_finished"));
+        assert_eq!(
+            activities[2].output.as_deref(),
+            Some("system cpu overloaded")
+        );
+        assert!(matches!(&emitted[4], DriverEvent::TextDelta(text) if text == "Recovered"));
+        assert!(matches!(&emitted[5], DriverEvent::RichActivity(item) if item.complete));
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, DriverEvent::TurnFinished { .. }))
+        );
+        assert!(state.run.is_live() && !state.failed && state.open_retry.is_none());
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "agent_settled"}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(event_rx.is_empty());
+    }
+
+    #[test]
+    fn automatic_retry_settlement_exhaustion_and_abort_close_the_row() {
+        for flavor in [PiFlavor::Pi, PiFlavor::OhMyPi] {
+            for (final_error, aborted) in [
+                (None, false),
+                (None, true),
+                (Some("ai: 502 Bad Gateway"), false),
+                (Some("Retry cancelled"), true),
+            ] {
+                let (pending, commands, _command_rx, mut state) = harness();
+                let (events, event_rx) = unbounded();
+                let mut frames = vec![
+                    json!({"type": "agent_start"}),
+                    json!({"type": "auto_retry_start", "attempt": 3, "maxAttempts": 3,
+                        "delayMs": 8000, "errorMessage": "ai: 502 Bad Gateway"}),
+                ];
+                if let Some(error) = final_error {
+                    frames.push(json!({"type": "auto_retry_end", "success": false,
+                        "attempt": 3, "finalError": error}));
+                }
+                frames.push(json!({"type": flavor.settled_event(), "aborted": aborted}));
+                for frame in frames {
+                    handle_pi_message(flavor, frame, &pending, &commands, &events, &mut state);
+                }
+                let emitted: Vec<_> = event_rx.try_iter().collect();
+                let activities: Vec<_> = emitted
+                    .iter()
+                    .filter_map(|event| match event {
+                        DriverEvent::RichActivity(item) => Some(item),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(activities.len(), 2);
+                assert_eq!(activities[0].source_id, activities[1].source_id);
+                assert!(!activities[0].complete && activities[1].complete);
+                assert_eq!(activities[1].title, tr!("activity.provider_retry_finished"));
+                assert!(
+                    matches!(emitted.last(), Some(DriverEvent::TurnFinished { success, interrupted, .. })
+                    if *success == final_error.is_none() && *interrupted == (aborted && flavor == PiFlavor::Pi))
+                );
+                assert!(!state.run.is_live() && state.open_retry.is_none());
+                assert!(
+                    !emitted
+                        .iter()
+                        .any(|event| matches!(event, DriverEvent::TextDelta(_)))
+                );
+                // A late retry start cannot reopen a settled run.
+                for frame in [
+                    json!({"type": "auto_retry_start", "attempt": 3, "maxAttempts": 3,
+                        "errorMessage": "late start"}),
+                    json!({"type": flavor.settled_event()}),
+                ] {
+                    handle_pi_message(flavor, frame, &pending, &commands, &events, &mut state);
+                }
+                assert!(event_rx.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_retry_after_partial_output_starts_a_new_tail_activity() {
+        for thinking in [false, true] {
+            for streamed in [false, true] {
+                let (pending, commands, _command_rx, mut state) = harness();
+                let (events, event_rx) = unbounded();
+                let mut frames = vec![
+                    json!({"type": "agent_start"}),
+                    json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3,
+                        "delayMs": 2000, "errorMessage": "connection lost"}),
+                    json!({"type": "message_start", "message": {"role": "assistant"}}),
+                ];
+                if streamed {
+                    frames.push(json!({"type": "message_update", "assistantMessageEvent": {
+                        "type": if thinking { "thinking_delta" } else { "text_delta" },
+                        "delta": "Partial output"
+                    }}));
+                }
+                let content = if thinking {
+                    json!({"type": "thinking", "thinking": "Partial output"})
+                } else {
+                    json!({"type": "text", "text": "Partial output"})
+                };
+                frames.extend([
+                    json!({"type": "message_end", "message": {"role": "assistant",
+                        "stopReason": "error", "errorMessage": "temporary", "content": [content]}}),
+                    json!({"type": "auto_retry_start", "attempt": 2, "maxAttempts": 3,
+                        "delayMs": 4000, "errorMessage": "system cpu overloaded"}),
+                    // Repeated starts without more content update the new tail row.
+                    json!({"type": "auto_retry_start", "attempt": 3, "maxAttempts": 3,
+                        "delayMs": 8000, "errorMessage": "502 Bad Gateway"}),
+                ]);
+                for frame in frames {
+                    handle_pi_message(
+                        PiFlavor::Pi,
+                        frame,
+                        &pending,
+                        &commands,
+                        &events,
+                        &mut state,
+                    );
+                }
+                let emitted: Vec<_> = event_rx.try_iter().collect();
+                assert_eq!(
+                    emitted.len(),
+                    6,
+                    "fallback must not duplicate streamed output"
+                );
+                assert!(
+                    matches!(&emitted[2], DriverEvent::TextDelta(text) | DriverEvent::ReasoningDelta(text)
+                    if text == "Partial output")
+                );
+                let activities: Vec<_> = emitted
+                    .iter()
+                    .filter_map(|event| match event {
+                        DriverEvent::RichActivity(item) => Some(item),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(activities.len(), 4);
+                assert_eq!(activities[0].source_id, activities[1].source_id);
+                assert!(activities[1].complete);
+                assert_ne!(activities[1].source_id, activities[2].source_id);
+                assert_eq!(activities[2].source_id, activities[3].source_id);
+                assert!(
+                    activities[2]
+                        .title
+                        .contains("(2/3) — system cpu overloaded")
+                );
+                assert!(!activities[2].complete && !activities[3].complete);
+                assert!(!state.retry_has_output_after);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_retry_cycles_do_not_reuse_saved_activity_ids() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let mut ids = HashSet::new();
+        for cycle in 0..4 {
+            if cycle == 3 {
+                state = PiStreamState::default(); // Reattached driver, same saved transcript.
+            }
+            for frame in [
+                json!({"type": "agent_start"}),
+                json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3,
+                    "errorMessage": "temporary"}),
+                json!({"type": "auto_retry_end", "success": true, "attempt": 1}),
+            ] {
+                handle_pi_message(
+                    PiFlavor::Pi,
+                    frame,
+                    &pending,
+                    &commands,
+                    &events,
+                    &mut state,
+                );
+            }
+            let activities: Vec<_> = event_rx
+                .try_iter()
+                .filter_map(|event| match event {
+                    DriverEvent::RichActivity(item) => Some(item),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(activities.len(), 2);
+            assert_eq!(activities[0].source_id, activities[1].source_id);
+            assert!(ids.insert(activities[0].source_id.clone().unwrap()));
+            // First two cycles share a run; the next starts after reset.
+            if cycle > 0 {
+                handle_pi_message(
+                    PiFlavor::Pi,
+                    json!({"type": "agent_settled"}),
+                    &pending,
+                    &commands,
+                    &events,
+                    &mut state,
+                );
+                event_rx.try_iter().for_each(drop);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_retry_normalizes_detail_without_requiring_optional_fields() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let frame = json!({"type": "auto_retry_start", "errorMessage":
+            format!("\n  Temporary overload  \n{}", "x".repeat(20_000))});
+        handle_pi_message(
+            PiFlavor::Pi,
+            frame.clone(),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(event_rx.is_empty(), "a retry cannot start a run");
+        state.run.open();
+        handle_pi_message(
+            PiFlavor::Pi,
+            frame,
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        let DriverEvent::RichActivity(item) = event_rx.try_recv().unwrap() else {
+            panic!("expected a retry activity");
+        };
+        assert_eq!(
+            item.title,
+            format!("{} — Temporary overload", tr!("activity.provider_retrying"))
+        );
+        assert!(item.output.as_ref().unwrap().chars().count() < 16_100);
+        assert!(
+            item.output
+                .as_ref()
+                .unwrap()
+                .ends_with(&tr!("activity.output_truncated"))
+        );
     }
 
     #[test]

@@ -1132,6 +1132,7 @@ board.reopened_toast: 任务已重新打开，对话回到左侧
 
 activity.background_shell: 后台 Shell
 activity.provider_retrying: 正在重试请求
+activity.provider_retry_finished: 请求重试已结束
 computer_use.desktop_access: 桌面访问
 computer_use.linux_access_description: 控制当前 Linux 桌面会话中的应用。截图与输入支持取决于你的合成器与无障碍服务。
 computer_use.windows_access_description: 控制当前 Windows 桌面会话中的应用。Windows 可能限制对提权应用和安全桌面的访问。

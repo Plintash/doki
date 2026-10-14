@@ -372,7 +372,7 @@ been verified to take the command.
 | `message_end` | fallback text/thinking when no delta was streamed |
 | `message_end` with `role: "custom"` | `BackgroundWork` (kind subagent) for pi-subagents' child and background notifications, which the work surface shows whatever their `display` flag says; `ExtensionMessage` for any other extension message, which the transcript renders only when `display` is true |
 | `tool_execution_start` / `_update` / `_end` | `RichActivity`; a `subagent` call's structured details also become `SubagentProgress`, the foreground run the composer's live-run card shows |
-| `auto_retry_end` | clears or sets the failure flag |
+| `auto_retry_start` / `auto_retry_end` | live `RichActivity` with attempt/maximum and cause; adjacent attempts update one row. After partial text or reasoning, the old row completes and the next retry appears at the current tail. The end completes the open row and clears or sets the failure flag. Settlement also completes an open retry; late starts cannot reopen a settled run |
 | `compaction_start` / `compaction_end` | `RichActivity` — one row per compaction: started, completed with its summary kept, or failed with the provider's own reason; the end's `estimatedTokensAfter` refreshes the context meter, and a manual compaction settles its own turn |
 | `agent_settled` (Pi) / `agent_end` (Oh My Pi) | `TurnFinished`, then resets stream state |
 | `queue_update` | `ProviderQueue` — the provider's complete steering and follow-up queues, which are the client's pending list |

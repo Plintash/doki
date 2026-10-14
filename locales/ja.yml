@@ -1183,6 +1183,7 @@ board.reopened_toast: タスクを再開しました。会話がサイドバー�
 
 activity.background_shell: バックグラウンドシェル
 activity.provider_retrying: リクエストを再試行しています
+activity.provider_retry_finished: リクエストの再試行が終了しました
 computer_use.desktop_access: デスクトップアクセス
 computer_use.linux_access_description: 現在の Linux デスクトップセッションのアプリを操作します。キャプチャと入力の対応はコンポジタとアクセシビリティサービスに依存します。
 computer_use.windows_access_description: 現在の Windows デスクトップセッションのアプリを操作します。Windows は昇格したアプリとセキュアデスクトップへのアクセスを制限する場合があります。

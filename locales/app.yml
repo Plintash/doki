@@ -821,6 +821,8 @@ activity.compaction_failed:
   en: Context compaction failed
 activity.provider_retrying:
   en: Retrying the request
+activity.provider_retry_finished:
+  en: Finished retrying the request
 activity.background_shell:
   en: Background shell
 activity.output_truncated:
