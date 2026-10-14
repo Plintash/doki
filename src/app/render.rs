@@ -112,8 +112,8 @@ impl Waku {
     /// pane islands — which render later, during layout — have to agree with.
     fn settle_panel_slides(&mut self, window: &Window) -> PanelFrame {
         let was_sliding = self.panels_sliding();
-        if self.settings_page.is_some() {
-            // Settings covers the workspace, so there is no edge on screen to
+        if self.settings_page.is_some() || self.board_open {
+            // Settings and the board cover the workspace, so there is no edge on screen to
             // move. Retire the slide rather than animate a layout nobody can
             // see; reopening the workspace finds the panels where they belong.
             self.sidebar_slide = None;
@@ -130,7 +130,7 @@ impl Waku {
         );
         let right_panel = slide_width(
             &mut self.right_panel_slide,
-            if self.right_panel_visible {
+            if self.right_panel_visible && !self.board_open {
                 right_panel_content
             } else {
                 0.0
@@ -188,7 +188,7 @@ impl Waku {
         // the chat column while it is open and gives it straight back when a
         // conversation is selected.
         if self.board_open {
-            return self.render_board(cx);
+            return self.render_board(window, cx);
         }
         let chat_viewport_width = self.chat_viewport_width(window);
         // The transcript's own element sizes itself with `flex_1`, which only
@@ -234,6 +234,7 @@ impl Render for Waku {
         // One task-facts pass per frame: the board and the sidebar's task rows
         // both read it, and nothing may carry the previous frame's counts on.
         self.task_stats_cache.borrow_mut().take();
+        crate::diagnostics::rendered();
         // Panel geometry first: the browser sync right below reads whether a
         // panel is mid-slide, and settling here rather than at the point of
         // use keeps the pane islands and the transcript on one set of widths.
@@ -273,6 +274,7 @@ impl Render for Waku {
                 .on_action(cx.listener(Self::confirm_task_switch_action))
                 .on_action(cx.listener(Self::cancel_task_switch_action))
                 .on_modifiers_changed(cx.listener(Self::task_switcher_modifiers_changed))
+                .children(crate::diagnostics::frame_probe())
                 .child(self.render_settings(window, cx))
                 .children(toast)
                 .children(command_palette)
@@ -303,6 +305,7 @@ impl Render for Waku {
             .key_context("Waku")
             .on_action(cx.listener(Self::close_window_or_right_panel_tab_action))
             .on_action(cx.listener(Self::new_session_action))
+            .on_action(cx.listener(Self::new_task_action))
             .on_action(cx.listener(Self::new_project_action))
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::toggle_sidebar_action))
@@ -346,6 +349,7 @@ impl Render for Waku {
             .flex()
             .text_color(theme.text)
             .font_family(".SystemUIFont")
+            .children(crate::diagnostics::frame_probe())
             // Both panels slide through a container that narrows while their
             // content keeps its full width and is clipped: the sidebar list
             // and the right panel's surfaces never reflow on the way in or
@@ -378,7 +382,11 @@ impl Render for Waku {
                     .when(panels.sidebar > 0.0, |element| {
                         element.border_l_1().border_color(theme.sidebar_border)
                     })
-                    .child(self.render_header(window, cx))
+                    .child(if self.board_open {
+                        self.render_board_header(window, cx)
+                    } else {
+                        self.render_header(window, cx).into_any_element()
+                    })
                     .child(if empty && !self.board_open {
                         self.render_empty_state(cx).into_any_element()
                     } else {
@@ -387,7 +395,7 @@ impl Render for Waku {
                             .cached(StyleRefinement::default().flex_1().min_h(px(0.0)).w_full())
                             .into_any_element()
                     })
-                    .children(permission)
+                    .when(!self.board_open, |element| element.children(permission))
                     .when(
                         !self.board_open && self.selected_project().is_some(),
                         |element| {

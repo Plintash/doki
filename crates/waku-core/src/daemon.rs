@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::{
@@ -9,15 +10,15 @@ use crate::{
     WorkspaceResult,
 };
 use anyhow::{Context as _, anyhow, bail};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::attachments::AttachmentStore;
 use crate::driver::{self, DriverHandle, DriverStartOptions, SessionOptions};
 use crate::model::{
-    AgentSession, Checkpoint, CheckpointStatus, DriverEvent, Project, ProviderKind,
-    ProviderResumeCursor, SessionStatus,
+    AgentSession, Checkpoint, CheckpointStatus, DriverEvent, GoalOperation, Project, ProviderKind,
+    ProviderResumeCursor, SessionStatus, Task, TaskState, ThreadGoalStatus,
 };
 use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
 use crate::settings::DaemonSettingsStore;
@@ -53,8 +54,48 @@ struct OwnedTerminal {
     terminal: crate::terminal::DaemonTerminal,
 }
 
+/// Records positive process-exit or owned-session shutdown evidence independently
+/// of client subscriptions. Shared services retain their user-owned process.
+/// A timed-out close keeps this latch, so a retry cannot mistake absence for exit.
+#[derive(Default)]
+struct RuntimeExit {
+    close_requested: AtomicBool,
+    exited: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl RuntimeExit {
+    fn request_close(&self) {
+        self.close_requested.store(true, Ordering::Release);
+    }
+
+    fn is_unconfirmed_close(&self) -> bool {
+        self.close_requested.load(Ordering::Acquire) && !*self.exited.lock()
+    }
+
+    fn observe(&self) {
+        *self.exited.lock() = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self, timeout: std::time::Duration) -> anyhow::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut exited = self.exited.lock();
+        while !*exited {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                bail!("the provider has not confirmed shutdown; the issue remains active");
+            }
+            self.changed.wait_for(&mut exited, remaining);
+        }
+        Ok(())
+    }
+}
+
 pub struct WakuBackend {
+    scratch: crate::automation_scratch::ScratchManager,
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
+    runtime_exits: Mutex<HashMap<(Uuid, Uuid), Arc<RuntimeExit>>>,
     terminals: Mutex<HashMap<Uuid, OwnedTerminal>>,
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
@@ -89,8 +130,11 @@ impl WakuBackend {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .to_owned();
+        let scratch = crate::automation_scratch::ScratchManager::new(&usage_rates_dir);
         Ok(Self {
+            scratch,
             sessions: Mutex::new(HashMap::new()),
+            runtime_exits: Mutex::new(HashMap::new()),
             terminals: Mutex::new(HashMap::new()),
             #[cfg(all(test, unix))]
             terminal_shell: None,
@@ -105,6 +149,80 @@ impl WakuBackend {
             usage_rates_dir,
             default_cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         })
+    }
+
+    fn close_session_and_wait(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let exit = self
+            .runtime_exits
+            .lock()
+            .get(&(session_id, runtime_id))
+            .cloned()
+            .ok_or_else(|| anyhow!("shutdown evidence for runtime {runtime_id} is unavailable"))?;
+        exit.request_close();
+        self.confirm_shared_session_shutdown(session_id, runtime_id)?;
+        let removed = {
+            let mut sessions = self.sessions.lock();
+            // A retry can confirm its old runtime independently, but must
+            // never shut down a replacement started by explicit continuation.
+            if sessions
+                .get(&session_id)
+                .is_some_and(|(id, _)| *id == runtime_id)
+            {
+                sessions.remove(&session_id)
+            } else {
+                None
+            }
+        };
+        // Driver Drop requests shutdown; only its ProcessExited event
+        // confirms that the asynchronous process owner has settled.
+        drop(removed);
+        exit.wait(timeout)?;
+        Ok(())
+    }
+
+    fn confirm_shared_session_shutdown(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let driver = self
+            .sessions
+            .lock()
+            .get(&session_id)
+            .filter(|(id, _)| *id == runtime_id)
+            .map(|(_, driver)| driver.clone());
+        if let Some(driver) = driver
+            && let Some(result) = driver.confirm_session_shutdown()
+        {
+            // OpenCode owns a native session on an adopted service, not that
+            // process. Its explicit session settlement is the close boundary.
+            result?;
+            if let Some(exit) = self.runtime_exits.lock().get(&(session_id, runtime_id)) {
+                exit.observe();
+            }
+        }
+        Ok(())
+    }
+
+    fn note_runtime_close_requested(&self, session_id: Uuid, runtime_id: Uuid) {
+        if let Some(exit) = self.runtime_exits.lock().get(&(session_id, runtime_id)) {
+            exit.request_close();
+        }
+    }
+
+    fn unconfirmed_shutdown_sessions(&self) -> HashSet<Uuid> {
+        self.runtime_exits
+            .lock()
+            .iter()
+            .filter_map(|((session_id, _), exit)| {
+                exit.is_unconfirmed_close().then_some(*session_id)
+            })
+            .collect()
     }
 
     #[cfg(all(test, unix))]
@@ -132,6 +250,31 @@ impl WakuBackend {
         }
         ensure_shell_environment();
         crate::terminal::DaemonTerminal::open(cwd, cols, rows, events)
+    }
+
+    /// Reopening is part of explicit work submission, never a consequence of
+    /// late stop/completion events or simply viewing an archived conversation.
+    fn reopen_task_for_work(&self, session_id: Uuid) -> anyhow::Result<bool> {
+        let mut state = self.task_state.lock();
+        let task_id = state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.task_id);
+        let Some(index) = state
+            .tasks
+            .iter()
+            .position(|task| Some(task.id) == task_id && task.state.is_done())
+        else {
+            return Ok(false);
+        };
+        let previous = state.tasks[index].clone();
+        state.tasks[index].set_state(TaskState::Doing);
+        if let Err(error) = self.task_store.save(&mut state) {
+            state.tasks[index] = previous;
+            return Err(error).context("could not reopen the task before submitting work");
+        }
+        Ok(true)
     }
 
     /// Capture and persist one ending checkpoint exactly once per daemon.
@@ -234,6 +377,26 @@ fn migrate_projectless_state(
 }
 
 impl Backend for WakuBackend {
+    fn handle_automation_scratch(
+        &self,
+        command: &waku_protocol::AutomationCommand,
+    ) -> anyhow::Result<waku_protocol::AutomationResult> {
+        self.scratch.handle(command)
+    }
+
+    fn forward_automation(
+        &self,
+        command: &waku_protocol::AutomationCommand,
+        outgoing: crossbeam_channel::Sender<crate::ServerMessage>,
+        subscriber_id: u64,
+    ) -> Option<anyhow::Result<waku_protocol::AutomationResult>> {
+        self.scratch.forward(command, outgoing, subscriber_id)
+    }
+
+    fn automation_subscriber_disconnected(&self, subscriber_id: u64) {
+        self.scratch.disconnected(subscriber_id);
+    }
+
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
@@ -377,6 +540,13 @@ impl Backend for WakuBackend {
                     .collect::<HashMap<_, _>>();
                 let mut state = self.task_state.lock();
                 let removed_session_ids = self.removed_session_ids.lock();
+                validate_task_completions(
+                    &state,
+                    &tasks,
+                    &sessions,
+                    &active_runtimes,
+                    &self.unconfirmed_shutdown_sessions(),
+                )?;
                 for project in projects {
                     if let Some(existing) = state
                         .projects
@@ -391,14 +561,17 @@ impl Backend for WakuBackend {
                 // Tasks merge the way projects do: a save is additive, and an
                 // older snapshot never overwrites a newer one. Deleting a task
                 // is an explicit client action, not a side effect of saving.
+                let previous_task_count = state.tasks.len();
+                let mut replaced_tasks = Vec::new();
                 for task in tasks {
-                    if let Some(existing) = state
+                    if let Some(index) = state
                         .tasks
-                        .iter_mut()
-                        .find(|existing| existing.id == task.id)
+                        .iter()
+                        .position(|existing| existing.id == task.id)
                     {
-                        if task.updated_at >= existing.updated_at {
-                            *existing = task;
+                        if task.updated_at > state.tasks[index].updated_at {
+                            let previous = std::mem::replace(&mut state.tasks[index], task);
+                            replaced_tasks.push((index, previous));
                         }
                     } else {
                         state.tasks.push(task);
@@ -460,7 +633,17 @@ impl Backend for WakuBackend {
                 for session_id in &saved_ids {
                     state.mark_session_dirty(*session_id);
                 }
-                self.task_store.save(&mut state)?;
+                if let Err(error) = self.task_store.save(&mut state) {
+                    // A failed acknowledged edit must not become the daemon's
+                    // authoritative issue state when the client refreshes.
+                    // Keep the replaced values, not cloned transcripts, for
+                    // this rollback. Dirty session data remains retryable.
+                    for (index, previous) in replaced_tasks.into_iter().rev() {
+                        state.tasks[index] = previous;
+                    }
+                    state.tasks.truncate(previous_task_count);
+                    return Err(error.into());
+                }
                 let sessions = saved_ids
                     .into_iter()
                     .filter_map(|session_id| {
@@ -505,6 +688,9 @@ impl Backend for WakuBackend {
                 }
                 let removed = self.sessions.lock().remove(&session_id);
                 drop(removed);
+                self.runtime_exits
+                    .lock()
+                    .retain(|(id, _), _| *id != session_id);
                 // The task owns its terminals: its shells end with it. A client
                 // closing only its surface never reaches this, which is what
                 // keeps a detached terminal running.
@@ -517,6 +703,31 @@ impl Backend for WakuBackend {
                 };
                 drop(disposed);
                 Ok(ResponsePayload::Ack)
+            }
+            Command::ReadTranscript {
+                conversation_id,
+                query,
+            } => {
+                if !cfg!(debug_assertions) {
+                    bail!("transcript inspection is only available in debug builds");
+                }
+                Ok(ResponsePayload::Transcript {
+                    result: crate::transcript::read_transcript(
+                        self.task_store.path(),
+                        conversation_id,
+                        &query,
+                    )
+                    .map_err(|error| {
+                        error
+                            .downcast::<waku_protocol::TranscriptError>()
+                            .unwrap_or_else(|error| {
+                                waku_protocol::TranscriptError::new(
+                                    "transcript_read_failed",
+                                    &error.to_string(),
+                                )
+                            })
+                    }),
+                })
             }
             Command::HydrateSession { session_id } => {
                 // Live runtimes stay resident; everything else is trimmed to
@@ -871,6 +1082,11 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             Command::Start { options } => {
+                let previous_id = self.sessions.lock().get(&session_id).map(|(id, _)| *id);
+                if let Some(previous_id) = previous_id {
+                    self.note_runtime_close_requested(session_id, previous_id);
+                    self.confirm_shared_session_shutdown(session_id, previous_id)?;
+                }
                 let previous = self.sessions.lock().remove(&session_id);
                 drop(previous);
                 let provider = decode_enum(&options.provider)?;
@@ -891,13 +1107,36 @@ impl Backend for WakuBackend {
                         .context("daemon received an invalid provider cursor")?,
                 };
                 let (wake, _wake_events) = smol::channel::bounded(1);
-                let (event_sender, event_receiver) = driver::event_channel(wake);
+                let runtime = crate::diagnostics::ProviderRuntime {
+                    provider,
+                    session_id,
+                    runtime_id,
+                };
+                let diagnostics = crate::diagnostics::ProviderDiagnostics::new(runtime, {
+                    let events = events.clone();
+                    move |record| events.record(|| Some(record))
+                });
+                let tracker = diagnostics.clone();
+                let (event_sender, event_receiver) =
+                    driver::event_channel_with_diagnostics(wake, Some(diagnostics));
                 let handle = driver::start_local(provider, options, event_sender)?;
                 let supports_steer = handle.supports_steer();
+                let exit = Arc::new(RuntimeExit::default());
+                let forwarding_exit = exit.clone();
                 std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
                     .spawn(move || {
+                        let mut active_turn = crate::diagnostics::ActiveTurn::default();
                         while let Ok(event) = event_receiver.recv() {
+                            let process_exited = matches!(&event, DriverEvent::ProcessExited);
+                            if process_exited {
+                                forwarding_exit.observe();
+                            }
+                            events.record(|| {
+                                let turn_id = active_turn.turn_for(&event);
+                                tracker.set_turn(turn_id);
+                                crate::diagnostics::driver_record(runtime, turn_id, &event)
+                            });
                             let wire = event_to_wire(event).unwrap_or_else(|error| {
                                 WireDriverEvent::new(
                                     "error",
@@ -906,18 +1145,34 @@ impl Backend for WakuBackend {
                                     )),
                                 )
                             });
-                            if events.send(wire).is_err() {
+                            // Shutdown evidence belongs to the daemon, not
+                            // to a still-connected client or event subscriber.
+                            let _ = events.send(wire);
+                            if process_exited {
                                 break;
                             }
                         }
                     })
                     .context("could not start daemon event forwarding thread")?;
+                self.runtime_exits
+                    .lock()
+                    .insert((session_id, runtime_id), exit);
                 self.sessions
                     .lock()
                     .insert(session_id, (runtime_id, handle));
                 Ok(ResponsePayload::Started { supports_steer })
             }
+            Command::CloseSessionAndWait => {
+                self.close_session_and_wait(
+                    session_id,
+                    runtime_id,
+                    std::time::Duration::from_secs(10),
+                )?;
+                Ok(ResponsePayload::Ack)
+            }
             Command::CloseSession => {
+                self.note_runtime_close_requested(session_id, runtime_id);
+                self.confirm_shared_session_shutdown(session_id, runtime_id)?;
                 let removed = {
                     let mut sessions = self.sessions.lock();
                     sessions
@@ -942,6 +1197,9 @@ impl Backend for WakuBackend {
                     }
                     driver.clone()
                 };
+                if command_starts_issue_work(&command) && self.reopen_task_for_work(session_id)? {
+                    events.task_state_changed();
+                }
                 if let Command::Prompt {
                     prompt,
                     turn_id,
@@ -967,11 +1225,96 @@ impl Backend for WakuBackend {
     }
 
     fn shutdown(&self) {
+        self.scratch.shutdown();
         let sessions = std::mem::take(&mut *self.sessions.lock());
         drop(sessions);
         let terminals = std::mem::take(&mut *self.terminals.lock());
         drop(terminals);
     }
+}
+
+/// Only explicit starts reopen an issue; refresh, pause, and provider events do not.
+fn command_starts_issue_work(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Prompt { .. }
+            | Command::Steer { .. }
+            | Command::Goal {
+                operation: GoalOperation::Set {
+                    status: Some(ThreadGoalStatus::Active),
+                    ..
+                }
+            }
+    )
+}
+
+/// A client may mark Done only after all conversation snapshots in the same
+/// save have settled. Stale clients cannot archive work that the daemon still
+/// knows is busy. Requested shutdowns also require positive process-exit
+/// evidence, even after a client restarts with an optimistic idle projection.
+/// Detached controls remain the confirming client's responsibility.
+fn validate_task_completions(
+    state: &PersistedState,
+    tasks: &[Task],
+    incoming_sessions: &[AgentSession],
+    active_runtimes: &HashMap<Uuid, Uuid>,
+    unconfirmed_shutdowns: &HashSet<Uuid>,
+) -> anyhow::Result<()> {
+    let completing = tasks
+        .iter()
+        .filter(|task| {
+            task.state.is_done()
+                && state
+                    .tasks
+                    .iter()
+                    .find(|old| old.id == task.id)
+                    .is_none_or(|old| !old.state.is_done() && task.updated_at > old.updated_at)
+        })
+        .map(|task| task.id)
+        .collect::<HashSet<_>>();
+    if completing.is_empty() {
+        return Ok(());
+    }
+    let is_unsettled = |session_id: Uuid, task_id: Option<Uuid>, status: SessionStatus| {
+        (status.is_busy()
+            || active_runtimes.contains_key(&session_id)
+            || unconfirmed_shutdowns.contains(&session_id))
+            && task_id.is_some_and(|id| completing.contains(&id))
+    };
+    for existing in &state.sessions {
+        let incoming = incoming_sessions
+            .iter()
+            .find(|session| session.id == existing.id);
+        let (task_id, status) = match incoming {
+            Some(incoming)
+                if !session_projection_precedes(
+                    existing,
+                    incoming,
+                    active_runtimes.get(&existing.id).copied(),
+                ) =>
+            {
+                (incoming.task_id, incoming.status)
+            }
+            Some(incoming) if incoming.updated_at >= existing.updated_at => {
+                (incoming.task_id, existing.status)
+            }
+            _ => (existing.task_id, existing.status),
+        };
+        if is_unsettled(existing.id, task_id, status) {
+            bail!("stop the task's running conversations before marking it done");
+        }
+    }
+    for incoming in incoming_sessions {
+        if !state
+            .sessions
+            .iter()
+            .any(|session| session.id == incoming.id)
+            && is_unsettled(incoming.id, incoming.task_id, incoming.status)
+        {
+            bail!("stop the task's running conversations before marking it done");
+        }
+    }
+    Ok(())
 }
 
 fn session_projection_precedes(
@@ -1234,6 +1577,18 @@ impl WakuBackend {
             }
         };
 
+        let runtime_id = self.sessions.lock().get(&session_id).map(|(id, _)| *id);
+        if let Some(runtime_id) = runtime_id {
+            self.note_runtime_close_requested(session_id, runtime_id);
+            if let Err(error) = self.confirm_shared_session_shutdown(session_id, runtime_id) {
+                return Err(restore_rewind_safety(
+                    &cwd,
+                    &safety_ref,
+                    "the provider did not confirm session shutdown",
+                    error,
+                ));
+            }
+        }
         let _ = crate::checkpoint::delete_ref(&cwd, &safety_ref);
         let cleanup_warning = crate::checkpoint::delete_turn_refs_after(
             &cwd,
@@ -1875,6 +2230,11 @@ fn handle_driver_command(
         }
         Command::AttachSession
         | Command::Start { .. }
+        | Command::Automation { .. }
+        | Command::DiagnosticLogs { .. }
+        | Command::DiagnosticTimeline { .. }
+        | Command::DiagnosticCounters
+        | Command::DiagnosticVerbosity { .. }
         | Command::GetSettings
         | Command::UpdateSettings { .. }
         | Command::ProbeProvider { .. }
@@ -1888,6 +2248,7 @@ fn handle_driver_command(
         | Command::SaveTaskState { .. }
         | Command::RemoveSession
         | Command::HydrateSession { .. }
+        | Command::ReadTranscript { .. }
         | Command::SearchSessionMessages { .. }
         | Command::ListProviderSessions { .. }
         | Command::LoadProviderSession { .. }
@@ -1909,7 +2270,8 @@ fn handle_driver_command(
         | Command::WriteTerminal { .. }
         | Command::ResizeTerminal { .. }
         | Command::CloseTerminal
-        | Command::CloseSession => {
+        | Command::CloseSession
+        | Command::CloseSessionAndWait => {
             bail!("daemon received a command in the wrong dispatch path")
         }
     }
@@ -1927,6 +2289,489 @@ fn ensure_shell_environment() {
 mod tests {
     use super::*;
     use waku_protocol::event_from_wire;
+
+    struct ShutdownTestDriver(crossbeam_channel::Sender<()>);
+
+    impl crate::driver::DriverControl for ShutdownTestDriver {
+        fn prompt(&self, _: String) {}
+        fn cancel(&self) {}
+        fn respond(&self, _: String, _: String) {}
+        fn rollback(&self, _: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
+            Ok(None)
+        }
+    }
+
+    impl Drop for ShutdownTestDriver {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    struct SharedShutdownTestDriver {
+        settled: Arc<AtomicBool>,
+        dropped: crossbeam_channel::Sender<()>,
+    }
+
+    impl crate::driver::DriverControl for SharedShutdownTestDriver {
+        fn prompt(&self, _: String) {}
+        fn cancel(&self) {}
+        fn respond(&self, _: String, _: String) {}
+        fn rollback(&self, _: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
+            Ok(None)
+        }
+        fn confirm_session_shutdown(&self) -> Option<anyhow::Result<()>> {
+            Some(if self.settled.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(anyhow!("session still running"))
+            })
+        }
+    }
+
+    impl Drop for SharedShutdownTestDriver {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(());
+        }
+    }
+
+    #[test]
+    fn confirmed_shutdown_retains_shared_service_adapter_until_session_acknowledges() {
+        let (root, backend) = shutdown_test_backend();
+        let session = Uuid::new_v4();
+        let runtime = Uuid::new_v4();
+        let settled = Arc::new(AtomicBool::new(false));
+        let exit = Arc::new(RuntimeExit::default());
+        let (dropped, dropped_rx) = crossbeam_channel::bounded(1);
+        backend
+            .runtime_exits
+            .lock()
+            .insert((session, runtime), exit);
+        backend.sessions.lock().insert(
+            session,
+            (
+                runtime,
+                DriverHandle::from_control(Arc::new(SharedShutdownTestDriver {
+                    settled: settled.clone(),
+                    dropped,
+                })),
+            ),
+        );
+        assert!(
+            backend
+                .close_session_and_wait(session, runtime, std::time::Duration::ZERO)
+                .is_err()
+        );
+        assert!(backend.sessions.lock().contains_key(&session));
+        assert!(dropped_rx.try_recv().is_err());
+        assert!(backend.unconfirmed_shutdown_sessions().contains(&session));
+        settled.store(true, Ordering::Release);
+        assert!(
+            backend
+                .close_session_and_wait(session, runtime, std::time::Duration::ZERO)
+                .is_ok()
+        );
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(!backend.sessions.lock().contains_key(&session));
+        assert!(!backend.unconfirmed_shutdown_sessions().contains(&session));
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn shutdown_test_backend() -> (std::path::PathBuf, Arc<WakuBackend>) {
+        let root = std::env::temp_dir().join(format!("waku-confirmed-shutdown-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap();
+        (root, Arc::new(backend))
+    }
+
+    #[test]
+    fn confirmed_shutdown_waits_for_process_exit_after_driver_drop() {
+        let (root, backend) = shutdown_test_backend();
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let exit = Arc::new(RuntimeExit::default());
+        backend
+            .runtime_exits
+            .lock()
+            .insert((session_id, runtime_id), exit.clone());
+        let (dropped, dropped_rx) = crossbeam_channel::bounded(1);
+        backend.sessions.lock().insert(
+            session_id,
+            (
+                runtime_id,
+                DriverHandle::from_control(Arc::new(ShutdownTestDriver(dropped))),
+            ),
+        );
+        let (finished, finished_rx) = crossbeam_channel::bounded(1);
+        let closing = backend.clone();
+        let worker = std::thread::spawn(move || {
+            finished
+                .send(closing.close_session_and_wait(
+                    session_id,
+                    runtime_id,
+                    std::time::Duration::from_secs(2),
+                ))
+                .unwrap();
+        });
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(backend.sessions.lock().is_empty());
+        assert!(
+            finished_rx.try_recv().is_err(),
+            "runtime removal is not process-exit evidence"
+        );
+        exit.observe();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        worker.join().unwrap();
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmed_shutdown_timeout_and_absence_do_not_acknowledge_stop() {
+        let (root, backend) = shutdown_test_backend();
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let timeout = std::time::Duration::ZERO;
+        assert!(
+            backend
+                .close_session_and_wait(session_id, runtime_id, timeout)
+                .is_err()
+        );
+        let exit = Arc::new(RuntimeExit::default());
+        backend
+            .runtime_exits
+            .lock()
+            .insert((session_id, runtime_id), exit.clone());
+        assert!(
+            backend
+                .close_session_and_wait(session_id, runtime_id, timeout)
+                .is_err()
+        );
+        assert!(
+            backend
+                .close_session_and_wait(session_id, runtime_id, timeout)
+                .is_err(),
+            "retry retains uncertainty after runtime removal"
+        );
+        assert!(
+            backend
+                .close_session_and_wait(session_id, Uuid::new_v4(), timeout)
+                .is_err()
+        );
+        exit.observe();
+        assert!(
+            backend
+                .close_session_and_wait(session_id, runtime_id, timeout)
+                .is_ok()
+        );
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmed_shutdown_retry_keeps_old_exit_evidence_after_replacement() {
+        let (root, backend) = shutdown_test_backend();
+        let session = Uuid::new_v4();
+        let old = Uuid::new_v4();
+        let replacement = Uuid::new_v4();
+        let old_exit = Arc::new(RuntimeExit::default());
+        let new_exit = Arc::new(RuntimeExit::default());
+        backend
+            .runtime_exits
+            .lock()
+            .insert((session, old), old_exit.clone());
+        assert!(
+            backend
+                .close_session_and_wait(session, old, std::time::Duration::ZERO)
+                .is_err()
+        );
+        let (dropped, dropped_rx) = crossbeam_channel::bounded(1);
+        backend.sessions.lock().insert(
+            session,
+            (
+                replacement,
+                DriverHandle::from_control(Arc::new(ShutdownTestDriver(dropped))),
+            ),
+        );
+        backend
+            .runtime_exits
+            .lock()
+            .insert((session, replacement), new_exit.clone());
+        assert!(
+            backend
+                .close_session_and_wait(session, old, std::time::Duration::ZERO)
+                .is_err()
+        );
+        assert!(
+            dropped_rx.try_recv().is_err(),
+            "an old close cannot stop the replacement"
+        );
+        old_exit.observe();
+        assert!(
+            backend
+                .close_session_and_wait(session, old, std::time::Duration::ZERO)
+                .is_ok()
+        );
+        assert_eq!(
+            backend.sessions.lock().get(&session).unwrap().0,
+            replacement
+        );
+        assert!(
+            backend
+                .close_session_and_wait(session, replacement, std::time::Duration::ZERO)
+                .is_err()
+        );
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        new_exit.observe();
+        assert!(
+            backend
+                .close_session_and_wait(session, replacement, std::time::Duration::ZERO)
+                .is_ok()
+        );
+        assert!(
+            backend
+                .close_session_and_wait(session, old, std::time::Duration::ZERO)
+                .is_ok(),
+            "retry can confirm both controls after the replacement stops"
+        );
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmed_shutdown_blocks_done_after_client_restart_with_saved_idle_session() {
+        let (root, backend) = shutdown_test_backend();
+        let project = Project::from_path(root.join("project"));
+        let mut task = Task::new("Stop before archiving", TaskState::Doing, 0);
+        let mut session = AgentSession::new(project.id, ProviderKind::Pi);
+        session.task_id = Some(task.id);
+        session.status = SessionStatus::Idle;
+        {
+            let mut state = backend.task_state.lock();
+            state.projects.push(project);
+            state.tasks.push(task.clone());
+            state.push_session(session.clone());
+            backend.task_store.save(&mut state).unwrap();
+        }
+        let runtime_id = Uuid::new_v4();
+        let exit = Arc::new(RuntimeExit::default());
+        backend
+            .runtime_exits
+            .lock()
+            .insert((session.id, runtime_id), exit.clone());
+        // Ordinary fire-and-forget Stop and confirmed-close timeout share the
+        // same evidence barrier, even once the desktop loses its in-memory map.
+        backend.note_runtime_close_requested(session.id, runtime_id);
+        let restarted = backend.task_store.load().unwrap();
+        assert_eq!(
+            restarted
+                .sessions
+                .iter()
+                .find(|stored| stored.id == session.id)
+                .unwrap()
+                .status,
+            SessionStatus::Idle
+        );
+        task.set_state(TaskState::Done);
+        assert!(
+            validate_task_completions(
+                &restarted,
+                &[task.clone()],
+                &[session.clone()],
+                &HashMap::new(),
+                &backend.unconfirmed_shutdown_sessions()
+            )
+            .is_err()
+        );
+        assert!(
+            backend
+                .close_session_and_wait(session.id, runtime_id, std::time::Duration::ZERO)
+                .is_err()
+        );
+        exit.observe();
+        assert!(
+            validate_task_completions(
+                &restarted,
+                &[task],
+                &[session],
+                &HashMap::new(),
+                &backend.unconfirmed_shutdown_sessions()
+            )
+            .is_ok()
+        );
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completing_an_issue_requires_its_conversations_to_settle() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let task = Task::new("Repair parser", TaskState::Doing, 0);
+        state.sessions[0].task_id = Some(task.id);
+        state.sessions[0].begin_turn("work");
+        state.sessions[0].status = SessionStatus::Working;
+        state.tasks.push(task.clone());
+        let mut done = task;
+        done.set_state(TaskState::Done);
+        assert!(
+            validate_task_completions(
+                &state,
+                &[done.clone()],
+                &[],
+                &HashMap::new(),
+                &HashSet::new()
+            )
+            .is_err()
+        );
+        let mut settled = state.sessions[0].clone();
+        settled.status = SessionStatus::Idle;
+        settled.updated_at = state.sessions[0].updated_at + 1;
+        assert!(
+            validate_task_completions(
+                &state,
+                &[done],
+                &[settled],
+                &HashMap::new(),
+                &HashSet::new()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn fresh_idle_projection_cannot_complete_a_linked_live_runtime() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let task = Task::new("Stop the actual runtime", TaskState::Doing, 0);
+        state.sessions[0].task_id = Some(task.id);
+        state.sessions[0].status = SessionStatus::Working;
+        let runtime = Uuid::new_v4();
+        state.sessions[0].runtime_event_cursor = Some(crate::model::RuntimeEventCursor {
+            runtime_id: runtime,
+            epoch: Uuid::new_v4(),
+            sequence: 12,
+        });
+        let mut fresh = state.sessions[0].clone();
+        fresh.status = SessionStatus::Idle;
+        fresh.updated_at = fresh.updated_at.saturating_add(1);
+        state.tasks.push(task.clone());
+        let mut done = task;
+        done.set_state(TaskState::Done);
+        let active = HashMap::from([(fresh.id, runtime)]);
+        assert!(
+            validate_task_completions(
+                &state,
+                &[done.clone()],
+                &[fresh.clone()],
+                &active,
+                &HashSet::new()
+            )
+            .is_err()
+        );
+        // Even a daemon catalog already showing Idle cannot override the
+        // authoritative fact that its provider runtime remains resident.
+        state.sessions[0].status = SessionStatus::Idle;
+        assert!(
+            validate_task_completions(
+                &state,
+                &[done.clone()],
+                &[fresh.clone()],
+                &active,
+                &HashSet::new()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_task_completions(&state, &[done], &[fresh], &HashMap::new(), &HashSet::new())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn stale_settlement_cannot_archive_a_newer_running_turn() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let task = Task::new("Repair parser", TaskState::Doing, 0);
+        state.sessions[0].task_id = Some(task.id);
+        state.sessions[0].status = SessionStatus::Working;
+        let mut stale = state.sessions[0].clone();
+        stale.status = SessionStatus::Idle;
+        stale.updated_at = stale.updated_at.saturating_sub(1);
+        state.tasks.push(task.clone());
+        let mut done = task;
+        done.set_state(TaskState::Done);
+        assert!(
+            validate_task_completions(&state, &[done], &[stale], &HashMap::new(), &HashSet::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn activating_a_goal_is_explicit_work_but_refreshing_or_pausing_is_not() {
+        for (status, expected) in [
+            (ThreadGoalStatus::Active, true),
+            (ThreadGoalStatus::Paused, false),
+            (ThreadGoalStatus::Complete, false),
+        ] {
+            assert_eq!(
+                command_starts_issue_work(&Command::Goal {
+                    operation: GoalOperation::Set {
+                        objective: None,
+                        status: Some(status),
+                        replace: false,
+                    }
+                }),
+                expected
+            );
+        }
+        assert!(!command_starts_issue_work(&Command::Goal {
+            operation: GoalOperation::Refresh
+        }));
+    }
+
+    #[test]
+    fn explicit_work_reopens_a_done_issue_and_persists_it() {
+        let root = std::env::temp_dir().join(format!("waku-issue-reopen-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("app.db");
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(database.clone()),
+        )
+        .unwrap();
+        let id = {
+            let mut state = backend.task_state.lock();
+            let project = Project::from_path(root.join("repo"));
+            let task = Task::new("Repair parser", TaskState::Done, 0);
+            let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+            session.task_id = Some(task.id);
+            let id = session.id;
+            state.projects.push(project);
+            state.tasks.push(task);
+            state.push_session(session);
+            backend.task_store.save(&mut state).unwrap();
+            id
+        };
+        assert!(backend.reopen_task_for_work(id).unwrap());
+        assert!(!backend.reopen_task_for_work(id).unwrap());
+        let restored = StateStore::daemon(database).load().unwrap();
+        assert_eq!(restored.tasks[0].state, TaskState::Doing);
+        assert!(restored.tasks[0].completed_at.is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn stale_runtime_projection_keeps_newer_transcript_cursor() {

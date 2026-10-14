@@ -527,14 +527,13 @@ impl PersistedState {
         self.right_panel_width = app_state.right_panel_width;
     }
 
-    /// A session only earns a row once it has started; drafts stay in memory.
-    /// A draft selection is stored as no selection at all, so relaunching
-    /// recreates a draft and lands on the new-session page the user quit from.
+    /// Issue sessions own durable identities before the first prompt. Ordinary
+    /// project drafts remain transient and are recreated on their new page.
     fn persistable_selected_session(&self) -> Option<Uuid> {
         self.selected_session.filter(|selected| {
-            self.sessions
-                .iter()
-                .any(|session| session.id == *selected && session.has_started())
+            self.sessions.iter().any(|session| {
+                session.id == *selected && (session.has_started() || session.task_id.is_some())
+            })
         })
     }
 
@@ -898,6 +897,9 @@ impl StateStore {
     /// per-user application support directory.
     pub fn default_path() -> PathBuf {
         if cfg!(debug_assertions) {
+            if let Some(directory) = std::env::var_os("WAKU_RPA_DATA_DIR") {
+                return PathBuf::from(directory).join("app.db");
+            }
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .and_then(Path::parent)
@@ -1131,7 +1133,7 @@ impl StateStore {
         let mut tasks = connection
             .prepare(
                 "SELECT id, title, state, position, project_id, path, branch, worktree,
-                        created_at, updated_at, completed_at
+                        created_at, updated_at, completed_at, description, new_worktree
                  FROM tasks ORDER BY state, position, created_at",
             )
             .map_err(to_io_error)?;
@@ -1149,6 +1151,8 @@ impl StateStore {
                     row.get::<_, i64>(8)?,
                     row.get::<_, i64>(9)?,
                     row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, bool>(12)?,
                 ))
             })
             .map_err(to_io_error)?
@@ -1163,7 +1167,7 @@ impl StateStore {
         let mut sessions = connection
             .prepare(
                 "SELECT id, project_id, title, auto_title, provider, model, status,
-                        task_id, created_at, updated_at, last_reply_at
+                        task_id, created_at, updated_at, last_reply_at, is_draft, workspace
                  FROM sessions ORDER BY updated_at",
             )
             .map_err(to_io_error)?;
@@ -1182,6 +1186,8 @@ impl StateStore {
                     row.get::<_, i64>(8)?,
                     row.get::<_, i64>(9)?,
                     row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, bool>(11)?,
+                    row.get::<_, String>(12)?,
                 ))
             })
             .map_err(to_io_error)?
@@ -1277,7 +1283,6 @@ impl StateStore {
         session.extension_status = stored.extension_status;
         session.extension_widgets = stored.extension_widgets;
         session.extension_window_title = stored.extension_window_title;
-        session.workspace = stored.workspace;
         session.provider_cursor = stored.provider_cursor;
         session.runtime_mode = stored.runtime_mode;
         session.reasoning_effort = stored.reasoning_effort;
@@ -1319,6 +1324,16 @@ impl StateStore {
     /// Persists whatever the app marked as changed, so a streaming turn writes
     /// one session row and a selection change writes no rows at all.
     pub fn save(&self, state: &mut PersistedState) -> io::Result<()> {
+        self.save_state(state, false)
+    }
+
+    /// Bootstrap an explicit scratch fixture, including intentionally empty
+    /// task rows. Later ordinary saves retain the usual draft lifecycle.
+    pub(crate) fn save_scratch_seed(&self, state: &mut PersistedState) -> io::Result<()> {
+        self.save_state(state, true)
+    }
+
+    fn save_state(&self, state: &mut PersistedState, include_empty: bool) -> io::Result<()> {
         // Only changed sessions can hold a new inline payload, so the blob walk
         // follows the same set rather than every transcript on every save.
         let dirty = state.dirty_sessions.clone();
@@ -1387,7 +1402,6 @@ impl StateStore {
                     )
                     .map_err(to_io_error)?;
             }
-            storage.saved_projects = projects_fingerprint;
         }
 
         let tasks = serde_json::to_string(&state.tasks).map_err(to_io_error)?;
@@ -1398,6 +1412,9 @@ impl StateStore {
                 .map_err(to_io_error)?;
             for task in &state.tasks {
                 let (project_id, path, branch, worktree) = match &task.workspace {
+                    Some(TaskWorkspace::NewWorktree { project_id }) => {
+                        (Some(project_id.to_string()), None, None, false)
+                    }
                     Some(TaskWorkspace::Local { project_id }) => {
                         (Some(project_id.to_string()), None, None, false)
                     }
@@ -1427,25 +1444,27 @@ impl StateStore {
                             worktree as i64,
                             task.created_at as i64,
                             task.updated_at as i64,
-                            task.completed_at.map(|at| at as i64)
+                            task.completed_at.map(|at| at as i64),
+                            task.description,
+                            matches!(task.workspace, Some(TaskWorkspace::NewWorktree { .. }))
                         ],
                     )
                     .map_err(to_io_error)?;
             }
-            storage.saved_tasks = tasks_fingerprint;
         }
 
-        // Only sessions the app reported as changed are written. A draft that
-        // has not started yet owns no row, so it counts as removed until it does.
+        // Only changed sessions are written. Issue-owned drafts keep their
+        // identity so their independently keyed composer content can reload.
         let mut live = HashSet::with_capacity(state.sessions.len());
         // Applied only after the commit below, so a transaction that rolls back
         // does not leave this connection believing rows it never wrote are on
         // disk — which would make the next save skip them for good.
         let mut written_messages = Vec::new();
+        let mut persisted_sessions = Vec::new();
         for session in state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| include_empty || session.has_started() || session.task_id.is_some())
         {
             live.insert(session.id);
             // A skeleton's empty transcript means "not fetched", not "empty".
@@ -1457,10 +1476,10 @@ impl StateStore {
                     transaction
                         .execute(
                             UPSERT_SESSION,
-                            rusqlite::params_from_iter(session_params(session)),
+                            rusqlite::params_from_iter(session_params(session)?),
                         )
                         .map_err(to_io_error)?;
-                    storage.persisted_sessions.insert(session.id);
+                    persisted_sessions.push(session.id);
                 }
                 continue;
             }
@@ -1473,12 +1492,13 @@ impl StateStore {
             transaction
                 .execute(
                     UPSERT_SESSION,
-                    rusqlite::params_from_iter(session_params(session)),
+                    rusqlite::params_from_iter(session_params(session)?),
                 )
                 .map_err(to_io_error)?;
             transaction
                 .execute(UPSERT_SESSION_DETAIL, params![session.id.to_string(), data])
                 .map_err(to_io_error)?;
+            persisted_sessions.push(session.id);
             written_messages.push((
                 session.id,
                 write_messages(
@@ -1487,7 +1507,6 @@ impl StateStore {
                     storage.written_messages.get(&session.id).unwrap_or(&EMPTY),
                 )?,
             ));
-            storage.persisted_sessions.insert(session.id);
         }
 
         let removed = storage
@@ -1496,7 +1515,7 @@ impl StateStore {
             .copied()
             .filter(|id| !live.contains(id))
             .collect::<Vec<_>>();
-        for id in removed {
+        for id in &removed {
             let key = id.to_string();
             transaction
                 .execute("DELETE FROM sessions WHERE id = ?1", params![key])
@@ -1510,12 +1529,18 @@ impl StateStore {
             transaction
                 .execute("DELETE FROM messages WHERE session_id = ?1", params![key])
                 .map_err(to_io_error)?;
-            storage.persisted_sessions.remove(&id);
-            storage.written_messages.remove(&id);
         }
 
         transaction.commit().map_err(to_io_error)?;
-        // Now that the rows are durable, and not before.
+        // Publish every database cache only once the whole transaction is
+        // durable. A failed task/session write must remain retryable.
+        storage.saved_projects = projects_fingerprint;
+        storage.saved_tasks = tasks_fingerprint;
+        storage.persisted_sessions.extend(persisted_sessions);
+        for id in removed {
+            storage.persisted_sessions.remove(&id);
+            storage.written_messages.remove(&id);
+        }
         for (session_id, fingerprints) in written_messages {
             storage.written_messages.insert(session_id, fingerprints);
         }
@@ -1581,6 +1606,8 @@ type SessionColumns = (
     i64,
     i64,
     Option<i64>,
+    bool,
+    String,
 );
 
 /// Builds a list-only session from its columns. `messages`,
@@ -1601,6 +1628,8 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         created_at,
         updated_at,
         last_reply_at,
+        is_draft,
+        workspace,
     ) = row;
     Some(AgentSession {
         id: Uuid::parse_str(&id).ok()?,
@@ -1608,7 +1637,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         auto_title,
         project_id: Uuid::parse_str(&project_id).ok()?,
         task_id: task_id.and_then(|id| Uuid::parse_str(&id).ok()),
-        workspace: SessionWorkspace::Local,
+        workspace: serde_json::from_str(&workspace).unwrap_or_default(),
         provider: serde_json::from_value(serde_json::Value::String(provider)).ok()?,
         model,
         // Hydration replaces these; the list never reads them.
@@ -1636,6 +1665,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         turns: Vec::new(),
         queued_messages: Vec::new(),
         detail_loaded: false,
+        is_draft,
     })
 }
 
@@ -1651,6 +1681,8 @@ type TaskColumns = (
     i64,
     i64,
     Option<i64>,
+    String,
+    bool,
 );
 
 /// Builds a task from its row. A workspace is recovered only when the row
@@ -1669,20 +1701,26 @@ fn task_from_row(row: TaskColumns) -> Option<Task> {
         created_at,
         updated_at,
         completed_at,
+        description,
+        new_worktree,
     ) = row;
     let project_id = project_id.and_then(|id| Uuid::parse_str(&id).ok());
-    let workspace = match (project_id, path, branch, worktree != 0) {
-        (Some(project_id), Some(path), Some(branch), true) => Some(TaskWorkspace::Worktree {
-            project_id,
-            path: PathBuf::from(path),
-            branch,
-        }),
-        (Some(project_id), _, _, false) => Some(TaskWorkspace::Local { project_id }),
+    let workspace = match (project_id, path, branch, worktree != 0, new_worktree) {
+        (Some(project_id), _, _, _, true) => Some(TaskWorkspace::NewWorktree { project_id }),
+        (Some(project_id), Some(path), Some(branch), true, false) => {
+            Some(TaskWorkspace::Worktree {
+                project_id,
+                path: PathBuf::from(path),
+                branch,
+            })
+        }
+        (Some(project_id), _, _, false, false) => Some(TaskWorkspace::Local { project_id }),
         _ => None,
     };
     Some(Task {
         id: Uuid::parse_str(&id).ok()?,
         title,
+        description,
         state: serde_json::from_value(serde_json::Value::String(state)).ok()?,
         position,
         workspace,
@@ -1949,8 +1987,8 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
 /// listing sessions never has to deserialize a transcript.
 const UPSERT_SESSION: &str = "INSERT INTO sessions(
          id, project_id, title, auto_title, provider, model, status, task_id,
-         created_at, updated_at, last_reply_at
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         created_at, updated_at, last_reply_at, is_draft, workspace
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
      ON CONFLICT(id) DO UPDATE SET
          project_id    = excluded.project_id,
          title         = excluded.title,
@@ -1961,7 +1999,9 @@ const UPSERT_SESSION: &str = "INSERT INTO sessions(
          task_id       = excluded.task_id,
          created_at    = excluded.created_at,
          updated_at    = excluded.updated_at,
-         last_reply_at = excluded.last_reply_at";
+         last_reply_at = excluded.last_reply_at,
+         is_draft      = excluded.is_draft,
+         workspace     = excluded.workspace";
 
 const INSERT_PROJECT: &str = "INSERT INTO projects(id, name, path, position, created_at)
      VALUES(?1, ?2, ?3, ?4, ?5)
@@ -1973,8 +2013,8 @@ const INSERT_PROJECT: &str = "INSERT INTO projects(id, name, path, position, cre
 
 const INSERT_TASK: &str = "INSERT INTO tasks(
          id, title, state, position, project_id, path, branch, worktree,
-         created_at, updated_at, completed_at
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         created_at, updated_at, completed_at, description, new_worktree
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
      ON CONFLICT(id) DO UPDATE SET
          title        = excluded.title,
          state        = excluded.state,
@@ -1985,7 +2025,9 @@ const INSERT_TASK: &str = "INSERT INTO tasks(
          worktree     = excluded.worktree,
          created_at   = excluded.created_at,
          updated_at   = excluded.updated_at,
-         completed_at = excluded.completed_at";
+         completed_at = excluded.completed_at,
+         description  = excluded.description,
+         new_worktree = excluded.new_worktree";
 
 /// The transcript, written alongside the list row it belongs to.
 const UPSERT_SESSION_DETAIL: &str = "INSERT INTO session_details(session_id, data)
@@ -2001,9 +2043,10 @@ fn tag_of(value: impl Serialize) -> String {
         .unwrap_or_default()
 }
 
-fn session_params(session: &AgentSession) -> Vec<rusqlite::types::Value> {
+fn session_params(session: &AgentSession) -> io::Result<Vec<rusqlite::types::Value>> {
     use rusqlite::types::Value;
-    vec![
+    let workspace = serde_json::to_string(&session.workspace).map_err(to_io_error)?;
+    Ok(vec![
         Value::Text(session.id.to_string()),
         Value::Text(session.project_id.to_string()),
         Value::Text(session.title.clone()),
@@ -2019,7 +2062,9 @@ fn session_params(session: &AgentSession) -> Vec<rusqlite::types::Value> {
         session
             .last_reply_at
             .map_or(Value::Null, |at| Value::Integer(at as i64)),
-    ]
+        Value::Integer(i64::from(!session.has_started())),
+        Value::Text(workspace),
+    ])
 }
 
 fn normalize_computer_app_grants(grants: &mut Vec<ComputerAppGrant>) {
@@ -2188,6 +2233,31 @@ mod tests {
             drafts.get_for(&relaunched_runtime_session),
             Some(&draft),
             "the blank session's transient UUID must not own its draft"
+        );
+    }
+
+    #[test]
+    fn unstarted_issue_drafts_are_isolated_from_each_other_and_the_project() {
+        let project_id = Uuid::new_v4();
+        let mut first = AgentSession::new(project_id, ProviderKind::Codex);
+        let mut second = AgentSession::new(project_id, ProviderKind::Codex);
+        let unbound = AgentSession::new(project_id, ProviderKind::Codex);
+        first.task_id = Some(Uuid::new_v4());
+        second.task_id = Some(Uuid::new_v4());
+        let mut drafts = ComposerDrafts::default();
+        for (session, text) in [
+            (&first, "first brief"),
+            (&second, "second brief"),
+            (&unbound, "general draft"),
+        ] {
+            drafts.set(ComposerDraftKey::for_session(session), text_draft(text));
+        }
+        assert_eq!(drafts.get_for(&first).unwrap().text, "first brief");
+        assert_eq!(drafts.get_for(&second).unwrap().text, "second brief");
+        assert_eq!(drafts.get_for(&unbound).unwrap().text, "general draft");
+        assert_eq!(
+            ComposerDraftKey::for_session(&first),
+            ComposerDraftKey::Session(first.id)
         );
     }
 
@@ -2482,9 +2552,9 @@ mod tests {
         assert!(!session.detail_loaded);
         assert!(session.messages.is_empty());
         assert!(session.turns.is_empty());
-        assert_eq!(session.workspace, SessionWorkspace::Local);
-        // A skeleton still counts as started, since only started sessions
-        // are stored at all.
+        assert_eq!(session.workspace, state.sessions[0].workspace);
+        // Persisted history remains started without loading the transcript;
+        // durable issue drafts are separately marked as unstarted.
         assert!(session.has_started());
 
         reopened.hydrate(&mut restored.sessions[0]).unwrap();
@@ -2518,13 +2588,15 @@ mod tests {
         let ids = (0..5)
             .map(|index| {
                 let mut session = AgentSession::new(project_id, ProviderKind::Codex);
-                session.updated_at = started + index;
                 session.begin_turn(format!("prompt {index}"));
                 session.push_message(
                     crate::model::MessageRole::Assistant,
                     format!("answer {index}"),
                 );
                 session.finish_active_turn(crate::model::TurnStatus::Completed);
+                // Establish fixture recency after real mutations have stamped
+                // wall time, so the eviction order does not depend on the clock.
+                session.updated_at = started + index;
                 let id = session.id;
                 state.push_session(session);
                 id
@@ -3879,6 +3951,203 @@ mod tests {
             Some("net.imput.helium")
         );
         assert!(saved.get("teamId").is_none());
+    }
+
+    #[test]
+    fn planned_worktree_and_explicit_local_issue_defaults_survive_restart() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let project_id = state.projects[0].id;
+        let mut isolated = Task::new("Implement in isolation", TaskState::Backlog, 0);
+        isolated.workspace = Some(TaskWorkspace::NewWorktree { project_id });
+        let mut local = Task::new("Explicit local", TaskState::Backlog, 1);
+        local.workspace = Some(TaskWorkspace::Local { project_id });
+        state.tasks = vec![isolated, local];
+        store.save(&mut state).unwrap();
+        assert_eq!(store_in(&directory).load().unwrap().tasks, state.tasks);
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn issue_details_and_unstarted_conversations_survive_restart() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let mut task = Task::new("Repair parser", TaskState::Backlog, 0);
+        task.description = "Reproduce\nThen cover Unicode: 日本語".into();
+        state.sessions[0].task_id = Some(task.id);
+        let workspace = SessionWorkspace::Worktree {
+            path: PathBuf::from("/tmp/issue-worktree"),
+            branch: "feature/issue".into(),
+        };
+        state.sessions[0].workspace = workspace.clone();
+        let session_id = state.sessions[0].id;
+        state.selected_session = Some(session_id);
+        state.tasks.push(task.clone());
+        store.save(&mut state).unwrap();
+
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load_or_fresh(PathBuf::from("/tmp/project"));
+        assert_eq!(restored.tasks, vec![task]);
+        assert_eq!(restored.selected_session, Some(session_id));
+        assert_eq!(restored.sessions.len(), 1);
+        assert_eq!(restored.sessions[0].id, session_id);
+        assert_eq!(restored.sessions[0].workspace, workspace);
+        assert!(!restored.sessions[0].has_started());
+        assert_eq!(
+            ComposerDraftKey::for_session(&restored.sessions[0]),
+            ComposerDraftKey::Session(session_id)
+        );
+        reopened.hydrate(&mut restored.sessions[0]).unwrap();
+        assert!(!restored.sessions[0].has_started());
+        reopened.save(&mut restored).unwrap();
+        assert_eq!(store_in(&directory).load().unwrap().sessions.len(), 1);
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn failed_session_write_does_not_poison_issue_or_project_save_caches() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        state
+            .tasks
+            .push(Task::new("Repair parser", TaskState::Backlog, 0));
+        store.save(&mut state).unwrap();
+        state.projects[0].name = "Renamed project".into();
+        state.tasks[0].description = "Keep this brief after retry".into();
+        state.tasks[0].touch();
+        state.sessions[0].begin_turn("Persist this too");
+        let id = state.sessions[0].id;
+        state.mark_session_dirty(id);
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_detail BEFORE INSERT ON session_details BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+        assert!(store.save(&mut state).is_err());
+        assert!(state.dirty_sessions.contains(&id));
+        let unchanged = store_in(&directory).load().unwrap();
+        assert!(unchanged.tasks[0].description.is_empty());
+        assert_ne!(unchanged.projects[0].name, "Renamed project");
+        connection
+            .execute_batch("DROP TRIGGER reject_detail")
+            .unwrap();
+        store.save(&mut state).unwrap();
+        let restored = load_hydrated(&store_in(&directory));
+        assert_eq!(restored.tasks[0].description, "Keep this brief after retry");
+        assert_eq!(restored.projects[0].name, "Renamed project");
+        assert_eq!(restored.sessions[0].id, id);
+        assert!(!restored.sessions[0].messages.is_empty());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn failed_session_deletion_keeps_every_removal_retryable() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        state.sessions[0].begin_turn("First conversation");
+        let mut second = state.new_session(state.projects[0].id, ProviderKind::Codex);
+        second.begin_turn("Second conversation");
+        state.push_session(second);
+        store.save(&mut state).unwrap();
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        connection.execute_batch("CREATE TABLE deletion_attempts (id TEXT); CREATE TRIGGER reject_second_deletion AFTER DELETE ON sessions BEGIN INSERT INTO deletion_attempts VALUES (OLD.id); SELECT CASE WHEN (SELECT COUNT(*) FROM deletion_attempts) = 2 THEN RAISE(ABORT, 'injected deletion failure') END; END;").unwrap();
+        state.sessions.clear();
+        state.selected_session = None;
+        assert!(store.save(&mut state).is_err());
+        assert_eq!(store_in(&directory).load().unwrap().sessions.len(), 2);
+        connection
+            .execute_batch("DROP TRIGGER reject_second_deletion")
+            .unwrap();
+        store.save(&mut state).unwrap();
+        assert!(store_in(&directory).load().unwrap().sessions.is_empty());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn issue_details_migration_preserves_existing_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATIONS_TABLE).unwrap();
+        let details_index = MIGRATIONS
+            .iter()
+            .position(|(tag, _)| *tag == "0005_issue_details")
+            .unwrap();
+        for (tag, sql) in &MIGRATIONS[..details_index] {
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO migrations(tag, applied_at) VALUES(?1, 0)",
+                    params![tag],
+                )
+                .unwrap();
+        }
+        connection.execute("INSERT INTO tasks(id, title, state, position, created_at, updated_at) VALUES('issue', 'Existing issue', 'doing', 0, 1, 1)", []).unwrap();
+        assert_eq!(
+            apply_migrations(&connection).unwrap(),
+            MIGRATIONS.len() - details_index
+        );
+        let (title, description): (String, String) = connection
+            .query_row(
+                "SELECT title, description FROM tasks WHERE id = 'issue'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "Existing issue");
+        assert!(description.is_empty());
+        assert_eq!(apply_migrations(&connection).unwrap(), 0);
+    }
+
+    #[test]
+    fn workspace_migration_backfills_lightweight_session_metadata() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATIONS_TABLE).unwrap();
+        let index = MIGRATIONS
+            .iter()
+            .position(|(tag, _)| *tag == "0006_session_workspace")
+            .unwrap();
+        for (tag, sql) in &MIGRATIONS[..index] {
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO migrations(tag, applied_at) VALUES(?1, 0)",
+                    params![tag],
+                )
+                .unwrap();
+        }
+        for id in ["worktree-session", "local-session"] {
+            connection.execute("INSERT INTO sessions(id, project_id, title, provider, status, created_at, updated_at) VALUES(?1, 'project', 'Existing session', 'codex', 'idle', 1, 1)", params![id]).unwrap();
+        }
+        connection.execute("INSERT INTO session_details(session_id, data) VALUES('worktree-session', ?1)", params![r#"{"workspace":{"kind":"worktree","path":"/tmp/feature","branch":"feature/fix"},"turns":[]}"#]).unwrap();
+        assert_eq!(
+            apply_migrations(&connection).unwrap(),
+            MIGRATIONS.len() - index
+        );
+        let workspace: String = connection
+            .query_row(
+                "SELECT workspace FROM sessions WHERE id = 'worktree-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<SessionWorkspace>(&workspace).unwrap(),
+            SessionWorkspace::Worktree {
+                path: PathBuf::from("/tmp/feature"),
+                branch: "feature/fix".into(),
+            }
+        );
+        let local: String = connection
+            .query_row(
+                "SELECT workspace FROM sessions WHERE id = 'local-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<SessionWorkspace>(&local).unwrap(),
+            SessionWorkspace::Local
+        );
     }
 
     #[test]

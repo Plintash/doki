@@ -301,6 +301,68 @@ impl BackgroundWorkRegistry {
         }
     }
 
+    fn event_loses_live_work(&self, event: &BackgroundWorkEvent) -> bool {
+        match event {
+            BackgroundWorkEvent::Upsert(item) => item.status == BackgroundWorkStatus::Lost,
+            BackgroundWorkEvent::ReconcileProcesses { items }
+            | BackgroundWorkEvent::ReconcileLive { items } => {
+                let processes_only =
+                    matches!(event, BackgroundWorkEvent::ReconcileProcesses { .. });
+                let present = items.iter().map(|item| &item.key).collect::<HashSet<_>>();
+                self.items.values().any(|item| {
+                    item.background
+                        && item.status.is_live()
+                        && (!processes_only
+                            || matches!(
+                                item.key.kind,
+                                BackgroundWorkKind::Process | BackgroundWorkKind::Monitor
+                            ))
+                        && !present.contains(&item.key)
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn task_completion_stop_requests(&self, has_runtime: bool) -> Option<Vec<BackgroundWorkKey>> {
+        let mut requests = Vec::new();
+        for item in self
+            .items
+            .values()
+            .filter(|item| item.background && item.status.is_live())
+        {
+            if !has_runtime {
+                return None;
+            }
+            if item.status == BackgroundWorkStatus::Stopping {
+                continue;
+            }
+            if !item.can_stop || item.control_id.is_none() || !item.status.is_stoppable() {
+                return None;
+            }
+            requests.push(item.key.clone());
+        }
+        Some(requests)
+    }
+
+    fn task_completion_state(&self) -> super::task_completion::BackgroundCompletionState {
+        use super::task_completion::BackgroundCompletionState;
+        let mut stopping = false;
+        for item in self.items.values().filter(|item| item.status.is_live()) {
+            if item.status != BackgroundWorkStatus::Stopping {
+                // Includes StopFailed and newly discovered work. Neither is a
+                // reason to hide the issue or silently broaden a stop request.
+                return BackgroundCompletionState::Failed;
+            }
+            stopping = true;
+        }
+        if stopping {
+            BackgroundCompletionState::Stopping
+        } else {
+            BackgroundCompletionState::Settled
+        }
+    }
+
     fn has_live(&self) -> bool {
         self.items.values().any(|item| item.status.is_live())
     }
@@ -585,6 +647,23 @@ impl Waku {
         session_id: Uuid,
         event: BackgroundWorkEvent,
     ) {
+        let watching_completion = !self.task_completion_stops.is_empty()
+            && self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .and_then(|session| session.task_id)
+                .is_some_and(|task_id| self.task_completion_stops.contains_key(&task_id));
+        let failed = matches!(&event, BackgroundWorkEvent::StopFailed { .. })
+            || (watching_completion
+                && self
+                    .background_work
+                    .get(&session_id)
+                    .is_some_and(|registry| registry.event_loses_live_work(&event)));
+        if !matches!(&event, BackgroundWorkEvent::OutputDelta { .. }) {
+            self.note_task_completion_background_event(session_id, failed);
+        }
         self.background_work
             .entry(session_id)
             .or_default()
@@ -592,6 +671,9 @@ impl Waku {
     }
 
     pub(super) fn mark_background_work_lost(&mut self, session_id: Uuid) {
+        if self.session_has_live_detached_work(session_id) {
+            self.note_task_completion_background_event(session_id, true);
+        }
         if let Some(registry) = self.background_work.get_mut(&session_id) {
             registry.mark_live_lost();
         }
@@ -634,7 +716,8 @@ impl Waku {
             return;
         };
         session.status = next;
-        session.updated_at = unix_time();
+        session.touch();
+        super::rpa::daemon::model_changed();
     }
 
     pub(super) fn background_work_counts(&self, session_id: Uuid) -> (usize, usize) {
@@ -726,6 +809,31 @@ impl Waku {
             self.state.mark_session_dirty(session_id);
             cx.notify();
         }
+        // Only intents dirtied by provider events do work here. This runs at
+        // the event-pump boundary, outside the driver's temporary removal.
+        self.reconcile_task_completions(cx);
+    }
+
+    /// Completion must keep observing a detached process until its provider
+    /// acknowledges its stop. Missing control or observation is a blocker.
+    pub(super) fn task_background_stop_requests(
+        &self,
+        session_id: Uuid,
+    ) -> Option<Vec<BackgroundWorkKey>> {
+        let Some(registry) = self.background_work.get(&session_id) else {
+            return Some(Vec::new());
+        };
+        registry.task_completion_stop_requests(self.runtimes.contains_key(&session_id))
+    }
+
+    pub(super) fn session_background_completion_state(
+        &self,
+        session_id: Uuid,
+    ) -> super::task_completion::BackgroundCompletionState {
+        self.background_work
+            .get(&session_id)
+            .map(BackgroundWorkRegistry::task_completion_state)
+            .unwrap_or(super::task_completion::BackgroundCompletionState::Settled)
     }
 
     pub(super) fn stop_background_work(
@@ -2271,6 +2379,65 @@ mod tests {
 
         registry.upsert(process);
         assert_eq!(registry.output_refresh_delay(), None);
+    }
+
+    #[test]
+    fn task_completion_stops_detached_work_only_with_observable_control() {
+        let mut registry = BackgroundWorkRegistry::default();
+        let mut process = item("detached", BackgroundWorkStatus::Running, true);
+        process.can_stop = true;
+        process.control_id = Some("terminal-1".into());
+        let key = process.key.clone();
+        registry.upsert(process);
+        assert_eq!(
+            registry.task_completion_stop_requests(true),
+            Some(vec![key.clone()])
+        );
+        assert_eq!(registry.task_completion_stop_requests(false), None);
+        registry.items.get_mut(&key).unwrap().can_stop = false;
+        assert_eq!(registry.task_completion_stop_requests(true), None);
+    }
+
+    #[test]
+    fn task_completion_treats_lost_observation_as_uncertain() {
+        let mut registry = BackgroundWorkRegistry::default();
+        registry.upsert(item("detached", BackgroundWorkStatus::Stopping, true));
+        assert!(
+            registry.event_loses_live_work(&BackgroundWorkEvent::ReconcileProcesses {
+                items: Vec::new()
+            })
+        );
+        assert!(
+            !registry.event_loses_live_work(&BackgroundWorkEvent::Upsert(item(
+                "detached",
+                BackgroundWorkStatus::Stopped,
+                true
+            )))
+        );
+    }
+
+    #[test]
+    fn task_completion_waits_for_stop_and_rejects_failure() {
+        use super::super::task_completion::BackgroundCompletionState::*;
+        let mut registry = BackgroundWorkRegistry::default();
+        let process = item("detached", BackgroundWorkStatus::Running, true);
+        let key = process.key.clone();
+        registry.upsert(process);
+        assert_eq!(registry.task_completion_state(), Failed);
+        registry.apply(BackgroundWorkEvent::StopRequested(key.clone()));
+        assert_eq!(registry.task_completion_state(), Stopping);
+        assert_eq!(
+            registry.task_completion_stop_requests(true),
+            Some(Vec::new())
+        );
+        registry.apply(BackgroundWorkEvent::StopFailed {
+            key: key.clone(),
+            message: "Provider refused".into(),
+        });
+        assert_eq!(registry.task_completion_state(), Failed);
+        registry.apply(BackgroundWorkEvent::StopRequested(key));
+        registry.upsert(item("detached", BackgroundWorkStatus::Stopped, true));
+        assert_eq!(registry.task_completion_state(), Settled);
     }
 
     #[test]

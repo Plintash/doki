@@ -9,7 +9,11 @@ import type { TaskWorkspace } from "./TaskWorkspace";
  * conversations (attempts, follow-ups, reviews) can belong to the same task.
  * It is the unit the board arranges and the unit that survives archiving.
  */
-export type Task = { id: string, title: string, state: TaskState,
+export type Task = { id: string, title: string,
+/**
+ * The issue brief, separate from any conversation or execution prompt.
+ */
+description: string, state: TaskState,
 /**
  * Order within its column, ascending. Ties fall back to recency.
  */

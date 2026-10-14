@@ -14,6 +14,8 @@ use gpui::{BoxShadow, KeyBinding, KeyDownEvent, actions};
 
 use super::sidebar::{CancelTaskRename, TASK_RENAME_PARENT_CONTEXT};
 use super::*;
+use crate::ui::SemanticControlExt;
+use crate::ui::menu::dropdown_menu_list;
 
 actions!(waku_board, [DismissNewTaskDialog, DismissTaskCompletion]);
 
@@ -77,7 +79,7 @@ pub(super) struct NewTaskDialog {
     pub state: TaskState,
 }
 
-/// A move to Done that must be confirmed because conversations are running.
+/// A move to Done that must confirm closing connected or running conversations.
 pub(super) struct TaskCompletionConfirm {
     pub task_id: Uuid,
     pub confirm_focus: FocusHandle,
@@ -93,6 +95,98 @@ pub(super) struct TaskStats {
     pub(super) busy: HashSet<Uuid>,
     pub(super) conversations: HashMap<Uuid, usize>,
     pub(super) attention_total: usize,
+    running: HashMap<Uuid, usize>,
+    attention_sessions: HashMap<Uuid, Vec<TaskAttention>>,
+    progress: HashMap<Uuid, (u64, String)>,
+}
+
+struct TaskAttention {
+    session_id: Uuid,
+    title: String,
+    reason: String,
+}
+
+fn board_preview(text: &str) -> String {
+    let bounded = text.chars().take(160).collect::<String>();
+    bounded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Use only the visible tail, never scan or parse a transcript in a frame.
+/// An idle session is not evidence that its issue has succeeded.
+fn session_progress_preview(session: &AgentSession) -> Option<String> {
+    if !session.detail_loaded {
+        return None;
+    }
+    if let Some(block) = session.transcript_blocks.last()
+        && block.after_message >= session.messages.len()
+        && let Some(activity) = block.activities.last()
+        && activity.kind != ActivityKind::Reasoning
+    {
+        return Some(board_preview(
+            activity
+                .display_description
+                .as_deref()
+                .unwrap_or(&activity.title),
+        ));
+    }
+    session
+        .messages
+        .last()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .map(|message| {
+            board_preview(
+                message
+                    .display_content
+                    .as_deref()
+                    .unwrap_or(&message.content),
+            )
+        })
+        .filter(|preview| !preview.is_empty())
+}
+
+impl TaskStats {
+    fn record_session(
+        &mut self,
+        session: &AgentSession,
+        active: bool,
+        background: bool,
+        reason: Option<String>,
+    ) {
+        let Some(task_id) = session.task_id else {
+            return;
+        };
+        *self.conversations.entry(task_id).or_default() += 1;
+        // A parked foreground turn can still have a live background process.
+        // Preserve both signals instead of letting attention hide running work.
+        if session.status.is_busy() || background {
+            self.busy.insert(task_id);
+            *self.running.entry(task_id).or_default() += 1;
+        }
+        if let Some(reason) = reason {
+            *self.attention.entry(task_id).or_default() += 1;
+            self.attention_sessions
+                .entry(task_id)
+                .or_default()
+                .push(TaskAttention {
+                    session_id: session.id,
+                    title: board_preview(session.display_title()),
+                    reason,
+                });
+            if active {
+                self.attention_total += 1;
+            }
+        }
+        if let Some(preview) = session_progress_preview(session) {
+            let at = session.last_reply_at.unwrap_or(session.created_at);
+            if self
+                .progress
+                .get(&task_id)
+                .is_none_or(|(previous, _)| at >= *previous)
+            {
+                self.progress.insert(task_id, (at, preview));
+            }
+        }
+    }
 }
 
 /// First-guess card height for a column's virtualized list; the list measures
@@ -115,11 +209,33 @@ impl BoardColumnList {
     }
 }
 
-fn task_state_label(state: TaskState) -> String {
+pub(super) fn task_state_label(state: TaskState) -> String {
     match state {
         TaskState::Backlog => tr!("board.backlog"),
         TaskState::Doing => tr!("board.doing"),
         TaskState::Done => tr!("board.done"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum BoardActivityFilter {
+    #[default]
+    All,
+    Running,
+    Attention,
+}
+
+fn board_activity_matches(task: &Task, filter: BoardActivityFilter, stats: &TaskStats) -> bool {
+    match filter {
+        BoardActivityFilter::All => true,
+        BoardActivityFilter::Running => !task.state.is_done() && stats.busy.contains(&task.id),
+        BoardActivityFilter::Attention => {
+            !task.state.is_done()
+                && stats
+                    .attention
+                    .get(&task.id)
+                    .is_some_and(|count| *count > 0)
+        }
     }
 }
 
@@ -144,42 +260,75 @@ impl Waku {
             let Some(task_id) = session.task_id else {
                 continue;
             };
-            *stats.conversations.entry(task_id).or_default() += 1;
-            match session.status {
-                // A failed turn needs the user as much as a question does.
-                SessionStatus::Waiting | SessionStatus::Failed => {
-                    *stats.attention.entry(task_id).or_default() += 1;
-                    if active.contains(&task_id) {
-                        stats.attention_total += 1;
-                    }
-                }
-                status if status.is_busy() => {
-                    stats.busy.insert(task_id);
-                }
-                _ => {}
-            }
+            let runtime = self.runtimes.get(&session.id);
+            let reason = if runtime.is_some_and(|runtime| {
+                runtime.pending_permission.is_some() || runtime.pending_computer_approval.is_some()
+            }) {
+                Some(tr!("board.awaiting_permission"))
+            } else if runtime.is_some_and(|runtime| runtime.pending_user_input.is_some()) {
+                Some(tr!("board.awaiting_input"))
+            } else if session.status == SessionStatus::Failed {
+                Some(
+                    runtime
+                        .and_then(|runtime| runtime.last_driver_error.as_deref())
+                        .map(|error| {
+                            format!("{}: {}", tr!("board.session_failed"), board_preview(error))
+                        })
+                        .unwrap_or_else(|| tr!("board.session_failed")),
+                )
+            } else if session.status == SessionStatus::Waiting {
+                Some(tr!("board.awaiting_input"))
+            } else {
+                None
+            };
+            stats.record_session(
+                session,
+                active.contains(&task_id),
+                self.session_has_live_background_work(session.id),
+                reason,
+            );
         }
         let stats = Rc::new(stats);
         *self.task_stats_cache.borrow_mut() = Some(Rc::clone(&stats));
         stats
     }
 
-    /// One-shot action path: a click may arrive between frames, so it reads
-    /// the live sessions rather than the frame's memoized stats.
-    fn task_is_busy(&self, task_id: Uuid) -> bool {
-        self.state
-            .sessions
-            .iter()
-            .any(|session| session.task_id == Some(task_id) && session.status.is_busy())
+    /// Project and text scope stay intact while inspecting an issue/session.
+    pub(super) fn task_matches_board_scope(&self, task: &Task) -> bool {
+        let project_id = task_details::task_project_id(task);
+        if self
+            .board_project_filter
+            .is_some_and(|id| Some(id) != project_id)
+        {
+            return false;
+        }
+        let query = self.board_search_query.trim().to_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+        task.title.to_lowercase().contains(&query)
+            || task.description.to_lowercase().contains(&query)
+            || self
+                .state
+                .projects
+                .iter()
+                .find(|project| Some(project.id) == project_id)
+                .is_some_and(|project| project.display_name().to_lowercase().contains(&query))
+            || matches!(&task.workspace, Some(TaskWorkspace::Worktree { branch, .. }) if branch.to_lowercase().contains(&query))
     }
 
     /// Task ids in one column, in board order.
     fn tasks_in_state(&self, state: TaskState) -> Vec<Uuid> {
+        let stats = self.task_stats();
         let mut tasks = self
             .state
             .tasks
             .iter()
-            .filter(|task| task.state == state)
+            .filter(|task| {
+                task.state == state
+                    && self.task_matches_board_scope(task)
+                    && board_activity_matches(task, self.board_activity_filter, &stats)
+            })
             .collect::<Vec<_>>();
         tasks.sort_by(|a, b| {
             a.position
@@ -190,7 +339,7 @@ impl Waku {
     }
 
     /// A position that sorts above everything else in the column.
-    fn next_task_position(&self, state: TaskState) -> i64 {
+    pub(super) fn next_task_position(&self, state: TaskState) -> i64 {
         self.state
             .tasks
             .iter()
@@ -204,14 +353,22 @@ impl Waku {
     // ── Board ─────────────────────────────────────────────────────────────
 
     pub(super) fn toggle_board(&mut self, cx: &mut Context<Self>) {
-        self.board_open = !self.board_open;
+        self.board_open = !self.board_open || self.selected_task.is_some();
+        self.selected_task = None;
+        self.task_detail = None;
         cx.notify();
     }
 
-    pub(super) fn render_board(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_board(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some(task_id) = self.selected_task {
+            return self.render_task_detail(task_id, window, cx);
+        }
         let theme = Theme::current(cx);
         let stats = self.task_stats();
-        let attention = stats.attention_total;
         div()
             .id("task-board")
             .size_full()
@@ -220,48 +377,11 @@ impl Waku {
             .bg(theme.surface)
             .child(
                 div()
-                    .h(px(48.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(16.0))
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .text_size(sp(15.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .child(tr!("board.title")),
-                    )
-                    .when(attention > 0, |element| {
-                        element.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.0))
-                                .px(px(7.0))
-                                .h(px(18.0))
-                                .rounded(px(9.0))
-                                .bg(theme.warning.opacity(0.14))
-                                .text_size(sp(11.0))
-                                .text_color(theme.warning)
-                                .child(icon("icons/alert.svg", 11.0, theme.warning))
-                                .child(tr!("board.needs_you", count = attention)),
-                        )
-                    })
-                    .child(div().flex_1())
-                    .child(self.render_task_create_button(
-                        "board-new-task",
-                        TaskState::Backlog,
-                        cx,
-                    )),
-            )
-            .child(
-                div()
+                    .id("board-columns")
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
+                    .overflow_x_scroll()
                     .flex()
                     .gap(px(14.0))
                     .p(px(14.0))
@@ -302,7 +422,7 @@ impl Waku {
         div()
             .id(column_id)
             .flex_1()
-            .min_w_0()
+            .min_w(px(240.0))
             .h_full()
             .flex()
             .flex_col()
@@ -347,6 +467,30 @@ impl Waku {
                         cx,
                     )),
             )
+            .when(count == 0, |element| {
+                element.child(
+                    div()
+                        .px(px(16.0))
+                        .py(px(28.0))
+                        .text_center()
+                        .text_size(sp(12.0))
+                        .text_color(theme.text_tertiary)
+                        .child(
+                            if self.board_project_filter.is_some()
+                                || !self.board_search_query.trim().is_empty()
+                                || self.board_activity_filter != BoardActivityFilter::All
+                            {
+                                tr!("board.no_matching_issues")
+                            } else {
+                                match state {
+                                    TaskState::Backlog => tr!("board.empty_backlog"),
+                                    TaskState::Doing => tr!("board.empty_doing"),
+                                    TaskState::Done => tr!("board.empty_done"),
+                                }
+                            },
+                        ),
+                )
+            })
             .child(
                 div().flex_1().min_h_0().p(px(8.0)).child(
                     list(list_state, move |index, _window, cx| {
@@ -388,19 +532,53 @@ impl Waku {
             return div().into_any_element();
         };
         let attention = stats.attention.get(&task_id).copied().unwrap_or(0);
-        let busy = stats.busy.contains(&task_id);
+        let running = stats.running.get(&task_id).copied().unwrap_or(0);
         let conversations = stats.conversations.get(&task_id).copied().unwrap_or(0);
         // A bound workspace shows where the task works: the worktree branch,
         // or the project a local task works in.
         let workspace = match task.workspace.as_ref() {
-            Some(TaskWorkspace::Worktree { branch, .. }) => {
-                Some(("icons/git-branch.svg", branch.clone()))
+            Some(TaskWorkspace::Worktree {
+                project_id, branch, ..
+            }) => {
+                let project = self
+                    .state
+                    .projects
+                    .iter()
+                    .find(|project| project.id == *project_id)
+                    .map(Project::display_name)
+                    .unwrap_or_default();
+                Some((
+                    "icons/git-branch.svg",
+                    if self.board_project_filter.is_none() {
+                        format!("{project} · {branch}")
+                    } else {
+                        branch.clone()
+                    },
+                ))
+            }
+            Some(TaskWorkspace::NewWorktree { project_id }) => {
+                let project = self
+                    .state
+                    .projects
+                    .iter()
+                    .find(|project| project.id == *project_id)
+                    .map(Project::display_name)
+                    .unwrap_or_default();
+                Some((
+                    "icons/git-branch.svg",
+                    if self.board_project_filter.is_none() {
+                        format!("{project} · {}", tr!("workspace.new_worktree"))
+                    } else {
+                        tr!("workspace.new_worktree")
+                    },
+                ))
             }
             Some(TaskWorkspace::Local { project_id }) => self
                 .state
                 .projects
                 .iter()
                 .find(|project| project.id == *project_id)
+                .filter(|_| self.board_project_filter.is_none())
                 .map(|project| ("icons/folder.svg", project.display_name())),
             None => None,
         };
@@ -451,19 +629,71 @@ impl Waku {
                 .into_any_element()
         };
 
-        let status = if attention > 0 {
-            Some((
-                "icons/alert.svg",
-                tr!("board.needs_you_short"),
-                theme.warning,
-                false,
-            ))
-        } else if busy {
-            Some((
-                "icons/loader-circle.svg",
-                tr!("board.running"),
-                theme.accent,
-                true,
+        let attention_sessions = stats
+            .attention_sessions
+            .get(&task_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let attention_rows = attention_sessions
+            .iter()
+            .take(2)
+            .map(|session| {
+                let session_id = session.session_id;
+                self.task_action_button(
+                    format!("board-attention-{session_id}"),
+                    format!("{} · {}", session.reason, session.title),
+                    false,
+                    true,
+                    move |this, _, cx| this.select_session(session_id, cx),
+                    cx,
+                )
+                .w_full()
+                .min_w_0()
+                .h(px(28.0))
+                .px(px(6.0))
+                .justify_start()
+                .text_size(sp(11.0))
+                .text_color(theme.warning)
+                .truncate()
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let more_attention = if attention_sessions.len() > 2 {
+            let handle = self.menu_handle(format!("board-attention-more-{task_id}"), cx);
+            let more_count = attention_sessions.len() - 2;
+            let weak = cx.entity().downgrade();
+            Some(dropdown_menu_list(
+                MenuChip::new(SharedString::from(format!(
+                    "board-attention-more-{task_id}"
+                )))
+                .label(tr!("board.more_attention", count = more_count))
+                .height(px(28.0))
+                .selected(handle.is_open()),
+                SharedString::from(format!("board-attention-more-menu-{task_id}")),
+                &handle,
+                MenuAlign::BelowLeft,
+                move |cx| {
+                    let Some(entity) = weak.upgrade() else {
+                        return Vec::new();
+                    };
+                    let stats = entity.read(cx).task_stats();
+                    stats
+                        .attention_sessions
+                        .get(&task_id)
+                        .into_iter()
+                        .flatten()
+                        .skip(2)
+                        .map(|session| {
+                            let weak = weak.clone();
+                            let id = session.session_id;
+                            let label = format!("{} · {}", session.reason, session.title);
+                            MenuItem::new(label, move |_, cx| {
+                                let _ = weak.update(cx, |this, cx| this.select_session(id, cx));
+                            })
+                            .semantic_id(format!("board-attention-menu-session-{id}"))
+                        })
+                        .collect()
+                },
             ))
         } else {
             None
@@ -471,6 +701,8 @@ impl Waku {
 
         let card = div()
             .id(SharedString::from(format!("task-card-{task_id}")))
+            .semantic_control(gpui::Role::Button, renaming)
+            .aria_label(task.title.clone())
             .w_full()
             .flex()
             .flex_col()
@@ -499,6 +731,17 @@ impl Waku {
                     })
                     .child(title),
             )
+            .when(!task.description.trim().is_empty(), |element| {
+                element.child(
+                    div()
+                        .text_size(sp(11.5))
+                        .text_color(theme.text_tertiary)
+                        .whitespace_normal()
+                        .line_clamp(2)
+                        .text_overflow(gpui::TextOverflow::Truncate("…".into()))
+                        .child(task.description.clone()),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -514,21 +757,52 @@ impl Waku {
                     })
                     .child(conversations_label(conversations)),
             )
-            .when_some(status, |element, (icon_path, label, tint, spin)| {
-                let glyph = icon(icon_path, 11.0, tint);
+            .when(running > 0 || attention > 0, |element| {
                 element.child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
-                        .gap(px(4.0))
+                        .gap(px(10.0))
                         .text_size(sp(11.0))
-                        .text_color(tint)
-                        .child(if spin {
-                            motion::spin_slow(glyph).into_any_element()
-                        } else {
-                            glyph.into_any_element()
+                        .when(running > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .text_color(theme.accent)
+                                    .child(motion::spin_slow(icon(
+                                        "icons/loader-circle.svg",
+                                        11.0,
+                                        theme.accent,
+                                    )))
+                                    .child(tr!("board.running_sessions", count = running)),
+                            )
                         })
-                        .child(label),
+                        .when(attention > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .text_color(theme.warning)
+                                    .child(icon("icons/alert.svg", 11.0, theme.warning))
+                                    .child(tr!("board.attention_count", count = attention)),
+                            )
+                        }),
+                )
+            })
+            .children(attention_rows)
+            .when_some(more_attention, |element, menu| element.child(menu))
+            .when_some(stats.progress.get(&task_id), |element, (_, preview)| {
+                element.child(
+                    div()
+                        .text_size(sp(11.0))
+                        .text_color(theme.text_secondary)
+                        .whitespace_normal()
+                        .line_clamp(2)
+                        .child(tr!("board.latest_progress", progress = preview)),
                 )
             })
             .when(!renaming, |element| {
@@ -580,8 +854,8 @@ impl Waku {
                     let backlog_weak = backlog_weak.clone();
                     let doing_weak = doing_weak.clone();
                     let mut items = Vec::new();
-                    if conversations > 0 {
-                        items.push(MenuItem::new(tr!("board.open_latest"), move |_, cx| {
+                    {
+                        items.push(MenuItem::new(tr!("board.open_task"), move |_, cx| {
                             let _ = open_weak
                                 .update(cx, |this, cx| this.open_task_from_card(task_id, cx));
                         }));
@@ -633,152 +907,31 @@ impl Waku {
         card
     }
 
-    /// Clicking a card resumes the task's most recent conversation; a task
-    /// with no conversations only takes focus.
+    /// Every card opens its issue, including cards with no conversations yet.
     pub(super) fn open_task_from_card(&mut self, task_id: Uuid, cx: &mut Context<Self>) {
-        let newest = self
+        if !self.state.tasks.iter().any(|task| task.id == task_id) {
+            return;
+        }
+        self.capture_and_save_current_composer_draft(cx);
+        self.settings_page = None;
+        self.board_open = true;
+        if self.selected_task != Some(task_id) {
+            self.task_detail = None;
+        }
+        self.selected_task = Some(task_id);
+        let sessions = self
             .state
             .sessions
             .iter()
-            .filter(|session| session.task_id == Some(task_id) && session.has_started())
-            .max_by_key(|session| session.last_reply_at.unwrap_or(session.updated_at))
-            .map(|session| session.id);
-        if let Some(session_id) = newest {
-            self.select_session(session_id, cx);
-        }
-    }
-
-    // ── Moves and completion ──────────────────────────────────────────────
-
-    /// The single entry point for column changes. Done routes through the
-    /// running-session confirmation.
-    pub(super) fn move_task(
-        &mut self,
-        task_id: Uuid,
-        state: TaskState,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(current) = self
-            .state
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .map(|task| task.state)
-        else {
-            return;
-        };
-        if current == state {
-            return;
-        }
-        if state.is_done() {
-            self.request_task_completion(task_id, window, cx);
-            return;
-        }
-        let position = self.next_task_position(state);
-        let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) else {
-            return;
-        };
-        task.set_state(state);
-        task.position = position;
-        // The row list filters by task state (archived conversations leave
-        // every view), so a move — including a restore out of Done — has to
-        // rebuild it.
-        self.sidebar_rows_fingerprint.set(None);
-        self.save(cx);
-        cx.notify();
-    }
-
-    /// A running conversation that is still preparing its worktree or
-    /// checkpoint cannot be interrupted, so completion has to wait instead of
-    /// archiving work that is about to start.
-    fn task_has_unstoppable_work(&self, task_id: Uuid) -> bool {
-        self.state.sessions.iter().any(|session| {
-            session.task_id == Some(task_id)
-                && session.status.is_busy()
-                && self.submission_preparations.contains(&session.id)
-        })
-    }
-
-    fn request_task_completion(
-        &mut self,
-        task_id: Uuid,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.task_has_unstoppable_work(task_id) {
-            self.show_toast(tr!("board.completion_waiting_for_setup"));
-            cx.notify();
-            return;
-        }
-        if self.task_is_busy(task_id) {
-            let confirm_focus = cx.focus_handle();
-            let cancel_focus = cx.focus_handle();
-            self.pending_task_completion = Some(TaskCompletionConfirm {
-                task_id,
-                confirm_focus,
-                cancel_focus: cancel_focus.clone(),
-            });
-            // A destructive confirmation opens on Cancel: one stray Return
-            // must not stop running turns and archive them.
-            focus_overlay_control(window, cx, cancel_focus, move |this| {
-                this.pending_task_completion
-                    .as_ref()
-                    .is_some_and(|pending| pending.task_id == task_id)
-            });
-            cx.notify();
-            return;
-        }
-        self.finish_task_completion(task_id, cx);
-    }
-
-    fn finish_task_completion(&mut self, task_id: Uuid, cx: &mut Context<Self>) {
-        // Re-checked here because the confirmation can sit open while a
-        // conversation starts preparing.
-        if self.task_has_unstoppable_work(task_id) {
-            self.show_toast(tr!("board.completion_waiting_for_setup"));
-            cx.notify();
-            return;
-        }
-        // Archive stops work: anything still running goes through the app's
-        // full stop sequence before its conversation leaves the sidebar.
-        // Archiving never deletes.
-        let running = self
-            .state
-            .sessions
-            .iter()
-            .filter(|session| session.task_id == Some(task_id) && session.status.is_busy())
-            .map(|session| session.id)
+            .filter(|session| session.task_id == Some(task_id))
+            .map(|session| (session.id, session.has_started()))
             .collect::<Vec<_>>();
-        for session_id in running {
-            self.stop_session_turn(session_id, cx);
+        for (id, started) in sessions {
+            self.ensure_session_loaded(id, cx);
+            if started {
+                self.start_runtime_attachment(id, cx);
+            }
         }
-        let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) else {
-            return;
-        };
-        task.set_state(TaskState::Done);
-        self.pending_task_completion = None;
-        self.sidebar_rows_fingerprint.set(None);
-        self.save(cx);
-        self.show_success_toast(tr!("board.completed_toast"));
-        cx.notify();
-    }
-
-    pub(super) fn confirm_task_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending_task_completion.take() else {
-            return;
-        };
-        let focus = self.board_dialog_focus(cx);
-        window.focus(&focus, cx);
-        self.finish_task_completion(pending.task_id, cx);
-    }
-
-    pub(super) fn cancel_task_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_task_completion.take().is_none() {
-            return;
-        }
-        let focus = self.board_dialog_focus(cx);
-        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -790,14 +943,20 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let input =
-            cx.new(|cx| TextInput::new(window, cx).placeholder(tr!("board.new_task_placeholder")));
+        let input = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .semantic_id("new-issue-title")
+                .tab_stop(true)
+                .placeholder(tr!("board.new_task_placeholder"))
+        });
         let focus = input.read(cx).focus();
         // Enter arrives through the field's own submit event, the same way the
         // sidebar's inline rename commits.
         cx.subscribe(&input, |this: &mut Self, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Submit(_)) {
                 this.commit_new_task(cx);
+            } else if matches!(event, InputEvent::Edited) {
+                cx.notify();
             }
         })
         .detach();
@@ -807,20 +966,31 @@ impl Waku {
     }
 
     pub(super) fn commit_new_task(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.new_task_dialog.take() else {
+        let Some(dialog) = self.new_task_dialog.as_ref() else {
             return;
         };
         let title = dialog.input.read(cx).content().trim().to_owned();
-        if !title.is_empty() {
-            let position = self.next_task_position(dialog.state);
-            self.state
-                .tasks
-                .push(Task::new(title, dialog.state, position));
-            self.reveal_new_task();
-            self.sidebar_rows_fingerprint.set(None);
-            self.save(cx);
+        if title.is_empty() {
+            return;
         }
-        cx.notify();
+        let state = dialog.state;
+        let position = self.next_task_position(state);
+        let mut task = Task::new(title, state, position);
+        task.workspace = self
+            .board_project_filter
+            .or_else(|| {
+                self.selected_project()
+                    .filter(|project| !project.is_projectless())
+                    .map(|project| project.id)
+            })
+            .map(|project_id| TaskWorkspace::NewWorktree { project_id });
+        let task_id = task.id;
+        self.state.tasks.push(task);
+        self.new_task_dialog = None;
+        self.reveal_new_task();
+        self.sidebar_rows_fingerprint.set(None);
+        self.save_task_changes(cx);
+        self.open_task_from_card(task_id, cx);
     }
 
     /// A declared task should be visible wherever the user is looking: the
@@ -847,16 +1017,21 @@ impl Waku {
     }
 
     /// Focus that exists while the board is open: the sidebar's board row, or
-    /// the board header's own "+" when the sidebar is hidden. Focusing the row
+    /// the board header's New issue control when the sidebar is hidden. Focusing the row
     /// while it is off screen would leave the keyboard nowhere visible.
-    fn board_dialog_focus(&self, cx: &mut Context<Self>) -> FocusHandle {
+    pub(super) fn board_dialog_focus(&self, cx: &mut Context<Self>) -> FocusHandle {
         if self.sidebar_visible {
             return self.board_focus.clone();
         }
-        self.task_create_focuses
+        let control = if self.selected_task.is_some() {
+            "board-detail-back"
+        } else {
+            "board-new-issue"
+        };
+        self.transcript_control_focuses
             .borrow_mut()
-            .entry("board-new-task")
-            .or_insert_with(|| cx.focus_handle())
+            .entry(control.to_owned())
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
             .clone()
     }
 
@@ -874,10 +1049,12 @@ impl Waku {
             .task_create_focuses
             .borrow_mut()
             .entry(id)
-            .or_insert_with(|| cx.focus_handle())
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
             .clone();
         div()
             .id(id)
+            .semantic_control(gpui::Role::Button, false)
+            .aria_label(tr!("board.new_task"))
             .track_focus(&focus)
             .tab_index(0)
             .tab_stop(true)
@@ -948,7 +1125,7 @@ impl Waku {
         if changed && let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) {
             task.title = title;
             task.touch();
-            self.save(cx);
+            self.save_task_changes(cx);
         }
         cx.notify();
     }
@@ -974,6 +1151,28 @@ impl Waku {
         task_id: Uuid,
         cx: &mut Context<Self>,
     ) {
+        let Some(task) = self.state.tasks.iter().find(|task| task.id == task_id) else {
+            return;
+        };
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+        if task_details::task_project_id(task)
+            .is_some_and(|project_id| project_id != session.project_id)
+        {
+            self.show_toast(tr!("board.session_project_mismatch"));
+            cx.notify();
+            return;
+        }
+        let old_draft_key = crate::persistence::ComposerDraftKey::for_session(session);
+        if self.state.selected_session == Some(session_id) {
+            self.capture_and_save_current_composer_draft(cx);
+        }
         let workspace = {
             let Some(session) = self.state.session_mut(session_id) else {
                 return;
@@ -982,14 +1181,13 @@ impl Waku {
                 return;
             }
             session.task_id = Some(task_id);
-            session.updated_at = crate::model::unix_time();
-            session
-                .detail_loaded
-                .then(|| task_workspace_from_session(session))
-                .flatten()
+            session.updated_at = session
+                .updated_at
+                .max(crate::model::unix_time())
+                .saturating_add(1);
+            task_workspace_from_session(session)
         };
-        if let Some(workspace) = workspace
-            && let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id)
+        if let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id)
             && task.workspace.is_none()
         {
             task.workspace = Some(workspace);
@@ -997,8 +1195,20 @@ impl Waku {
             // stamp a reload's merge would keep the older workspace-less copy.
             task.touch();
         }
+        if let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        {
+            let key = crate::persistence::ComposerDraftKey::for_session(session);
+            if self.composer_drafts.move_to_empty(old_draft_key, key) {
+                self.schedule_composer_draft_save(cx);
+            }
+        }
+        self.ensure_session_loaded(session_id, cx);
         self.sidebar_rows_fingerprint.set(None);
-        self.save(cx);
+        self.save_task_changes(cx);
         // Filing new work under a finished task is continuing it.
         if self.reopen_task_for_continued_work(task_id, cx) {
             self.show_success_toast(tr!("board.reopened_toast"));
@@ -1007,15 +1217,28 @@ impl Waku {
     }
 
     pub(super) fn unbind_session_from_task(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        if self
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id && !session.has_started())
+        {
+            self.show_toast(tr!("board.detach_draft_hint"));
+            cx.notify();
+            return;
+        }
         let Some(session) = self.state.session_mut(session_id) else {
             return;
         };
         if session.task_id.take().is_none() {
             return;
         }
-        session.updated_at = crate::model::unix_time();
+        session.updated_at = session
+            .updated_at
+            .max(crate::model::unix_time())
+            .saturating_add(1);
         self.sidebar_rows_fingerprint.set(None);
-        self.save(cx);
+        self.save_task_changes(cx);
         cx.notify();
     }
 
@@ -1036,6 +1259,7 @@ impl Waku {
         self.state.tasks.push(task);
         self.reveal_new_task();
         self.bind_session_to_task(session_id, task_id, cx);
+        self.open_task_from_card(task_id, cx);
     }
 
     /// Restoring from the archive puts the task back on the board; its
@@ -1054,18 +1278,8 @@ impl Waku {
         window.focus(&focus, cx);
     }
 
-    /// Opening a task from the archive closes settings and resumes its newest
-    /// conversation. A completed task may have none, and there is nowhere to
-    /// land then, so Settings stays put.
+    /// Completed issues remain inspectable even if they never had a session.
     pub(super) fn open_archived_task(&mut self, task_id: Uuid, cx: &mut Context<Self>) {
-        let has_conversations = self
-            .state
-            .sessions
-            .iter()
-            .any(|session| session.task_id == Some(task_id) && session.has_started());
-        if !has_conversations {
-            return;
-        }
         self.settings_page = None;
         self.open_task_from_card(task_id, cx);
     }
@@ -1078,6 +1292,10 @@ impl Waku {
         task_id: Uuid,
         cx: &mut Context<Self>,
     ) -> bool {
+        // An explicit continuation supersedes a pending archive request.
+        self.task_completion_stops.remove(&task_id);
+        self.task_completion_save_rollbacks.remove(&task_id);
+        self.task_completion_preflights.remove(&task_id);
         if self
             .state
             .tasks
@@ -1094,7 +1312,7 @@ impl Waku {
         task.set_state(TaskState::Doing);
         task.position = position;
         self.sidebar_rows_fingerprint.set(None);
-        self.save(cx);
+        self.save_task_changes(cx);
         cx.notify();
         true
     }
@@ -1114,6 +1332,23 @@ impl Waku {
         let theme = Theme::current(cx);
         let state_label = task_state_label(dialog.state);
         let input = dialog.input.clone();
+        let can_create = !input.read(cx).content().trim().is_empty();
+        let cancel = self.task_action_button(
+            "new-task-cancel",
+            tr!("common.cancel"),
+            false,
+            true,
+            |this, window, cx| this.close_new_task_dialog(window, cx),
+            cx,
+        );
+        let create = self.task_action_button(
+            "new-task-create",
+            tr!("board.create_task"),
+            true,
+            can_create,
+            |this, _, cx| this.commit_new_task(cx),
+            cx,
+        );
         let card = div()
             .id("new-task-card")
             .w_full()
@@ -1183,6 +1418,16 @@ impl Waku {
                     .text_color(theme.text_tertiary)
                     .child(tr!("board.new_task_hint")),
             )
+            .child(
+                div()
+                    .px(px(12.0))
+                    .pb(px(12.0))
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(cancel)
+                    .child(create),
+            )
             .with_animation(
                 SharedString::from("new-task-dialog-enter"),
                 gpui::Animation::new(std::time::Duration::from_millis(150))
@@ -1221,17 +1466,14 @@ impl Waku {
             .find(|task| task.id == task_id)
             .map(|task| task.title.clone())
             .unwrap_or_default();
-        let running = self
-            .state
-            .sessions
-            .iter()
-            .filter(|session| session.task_id == Some(task_id) && session.status.is_busy())
-            .count();
+        let affected = self.task_completion_stop_count(task_id);
         let confirm_focus = pending.confirm_focus.clone();
         let cancel_focus = pending.cancel_focus.clone();
 
         let cancel = div()
             .id("task-complete-cancel")
+            .semantic_control(gpui::Role::Button, false)
+            .aria_label(tr!("common.cancel"))
             .track_focus(&cancel_focus)
             .tab_index(0)
             .tab_stop(true)
@@ -1262,6 +1504,8 @@ impl Waku {
 
         let confirm = div()
             .id("task-complete-confirm")
+            .semantic_control(gpui::Role::Button, false)
+            .aria_label(tr!("board.complete_and_stop"))
             .track_focus(&confirm_focus)
             .tab_index(0)
             .tab_stop(true)
@@ -1323,7 +1567,7 @@ impl Waku {
                     .text_size(sp(13.0))
                     .line_height(sp(20.0))
                     .text_color(theme.text_secondary)
-                    .child(tr!("board.complete_confirm_body", count = running)),
+                    .child(tr!("board.complete_confirm_body", count = affected)),
             )
             .child(
                 div()
@@ -1379,7 +1623,7 @@ impl Waku {
 /// two frames, the same way the command palette hands focus to its search
 /// field. `still_open` re-checks the dialog because the user can close it
 /// inside that window.
-fn focus_overlay_control(
+pub(super) fn focus_overlay_control(
     window: &mut Window,
     cx: &mut Context<Waku>,
     focus: FocusHandle,
@@ -1396,19 +1640,20 @@ fn focus_overlay_control(
     });
 }
 
-/// The workspace a session runs in, when the session knows it. Skeletons
-/// normalize their workspace to `Local`, so they are not consulted.
-fn task_workspace_from_session(session: &AgentSession) -> Option<TaskWorkspace> {
+/// Workspace metadata is carried by list projections as well as loaded history.
+fn task_workspace_from_session(session: &AgentSession) -> TaskWorkspace {
     match &session.workspace {
-        SessionWorkspace::Worktree { path, branch } => Some(TaskWorkspace::Worktree {
+        SessionWorkspace::Worktree { path, branch } => TaskWorkspace::Worktree {
             project_id: session.project_id,
             path: path.clone(),
             branch: branch.clone(),
-        }),
-        SessionWorkspace::Local => Some(TaskWorkspace::Local {
+        },
+        SessionWorkspace::Local => TaskWorkspace::Local {
             project_id: session.project_id,
-        }),
-        SessionWorkspace::NewWorktree { .. } => None,
+        },
+        SessionWorkspace::NewWorktree { .. } => TaskWorkspace::NewWorktree {
+            project_id: session.project_id,
+        },
     }
 }
 
@@ -1434,4 +1679,110 @@ fn session_task_title(session: &AgentSession) -> String {
         .filter(|title| !title.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| tr!("board.untitled_task").to_string())
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use crate::ui::SemanticControlExt;
+
+    #[test]
+    fn all_attention_sessions_remain_visible_alongside_running_work() {
+        let task_id = Uuid::new_v4();
+        let mut waiting = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        waiting.task_id = Some(task_id);
+        waiting.status = SessionStatus::Waiting;
+        let mut running = waiting.clone();
+        running.id = Uuid::new_v4();
+        running.status = SessionStatus::Working;
+        let mut failed = waiting.clone();
+        failed.id = Uuid::new_v4();
+        failed.status = SessionStatus::Failed;
+        let mut stats = TaskStats::default();
+        stats.record_session(&waiting, true, true, Some("Awaiting permission".into()));
+        stats.record_session(&running, true, false, None);
+        stats.record_session(&failed, true, false, Some("Failed".into()));
+        assert_eq!(stats.conversations[&task_id], 3);
+        assert_eq!(stats.running[&task_id], 2);
+        assert_eq!(stats.attention[&task_id], 2);
+        assert_eq!(
+            stats.attention_sessions[&task_id]
+                .iter()
+                .map(|item| item.session_id)
+                .collect::<Vec<_>>(),
+            vec![waiting.id, failed.id]
+        );
+        assert_eq!(waiting.status, SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn latest_preview_uses_visible_tail_and_never_claims_idle_is_done() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        session
+            .messages
+            .push(Message::new(MessageRole::Assistant, "Tests are running."));
+        assert_eq!(
+            session_progress_preview(&session).as_deref(),
+            Some("Tests are running.")
+        );
+        session.transcript_blocks.push(TranscriptBlock {
+            after_message: 1,
+            turn_id: None,
+            activities: vec![ActivityItem::new(
+                None,
+                ActivityKind::Reasoning,
+                "private reasoning",
+                None,
+                false,
+            )],
+        });
+        assert_eq!(
+            session_progress_preview(&session).as_deref(),
+            Some("Tests are running.")
+        );
+        session.detail_loaded = false;
+        assert_eq!(session_progress_preview(&session), None);
+        assert_eq!(board_preview(&"字".repeat(400)).chars().count(), 160);
+    }
+
+    #[test]
+    fn activity_filters_describe_live_work_without_moving_workflow_columns() {
+        let task = Task::new("Follow through", TaskState::Doing, 0);
+        let mut stats = TaskStats::default();
+        assert!(board_activity_matches(
+            &task,
+            BoardActivityFilter::All,
+            &stats
+        ));
+        assert!(!board_activity_matches(
+            &task,
+            BoardActivityFilter::Running,
+            &stats
+        ));
+        stats.busy.insert(task.id);
+        stats.attention.insert(task.id, 1);
+        assert!(board_activity_matches(
+            &task,
+            BoardActivityFilter::Running,
+            &stats
+        ));
+        assert!(board_activity_matches(
+            &task,
+            BoardActivityFilter::Attention,
+            &stats
+        ));
+        assert_eq!(task.state, TaskState::Doing);
+        let mut done = task;
+        done.set_state(TaskState::Done);
+        assert!(!board_activity_matches(
+            &done,
+            BoardActivityFilter::Running,
+            &stats
+        ));
+        assert!(!board_activity_matches(
+            &done,
+            BoardActivityFilter::Attention,
+            &stats
+        ));
+    }
 }

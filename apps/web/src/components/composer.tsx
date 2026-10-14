@@ -553,7 +553,7 @@ export function Composer({
   }
 
   function savePatch(patch: Partial<AgentSession>) {
-    const next = { ...session, ...patch, updated_at: Math.floor(Date.now() / 1_000) }
+    const next = { ...session, ...patch, updated_at: Math.max(session.updated_at, Math.floor(Date.now() / 1_000)) }
     if (config && next.model) {
       const storage = browserComposerPreferenceStorage()
       const preferences = rememberComposerSession(

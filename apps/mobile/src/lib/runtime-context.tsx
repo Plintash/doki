@@ -853,7 +853,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     const next = {
       ...current,
       title: trimmed || 'New task',
-      updated_at: clock.nowSeconds(),
+      updated_at: Math.max(current.updated_at, clock.nowSeconds()),
     };
     cacheSession(next);
     await persistOrdered(next);

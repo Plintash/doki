@@ -35,6 +35,15 @@ pub(super) struct ComputerUseRuntime {
 }
 
 impl ComputerUseRuntime {
+    /// RPA-only REPL registration must not resolve the native helper, create
+    /// its process registry, or start the preview monitor.
+    pub(super) fn start_if_enabled(
+        enabled: bool,
+        events: DriverEventSender,
+    ) -> anyhow::Result<Option<Self>> {
+        enabled.then(|| Self::start(events)).transpose()
+    }
+
     pub(super) fn start(events: DriverEventSender) -> anyhow::Result<Self> {
         let server_path = computer_use::mcp_server_command()?;
         let repl_path = computer_use::js_repl_server_path()?;
@@ -230,4 +239,22 @@ pub(super) fn process_executable(pid: i32) -> Option<PathBuf> {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub(super) fn process_executable(_: i32) -> Option<PathBuf> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_computer_use_never_initializes_helper_or_preview_monitor() {
+        let (events, received) = crate::driver::test_event_channel();
+        // A missing packaged helper is immaterial: the disabled branch never
+        // even resolves its path and owns no monitor or process directory.
+        assert!(
+            ComputerUseRuntime::start_if_enabled(false, events)
+                .unwrap()
+                .is_none()
+        );
+        assert!(received.try_recv().is_err());
+    }
 }

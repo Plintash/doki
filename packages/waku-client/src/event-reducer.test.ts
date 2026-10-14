@@ -19,6 +19,19 @@ const SUBMISSION = {
   messageId: '20000000-0000-4000-8000-000000000002',
 }
 
+describe('session revision', () => {
+  test('submission and streamed events preserve a newer issue metadata revision', () => {
+    const session = { ...idleSession(), task_id: 'filed-issue', updated_at: 201 }
+    const submitted = apply(session, 'promptSubmitted', SUBMISSION)
+    const started = apply(submitted, 'turnStarted', null)
+    const replied = apply(started, 'textDelta', 'Sure.')
+    expect(replied.updated_at).toBe(201)
+    expect(replied.task_id).toBe('filed-issue')
+    expect(replied.last_reply_at).toBe(200)
+    expect(replied.messages.at(-1)?.content).toBe('Sure.')
+  })
+})
+
 describe('promptSubmitted', () => {
   test('a client following the runtime mirrors another client’s submission under its ids', () => {
     // The desktop stayed attached to the idle runtime after the first turn;
@@ -113,6 +126,73 @@ describe('promptSubmitted', () => {
     expect(result.session.auto_title).toBe('Add a dark mode toggle to settings')
     expect(result.session.turns.at(-1)?.turn_count).toBe(1)
   })
+})
+
+describe('provider-initiated Pi turns', () => {
+  for (const provider of ['pi', 'ohMyPi'] as const) {
+    for (const status of ['idle', 'background'] as const) {
+      test(`${provider} streams and settles a wake from ${status}`, () => {
+        const previous: AgentSession = { ...idleSession(), provider, status }
+        let session = apply(previous, 'turnStarted', null)
+
+        expect(session.status).toBe('working')
+        expect(session.turns).toHaveLength(2)
+        const turn = session.turns.at(-1)!
+        expect(turn).toMatchObject({
+          turn_count: 2,
+          status: 'running',
+          provider_turn_started: true,
+        })
+        expect(session.messages).toEqual(previous.messages)
+
+        // Replayed starts confirm the same turn instead of opening another.
+        session = apply(session, 'turnStarted', null)
+        expect(session.turns).toHaveLength(2)
+        session = apply(session, 'activity', {
+          id: 'wake-tool', kind: 'tool', title: 'Read child result', complete: true,
+        })
+        session = apply(session, 'textDelta', 'The child finished.')
+        expect(session.messages.at(-1)).toMatchObject({
+          turn_id: turn.id, role: 'assistant', content: 'The child finished.', streaming: true,
+        })
+        expect(session.transcript_blocks.at(-1)?.turn_id).toBe(turn.id)
+        const activity = session.transcript_blocks.at(-1)?.content
+        expect(activity?.kind).toBe('activities')
+        if (activity?.kind === 'activities') {
+          expect(activity.data[0]?.title).toBe('Read child result')
+        }
+
+        const result = reduceRuntimeEvent(session, event('turnFinished', { success: true }), clock)
+        expect(result.settled).toBe(true)
+        expect(result.session.status).toBe('idle')
+        expect(result.session.turns.at(-1)).toMatchObject({ id: turn.id, status: 'completed' })
+        expect(result.session.messages.at(-1)?.streaming).toBe(false)
+        expect(result.session.messages.filter((message) => message.role === 'user')).toHaveLength(1)
+        expect(previous.turns).toHaveLength(1)
+        expect(previous.messages).toHaveLength(2)
+      })
+    }
+
+    test(`${provider} confirms an existing prompted turn`, () => {
+      const previous: AgentSession = { ...runningSession(), provider }
+      const session = apply(previous, 'turnStarted', null)
+      expect(session.turns).toHaveLength(1)
+      expect(session.turns[0]).toMatchObject({ id: 'turn', provider_turn_started: true })
+      expect(session.messages).toEqual(previous.messages)
+      expect(session.status).toBe('working')
+    })
+
+    test(`${provider} does not invent a turn from an extension message or output alone`, () => {
+      const previous: AgentSession = { ...idleSession(), provider }
+      let session = apply(previous, 'extensionMessage', {
+        customType: 'notification', text: 'Child finished', display: true,
+      })
+      session = apply(session, 'textDelta', 'No run has started')
+      expect(session.turns).toEqual(previous.turns)
+      expect(session.messages).toEqual(previous.messages)
+      expect(session.status).toBe('idle')
+    })
+  }
 })
 
 test('MCP tool identity survives partial updates and stays separate in expanded details', () => {

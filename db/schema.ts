@@ -31,6 +31,10 @@ export const sessions = sqliteTable(
     projectId: text("project_id").notNull(),
     /** The task this conversation is filed under, when the user filed it. */
     taskId: text("task_id"),
+    /** Distinguishes persisted issue drafts from unloaded history. */
+    isDraft: integer("is_draft", { mode: "boolean" }).notNull().default(false),
+    /** Compact SessionWorkspace JSON for accurate unloaded conversation rows. */
+    workspace: text("workspace").notNull().default('{"kind":"local"}'),
     /** Explicit user title; "New task" means the automatic fallback is active. */
     title: text("title").notNull(),
     /** Provider-generated title, with the first prompt as a local fallback. */
@@ -65,6 +69,7 @@ export const tasks = sqliteTable(
   {
     id: text("id").primaryKey(),
     title: text("title").notNull(),
+    description: text("description").notNull().default(""),
     state: text("state").notNull(),
     /** Order within the column, ascending. */
     position: integer("position").notNull(),
@@ -73,6 +78,8 @@ export const tasks = sqliteTable(
     path: text("path"),
     branch: text("branch"),
     worktree: integer("worktree", { mode: "boolean" }).notNull().default(false),
+    /** Deferred creation intent; preserves an explicitly selected local checkout. */
+    newWorktree: integer("new_worktree", { mode: "boolean" }).notNull().default(false),
     createdAt: integer("created_at").notNull(),
     /** Any mutation, including state moves and title edits. */
     updatedAt: integer("updated_at").notNull(),

@@ -130,6 +130,7 @@ enum DriverCommand {
         turns: usize,
         reply: Sender<anyhow::Result<ProviderResumeCursor>>,
     },
+    ConfirmShutdown(Sender<anyhow::Result<()>>),
     Shutdown,
 }
 
@@ -501,9 +502,16 @@ impl OpenCodeDriver {
             let _ = opencode_api::switch_model(&endpoint, &session_id, model);
         }
 
-        let computer_use = if computer_use_enabled {
-            let attached =
-                OpenCodeComputerUse::start(&service, &directory, &session_id, events.clone());
+        let automation_repl = super::automation_repl::AutomationReplConfig::load()?;
+        let computer_use = if computer_use_enabled || automation_repl.is_some() {
+            let attached = OpenCodeComputerUse::start(
+                &service,
+                &directory,
+                &session_id,
+                events.clone(),
+                computer_use_enabled,
+                automation_repl,
+            );
             match attached {
                 Ok(runtime) => Some(Arc::new(runtime)),
                 Err(error) => {
@@ -667,6 +675,20 @@ impl DriverControl for OpenCodeDriver {
         if let Some(computer_use) = self.computer_use.as_ref() {
             computer_use.stop();
         }
+    }
+
+    fn confirm_session_shutdown(&self) -> Option<anyhow::Result<()>> {
+        // Keep the subscription and worker alive until the service confirms
+        // this session is quiescent. The adopted service itself stays alive.
+        Some((|| {
+            let (reply, answer) = bounded(1);
+            self.commands
+                .send(DriverCommand::ConfirmShutdown(reply))
+                .map_err(|_| anyhow!("the OpenCode session shutdown cannot be confirmed"))?;
+            answer
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| anyhow!("OpenCode did not confirm session shutdown"))?
+        })())
     }
 
     fn respond(&self, request_id: String, option_id: String) {
@@ -1106,9 +1128,41 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
         DriverCommand::Fork { turns, reply } => {
             let _ = reply.send(fork_session(&endpoint, worker, turns));
         }
+        DriverCommand::ConfirmShutdown(reply) => {
+            let result = confirm_owned_session_shutdown(
+                || {
+                    opencode_api::interrupt(&endpoint, &worker.session_id)
+                        .map(|_| ())
+                        .map_err(Into::into)
+                },
+                || {
+                    let active = opencode_api::active_sessions(&endpoint)?;
+                    if active.contains(&worker.session_id) {
+                        return Ok(false);
+                    }
+                    // An undelivered input can start another execution after
+                    // the interrupt. Its absence must also be authoritative.
+                    Ok(opencode_api::list_inbox(&endpoint, &worker.session_id)?.is_empty())
+                },
+            );
+            let _ = reply.send(result);
+        }
         DriverCommand::Shutdown => return false,
     }
     true
+}
+
+/// Positive owned-session evidence only: neither dropping SSE nor a failed
+/// status query proves the user's shared service has stopped this session.
+fn confirm_owned_session_shutdown(
+    interrupt: impl FnOnce() -> anyhow::Result<()>,
+    is_quiescent: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    interrupt()?;
+    if !is_quiescent()? {
+        anyhow::bail!("OpenCode still has running or queued work in this session");
+    }
+    Ok(())
 }
 
 /// Sends the one-shot replies [`support::permission_responses`] resolved.
@@ -2442,6 +2496,26 @@ fn permission_options() -> Vec<PermissionOption> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn confirmed_shutdown_of_shared_service_requires_owned_session_settlement() {
+        assert!(super::confirm_owned_session_shutdown(|| Ok(()), || Ok(true)).is_ok());
+        assert!(super::confirm_owned_session_shutdown(|| Ok(()), || Ok(false)).is_err());
+        assert!(
+            super::confirm_owned_session_shutdown(
+                || Ok(()),
+                || Err(anyhow::anyhow!("status unavailable"))
+            )
+            .is_err()
+        );
+        assert!(
+            super::confirm_owned_session_shutdown(
+                || Err(anyhow::anyhow!("interrupt rejected")),
+                || panic!("must not accept a status after rejected interruption")
+            )
+            .is_err()
+        );
+    }
+
     use super::*;
 
     use crossbeam_channel::Receiver;

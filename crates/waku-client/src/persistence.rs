@@ -763,9 +763,9 @@ impl PersistedState {
 
     fn persistable_selected_session(&self) -> Option<Uuid> {
         self.selected_session.filter(|selected| {
-            self.sessions
-                .iter()
-                .any(|session| session.id == *selected && session.has_started())
+            self.sessions.iter().any(|session| {
+                session.id == *selected && (session.has_started() || session.task_id.is_some())
+            })
         })
     }
 
@@ -986,6 +986,9 @@ pub struct StateStore {
 impl StateStore {
     pub fn default_path() -> PathBuf {
         if cfg!(debug_assertions) {
+            if let Some(directory) = std::env::var_os("WAKU_RPA_DATA_DIR") {
+                return PathBuf::from(directory).join("app.db");
+            }
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .and_then(Path::parent)
@@ -1196,6 +1199,44 @@ impl StateStore {
     }
 
     pub fn save(&self, state: &mut PersistedState) -> io::Result<()> {
+        let (_, command) = self.prepare_save_command(state)?;
+        self.daemon
+            .client()
+            .notify(Uuid::nil(), Uuid::nil(), command)
+            .map_err(to_io_error)?;
+        state.dirty_sessions.clear();
+        Ok(())
+    }
+
+    /// Prepare a durable, acknowledged save for explicit issue actions.
+    /// The caller runs the closure on a worker, reports a failure, and marks
+    /// the returned session ids dirty again so the next change can retry.
+    /// Streaming saves keep their existing nonblocking notification path.
+    pub fn prepare_confirmed_save(
+        &self,
+        state: &mut PersistedState,
+    ) -> io::Result<(
+        Vec<Uuid>,
+        impl FnOnce() -> io::Result<()> + Send + 'static + use<>,
+    )> {
+        let (dirty_ids, command) = self.prepare_save_command(state)?;
+        let daemon = self.daemon.clone();
+        state.dirty_sessions.clear();
+        Ok((dirty_ids, move || {
+            match daemon
+                .client()
+                .request(Uuid::nil(), Uuid::nil(), command)
+                .map_err(to_io_error)?
+            {
+                ResponsePayload::TaskStateSaved { .. } => Ok(()),
+                _ => Err(io::Error::other(
+                    "Waku daemon returned an invalid task-save response",
+                )),
+            }
+        }))
+    }
+
+    fn prepare_save_command(&self, state: &PersistedState) -> io::Result<(Vec<Uuid>, Command)> {
         self.write_app_settings(&state.app_settings())?;
         self.write_app_state(&state.app_state())?;
         if !self.task_state_loaded.load(Ordering::Acquire) {
@@ -1204,11 +1245,11 @@ impl StateStore {
                 "task state was not loaded; refusing to overwrite daemon data",
             ));
         }
-        let dirty_ids = state.dirty_sessions.clone();
+        let dirty_ids = state.dirty_sessions.iter().copied().collect();
         let sessions = state
             .sessions
             .iter()
-            .filter(|session| dirty_ids.contains(&session.id))
+            .filter(|session| state.dirty_sessions.contains(&session.id))
             .cloned()
             .collect::<Vec<AgentSession>>();
         // `detail_loaded` is process-local and does not cross the wire, so a
@@ -1221,22 +1262,16 @@ impl StateStore {
             .map(|session| session.id)
             .collect();
         let live_session_ids = state.sessions.iter().map(|session| session.id).collect();
-        self.daemon
-            .client()
-            .notify(
-                Uuid::nil(),
-                Uuid::nil(),
-                Command::SaveTaskState {
-                    projects: state.projects.clone(),
-                    tasks: state.tasks.clone(),
-                    live_session_ids,
-                    skeleton_session_ids,
-                    sessions,
-                },
-            )
-            .map_err(to_io_error)?;
-        state.dirty_sessions.clear();
-        Ok(())
+        Ok((
+            dirty_ids,
+            Command::SaveTaskState {
+                projects: state.projects.clone(),
+                tasks: state.tasks.clone(),
+                live_session_ids,
+                skeleton_session_ids,
+                sessions,
+            },
+        ))
     }
 
     pub fn remove_session(&self, session_id: Uuid) -> io::Result<()> {
@@ -1273,6 +1308,32 @@ impl StateStore {
 
     fn write_app_state(&self, state: &AppState) -> io::Result<()> {
         write_json_atomically(&self.app_state_path, state)
+    }
+}
+
+/// Bounded read of persisted history without hydrating or selecting a session.
+pub fn read_transcript(
+    daemon: &DaemonSupervisor,
+    conversation_id: Uuid,
+    query: waku_protocol::TranscriptQuery,
+) -> io::Result<waku_protocol::TranscriptResult> {
+    query.validate().map_err(io::Error::other)?;
+    match daemon
+        .client()
+        .request(
+            Uuid::nil(),
+            Uuid::nil(),
+            Command::ReadTranscript {
+                conversation_id,
+                query,
+            },
+        )
+        .map_err(to_io_error)?
+    {
+        ResponsePayload::Transcript { result } => result.map_err(io::Error::other),
+        _ => Err(io::Error::other(
+            "Waku daemon returned an invalid transcript response",
+        )),
     }
 }
 
@@ -1610,6 +1671,24 @@ mod tests {
     fn app_state_skips_the_right_panel_key_when_nothing_is_open() {
         let encoded = serde_json::to_value(PersistedState::empty().app_state()).unwrap();
         assert!(encoded.get("right_panel").is_none());
+    }
+
+    #[test]
+    fn persisted_issue_draft_remains_unstarted_and_selected_on_the_client() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let session = &mut state.sessions[0];
+        session.task_id = Some(Uuid::new_v4());
+        let id = session.id;
+        let encoded = serde_json::to_value(session.list_projection()).unwrap();
+        let mut restored = vec![serde_json::from_value(encoded).unwrap()];
+        restore_task_state_skeletons(&mut restored);
+        assert!(!restored[0].has_started());
+        state.sessions = restored;
+        state.selected_session = Some(id);
+        assert_eq!(state.persistable_selected_session(), Some(id));
+        state.ensure_runtime_session();
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.selected_session, Some(id));
     }
 
     #[test]

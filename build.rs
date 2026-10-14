@@ -7,6 +7,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     export_sparkle_public_key();
+    export_build_identity();
 
     #[cfg(target_os = "windows")]
     {
@@ -110,4 +111,52 @@ END
     embed_resource::compile(&script, embed_resource::NONE)
         .manifest_optional()
         .expect("compile Windows resources");
+}
+
+/// A build is not the package version or the process id. Hash the actual
+/// application/workspace sources, then stamp this build-script execution.
+/// Cargo tracks the directories too, so adding a source changes the identity.
+fn export_build_identity() {
+    use std::path::Path;
+    fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn visit(path: &Path, hash: &mut u64) {
+        if path.is_dir() {
+            let mut entries = std::fs::read_dir(path)
+                .expect("read build identity sources")
+                .map(|entry| entry.expect("read source entry").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for entry in entries {
+                visit(&entry, hash);
+            }
+        } else {
+            hash_bytes(hash, path.to_string_lossy().as_bytes());
+            hash_bytes(
+                hash,
+                &std::fs::read(path).expect("read build identity source"),
+            );
+        }
+    }
+    let mut fingerprint = 0xcbf29ce484222325;
+    for source in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "src",
+        "crates",
+        "resources",
+    ] {
+        println!("cargo:rerun-if-changed={source}");
+        visit(Path::new(source), &mut fingerprint);
+    }
+    let built_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("build time is after the Unix epoch")
+        .as_nanos();
+    println!("cargo:rustc-env=WAKU_BUILD_ID={fingerprint:016x}-{built_at:x}");
 }

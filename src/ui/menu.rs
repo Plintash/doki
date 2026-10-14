@@ -23,15 +23,16 @@
 //!   focusing any earlier silently does nothing — and then no key reaches the
 //!   menu at all.
 
+use super::SemanticControlExt;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, Bounds, Display, Element, ElementId, FocusHandle, FontWeight, GlobalElementId,
-    InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Point, Position, RenderOnce, SharedString, Size,
-    StatefulInteractiveElement, Style, Styled, Window, actions, anchored, canvas, deferred, div,
-    img, prelude::FluentBuilder, px,
+    InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, ListAlignment,
+    ListOffset, ListState, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Position,
+    RenderOnce, SharedString, Size, StatefulInteractiveElement, Style, Styled, Window, actions,
+    anchored, canvas, deferred, div, img, list, prelude::FluentBuilder, px,
 };
 
 actions!(
@@ -51,6 +52,9 @@ const MENU_CONTEXT: &str = "WakuMenu";
 
 /// Vertical gap between a trigger and its anchored card.
 const TRIGGER_GAP: f32 = 4.0;
+const COLLECTION_ROW_HEIGHT: f32 = 26.0;
+const COLLECTION_MAX_HEIGHT: f32 = 320.0;
+const MENU_CHROME_HEIGHT: f32 = 10.0;
 
 /// A text field inside an open panel, such as a picker's filter box.
 ///
@@ -85,6 +89,7 @@ use crate::ui::icon;
 #[derive(Clone)]
 pub enum MenuItem {
     Entry {
+        semantic_id: Option<SharedString>,
         label: SharedString,
         icon: Option<&'static str>,
         /// A full-color raster icon — a real app icon — where `icon` would
@@ -102,6 +107,7 @@ pub enum MenuItem {
     /// current choice visible in the parent row, matching native inspector
     /// menus whose submenu is a preference rather than an action.
     Submenu {
+        semantic_id: Option<SharedString>,
         label: SharedString,
         value: Option<SharedString>,
         #[allow(clippy::type_complexity)]
@@ -126,6 +132,7 @@ impl MenuItem {
         on_click: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Self {
         Self::Entry {
+            semantic_id: None,
             label: label.into(),
             icon: None,
             image: None,
@@ -133,6 +140,17 @@ impl MenuItem {
             disabled: false,
             on_click: Rc::new(on_click),
         }
+    }
+
+    /// Stable domain identity for entries whose label or position can change.
+    pub fn semantic_id(mut self, id: impl Into<SharedString>) -> Self {
+        match &mut self {
+            Self::Entry { semantic_id, .. } | Self::Submenu { semantic_id, .. } => {
+                *semantic_id = Some(id.into());
+            }
+            _ => {}
+        }
+        self
     }
 
     /// A caller-drawn row. `render` runs on every frame the menu is open.
@@ -149,6 +167,7 @@ impl MenuItem {
         items: impl Fn(&mut App) -> Vec<MenuItem> + 'static,
     ) -> Self {
         Self::Submenu {
+            semantic_id: None,
             label: label.into(),
             value: Some(value.into()),
             items: Rc::new(items),
@@ -233,6 +252,41 @@ struct MenuState {
     /// outside-click capture must leave that click alone so the later trigger
     /// handler can close it; a context-menu row has no such handler.
     trigger_click_toggles: bool,
+    /// Large dropdowns snapshot their choices once per opening. Keeping both
+    /// the rows and their keyboard indexes here makes each frame O(visible).
+    collection: Option<MenuCollection>,
+}
+
+#[derive(Clone)]
+struct MenuCollection {
+    items: Rc<Vec<MenuItem>>,
+    focusable: Rc<Vec<usize>>,
+    list: ListState,
+    /// Only this frame's measured rows can use pixel-based nearest-edge reveal.
+    rendered_rows: Rc<Cell<Option<(usize, usize)>>>,
+    content_height: f32,
+}
+
+impl MenuCollection {
+    fn new(items: Vec<MenuItem>) -> Self {
+        let focusable = focusable_indexes(&items);
+        let content_height = items
+            .iter()
+            .map(|item| match item {
+                MenuItem::Separator => 9.0,
+                MenuItem::Header(_) => 22.0,
+                _ => COLLECTION_ROW_HEIGHT,
+            })
+            .sum();
+        let list = ListState::new(items.len(), ListAlignment::Top, px(COLLECTION_ROW_HEIGHT));
+        Self {
+            items: Rc::new(items),
+            focusable,
+            list,
+            rendered_rows: Rc::new(Cell::new(None)),
+            content_height,
+        }
+    }
 }
 
 /// Cross-frame state for one context menu. The owner keeps one per menu site.
@@ -256,7 +310,7 @@ impl ContextMenuHandle {
     pub fn new(cx: &mut App) -> Self {
         Self {
             state: Rc::new(RefCell::new(MenuState::default())),
-            trigger_focus: cx.focus_handle(),
+            trigger_focus: cx.focus_handle().tab_stop(true),
             focus: cx.focus_handle(),
             trigger_bounds: Rc::new(Cell::new(None)),
             on_toggle: Rc::new(Vec::new()),
@@ -310,9 +364,10 @@ impl ContextMenuHandle {
     }
 
     pub fn close(&self, window: &mut Window, cx: &mut App) {
-        let was_open = {
+        let (was_open, restore_trigger_focus) = {
             let mut state = self.state.borrow_mut();
             let was_open = state.open.is_some();
+            let restore_trigger_focus = state.collection.is_some() && self.focus.is_focused(window);
             state.open = None;
             state.pending_context_items.clear();
             state.context_items.clear();
@@ -321,8 +376,12 @@ impl ContextMenuHandle {
             state.submenu_highlighted = None;
             state.submenu_focused = false;
             state.trigger_click_toggles = false;
-            was_open
+            state.collection = None;
+            (was_open, restore_trigger_focus)
         };
+        if restore_trigger_focus {
+            window.focus(&self.trigger_focus, cx);
+        }
         if was_open {
             self.notify_toggle(false, window, cx);
         }
@@ -363,6 +422,7 @@ impl ContextMenuHandle {
             state.submenu_highlighted = None;
             state.submenu_focused = false;
             state.trigger_click_toggles = trigger_click_toggles;
+            state.collection = None;
             was_open
         };
         if !was_open {
@@ -710,15 +770,46 @@ pub fn dropdown_menu<E>(
     items: impl Fn(&mut App) -> Vec<MenuItem> + 'static,
 ) -> AnyElement
 where
-    E: ParentElement + Styled + InteractiveElement + IntoElement + 'static,
+    E: ParentElement + Styled + StatefulInteractiveElement + IntoElement + 'static,
 {
-    let id: ElementId = id.into();
+    dropdown_menu_inner(trigger, id.into(), handle, align, false, items)
+}
+
+/// A bounded dropdown for a potentially large collection. It keeps the same
+/// native rows, anchoring and dismissal as `dropdown_menu`, but snapshots its
+/// lazy builder once per opening and virtualizes the rows with GPUI `list`.
+/// Reopening refreshes the choices; callbacks must still validate their target.
+pub fn dropdown_menu_list<E>(
+    trigger: E,
+    id: impl Into<ElementId>,
+    handle: &ContextMenuHandle,
+    align: MenuAlign,
+    items: impl Fn(&mut App) -> Vec<MenuItem> + 'static,
+) -> AnyElement
+where
+    E: ParentElement + Styled + StatefulInteractiveElement + IntoElement + 'static,
+{
+    dropdown_menu_inner(trigger, id.into(), handle, align, true, items)
+}
+
+fn dropdown_menu_inner<E>(
+    trigger: E,
+    id: ElementId,
+    handle: &ContextMenuHandle,
+    align: MenuAlign,
+    virtualized: bool,
+    items: impl Fn(&mut App) -> Vec<MenuItem> + 'static,
+) -> AnyElement
+where
+    E: ParentElement + Styled + StatefulInteractiveElement + IntoElement + 'static,
+{
     let items = Rc::new(items);
     anchored_surface(trigger, handle, align, SurfaceFocus::Card, move |handle| {
         MenuCard {
             id: id.clone(),
             handle: handle.clone(),
             items: items.clone(),
+            virtualized,
         }
         .into_any_element()
     })
@@ -738,7 +829,7 @@ pub fn popover<E>(
     content: impl Fn(&ContextMenuHandle, &mut Window, &mut App) -> AnyElement + 'static,
 ) -> AnyElement
 where
-    E: ParentElement + Styled + InteractiveElement + IntoElement + 'static,
+    E: ParentElement + Styled + StatefulInteractiveElement + IntoElement + 'static,
 {
     let content = Rc::new(content);
     anchored_surface(
@@ -792,17 +883,21 @@ fn anchored_surface<E>(
     card: impl Fn(&ContextMenuHandle) -> AnyElement + 'static,
 ) -> AnyElement
 where
-    E: ParentElement + Styled + InteractiveElement + IntoElement + 'static,
+    E: ParentElement + Styled + StatefulInteractiveElement + IntoElement + 'static,
 {
     let open_at = handle.state.borrow().open;
     let toggle_handle = handle.clone();
     let key_handle = handle.clone();
+    let semantic_handle = handle.clone();
 
     let trigger = trigger
         .relative()
         .track_focus(&handle.trigger_focus)
         .tab_index(0)
         .child(trigger_bounds_probe(handle))
+        .on_a11y_action(gpui::accesskit::Action::Click, move |_, window, cx| {
+            toggle_anchored_surface(&semantic_handle, align, focus_target, window, cx);
+        })
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             toggle_anchored_surface(&toggle_handle, align, focus_target, window, cx);
             cx.stop_propagation();
@@ -949,6 +1044,7 @@ where
                         id,
                         handle: handle.clone(),
                         items,
+                        virtualized: false,
                     }),
             )
             .with_priority(1),
@@ -959,6 +1055,7 @@ where
 #[derive(IntoElement)]
 struct MenuCard {
     id: ElementId,
+    virtualized: bool,
     handle: ContextMenuHandle,
     #[allow(clippy::type_complexity)]
     items: Rc<dyn Fn(&mut App) -> Vec<MenuItem>>,
@@ -976,8 +1073,28 @@ impl RenderOnce for MenuCard {
                 items
             })
         };
+        let collection = if self.virtualized {
+            let cached = self.handle.state.borrow().collection.clone();
+            Some(cached.unwrap_or_else(|| {
+                let collection = MenuCollection::new(item_builder(cx));
+                self.handle.state.borrow_mut().collection = Some(collection.clone());
+                collection
+            }))
+        } else {
+            None
+        };
+        let item_builder: Rc<dyn Fn(&mut App) -> Rc<Vec<MenuItem>>> =
+            if let Some(collection) = &collection {
+                let items = collection.items.clone();
+                Rc::new(move |_| items.clone())
+            } else {
+                Rc::new(move |cx| Rc::new(item_builder(cx)))
+            };
         let items = item_builder(cx);
-        let focusable = focusable_indexes(&items);
+        let focusable = collection.as_ref().map_or_else(
+            || focusable_indexes(&items),
+            |collection| collection.focusable.clone(),
+        );
         let (highlighted, active_submenu, submenu_highlighted) = {
             let state = self.handle.state.borrow();
             (
@@ -1006,17 +1123,57 @@ impl RenderOnce for MenuCard {
             .flex()
             .flex_col();
 
-        for (index, item) in items.into_iter().enumerate() {
-            root_card = root_card.child(render_menu_item(
-                item,
-                index,
-                highlighted == Some(index) || active_submenu == Some(index),
-                false,
-                &theme,
-                self.handle.clone(),
-                window,
-                cx,
-            ));
+        let collection_height = collection.as_ref().map(|collection| {
+            collection_list_height(
+                collection.content_height,
+                f32::from(window.viewport_size().height),
+                self.handle.trigger_bounds.get(),
+                8.0 + f32::from(window.client_inset().unwrap_or(px(0.0))),
+            )
+        });
+        if let Some(collection) = &collection {
+            let width = (f32::from(window.viewport_size().width)
+                - 16.0
+                - 2.0 * f32::from(window.client_inset().unwrap_or(px(0.0))))
+            .clamp(0.0, 320.0);
+            let handle = self.handle.clone();
+            let items = items.clone();
+            let rendered_rows = collection.rendered_rows.clone();
+            rendered_rows.set(None);
+            root_card = root_card.min_w(px(width.min(176.0))).w(px(width)).child(
+                list(collection.list.clone(), move |index, window, cx| {
+                    rendered_rows.set(Some(
+                        rendered_rows.get().map_or((index, index), |(first, last)| {
+                            (first.min(index), last.max(index))
+                        }),
+                    ));
+                    render_menu_item(
+                        items[index].clone(),
+                        index,
+                        highlighted == Some(index) || active_submenu == Some(index),
+                        false,
+                        &theme,
+                        handle.clone(),
+                        window,
+                        cx,
+                    )
+                })
+                .w_full()
+                .h(px(collection_height.unwrap_or(0.0))),
+            );
+        } else {
+            for (index, item) in items.iter().cloned().enumerate() {
+                root_card = root_card.child(render_menu_item(
+                    item,
+                    index,
+                    highlighted == Some(index) || active_submenu == Some(index),
+                    false,
+                    &theme,
+                    self.handle.clone(),
+                    window,
+                    cx,
+                ));
+            }
         }
 
         let mut surface = div()
@@ -1041,7 +1198,22 @@ impl RenderOnce for MenuCard {
                 let focusable = focusable.clone();
                 let items = item_builder.clone();
                 move |event: &KeyDownEvent, window, cx| {
-                    on_menu_key(&handle, &focusable, &items, event, window, cx);
+                    on_menu_key(
+                        &handle,
+                        &focusable,
+                        &items,
+                        collection.as_ref().map(|collection| {
+                            (
+                                collection,
+                                ((collection_height.unwrap_or(0.0) / COLLECTION_ROW_HEIGHT).floor()
+                                    as usize)
+                                    .max(1),
+                            )
+                        }),
+                        event,
+                        window,
+                        cx,
+                    );
                 }
             })
             .child(root_card);
@@ -1078,6 +1250,25 @@ impl RenderOnce for MenuCard {
     }
 }
 
+/// Leave room for the border/padding and prefer a side that does not cover
+/// the trigger, even in a short window. FloatingSurface handles final flipping.
+fn collection_list_height(
+    content_height: f32,
+    viewport_height: f32,
+    trigger: Option<Bounds<Pixels>>,
+    margin: f32,
+) -> f32 {
+    let available = (viewport_height - 2.0 * margin).max(0.0);
+    let available = trigger.map_or(available, |trigger| {
+        let above = (f32::from(trigger.top()) - TRIGGER_GAP - margin).max(0.0);
+        let below = (viewport_height - f32::from(trigger.bottom()) - TRIGGER_GAP - margin).max(0.0);
+        above.max(below).min(available)
+    });
+    content_height
+        .min(COLLECTION_MAX_HEIGHT)
+        .min((available - MENU_CHROME_HEIGHT).max(0.0))
+}
+
 fn render_menu_item(
     item: MenuItem,
     index: usize,
@@ -1106,6 +1297,7 @@ fn render_menu_item(
             .child(label)
             .into_any_element(),
         MenuItem::Entry {
+            semantic_id,
             label,
             icon: item_icon,
             image,
@@ -1118,13 +1310,16 @@ fn render_menu_item(
                 (false, true) => theme.text,
                 (false, false) => theme.text_secondary,
             };
+            let id = semantic_id.unwrap_or_else(|| format!("menu-entry-{label}").into());
             let entry = row(
-                index,
+                id,
                 highlighted,
                 theme,
                 handle.clone(),
                 (!disabled).then_some(on_click),
             )
+            .semantic_control(gpui::Role::MenuItem, disabled)
+            .aria_label(label.clone())
             .text_color(color)
             .when(selected, |element| element.font_weight(FontWeight::MEDIUM))
             .when_some(item_icon, |element, path| {
@@ -1140,6 +1335,7 @@ fn render_menu_item(
             track_pointer_highlight(entry, index, in_submenu, disabled, handle).into_any_element()
         }
         MenuItem::Submenu {
+            semantic_id,
             label,
             value,
             items: _,
@@ -1147,8 +1343,11 @@ fn render_menu_item(
             // Waku currently exposes one flyout level. Keeping a nested
             // submenu row inert prevents a child builder from accidentally
             // stealing the parent flyout's keyboard state.
+            let id = semantic_id.unwrap_or_else(|| format!("menu-submenu-{label}").into());
             if in_submenu {
-                return row(index, highlighted, theme, handle, None)
+                return row(id, highlighted, theme, handle, None)
+                    .semantic_control(gpui::Role::MenuItem, true)
+                    .aria_label(label.clone())
                     .text_color(theme.text_ghost)
                     .child(div().flex_1().min_w_0().truncate().child(label))
                     .child(icon("icons/chevron-right.svg", 10.0, theme.text_ghost))
@@ -1157,7 +1356,10 @@ fn render_menu_item(
             let hover = theme.overlay;
             let hover_handle = handle.clone();
             let click_handle = handle.clone();
-            row(index, highlighted, theme, handle, None)
+            let semantic_handle = handle.clone();
+            row(id, highlighted, theme, handle, None)
+                .semantic_control(gpui::Role::MenuItem, false)
+                .aria_label(label.clone())
                 .cursor_default()
                 .hover(move |element| element.bg(hover))
                 .text_color(theme.text_secondary)
@@ -1166,6 +1368,10 @@ fn render_menu_item(
                         open_submenu(&hover_handle, index, false);
                         window.refresh();
                     }
+                })
+                .on_a11y_action(gpui::accesskit::Action::Click, move |_, window, _| {
+                    open_submenu(&semantic_handle, index, true);
+                    window.refresh();
                 })
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     open_submenu(&click_handle, index, false);
@@ -1241,7 +1447,7 @@ fn track_pointer_highlight(
 /// close-then-act when it has a handler. A `None` handler renders the same
 /// geometry inert, which is how a disabled entry keeps the menu's shape.
 fn row(
-    index: usize,
+    id: impl Into<ElementId>,
     highlighted: bool,
     theme: &Theme,
     handle: ContextMenuHandle,
@@ -1250,7 +1456,7 @@ fn row(
     let hover = theme.overlay;
     let highlight = theme.overlay_strong;
     div()
-        .id(index)
+        .id(id)
         .mx(px(4.0))
         .px(px(8.0))
         .min_h(px(26.0))
@@ -1262,13 +1468,20 @@ fn row(
         .line_height(sp(15.0))
         .when(highlighted, |element| element.bg(highlight))
         .when_some(on_click, |element, on_click| {
+            let activate = Rc::new(move |window: &mut Window, cx: &mut App| {
+                handle.close(window, cx);
+                on_click(window, cx);
+                window.refresh();
+            });
+            let semantic_activate = activate.clone();
             element
                 .cursor_default()
                 .hover(move |element| element.bg(hover))
+                .on_a11y_action(gpui::accesskit::Action::Click, move |_, window, cx| {
+                    semantic_activate(window, cx);
+                })
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    handle.close(window, cx);
-                    on_click(window, cx);
-                    window.refresh();
+                    activate(window, cx);
                 })
         })
 }
@@ -1288,6 +1501,15 @@ fn focusable_indexes(items: &[MenuItem]) -> Rc<Vec<usize>> {
 /// `current` and the result are indexes into the *item list*, not into
 /// `focusable`. `None` means the key does not navigate.
 fn next_highlight(focusable: &[usize], current: Option<usize>, key: &str) -> Option<usize> {
+    next_highlight_page(focusable, current, key, 10)
+}
+
+fn next_highlight_page(
+    focusable: &[usize],
+    current: Option<usize>,
+    key: &str,
+    page_size: usize,
+) -> Option<usize> {
     if focusable.is_empty() {
         return None;
     }
@@ -1300,6 +1522,14 @@ fn next_highlight(focusable: &[usize], current: Option<usize>, key: &str) -> Opt
         }),
         "home" => 0,
         "end" => focusable.len() - 1,
+        "pagedown" => position.map_or(0, |index| {
+            index
+                .saturating_add(page_size.max(1))
+                .min(focusable.len() - 1)
+        }),
+        "pageup" => position.map_or(focusable.len() - 1, |index| {
+            index.saturating_sub(page_size.max(1))
+        }),
         _ => return None,
     };
     Some(focusable[next])
@@ -1308,7 +1538,8 @@ fn next_highlight(focusable: &[usize], current: Option<usize>, key: &str) -> Opt
 fn on_menu_key(
     handle: &ContextMenuHandle,
     focusable: &[usize],
-    items: &Rc<dyn Fn(&mut App) -> Vec<MenuItem>>,
+    items: &Rc<dyn Fn(&mut App) -> Rc<Vec<MenuItem>>>,
+    collection: Option<(&MenuCollection, usize)>,
     event: &KeyDownEvent,
     window: &mut Window,
     cx: &mut App,
@@ -1331,7 +1562,7 @@ fn on_menu_key(
     };
     if submenu_focused {
         let submenu_items = active_submenu
-            .and_then(|index| items(cx).into_iter().nth(index))
+            .and_then(|index| items(cx).get(index).cloned())
             .and_then(|item| match item {
                 MenuItem::Submenu { items, .. } => Some(items(cx)),
                 _ => None,
@@ -1394,9 +1625,33 @@ fn on_menu_key(
     }
 
     let current = handle.state.borrow().highlighted;
-    if let Some(next) = next_highlight(focusable, current, key) {
+    if let Some(next) = next_highlight_page(
+        focusable,
+        current,
+        key,
+        collection.map_or(10, |(_, page_size)| page_size),
+    ) {
         let mut state = handle.state.borrow_mut();
         state.highlighted = Some(next);
+        if let Some((collection, _)) = collection {
+            if collection
+                .rendered_rows
+                .get()
+                .is_some_and(|(first, last)| (first..=last).contains(&next))
+            {
+                collection.list.scroll_to_reveal_item(next);
+            } else {
+                // GPUI discards height hints when the list width is first
+                // established or changes. Pixel-based reveal cannot skip
+                // unmeasured rows: anchor distant targets by logical index,
+                // then let list() measure just that viewport (including
+                // variable-height headers and separators).
+                collection.list.scroll_to(ListOffset {
+                    item_ix: next,
+                    offset_in_item: px(0.0),
+                });
+            }
+        }
         state.active_submenu = None;
         state.submenu_highlighted = None;
         state.submenu_focused = false;
@@ -1410,9 +1665,9 @@ fn on_menu_key(
         let Some(highlighted) = handle.state.borrow().highlighted else {
             return;
         };
-        // Rebuild to reach the entry's closure: the item list is intentionally
-        // not retained between frames.
-        let Some(item) = items(cx).into_iter().nth(highlighted) else {
+        // Ordinary menus refresh their actions; collection dropdowns use the
+        // opening snapshot so reflow cannot retarget the keyboard selection.
+        let Some(item) = items(cx).get(highlighted).cloned() else {
             return;
         };
         match item {
@@ -1532,7 +1787,7 @@ mod tests {
 
     impl Render for Harness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let trigger = div().w(px(120.0)).h(px(32.0));
+            let trigger = div().id("test-menu-trigger").w(px(120.0)).h(px(32.0));
             div()
                 .size_full()
                 .tab_index(0)
@@ -1562,7 +1817,7 @@ mod tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let descendant_focus = self.descendant_focus.clone();
             popover(
-                div().w(px(120.0)).h(px(32.0)),
+                div().id("test-menu-trigger").w(px(120.0)).h(px(32.0)),
                 &self.handle,
                 MenuAlign::BelowLeft,
                 move |_, _, _| {
@@ -1580,25 +1835,315 @@ mod tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let activated = self.activated.clone();
             dropdown_menu(
-                div().w(px(120.0)).h(px(32.0)),
+                div()
+                    .id("semantic-menu-trigger")
+                    .semantic_control(gpui::Role::Button, false)
+                    .aria_label("Menu")
+                    .w(px(120.0))
+                    .h(px(32.0)),
                 "submenu-dropdown",
                 &self.handle,
                 MenuAlign::BelowLeft,
                 move |_| {
                     let activated = activated.clone();
-                    vec![MenuItem::submenu_with_value(
-                        "Grouping",
-                        "Updated",
-                        move |_| {
+                    vec![
+                        MenuItem::submenu_with_value("Grouping", "Updated", move |_| {
                             let activated = activated.clone();
-                            vec![MenuItem::new("Project", move |_, _| {
-                                activated.set(true);
-                            })]
-                        },
-                    )]
+                            vec![
+                                MenuItem::new("Project", move |_, _| {
+                                    activated.set(true);
+                                })
+                                .semantic_id("semantic-menu-entry"),
+                            ]
+                        })
+                        .semantic_id("semantic-menu-submenu"),
+                    ]
                 },
             )
         }
+    }
+
+    #[gpui::test]
+    fn semantic_clicks_open_trigger_submenu_and_activate_entry(cx: &mut TestAppContext) {
+        let handle = cx.update(ContextMenuHandle::new);
+        let activated = Rc::new(Cell::new(false));
+        let (_, cx) = cx.add_window_view(|window, _| {
+            window.set_a11y_automation(true);
+            SubmenuHarness {
+                handle: handle.clone(),
+                activated: activated.clone(),
+            }
+        });
+        cx.run_until_parked();
+        let click = |cx: &mut gpui::VisualTestContext, id: &str| {
+            let raw = cx
+                .update(|window, _| window.a11y_automation_snapshot())
+                .unwrap();
+            let tree: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let node = tree["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["element_id"] == id)
+                .unwrap_or_else(|| panic!("missing semantic menu {id}: {raw}"));
+            assert!(
+                node["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action == "Click")
+            );
+            let node = gpui::accesskit::NodeId(node["node"].as_str().unwrap().parse().unwrap());
+            cx.update(|window, cx| {
+                window.dispatch_a11y_action(node, gpui::AccessibleAction::Click, None, cx)
+            });
+            cx.run_until_parked();
+        };
+        click(cx, "semantic-menu-trigger");
+        assert!(handle.is_open());
+        click(cx, "semantic-menu-submenu");
+        assert_eq!(handle.state.borrow().active_submenu, Some(0));
+        click(cx, "semantic-menu-entry");
+        assert!(activated.get());
+        assert!(!handle.is_open());
+    }
+
+    struct CollectionHarness {
+        handle: ContextMenuHandle,
+        builds: Rc<Cell<usize>>,
+        rendered: Rc<RefCell<Vec<usize>>>,
+        activated: Rc<Cell<Option<usize>>>,
+    }
+
+    impl Render for CollectionHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let builds = self.builds.clone();
+            let rendered = self.rendered.clone();
+            let activated = self.activated.clone();
+            dropdown_menu_list(
+                div().id("test-menu-trigger").w(px(120.0)).h(px(32.0)),
+                "collection-dropdown",
+                &self.handle,
+                MenuAlign::BelowLeft,
+                move |_| {
+                    builds.set(builds.get() + 1);
+                    (0..10_000)
+                        .map(|index| {
+                            let rendered = rendered.clone();
+                            let activated = activated.clone();
+                            MenuItem::custom(move |_, _| {
+                                rendered.borrow_mut().push(index);
+                                div().h(px(COLLECTION_ROW_HEIGHT)).into_any_element()
+                            })
+                            .on_click(move |_, _| activated.set(Some(index)))
+                        })
+                        .collect()
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn collection_height_fits_short_viewports_and_trigger_side() {
+        let trigger = Bounds::new(point(px(20.0), px(110.0)), size(px(100.0), px(30.0)));
+        assert_eq!(
+            collection_list_height(260_000.0, 240.0, Some(trigger), 8.0),
+            88.0
+        );
+        assert_eq!(collection_list_height(260_000.0, 900.0, None, 8.0), 320.0);
+        assert_eq!(collection_list_height(26.0, 900.0, None, 8.0), 26.0);
+        assert_eq!(collection_list_height(260_000.0, 20.0, None, 8.0), 0.0);
+    }
+
+    #[test]
+    fn collection_keyboard_pages_skip_inert_rows_and_clamp_at_edges() {
+        let items = vec![
+            MenuItem::Header("Group".into()),
+            MenuItem::new("First", |_, _| {}),
+            MenuItem::new("Disabled", |_, _| {}).disabled(true),
+            MenuItem::Separator,
+            MenuItem::new("Second", |_, _| {}),
+            MenuItem::new("Third", |_, _| {}),
+            MenuItem::new("Last", |_, _| {}),
+        ];
+        let indexes = focusable_indexes(&items);
+        assert_eq!(
+            next_highlight_page(&indexes, Some(1), "pagedown", 2),
+            Some(5)
+        );
+        assert_eq!(
+            next_highlight_page(&indexes, Some(5), "pagedown", 2),
+            Some(6)
+        );
+        assert_eq!(
+            next_highlight_page(&indexes, Some(6), "pagedown", 2),
+            Some(6)
+        );
+        assert_eq!(next_highlight_page(&indexes, Some(6), "pageup", 2), Some(4));
+        assert_eq!(next_highlight_page(&indexes, Some(4), "pageup", 2), Some(1));
+        assert_eq!(next_highlight_page(&indexes, None, "home", 2), Some(1));
+        assert_eq!(next_highlight_page(&indexes, None, "end", 2), Some(6));
+        assert_eq!(next_highlight_page(&[], None, "pagedown", 2), None);
+    }
+
+    #[gpui::test]
+    fn collection_dropdown_virtualizes_and_scrolls_keyboard_selection(cx: &mut TestAppContext) {
+        let handle = cx.update(ContextMenuHandle::new);
+        let builds = Rc::new(Cell::new(0));
+        let rendered = Rc::new(RefCell::new(Vec::new()));
+        let activated = Rc::new(Cell::new(None));
+        let (_view, cx) = cx.add_window_view(|_, _| CollectionHarness {
+            handle: handle.clone(),
+            builds: builds.clone(),
+            rendered: rendered.clone(),
+            activated: activated.clone(),
+        });
+        cx.run_until_parked();
+        assert_eq!(builds.get(), 0, "closed dropdown must remain lazy");
+        cx.simulate_mouse_down(
+            point(px(10.0), px(10.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        cx.update(|window, cx| window.focus(&handle.focus, cx));
+        assert_eq!(builds.get(), 1);
+        assert!(rendered.borrow().contains(&0));
+        assert!(rendered.borrow().iter().all(|index| *index < 32));
+        // Changing mouse -> keyboard modality dirties the window; pinned GPUI
+        // dispatch_key_event draws that old viewport before handling the key.
+        // Establish keyboard modality before measuring the distant jump.
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        rendered.borrow_mut().clear();
+
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        assert_eq!(handle.state.borrow().highlighted, Some(9_999));
+        let list = handle
+            .state
+            .borrow()
+            .collection
+            .as_ref()
+            .unwrap()
+            .list
+            .clone();
+        let diagnostics = || {
+            let rows = rendered.borrow();
+            format!(
+                "count={}, first={:?}, last={:?}, offset={:?}, viewport={:?}, selected={:?}",
+                rows.len(),
+                rows.iter().take(16).collect::<Vec<_>>(),
+                rows.iter().rev().take(16).collect::<Vec<_>>(),
+                list.logical_scroll_top(),
+                list.viewport_bounds(),
+                handle.state.borrow().highlighted,
+            )
+        };
+        assert!(
+            rendered.borrow().contains(&9_999),
+            "End must paint its target: {}",
+            diagnostics()
+        );
+        assert!(
+            rendered.borrow().len() < 128,
+            "End must not render intervening rows: {}",
+            diagnostics()
+        );
+        assert!(
+            rendered.borrow().iter().all(|index| *index > 9_960),
+            "{}",
+            diagnostics()
+        );
+        assert_eq!(
+            list.item_is_below_viewport(9_999),
+            Some(false),
+            "{}",
+            diagnostics()
+        );
+        assert_eq!(
+            list.item_is_above_viewport(9_999),
+            Some(false),
+            "{}",
+            diagnostics()
+        );
+
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        assert_eq!(handle.state.borrow().highlighted, Some(0));
+        assert_eq!(list.logical_scroll_top().item_ix, 0, "{}", diagnostics());
+        cx.simulate_keystrokes("pagedown");
+        cx.run_until_parked();
+        let page = handle.state.borrow().highlighted.unwrap();
+        assert!((1..=12).contains(&page), "{}", diagnostics());
+        assert_eq!(
+            list.item_is_below_viewport(page),
+            Some(false),
+            "{}",
+            diagnostics()
+        );
+        cx.simulate_keystrokes("pageup");
+        assert_eq!(handle.state.borrow().highlighted, Some(0));
+        cx.simulate_keystrokes("up");
+        assert_eq!(handle.state.borrow().highlighted, Some(9_999));
+        cx.simulate_keystrokes("down");
+        assert_eq!(handle.state.borrow().highlighted, Some(0));
+        rendered.borrow_mut().clear();
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        assert!(
+            rendered.borrow().contains(&9_999),
+            "repeated End must also paint its target: {}",
+            diagnostics()
+        );
+        assert!(rendered.borrow().len() < 128, "{}", diagnostics());
+        assert_eq!(
+            list.item_is_below_viewport(9_999),
+            Some(false),
+            "{}",
+            diagnostics()
+        );
+        cx.simulate_keystrokes("enter");
+        assert_eq!(activated.get(), Some(9_999));
+        assert!(!handle.is_open());
+        assert_eq!(
+            builds.get(),
+            1,
+            "keys and rerenders must reuse the opening snapshot"
+        );
+        assert!(handle.state.borrow().collection.is_none());
+
+        cx.simulate_mouse_down(
+            point(px(10.0), px(10.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        cx.update(|window, cx| window.focus(&handle.focus, cx));
+        assert_eq!(builds.get(), 2, "reopening must refresh the collection");
+        cx.simulate_keystrokes("escape");
+        assert!(!handle.is_open());
+        assert!(handle.state.borrow().collection.is_none());
+        assert_eq!(activated.get(), Some(9_999), "Escape must not invoke a row");
+        cx.update(|window, _| assert!(handle.trigger_focus.is_focused(window)));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            handle.is_open(),
+            "Escape must return keyboard control to the trigger"
+        );
+        assert_eq!(builds.get(), 3);
+        cx.simulate_mouse_down(
+            point(px(20.0), px(50.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        assert_eq!(
+            activated.get(),
+            Some(0),
+            "visible rows keep native click handlers"
+        );
+        assert!(!handle.is_open());
     }
 
     /// The trigger sits at the window origin, 120×32; the card hangs below it,

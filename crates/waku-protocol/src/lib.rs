@@ -27,10 +27,12 @@ macro_rules! tr {
 }
 
 pub mod attachments;
+pub mod automation;
 pub mod blob;
 pub mod checkpoint;
 pub mod composer;
 pub mod computer_use;
+pub mod diagnostics;
 mod driver_wire;
 pub mod git;
 pub mod i18n;
@@ -44,12 +46,15 @@ pub mod settings;
 pub mod skills;
 pub mod subagent;
 pub mod theme;
+pub mod transcript;
 pub mod usage;
 pub mod usage_history;
 pub mod workspace;
 
 mod protocol;
 
+pub use automation::*;
+pub use diagnostics::*;
 pub use driver_wire::{decode_enum, encode_enum, event_from_wire, event_to_wire};
 pub use protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
@@ -58,4 +63,5 @@ pub use protocol::{
     WireComputerToolRequest, WireDriverEvent, WireDriverStartOptions, WireSessionOptions,
 };
 pub use settings::DaemonSettings;
+pub use transcript::*;
 pub use workspace::{WorkspaceOperation, WorkspaceResult};

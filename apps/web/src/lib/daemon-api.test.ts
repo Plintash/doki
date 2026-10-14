@@ -48,6 +48,16 @@ describe('applyComposerDraftChanges', () => {
 })
 
 describe('beginTurn', () => {
+  test('keeps a filed issue revision ahead of a same-second submission', () => {
+    const draft = createSession('project', 'codex', false)
+    draft.task_id = 'filed-issue'
+    draft.updated_at += 100
+    const active = beginTurn(draft, 'Continue this issue')
+    expect(active.updated_at).toBe(draft.updated_at)
+    expect(active.task_id).toBe('filed-issue')
+    expect(active.last_reply_at).toBeLessThan(active.updated_at)
+  })
+
   test('puts the submitted prompt in the transcript before runtime startup', () => {
     const draft = createSession('project', 'codex', false)
     const active = beginTurn(draft, 'Build the feature')
@@ -302,6 +312,30 @@ describe('persistProject', () => {
 })
 
 describe('persistSession', () => {
+  test.each([undefined, false, true])('preserves optional draft marker %p and issue membership', async (isDraft) => {
+    const session = {
+      ...createSession('project', 'pi', false),
+      task_id: 'issue',
+      ...(isDraft === undefined ? {} : { is_draft: isDraft }),
+    }
+    let command: unknown
+    const client = {
+      request: async (next: unknown) => {
+        command = next
+        return { type: 'taskStateSaved', sessions: [session] }
+      },
+    } as unknown as WakuClient
+
+    await expect(persistSession(client, session)).resolves.toEqual(session)
+    expect(command).toEqual({
+      type: 'saveTaskState', projects: [], liveSessionIds: [session.id], sessions: [session],
+    })
+    // A client without board editing must leave the daemon's issue catalog
+    // (including its descriptions) untouched when checkpointing a session.
+    expect(command).not.toHaveProperty('tasks')
+    if (isDraft === undefined) expect(session).not.toHaveProperty('is_draft')
+  })
+
   test('checkpoints one session without reloading or replacing the catalog', async () => {
     const saved = createSession('project', 'codex', false)
     const commands: unknown[] = []

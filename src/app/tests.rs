@@ -6,7 +6,8 @@ use super::composer::{
     merged_submission, next_picker_highlight, subagent_card_rows, visible_branch_entries,
 };
 use super::runtime::{
-    merge_remote_session_catalog, session_has_active_provider_turn, submission_waits_for_a_turn,
+    merge_remote_session_catalog, replace_hydrated_session, session_has_active_provider_turn,
+    submission_waits_for_a_turn,
 };
 use super::sessions::denial_answer;
 use super::settings::visible_settings_pages;
@@ -365,6 +366,34 @@ fn the_annotation_hover_panel_offers_edit_delete_and_jump() {
         !body.contains("TextField::new("),
         "comment text belongs in the floating editor, not inside the hover panel"
     );
+}
+
+#[test]
+fn opening_annotation_editor_dismisses_the_preview_before_showing_the_editor() {
+    let source = include_str!("transcript_view.rs");
+    let start = source.find("fn open_annotation_editor(").unwrap();
+    let body = &source[start..];
+    let end = body.find("\n    fn annotation_mark_anchor(").unwrap();
+    let body = &body[..end];
+    let dismiss = body.find("self.reset_annotation_preview_hover();").unwrap();
+    let open = body.find("Some(AnnotationEditor { id, anchor })").unwrap();
+    assert!(
+        dismiss < open,
+        "the preview's outside-click handler must not close the editor before Save"
+    );
+
+    let source = include_str!("composer.rs");
+    for start in [
+        source.find(".id(\"composer-annotations-label\")").unwrap(),
+        source.find("fn set_annotation_preview_hover(").unwrap(),
+    ] {
+        let body = &source[start..];
+        let show = body.find("annotation_preview_visible.set(true)").unwrap();
+        assert!(
+            body[..show].contains("annotation_editor.borrow().is_some()"),
+            "hovering or activating the chip must not reopen the preview while editing"
+        );
+    }
 }
 
 #[test]
@@ -2989,4 +3018,130 @@ fn the_subagent_card_rows_keep_live_work_visible() {
     assert_eq!(rows.len(), 5);
     assert_eq!(live, 7);
     assert_eq!(hidden, 2);
+}
+
+#[test]
+fn repeated_stale_catalog_snapshots_cannot_unfile_a_local_issue_edit() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    session.begin_turn("Existing work");
+    let stale = session.list_projection();
+    let task_id = Uuid::new_v4();
+    session.task_id = Some(task_id);
+    session.updated_at += 1;
+    let revised_at = session.updated_at;
+    let mut catalog = vec![session];
+    merge_remote_session_catalog(&mut catalog, vec![stale.clone()], |_| false);
+    merge_remote_session_catalog(&mut catalog, vec![stale], |_| false);
+    assert_eq!(catalog[0].task_id, Some(task_id));
+    assert_eq!(catalog[0].updated_at, revised_at);
+}
+
+#[test]
+fn stale_hydration_preserves_newer_catalog_metadata_and_loads_the_transcript() {
+    let mut response = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    response.begin_turn("Loaded transcript");
+    let mut local = response.list_projection();
+    let task_id = Uuid::new_v4();
+    let project_id = Uuid::new_v4();
+    local.task_id = Some(task_id);
+    local.project_id = project_id;
+    local.workspace = crate::model::SessionWorkspace::NewWorktree {
+        base_branch: Some("issue-branch".into()),
+    };
+    local.title = "New local title".into();
+    local.model = Some("local-model".into());
+    local.updated_at = response.updated_at + 1;
+    let revision = local.updated_at;
+    let expected_workspace = local.workspace.clone();
+    let expected_turn = response.turns[0].id;
+    let expected_message = response.messages[0].id;
+
+    // Both ordinary loading and runtime attachment use this replacement.
+    replace_hydrated_session(&mut local, response);
+
+    assert!(local.detail_loaded);
+    assert_eq!(local.task_id, Some(task_id));
+    assert_eq!(local.project_id, project_id);
+    assert_eq!(local.workspace, expected_workspace);
+    assert_eq!(local.title, "New local title");
+    assert_eq!(local.model.as_deref(), Some("local-model"));
+    assert_eq!(local.updated_at, revision);
+    assert_eq!(local.turns[0].id, expected_turn);
+    assert_eq!(local.messages[0].id, expected_message);
+    assert_eq!(local.messages[0].content, "Loaded transcript");
+}
+
+#[test]
+fn hydration_adopts_newer_remote_catalog_metadata() {
+    let mut response = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    let mut local = response.list_projection();
+    response.begin_turn("New remote work");
+    response.task_id = Some(Uuid::new_v4());
+    response.project_id = Uuid::new_v4();
+    response.workspace = crate::model::SessionWorkspace::NewWorktree { base_branch: None };
+    response.updated_at = local.updated_at + 1;
+    let task_id = response.task_id;
+    let project_id = response.project_id;
+    let revision = response.updated_at;
+
+    replace_hydrated_session(&mut local, response);
+
+    assert_eq!(local.task_id, task_id);
+    assert_eq!(local.project_id, project_id);
+    assert!(local.workspace.is_worktree());
+    assert_eq!(local.updated_at, revision);
+    assert_eq!(local.messages[0].content, "New remote work");
+}
+
+#[test]
+fn filing_then_submitting_and_streaming_cannot_reenable_a_stale_catalog_snapshot() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    session.begin_turn("Previous work");
+    session.finish_active_turn(TurnStatus::Completed);
+    // A clock ahead of wall time deterministically models multiple mutations
+    // in one second without sleeping or relying on a clock boundary.
+    session.updated_at = crate::model::unix_time() + 100;
+    let stale = session.list_projection();
+    let task_id = Uuid::new_v4();
+    session.task_id = Some(task_id);
+    session.updated_at += 1;
+    let filed_revision = session.updated_at;
+    session.begin_turn("Continue this issue");
+    session.status = SessionStatus::Connecting;
+    session.touch();
+    assert_eq!(session.updated_at, filed_revision);
+    let session_id = session.id;
+    let mut catalog = vec![session];
+    append_text_delta_to_session(&mut catalog, session_id, false, "Reply".into());
+    assert_eq!(catalog[0].updated_at, filed_revision);
+
+    merge_remote_session_catalog(&mut catalog, vec![stale.clone()], |_| false);
+    merge_remote_session_catalog(&mut catalog, vec![stale], |_| false);
+
+    assert_eq!(catalog[0].task_id, Some(task_id));
+    assert_eq!(catalog[0].updated_at, filed_revision);
+    assert_eq!(catalog[0].messages.last().unwrap().content, "Reply");
+}
+
+#[test]
+fn cold_catalog_defaults_do_not_erase_hydrated_provider_options() {
+    let mut hydrated = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+    hydrated.runtime_mode = crate::model::RuntimeMode::Ask;
+    hydrated.reasoning_effort = Some("high".into());
+    hydrated.service_tier = Some("fast".into());
+    hydrated.context_window = Some("1m".into());
+    hydrated.agent_preset = Some("code".into());
+    let mut skeleton = hydrated.list_projection();
+    skeleton.runtime_mode = crate::model::RuntimeMode::default();
+    skeleton.reasoning_effort = None;
+    skeleton.service_tier = None;
+    skeleton.context_window = None;
+    skeleton.agent_preset = None;
+    skeleton.updated_at += 1; // e.g. an issue workspace edit during hydration
+    replace_hydrated_session(&mut skeleton, hydrated);
+    assert_eq!(skeleton.runtime_mode, crate::model::RuntimeMode::Ask);
+    assert_eq!(skeleton.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(skeleton.service_tier.as_deref(), Some("fast"));
+    assert_eq!(skeleton.context_window.as_deref(), Some("1m"));
+    assert_eq!(skeleton.agent_preset.as_deref(), Some("code"));
 }

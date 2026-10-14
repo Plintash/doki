@@ -1,6 +1,6 @@
 use super::right_panel::{DiffRowStyle, render_diff_code_row};
 use super::*;
-use crate::ui::ActivationExt;
+use crate::ui::{ActivationExt, SemanticControlExt};
 use base64::Engine as _;
 
 const CHANGED_FILES_PREVIEW_LIMIT: usize = 3;
@@ -557,6 +557,8 @@ impl Waku {
             let input = self.annotation_prompt_input.borrow().clone()?;
             div()
                 .id("annotation-comment-field")
+                .role(gpui::Role::Group)
+                .aria_label(tr!("annotation.comment_placeholder"))
                 .w(px(360.0))
                 .h(px(36.0))
                 .px(px(14.0))
@@ -582,7 +584,11 @@ impl Waku {
                 .child(div().flex_1().min_w_0().child(input))
                 .into_any_element()
         } else {
+            let focus = self.annotation_control_focus("selection-add-to-chat", cx);
             div()
+                .id("selection-toolbar")
+                .role(gpui::Role::Group)
+                .aria_label(tr!("annotation.add_to_chat"))
                 .p(px(4.0))
                 .flex()
                 .items_center()
@@ -599,6 +605,11 @@ impl Waku {
                 .child(
                     div()
                         .id("selection-add-to-chat")
+                        .semantic_control(gpui::Role::Button, false)
+                        .aria_label(tr!("annotation.add_to_chat"))
+                        .track_focus(&focus)
+                        .tab_index(0)
+                        .focus_visible(|style| style.bg(theme.overlay_strong))
                         .h(px(28.0))
                         .px(px(10.0))
                         .flex()
@@ -615,9 +626,9 @@ impl Waku {
                                 .text_color(theme.text)
                                 .child(tr!("annotation.add_to_chat")),
                         )
-                        .on_click(cx.listener(|this, _, window, cx| {
+                        .on_activation(cx, |this, window, cx| {
                             this.begin_annotation_comment(window, cx);
-                        })),
+                        }),
                 )
                 .into_any_element()
         };
@@ -780,6 +791,9 @@ impl Waku {
         // point is only the fallback for a mark that is off screen.
         let anchor = self.annotation_mark_anchor(id).unwrap_or(fallback);
         let comment = self.annotation_comment(id).unwrap_or_default();
+        // The preview's outside-click handler must not dismiss the editor when
+        // the user clicks Save, Cancel, or its text field.
+        self.reset_annotation_preview_hover();
         let input = self.annotation_editor_input(window, cx);
         input.update(cx, |input, cx| input.set_content(comment, cx));
         self.active_annotation.set(Some(id));
@@ -947,7 +961,9 @@ impl Waku {
             return input;
         }
         let input = cx.new(|cx| {
-            TextInput::new(window, cx).placeholder(tr!("annotation.comment_placeholder"))
+            TextInput::new(window, cx)
+                .semantic_id("annotation-editor-input")
+                .placeholder(tr!("annotation.comment_placeholder"))
         });
         self.annotation_editor_input
             .borrow_mut()
@@ -970,6 +986,8 @@ impl Waku {
             self.clamp_annotation_editor(self.annotation_mark_anchor(id).unwrap_or(editor.anchor));
         let body = div()
             .id("annotation-editor")
+            .role(gpui::Role::Group)
+            .aria_label(tr!("annotation.comment_placeholder"))
             .w(px(340.0))
             .flex()
             .flex_col()
@@ -1011,6 +1029,8 @@ impl Waku {
                     .child(
                         div()
                             .id("annotation-editor-cancel")
+                            .semantic_control(gpui::Role::Button, false)
+                            .aria_label(tr!("common.cancel"))
                             .h(px(26.0))
                             .px(px(10.0))
                             .flex()
@@ -1033,6 +1053,8 @@ impl Waku {
                     .child(
                         div()
                             .id("annotation-editor-save")
+                            .semantic_control(gpui::Role::Button, false)
+                            .aria_label(tr!("common.save"))
                             .h(px(26.0))
                             .px(px(12.0))
                             .flex()
@@ -1096,7 +1118,9 @@ impl Waku {
             return input;
         }
         let input = cx.new(|cx| {
-            TextInput::new(window, cx).placeholder(tr!("annotation.comment_placeholder"))
+            TextInput::new(window, cx)
+                .semantic_id("annotation-comment-input")
+                .placeholder(tr!("annotation.comment_placeholder"))
         });
         self.annotation_prompt_input
             .borrow_mut()

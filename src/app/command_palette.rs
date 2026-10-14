@@ -147,6 +147,7 @@ impl PaletteIdentifier {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PaletteAction {
     NewTask,
+    NewSession,
     Resume,
     ChooseResumeProvider,
     SelectResumeProvider(ProviderKind),
@@ -704,6 +705,15 @@ impl Waku {
                 next(),
             ),
             CommandPaletteItem::command(
+                display_section(PaletteSection::Commands),
+                tr!("menu.new_session"),
+                "icons/pencil.svg",
+                Some(crate::platform::primary_shortcut("⌘⇧N", "Ctrl+Shift+N")),
+                PaletteAction::NewSession,
+                "new standalone session chat conversation draft",
+                next(),
+            ),
+            CommandPaletteItem::command(
                 display_section(PaletteSection::Suggested),
                 tr!("command_palette.resume"),
                 "icons/rotate-cw.svg",
@@ -809,7 +819,7 @@ impl Waku {
             ),
             CommandPaletteItem::command(
                 PaletteSection::Commands,
-                tr!(if self.board_open {
+                tr!(if self.board_open && self.selected_task.is_none() {
                     "command_palette.hide_board"
                 } else {
                     "command_palette.show_board"
@@ -1590,7 +1600,8 @@ impl Waku {
 
         self.close_command_palette(window, cx);
         match action {
-            PaletteAction::NewTask => self.new_session_action(&NewSession, window, cx),
+            PaletteAction::NewTask => self.new_task_action(&NewTask, window, cx),
+            PaletteAction::NewSession => self.new_session_action(&NewSession, window, cx),
             PaletteAction::OpenProject => self.new_project_action(&NewProject, window, cx),
             PaletteAction::FocusComposer => self.focus_composer_action(&FocusComposer, window, cx),
             PaletteAction::CopyIdentifier(identifier) => {

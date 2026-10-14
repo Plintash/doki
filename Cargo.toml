@@ -24,12 +24,12 @@ base64 = "0.22"
 chrono = "0.4"
 crossbeam-channel = "0.5"
 dirs = "6.0"
-# The egoist/zed fork is upstream main plus PR #61945 (layered scene
-# rendering), which lets GPUI composite menus and tooltips above native child
-# views — the browser surface's WKWebView. Drop back to upstream once the PR
-# merges.
-gpui = { git = "https://github.com/egoist/zed", branch = "waku-webview" }
-gpui_platform = { git = "https://github.com/egoist/zed", branch = "waku-webview", features = [
+# Our fork of GPUI: upstream main plus PR #61945 (layered scene rendering,
+# which lets GPUI composite menus and tooltips above native child views — the
+# browser surface's WKWebView) and the debug automation taps Waku's RPA
+# bridge drives. Drop back to upstream once both land there.
+gpui = { git = "https://github.com/Plintash/zed", branch = "waku-rpa" }
+gpui_platform = { git = "https://github.com/Plintash/zed", branch = "waku-rpa", features = [
   "font-kit",
   "wayland",
   "x11",
@@ -64,7 +64,8 @@ nucleo-matcher = "0.3.1"
 # happens instead of coalescing into the display link's next one — a panel
 # resize drew once per mouse-move event rather than once per displayed frame.
 [dev-dependencies]
-gpui = { git = "https://github.com/egoist/zed", branch = "waku-webview", features = [
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+gpui = { git = "https://github.com/Plintash/zed", branch = "waku-rpa", features = [
   "test-support",
 ] }
 

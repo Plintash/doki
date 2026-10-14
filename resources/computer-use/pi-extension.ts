@@ -6,7 +6,13 @@ import { Type } from "typebox";
 type JsonObject = Record<string, unknown>;
 
 const jsToolDescription =
-  "Run JavaScript in Waku's persistent QuickJS kernel for Computer Use. Initialize `cua` with `await setupComputerUseRuntime({ globals: globalThis })`, then call native tools directly, such as `cua.list_apps()` and `cua.click(arguments)`. The bundled Computer Use skill documents the method signatures; call the methods directly. Calls time out after 30000 ms (30 seconds) unless `timeout_ms` is provided. Use `jsRepl.write(...)` for text and `await jsRepl.emitImage(...)` for images. Bindings and scheduled timers persist until the JavaScript kernel is reset.";
+  "Run JavaScript in Waku's persistent QuickJS kernel. Calls time out after 30000 ms (30 seconds) unless timeout_ms is provided. Use jsRepl.write(...) for text and await jsRepl.emitImage(...) for images. Bindings and scheduled timers persist until the JavaScript kernel is reset." +
+  (process.env.WAKU_COMPUTER_USE_SERVER
+    ? " Computer Use is enabled. Initialize cua with await setupComputerUseRuntime({ globals: globalThis }), then call native tools directly. The bundled Computer Use skill documents the methods."
+    : "") +
+  (process.env.WAKU_RPA_REPL_ENV_FILE
+    ? " Debug app automation is available as waku.rpa. Start with await waku.rpa.instances(), then await waku.rpa.attach(instanceId). Pass the returned session.sessionId to snapshot, describe, click/act/type/key/invoke, subscribe/events, diff, wait/waitResult and scenarioStart/scenarioResult/scenarioAbort. Diagnostics use logs, timeline, counters and verbosity. scratchCreate/scratchRemove manage disposable instances. waitForBuild(checkout, previousBuild, {timeoutMs,pollMs}) waits for a new connected build. Calls return shared daemon protocol result envelopes; failures preserve code and bundle."
+    : "");
 
 class WakuMcpClient {
   private child: ChildProcessWithoutNullStreams | undefined;
@@ -33,8 +39,15 @@ class WakuMcpClient {
     if (!executable) {
       throw new Error("WAKU_JS_REPL_SERVER is not configured");
     }
+    // Only the nonsecret capability-file path reaches this extension. Its
+    // contents are read by Rust, never by provider-side JavaScript.
+    const env = { ...process.env };
+    delete env.WAKU_DAEMON_TOKEN;
+    if (process.env.WAKU_RPA_REPL_ENV_FILE) {
+      env.WAKU_RPA_REPL_ENV_FILE = process.env.WAKU_RPA_REPL_ENV_FILE;
+    }
     const child = spawn(executable, [], {
-      env: process.env,
+      env,
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;

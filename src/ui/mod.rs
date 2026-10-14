@@ -8,6 +8,8 @@ use gpui::{
 pub mod menu;
 pub mod motion;
 pub mod scrollbar;
+pub mod semantics;
+pub use semantics::SemanticControlExt;
 pub mod text_field;
 pub mod tooltip;
 
@@ -38,6 +40,8 @@ pub fn file_icon(path: &'static str, size: f32) -> Img {
 pub fn icon_button(id: impl Into<ElementId>, path: &'static str, theme: Theme) -> Stateful<Div> {
     div()
         .id(id)
+        .semantic_control(gpui::Role::Button, false)
+        .aria_label(path.trim_start_matches("icons/").trim_end_matches(".svg"))
         .size(px(22.0))
         .rounded(px(6.0))
         .flex()
@@ -90,22 +94,23 @@ impl ActivationExt for Stateful<Div> {
         let activate = std::rc::Rc::new(activate);
         let click_activate = activate.clone();
         let key_activate = activate;
-        self.on_click(cx.listener(move |this, _, window, cx| {
-            click_activate(this, window, cx);
-            cx.stop_propagation();
-        }))
-        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-            // Bare Enter/Space only. A modified chord belongs to whatever
-            // command owns it, so a focused control must not swallow it —
-            // this is the guard the hand-rolled settings toggles carried
-            // before they moved onto this helper.
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                key_activate(this, window, cx);
+        self.semantic_control(gpui::Role::Button, false)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                click_activate(this, window, cx);
                 cx.stop_propagation();
-            }
-        }))
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                // Bare Enter/Space only. A modified chord belongs to whatever
+                // command owns it, so a focused control must not swallow it —
+                // this is the guard the hand-rolled settings toggles carried
+                // before they moved onto this helper.
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    key_activate(this, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
     }
 }
 
@@ -126,6 +131,12 @@ where
 {
     let base = div()
         .id(id)
+        .semantic_control(gpui::Role::Switch, disabled)
+        .aria_toggled(if on {
+            gpui::accesskit::Toggled::True
+        } else {
+            gpui::accesskit::Toggled::False
+        })
         .tab_index(0)
         .focus_visible(|style| style.border_color(theme.accent))
         .w(px(36.0))
@@ -155,6 +166,7 @@ where
         base
     } else {
         base.on_activation(cx, activate)
+            .semantic_control(gpui::Role::Switch, false)
     }
 }
 
@@ -344,6 +356,8 @@ impl InteractiveElement for MenuChip {
     }
 }
 
+impl gpui::StatefulInteractiveElement for MenuChip {}
+
 impl ParentElement for MenuChip {
     fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
         self.base.extend(elements);
@@ -354,6 +368,8 @@ impl RenderOnce for MenuChip {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = Theme::current(cx);
         self.base
+            .semantic_control(gpui::Role::Button, self.disabled)
+            .aria_label(self.label.clone())
             .h(self
                 .height
                 .unwrap_or(if self.outlined { px(30.0) } else { px(26.0) }))
@@ -430,6 +446,8 @@ impl InteractiveElement for ProjectNameSelector {
     }
 }
 
+impl gpui::StatefulInteractiveElement for ProjectNameSelector {}
+
 impl ParentElement for ProjectNameSelector {
     fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
         self.base.extend(elements);
@@ -446,6 +464,8 @@ impl RenderOnce for ProjectNameSelector {
         };
 
         self.base
+            .semantic_control(gpui::Role::Button, false)
+            .aria_label(self.label.clone())
             .relative()
             .flex_none()
             .cursor_default()

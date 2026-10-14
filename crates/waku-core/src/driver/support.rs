@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow};
@@ -218,6 +219,27 @@ pub(super) fn grok_computer_use_launch_configuration(
         (args, environment)
     } else {
         (Vec::new(), Vec::new())
+    }
+}
+
+/// Read a provider's stderr to the end, recording every non-blank line in the
+/// instance's diagnostic stream and handing it to `on_line`. One rule for
+/// every provider: blank lines are noise, and each real line is attributed to
+/// the runtime that produced it.
+pub(super) fn read_stderr_lines(
+    stderr: impl std::io::Read,
+    events: &super::DriverEventSender,
+    mut on_line: impl FnMut(String),
+) {
+    for line in std::io::BufReader::new(stderr)
+        .lines()
+        .map_while(Result::ok)
+    {
+        if line.trim().is_empty() {
+            continue;
+        }
+        events.record_stderr(&line);
+        on_line(line);
     }
 }
 

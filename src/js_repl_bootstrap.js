@@ -17,6 +17,8 @@
     }
   };
 
+  const nativeRpaCall = globalThis.__wakuRpaCall;
+  delete globalThis.__wakuRpaCall;
   const nativeCuaCall = globalThis.__wakuCuaCall;
   const nativeWrite = globalThis.__wakuWrite;
   const nativeEmitImage = globalThis.__wakuEmitImage;
@@ -379,6 +381,119 @@
     Reflect.set(globals, "cua", cua);
     return cua;
   };
+
+  // The callback owns authentication in Rust. No credential or endpoint is
+  // copied into this closure, request metadata, environment, or public state.
+  if (typeof nativeRpaCall === "function") {
+    const request = async (method, args = {}, timeoutMs = undefined) => {
+      const envelope = JSON.parse(nativeRpaCall(method, JSON.stringify(args), timeoutMs));
+      if (!envelope.ok) {
+        const detail = envelope.error || {};
+        const error = new Error(detail.message || "RPA request failed");
+        Object.assign(error, detail);
+        throw error;
+      }
+      return envelope.value;
+    };
+    const automation = (command, timeoutMs) => request("automation", command, timeoutMs);
+    const call = (sessionId, call) => automation({ type: "call", sessionId, call });
+    const contextSections = ["route", "selection", "task", "composer", "providers", "runtime", "workspace", "board", "panels", "ui"];
+    globalThis.waku = Object.freeze({ rpa: Object.freeze({
+      instances: () => automation({ type: "instances" }),
+      waitForBuild: async (checkout, previousBuild, { timeoutMs = 30000, pollMs = 100 } = {}) => {
+        if (typeof checkout !== "string" || !checkout || typeof previousBuild !== "string") {
+          throw new TypeError("waitForBuild requires an explicit checkout and previous build identity");
+        }
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 300000 ||
+            !Number.isSafeInteger(pollMs) || pollMs < 10 || pollMs > 1000) {
+          throw new TypeError("waitForBuild requires timeoutMs 1..300000 and pollMs 10..1000");
+        }
+        const deadline = Date.now() + timeoutMs;
+        const remaining = () => Math.max(0, deadline - Date.now());
+        const failure = (code, message) => Object.assign(new Error(message), { code });
+        let lastError;
+        const timedOut = () => Object.assign(
+          failure("timeout", "Timed out waiting for a fresh build of " + checkout), { lastError });
+        const execute = (command) => {
+          const budget = remaining();
+          if (budget === 0) throw timedOut();
+          return automation(command, budget);
+        };
+        for (;;) {
+          try {
+            const { instances } = await execute({ type: "instances" });
+            const matches = instances.filter((instance) => instance.checkout === checkout && instance.executorConnected);
+            if (matches.length > 1) throw failure("ambiguous_instance", "More than one instance matches this checkout; select an instance explicitly with attach");
+            if (matches.length === 0) throw failure("instance_not_found", "No instance matches this checkout");
+            const instance = matches[0];
+            const selectedId = instance.instanceId;
+            if (instance.executorConnected && instance.build !== previousBuild) {
+              const attached = await execute({ type: "attach", instanceId: selectedId });
+              if (attached.type !== "attached") throw new Error("Unexpected fresh-build attach response");
+              try {
+                const verified = await execute({ type: "call", sessionId: attached.session.sessionId, call: { type: "describe" } });
+                const observed = verified.type === "called" && verified.result.value?.instance;
+                if (!observed || observed.instanceId !== selectedId || observed.checkout !== checkout ||
+                    observed.build !== instance.build || observed.build !== attached.session.instance.build ||
+                    observed.build === previousBuild || !attached.session.instance.executorConnected) {
+                  throw failure("executor_changed", "The executor identity changed while verifying the fresh build");
+                }
+                return attached.session.instance;
+              } finally {
+                // Cleanup cannot replace the verified result or original error,
+                // and cannot acquire a fresh request budget after the deadline.
+                const budget = remaining();
+                if (budget > 0) {
+                  await automation({ type: "detach", sessionId: attached.session.sessionId }, budget).catch(() => undefined);
+                }
+              }
+            }
+          } catch (error) {
+            // Only read-side reconnect/registration races may be retried.
+            if (!(error.code === "transport" && String(error.message).includes("daemon")) &&
+                !["instance_not_found", "executor_unavailable", "executor_disconnected", "executor_gone", "no_executor", "executor_changed"].includes(error.code)) throw error;
+            lastError = error;
+          }
+          const delay = Math.min(pollMs, remaining());
+          if (delay === 0) throw timedOut();
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      },
+      scratchCreate: (seed = {}, name = null) => automation({ type: "scratchCreate", seed, name }),
+      scratchRemove: (instanceId) => automation({ type: "scratchRemove", instanceId }),
+      attach: (instanceId) => automation({ type: "attach", instanceId }),
+      resume: (sessionId, after = null) => automation({ type: "resume", sessionId, after }),
+      detach: (sessionId) => automation({ type: "detach", sessionId }),
+      describe: (sessionId) => call(sessionId, { type: "describe" }),
+      snapshot: (sessionId, sections = []) => call(sessionId, { type: "snapshot", sections }),
+      transcript: (sessionId, conversationId, query) => call(sessionId, { type: "transcript", conversationId, query }),
+      inspect: (sessionId) => call(sessionId, { type: "snapshot", sections: contextSections }),
+      tree: (sessionId) => call(sessionId, { type: "snapshot", sections: ["tree"] }),
+      state: async (sessionId, pointer = "") => {
+        if (typeof pointer !== "string" || (pointer && (!pointer.startsWith("/") || /~(?![01])/.test(pointer)))) throw new TypeError("state pointer must be a valid JSON pointer starting with /");
+        const parts = pointer ? pointer.slice(1).split("/").map(part => part.replace(/~1/g, "/").replace(/~0/g, "~")) : [];
+        const envelope = await call(sessionId, { type: "snapshot", sections: parts.length ? [parts[0]] : contextSections });
+        return parts.reduce((value, part) => value?.[part], envelope.result.value.state);
+      },
+      act: (sessionId, action, target) => call(sessionId, { type: "act", action, target }),
+      click: (sessionId, id) => call(sessionId, { type: "act", action: "click", target: { id } }),
+      type: (sessionId, text, target = null) => call(sessionId, { type: "type", text, target }),
+      key: (sessionId, chord) => call(sessionId, { type: "key", chord }),
+      invoke: (sessionId, verb, args = null) => call(sessionId, { type: "invoke", verb, args }),
+      diff: (sessionId, after, streams = []) => automation({ type: "diff", sessionId, after, streams }),
+      subscribe: (sessionId, streams = ["ui", "model", "diagnostic"]) => automation({ type: "subscribe", sessionId, streams }),
+      events: (sessionId) => request("events", { sessionId }),
+      wait: (sessionId, condition, timeoutMs = 5000) => automation({ type: "wait", sessionId, condition, timeoutMs }),
+      waitResult: (sessionId, waitId) => automation({ type: "waitResult", sessionId, waitId }),
+      scenarioStart: (sessionId, scenario) => automation({ type: "scenarioStart", sessionId, scenario }),
+      scenarioResult: (sessionId, runId) => automation({ type: "scenarioResult", sessionId, runId }),
+      scenarioAbort: (sessionId, runId) => automation({ type: "scenarioAbort", sessionId, runId }),
+      logs: (query = {}) => request("logs", query),
+      timeline: (query = {}) => request("timeline", query),
+      counters: () => request("counters"),
+      verbosity: (update = null) => request("verbosity", update),
+    }) });
+  }
 
   let requestMeta = Object.freeze({});
   globalThis.__wakuSetRequestMeta = (meta) => {

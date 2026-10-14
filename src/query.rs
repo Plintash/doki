@@ -59,6 +59,14 @@ pub enum Query<K, V> {
     Missing(FetchToken<K>),
 }
 
+/// Read-only cache observation; unlike `Query`, a miss owns no fetch token.
+#[derive(Debug, PartialEq)]
+pub enum QueryState<'a, V> {
+    Missing,
+    Pending,
+    Ready(&'a V),
+}
+
 #[derive(Debug)]
 enum Slot<V> {
     Loading,
@@ -137,6 +145,15 @@ impl<K: Clone + Eq + Hash, V> QueryCache<K, V> {
         }
     }
 
+    /// Observe a cached result without claiming a fetch or changing its age.
+    pub fn observe(&self, key: &K) -> QueryState<'_, V> {
+        match self.entries.get(key).map(|cached| &cached.slot) {
+            None => QueryState::Missing,
+            Some(Slot::Loading) => QueryState::Pending,
+            Some(Slot::Ready(value)) => QueryState::Ready(value.as_ref()),
+        }
+    }
+
     /// Stores a fetched value. Returns whether it was accepted — a token from
     /// before an invalidation is dropped, so stale results cannot win.
     pub fn fulfill(&mut self, token: FetchToken<K>, value: V) -> bool {
@@ -209,6 +226,21 @@ mod tests {
 
     fn cache() -> QueryCache<&'static str, String> {
         QueryCache::new(4)
+    }
+
+    #[test]
+    fn observation_never_claims_a_fetch_and_distinguishes_pending() {
+        let mut cache = cache();
+        assert_eq!(cache.observe(&"a"), QueryState::Missing);
+        assert_eq!(cache.len(), 0);
+        let Query::Missing(token) = cache.read(&"a") else {
+            panic!()
+        };
+        assert_eq!(cache.observe(&"a"), QueryState::Pending);
+        cache.fulfill(token, "ready".into());
+        assert_eq!(cache.observe(&"a"), QueryState::Ready(&"ready".to_owned()));
+        cache.invalidate(&"a");
+        assert_eq!(cache.observe(&"a"), QueryState::Missing);
     }
 
     #[test]

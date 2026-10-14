@@ -266,6 +266,9 @@ visible.
 
 ## Pi and Oh My Pi
 
+See [Pi compatibility](pi-compatibility.md) for the exact 1.0.4/1.2.0 matrix,
+startup/abort semantics, and reproducible provider-free checks.
+
 Oh My Pi is a fork of Pi that kept the RPC transport and renamed part of its
 surface, so one driver serves both. `PiFlavor`
 ([pi.rs:59](../crates/waku-core/src/driver/pi.rs#L52)) carries every divergence,
@@ -313,8 +316,8 @@ which Pi itself budgets 15 s for, so the live-process timeout there would fail
 a session that was merely slow to start.
 
 **Lifetime** — long-lived, and unlike Codex it survives Stop: cancelling sends
-`abort` over the existing connection. It ends when the runtime is dropped, by
-stdin EOF; nothing reaps it afterwards.
+`abort` over the existing connection. Dropping the runtime closes stdin; the
+process thread waits for exit and announces `ProcessExited`.
 
 **Handshake** — `get_state` → optional `switch_session {sessionPath}` when
 resuming → `set_model {provider, modelId}` → `set_thinking_level {level}` →
@@ -335,9 +338,11 @@ drains its steering and follow-up queues before it settles — so it neither ope
 a turn nor settles one. `handled` means an extension command or input handler
 consumed the prompt, so it settles at once, unless a run is already live: an
 extension command that wakes the session by appending a message with
-`{triggerTurn: true}` starts that run inside the handler, and since Pi emits
-`agent_start` before it writes the answer, the turn belongs to the run and the
-run's own settle ends it. Settlement never depends on the answer at all: a
+`{triggerTurn: true}` starts that run inside the handler. On Pi 1.2, its
+`before_agent_start` hook may still be pending when the command answers, so a
+handled response without an observed run triggers a `get_state` check. Busy
+state keeps the same turn open until the run's own settlement. A local command
+is finished only after idle is confirmed. Settlement never depends on the answer at all: a
 prompt answer is written only from the prompt's preflight, so a prompt submitted
 while Pi is emitting `agent_settled` is deferred and never answered, and a
 prompt refused before acceptance settles as that message's delivery failure
@@ -367,7 +372,7 @@ been verified to take the command.
 | `message_end` | fallback text/thinking when no delta was streamed |
 | `message_end` with `role: "custom"` | `BackgroundWork` (kind subagent) for pi-subagents' child and background notifications, which the work surface shows whatever their `display` flag says; `ExtensionMessage` for any other extension message, which the transcript renders only when `display` is true |
 | `tool_execution_start` / `_update` / `_end` | `RichActivity`; a `subagent` call's structured details also become `SubagentProgress`, the foreground run the composer's live-run card shows |
-| `auto_retry_end` | clears or sets the failure flag |
+| `auto_retry_start` / `auto_retry_end` | live `RichActivity` with attempt/maximum and cause; adjacent attempts update one row. After partial text or reasoning, the old row completes and the next retry appears at the current tail. The end completes the open row and clears or sets the failure flag. Settlement also completes an open retry; late starts cannot reopen a settled run |
 | `compaction_start` / `compaction_end` | `RichActivity` — one row per compaction: started, completed with its summary kept, or failed with the provider's own reason; the end's `estimatedTokensAfter` refreshes the context meter, and a manual compaction settles its own turn |
 | `agent_settled` (Pi) / `agent_end` (Oh My Pi) | `TurnFinished`, then resets stream state |
 | `queue_update` | `ProviderQueue` — the provider's complete steering and follow-up queues, which are the client's pending list |

@@ -821,6 +821,8 @@ activity.compaction_failed:
   en: Context compaction failed
 activity.provider_retrying:
   en: Retrying the request
+activity.provider_retry_finished:
+  en: Finished retrying the request
 activity.background_shell:
   en: Background shell
 activity.output_truncated:
@@ -2272,7 +2274,7 @@ board.new_task:
 board.new_task_placeholder:
   en: What is this task about?
 board.new_task_hint:
-  en: The name is enough; project, workspace, and conversations come later.
+  en: Create a task, then add details and start or attach conversations.
 board.needs_you:
   en: "%{count} waiting on you"
 board.needs_you_short:
@@ -2298,7 +2300,7 @@ board.completed_toast:
 board.complete_confirm_title:
   en: "Complete “%{title}”?"
 board.complete_confirm_body:
-  en: "%{count} conversations are still running. Completing stops them and archives their conversations out of the sidebar."
+  en: "Completing will stop and close %{count} connected or running conversations, then archive this issue’s conversations out of the sidebar."
 board.archive_not_delete:
   en: Archiving is not deleting; nothing is removed.
 board.complete_and_stop:
@@ -2355,3 +2357,125 @@ subagent.state.detached:
 
 subagent.title:
   en: Subagent
+
+# Issue detail workflow
+menu.new_session:
+  en: "New session"
+session.new_session:
+  en: "New session"
+sidebar.unfiled_sessions:
+  en: "Unfiled sessions"
+board.open_task:
+  en: "Open task"
+board.back_to_board:
+  en: "← Board"
+board.description:
+  en: "Description"
+board.description_placeholder:
+  en: "Describe the outcome, requirements, and useful context…"
+board.saved_automatically:
+  en: "Changes save automatically"
+board.project_workspace:
+  en: "Project & default workspace"
+board.choose_project:
+  en: "Choose project…"
+board.choose_project_first:
+  en: "Choose a project before starting a session"
+board.project_locked:
+  en: "Detach conversations to change project"
+board.session_new_worktree:
+  en: "New session in a new worktree…"
+board.attach_session:
+  en: "Attach existing"
+board.no_unfiled_sessions:
+  en: "No unfiled sessions to attach"
+board.new_session:
+  en: "New session"
+board.reopen_new_session:
+  en: "Reopen & start session"
+board.continue_session:
+  en: "Open conversation"
+board.open_draft:
+  en: "Continue draft"
+board.detach_session:
+  en: "Detach"
+board.draft_session:
+  en: "Unsent draft"
+board.session_failed:
+  en: "Failed"
+board.archived:
+  en: "Archived"
+board.session_idle:
+  en: "Idle"
+board.loading_workspace:
+  en: "Loading workspace…"
+board.archived_hint:
+  en: "Completed. Conversations are kept here and hidden from the active sidebar. Reopen the task to continue working."
+board.title_required:
+  en: "A task needs a title"
+board.no_sessions:
+  en: "No conversations yet"
+board.session_context_hint:
+  en: "Start a session with this task’s description and workspace, or attach an existing conversation."
+board.session_project_mismatch:
+  en: "That conversation belongs to a different project"
+board.create_task:
+  en: "Create task"
+board.empty_backlog:
+  en: "Plan your next task"
+board.empty_doing:
+  en: "Work in progress appears here"
+board.empty_done:
+  en: "Completed tasks stay here"
+
+board.back_to_task:
+  en: "← Task"
+board.detach_draft_hint:
+  en: "This unsent draft belongs to the task. Send it before detaching, or remove the draft if you no longer need it."
+board.completion_stopping:
+  en: "Stopping work…"
+board.completion_cannot_stop:
+  en: "Could not stop all background work. The task is still active; stop it from the session and try again."
+board.completion_stop_failed:
+  en: "Some work did not stop. The issue is still active; review the conversation and try again."
+
+board.cancel_completion:
+  en: Cancel completion
+
+board.completion_waiting_for_runtime:
+  en: "Connecting to conversations…"
+
+board.retry_save:
+  en: "Changes not saved · Retry"
+board.saving:
+  en: "Saving…"
+
+# Board scope and live session signals
+board.all_projects:
+  en: "All projects"
+board.search_issues:
+  en: "Search issues"
+board.running_count:
+  en: "Running %{count}"
+board.attention_count:
+  en: "Needs attention %{count}"
+board.new_issue:
+  en: "New issue"
+board.no_matching_issues:
+  en: "No matching issues"
+board.awaiting_permission:
+  en: "Awaiting permission"
+board.awaiting_input:
+  en: "Awaiting input"
+board.running_sessions:
+  en: "%{count} running"
+board.more_attention:
+  en: "+%{count} more to review"
+board.latest_progress:
+  en: "Latest: %{progress}"
+workspace.create_worktree:
+  en: "Create worktree"
+workspace.create_worktree_hint:
+  en: "Creates an isolated worktree when you send your first message"
+workspace.create_worktree_requires_project:
+  en: "Choose a project to create a worktree"

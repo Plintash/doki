@@ -1,0 +1,101 @@
+{
+  "name": "Real-model foreground fan-out acceptance (explicit opt-in)",
+  "steps": [
+    {
+      "name": "record the target build and executor identity",
+      "type": "call",
+      "call": {
+        "type": "describe"
+      }
+    },
+    {
+      "name": "open a fresh standalone session",
+      "type": "call",
+      "call": {
+        "type": "invoke",
+        "verb": "newSession",
+        "args": {}
+      }
+    },
+    {
+      "name": "require a clean session before the model request",
+      "type": "wait",
+      "condition": {
+        "on": "state",
+        "pointer": "/session/subagent_runs",
+        "equals": []
+      },
+      "timeoutMs": 10000
+    },
+    {
+      "name": "select the already configured Pi provider",
+      "type": "call",
+      "call": {
+        "type": "invoke",
+        "verb": "chooseProvider",
+        "args": {
+          "provider": "pi"
+        }
+      }
+    },
+    {
+      "name": "submit the real two-child foreground trial",
+      "type": "call",
+      "call": {
+        "type": "invoke",
+        "verb": "submitPrompt",
+        "args": {
+          "text": "Run this small RPA acceptance trial using your subagent tool. Launch exactly one foreground parallel fan-out with exactly two children, called RPA Alpha and RPA Beta. Alpha should calculate 17 + 25 and return RPA_ALPHA=42. Beta should calculate 6 * 7 and return RPA_BETA=42. Do not edit files, execute shell commands, access the network, or launch more children. Wait for both children to finish, then reply with both results. This must use two real subagents in one fan-out; do not simulate their work or answer on their behalf."
+        }
+      }
+    },
+    {
+      "name": "observe the first child complete",
+      "type": "wait",
+      "condition": {
+        "on": "state",
+        "pointer": "/session/subagent_runs/0/children/0/state",
+        "equals": "completed"
+      },
+      "timeoutMs": 120000
+    },
+    {
+      "name": "observe the second child complete",
+      "type": "wait",
+      "condition": {
+        "on": "state",
+        "pointer": "/session/subagent_runs/0/children/1/state",
+        "equals": "completed"
+      },
+      "timeoutMs": 120000
+    },
+    {
+      "name": "observe the foreground fan-out complete",
+      "type": "wait",
+      "condition": {
+        "on": "state",
+        "pointer": "/session/subagent_runs/0/state",
+        "equals": "completed"
+      },
+      "timeoutMs": 120000
+    },
+    {
+      "name": "observe the parent turn settle",
+      "type": "wait",
+      "condition": {
+        "on": "state",
+        "pointer": "/session/status",
+        "equals": "idle"
+      },
+      "timeoutMs": 120000
+    },
+    {
+      "name": "retain final model UI and health evidence",
+      "type": "call",
+      "call": {
+        "type": "snapshot",
+        "sections": []
+      }
+    }
+  ]
+}

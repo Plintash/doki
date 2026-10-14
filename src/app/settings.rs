@@ -2,6 +2,7 @@ use chrono::Datelike;
 
 use super::composer::next_picker_highlight;
 use super::*;
+use crate::ui::SemanticControlExt;
 
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
 
@@ -802,16 +803,18 @@ impl Waku {
             .archive_control_focuses
             .borrow_mut()
             .entry(format!("open-{task_id}"))
-            .or_insert_with(|| cx.focus_handle())
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
             .clone();
         let restore_focus = self
             .archive_control_focuses
             .borrow_mut()
             .entry(format!("restore-{task_id}"))
-            .or_insert_with(|| cx.focus_handle())
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
             .clone();
         div()
             .id(SharedString::from(format!("archive-task-{task_id}")))
+            .semantic_control(gpui::Role::Button, false)
+            .aria_label(task.title.clone())
             .w_full()
             .px(px(16.0))
             .py(px(12.0))
@@ -865,6 +868,8 @@ impl Waku {
             .child(
                 div()
                     .id(SharedString::from(format!("archive-restore-{task_id}")))
+                    .semantic_control(gpui::Role::Button, false)
+                    .aria_label(tr!("archive.restore"))
                     .h(px(26.0))
                     .px(px(10.0))
                     .rounded(px(7.0))

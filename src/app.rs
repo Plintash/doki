@@ -72,11 +72,11 @@ use crate::ui::{
 use crate::{
     AnnotateSelection, CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch,
     CopySelection, DismissAnnotationEditor, FindNext, FindPrevious, FocusComposer, FocusNext,
-    FocusPrev, NavigateBack, NavigateForward, NewProject, NewSession, OpenFind, OpenFindReplace,
-    OpenResumePicker, OpenSettings, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask,
-    SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette, ToggleFindCaseSensitive,
-    ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter, ToggleFullScreen, ToggleModelPicker,
-    ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
+    FocusPrev, NavigateBack, NavigateForward, NewProject, NewSession, NewTask, OpenFind,
+    OpenFindReplace, OpenResumePicker, OpenSettings, ReplaceAllMatches, SaveFile, SelectFirstTask,
+    SelectLastTask, SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette,
+    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
+    ToggleFullScreen, ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]
@@ -184,7 +184,7 @@ const LIVE_REASONING_WINDOW_TARGET: usize = 6 * 1024;
 const LIVE_REASONING_WINDOW_MAX: usize = 18 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StreamPhase {
+pub(crate) enum StreamPhase {
     Text,
     Reasoning,
     Activity,
@@ -1114,6 +1114,7 @@ impl SessionNavigation {
             sessions.iter().any(|session| {
                 session.id == *session_id
                     && session.project_id == current_project_id
+                    && session.task_id.is_none()
                     && !session.has_started()
             })
         })
@@ -1509,6 +1510,18 @@ pub struct Waku {
     task_rename_input: Entity<TextInput>,
     /// Whether the task board is covering the chat column.
     board_open: bool,
+    board_project_filter: Option<Uuid>,
+    board_search: Option<Entity<TextInput>>,
+    board_search_query: String,
+    board_activity_filter: board::BoardActivityFilter,
+    /// The board details stay separate from conversation selection.
+    selected_task: Option<Uuid>,
+    task_detail: Option<task_details::TaskDetail>,
+    task_detail_save_generation: u64,
+    task_save_in_flight: bool,
+    task_save_pending: bool,
+    task_save_error: Option<String>,
+    sidebar_action_focuses: RefCell<HashMap<&'static str, FocusHandle>>,
     /// Stable focus for the sidebar's board entry row, plus one handle per
     /// task-creation button (see `render_task_create_button`).
     board_focus: FocusHandle,
@@ -1517,6 +1530,11 @@ pub struct Waku {
     new_task_dialog: Option<board::NewTaskDialog>,
     /// A move to Done that is waiting on the running-session confirmation.
     pending_task_completion: Option<board::TaskCompletionConfirm>,
+    task_completion_stops: HashMap<Uuid, task_completion::TaskCompletionStop>,
+    task_completion_preflights: HashMap<Uuid, task_completion::TaskCompletionPreflight>,
+    task_completion_save_rollbacks: HashMap<Uuid, task_completion::TaskCompletionSaveRollback>,
+    // Failed/canceled completion must not turn lost runtime observation into success.
+    unconfirmed_task_closes: HashMap<Uuid, HashMap<Uuid, (Uuid, DriverHandle)>>,
     /// The frame's memoized task facts. Render clears it before any board or
     /// sidebar row can read it.
     task_stats_cache: RefCell<Option<Rc<board::TaskStats>>>,
@@ -1536,6 +1554,7 @@ pub struct Waku {
     /// Stable keyboard focus for each virtualized sidebar group header and
     /// its hover-revealed New Task control.
     sidebar_group_header_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
+    sidebar_group_disclosure_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
     sidebar_group_compose_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
     /// Stable keyboard focus for each virtualized project-history reveal row.
     sidebar_show_more_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
@@ -1839,6 +1858,7 @@ mod annotation_resolution;
 mod autocomplete;
 mod background_work;
 mod board;
+mod board_header;
 mod branches;
 mod command_palette;
 mod commit_dialog;
@@ -1850,12 +1870,15 @@ mod goal_dialog;
 mod image_preview;
 mod render;
 mod right_panel;
+pub(crate) mod rpa;
 mod runtime;
 mod sessions;
 mod settings;
 mod sidebar;
 mod skills_page;
 mod streaming;
+mod task_completion;
+mod task_details;
 mod task_switcher;
 mod transcript;
 mod transcript_search;
@@ -1873,6 +1896,7 @@ pub use board::init as init_board_keys;
 pub use command_palette::init as init_command_palette;
 pub use commit_dialog::init as init_commit_dialog_keys;
 use components::*;
+pub use composer::init_workspace_keys;
 pub use goal_dialog::init as init_goal_dialog_keys;
 pub use image_preview::init as init_image_preview_keys;
 pub use settings::init as init_settings_keys;
@@ -2275,7 +2299,8 @@ impl Waku {
                 .placeholder(tr!("skills.search"))
         });
         let session_rename_input = cx.new(|cx| TextInput::new(window, cx));
-        let task_rename_input = cx.new(|cx| TextInput::new(window, cx));
+        let task_rename_input =
+            cx.new(|cx| TextInput::new(window, cx).semantic_id("issue-rename-input"));
         let provider_path_input = cx.new(|cx| {
             TextInput::new(window, cx)
                 .select_all_on_focus_click()
@@ -2547,7 +2572,7 @@ impl Waku {
             let onboarding_projectless_focus = cx.focus_handle();
             let updater_button_focus = cx.focus_handle();
             let model_picker_empty_focus = cx.focus_handle();
-            let board_focus = cx.focus_handle();
+            let board_focus = cx.focus_handle().tab_stop(true);
             let archive_focus = cx.focus_handle();
             let task_switcher_focus = cx.focus_handle();
             cx.on_focus_out(
@@ -2640,37 +2665,35 @@ impl Waku {
                 &composer,
                 |this: &mut Self, _, event: &ComposerEvent, cx| match event {
                     ComposerEvent::Submit(prompt) => {
-                        if let Some(session_id) = this.selected_session().and_then(|session| {
-                            this.response_fork_preparations
-                                .contains_key(&session.id)
-                                .then_some(session.id)
+                        if this.selected_session().is_some_and(|session| {
+                            this.response_fork_preparations.contains_key(&session.id)
                         }) {
-                            this.defer_restore_composer_after_fork(session_id, prompt.clone(), cx);
-                        } else if let Some(submission) =
-                            this.submission_with_attachments(prompt, cx)
-                        {
+                            return;
+                        }
+                        if let Some(submission) = this.submission_with_attachments(prompt, cx) {
+                            this.composer.update(cx, |input, cx| input.clear(cx));
                             this.submit_composer_submission(submission, cx);
                         }
                     }
                     ComposerEvent::SubmitOpposite(prompt) => {
-                        if let Some(session_id) = this.selected_session().and_then(|session| {
-                            this.response_fork_preparations
-                                .contains_key(&session.id)
-                                .then_some(session.id)
+                        if this.selected_session().is_some_and(|session| {
+                            this.response_fork_preparations.contains_key(&session.id)
                         }) {
-                            this.defer_restore_composer_after_fork(session_id, prompt.clone(), cx);
-                        } else if let Some(submission) =
-                            this.submission_with_attachments(prompt, cx)
-                        {
+                            return;
+                        }
+                        if let Some(submission) = this.submission_with_attachments(prompt, cx) {
+                            this.composer.update(cx, |input, cx| input.clear(cx));
                             this.submit_opposite_composer_submission(submission, cx);
                         }
                     }
                     ComposerEvent::SteerQueued => {
-                        // Staged attachments make this a real draft even when
-                        // the text field is empty. Preserve the shortcut's
-                        // previous no-op behavior until that draft is sent or
+                        // Staged attachments or annotations make this a real
+                        // draft even when the text field is empty. Keep the
+                        // queue shortcut a no-op until that draft is sent or
                         // cleared.
-                        if this.composer_attachments.is_empty() {
+                        if this.composer_attachments.is_empty()
+                            && this.composer_annotations.is_empty()
+                        {
                             this.steer_oldest_queued_message(cx);
                         }
                     }
@@ -3158,11 +3181,26 @@ impl Waku {
                 session_rename_input,
                 task_rename: None,
                 task_rename_input,
-                board_open: false,
+                board_open: true,
+                board_project_filter: None,
+                board_search: None,
+                board_search_query: String::new(),
+                board_activity_filter: board::BoardActivityFilter::All,
+                selected_task: None,
+                task_detail: None,
+                task_detail_save_generation: 0,
+                task_save_in_flight: false,
+                task_save_pending: false,
+                task_save_error: None,
+                sidebar_action_focuses: RefCell::new(HashMap::new()),
                 board_focus,
                 task_create_focuses: RefCell::new(HashMap::new()),
                 new_task_dialog: None,
                 pending_task_completion: None,
+                task_completion_stops: HashMap::new(),
+                task_completion_preflights: HashMap::new(),
+                task_completion_save_rollbacks: HashMap::new(),
+                unconfirmed_task_closes: HashMap::new(),
                 task_stats_cache: RefCell::new(None),
                 board_column_lists: RefCell::new([
                     board::BoardColumnList::new(),
@@ -3174,6 +3212,7 @@ impl Waku {
                 sidebar_collapsed_groups: HashSet::new(),
                 sidebar_project_reveal_counts: HashMap::new(),
                 sidebar_group_header_focuses: RefCell::new(HashMap::new()),
+                sidebar_group_disclosure_focuses: RefCell::new(HashMap::new()),
                 sidebar_group_compose_focuses: RefCell::new(HashMap::new()),
                 sidebar_show_more_focuses: RefCell::new(HashMap::new()),
                 sidebar_visible,

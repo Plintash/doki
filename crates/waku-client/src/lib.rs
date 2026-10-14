@@ -13,7 +13,10 @@ pub mod persistence;
 mod process;
 mod workspace_client;
 
-pub use client::DaemonClient;
+pub use client::{
+    AutomationExecutorMessage, AutomationMessage, DaemonAutomationError, DaemonClient,
+    DaemonRpcError, DiagnosticMessage,
+};
 pub use process::{
     DEFAULT_EXPOSED_DAEMON_PORT, DaemonExposureSettings, DaemonProcess, DaemonSupervisor,
     parse_allowed_origins,

@@ -24,7 +24,19 @@
   validate the freshly relaunched debug app. Do not run `scripts/bundle.sh
   debug` for a checkout whose watcher is running; the watcher owns that
   bundle. Quitting the app also stops its watcher.
-- No visual test unless requested.
+- Follow [docs/rpa.md](docs/rpa.md) for the agent validation loop: record the
+  old build identity, let the checkout's watcher rebuild, verify the fresh
+  executor, then run the relevant semantic scenario. `wait-build --checkout`
+  follows relaunches only through an already configured stable daemon
+  connection; refresh the supplied connection when the default app-owned
+  daemon is replaced. Read failure evidence before adding probes or rebuilding.
+- Use the existing authenticated daemon connection, explicitly target the
+  checkout or instance, and use a disposable scratch instance for mutations.
+  Scratch defaults to provider-free isolation; do not copy credentials or
+  enable model calls merely to make a test pass.
+- Use semantic scenarios for ordinary behavior. For visible changes or visual
+  questions, show the requested prototype and inspect/share screenshots of the
+  freshly rebuilt signed app; a semantic pass alone does not validate pixels.
 
 ## Performance
 
@@ -113,8 +125,9 @@
   verify the real provider payload and preserve its ordering. Never expose
   private provider control markers in the transcript.
 - Validate visible changes in the freshly rebuilt, signed app managed by the
-  dev watcher against the exact provider interaction; a successful Rust build
-  alone is insufficient.
+  dev watcher, using screenshots and the exact provider interaction when
+  relevant; a successful Rust build alone is insufficient. Keep real-model
+  acceptance separate from provider-free semantic smoke tests.
 
 ## Agent skills
 

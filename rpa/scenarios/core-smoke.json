@@ -1,0 +1,10 @@
+{
+  "name": "Core semantic controls (selected session, sidebar visible)",
+  "steps": [
+    {"name":"Capture current semantic frame","type":"call","call":{"type":"snapshot","sections":["tree","route","composer"]}},
+    {"name":"Pin composer input","type":"wait","condition":{"on":"node","id":"composer-field","present":true},"timeoutMs":1000},
+    {"name":"Pin send/stop control","type":"wait","condition":{"on":"node","id":"send-or-stop","present":true},"timeoutMs":1000},
+    {"name":"Pin sidebar toggle","type":"wait","condition":{"on":"node","id":"toggle-sidebar","present":true},"timeoutMs":1000},
+    {"name":"Pin settings control","type":"wait","condition":{"on":"node","id":"open-settings","present":true},"timeoutMs":1000}
+  ]
+}

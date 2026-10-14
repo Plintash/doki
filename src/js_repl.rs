@@ -1,3 +1,7 @@
+#[cfg(debug_assertions)]
+#[path = "js_repl_rpa.rs"]
+mod rpa;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -25,6 +29,11 @@ const SERVER_INSTRUCTIONS: &str = "Use `js` to run JavaScript in the persistent 
 
 const KERNEL_BOOTSTRAP: &str = include_str!("js_repl_bootstrap.js");
 const JS_TOOL_DESCRIPTION: &str = "Run JavaScript in a persistent QuickJS kernel with top-level await. This is the JavaScript execution tool for the `waku_js_repl` MCP server; use it whenever instructions say to use `waku_js_repl`, the Waku JavaScript REPL MCP, or run Waku JavaScript REPL code. If `timeout_ms` is omitted, execution times out after 30000 ms (30 seconds); pass a larger `timeout_ms` for slow Computer Use automation or other long-running operations. Use `jsRepl.cwd`, `jsRepl.homeDir`, and `jsRepl.tmpDir` to inspect host paths. Use `jsRepl.requestMeta` to inspect the current MCP request `_meta` object during a tool call. Use `jsRepl.setResponseMeta(meta)` to attach top-level MCP result `_meta`; repeated calls shallow-merge object keys for the current tool call. Use `jsRepl.write(value)` to add output without a newline. Strings are unchanged; other values use console-style formatting, including BigInt and circular objects. Prefer it over `console.log(...)` for final output; `console.log(...)` remains useful for debugging or multiple values. Use `await jsRepl.emitImage(imageLike)` to return images; each call adds one image to the outer tool result, so call it multiple times to emit multiple images. Supported image inputs are a base64 data URL, a file URL, an object with a `url` property, or a Cua image content block with `data` and `mimeType`. Saved references to `jsRepl.write(...)` and `jsRepl.emitImage(...)` stay reusable across calls. Scheduled callbacks only run while a JavaScript execution call is active; overdue timers resume at the start of the next call. Top-level bindings persist across calls until `js_reset`. If a call throws, prior bindings remain available and bindings that finished initializing before the throw often remain reusable. For reusable names that may be assigned again later, prefer top-level `var name = ...`; `var` can be redeclared across calls. If you hit `SyntaxError: Identifier 'x' has already been declared`, reuse the existing binding if possible, reassign it only if it was declared with `let` or `var`, or pick a new name instead of resetting immediately; a previous `const x` cannot be changed into `var x`. Use a short `{ ... }` block only for temporary scratch names, and do not wrap an entire call in block scope if you want those names reusable later. Initialize Cua Driver with `await setupComputerUseRuntime({ globals: globalThis })`, which exposes every native tool as `cua.<tool_name>(arguments)`, such as `cua.list_apps()` or `cua.click(arguments)`. The bundled Computer Use skill documents the method signatures; call the methods directly. Module imports are not supported. Prefer `jsRepl.write(...)` for text or formatted values and `jsRepl.emitImage(...)` for images.";
+
+#[cfg(debug_assertions)]
+const RPA_DESCRIPTION: &str = " Debug app automation is available as waku.rpa, independently of Computer Use. Start with await waku.rpa.instances(), then await waku.rpa.attach(instanceId); pass the returned session.sessionId to inspect (compact context), tree, state (JSON pointer), snapshot (explicit sections), describe (argument contracts), click/act/type/key/invoke, subscribe/events, diff, wait/waitResult, and scenarioStart/scenarioResult/scenarioAbort. transcript(attachmentId, conversationId, query) reads bounded history by explicit conversation without opening it. Diagnostics use logs, timeline, counters and verbosity. Pass a conversation UUID as logs/timeline query.sessionId; it is distinct from the automation attachment sessionId and a Board issue taskId. scratchCreate/scratchRemove manage disposable instances. waitForBuild(checkout, previousBuild, {timeoutMs, pollMs}) waits for a new connected build of the explicit checkout. Methods return the shared daemon protocol result envelopes, except state returns the selected state value; failures preserve their code and failure bundle. Wait and scenario start calls return promptly; inspect their status or subscribe for results.";
+#[cfg(not(debug_assertions))]
+const RPA_DESCRIPTION: &str = "";
 
 #[derive(Default)]
 struct CallOutput {
@@ -198,9 +207,13 @@ fn serve<R: BufRead, W: Write>(mut input: R, mut output: W) -> anyhow::Result<()
 
 #[derive(Clone, Deserialize, Eq, PartialEq)]
 struct SessionConfig {
+    #[serde(default)]
     server_path: PathBuf,
+    #[serde(default)]
     process_directory: PathBuf,
     cwd: PathBuf,
+    #[serde(default)]
+    registration_id: String,
 }
 
 enum ReplHost {
@@ -249,7 +262,9 @@ impl ReplHost {
                     .context("Computer Use is not enabled for this OpenCode session")?;
                 let config: SessionConfig = serde_json::from_slice(&bytes)
                     .context("invalid Doki Computer Use session registration")?;
-                if !config.process_directory.is_dir() {
+                if !config.process_directory.as_os_str().is_empty()
+                    && !config.process_directory.is_dir()
+                {
                     kernels.remove(session);
                     bail!("this Doki Computer Use session has ended");
                 }
@@ -282,7 +297,7 @@ fn initialize_result() -> JsonValue {
             "name": "waku_js_repl",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": SERVER_INSTRUCTIONS
+        "instructions": format!("{SERVER_INSTRUCTIONS}{RPA_DESCRIPTION}")
     })
 }
 
@@ -290,7 +305,7 @@ fn tool_definitions() -> Vec<JsonValue> {
     vec![
         json!({
             "name": "js",
-            "description": JS_TOOL_DESCRIPTION.trim(),
+            "description": format!("{}{RPA_DESCRIPTION}", JS_TOOL_DESCRIPTION.trim()),
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -584,6 +599,23 @@ fn create_kernel(
         |ctx| -> anyhow::Result<(Persistent<Function<'static>>, Persistent<Function<'static>>)> {
             let globals = ctx.globals();
 
+            #[cfg(debug_assertions)]
+            {
+                let rpa = Arc::new(Mutex::new(rpa::NativeRpaClient::new()));
+                let rpa_deadline = deadline.clone();
+                globals.set("__wakuRpaCall", Function::new(ctx.clone(), move |method: String, arguments: String, timeout_ms: Option<u64>| {
+                    let execution_deadline = *rpa_deadline.lock();
+                    let request_deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms.min(300_000)));
+                    let deadline = match (execution_deadline, request_deadline) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    match serde_json::from_str::<JsonValue>(&arguments) {
+                        Ok(arguments) => rpa.lock().call(&method, arguments, deadline).to_string(),
+                        Err(_) => json!({"ok": false, "error": {"code": "invalidArguments", "message": "invalid RPA arguments"}}).to_string(),
+                    }
+                })?)?;
+            }
             globals.set("__wakuComputerPlatform", std::env::consts::OS)?;
             let cua_bridge = bridge.clone();
             let cua_deadline = deadline.clone();
@@ -973,7 +1005,11 @@ impl HelperConnection {
         if !waku_protocol::computer_use::is_available() {
             bail!("Doki Computer Use is not available in this build");
         }
+        if config.is_some_and(|config| config.server_path.as_os_str().is_empty()) {
+            bail!("Computer Use is not enabled for this REPL session");
+        }
         let command = config
+            .filter(|config| !config.server_path.as_os_str().is_empty())
             .map(|config| config.server_path.clone())
             .or_else(|| std::env::var_os("WAKU_COMPUTER_USE_SERVER").map(PathBuf::from))
             .ok_or_else(|| {
@@ -1150,6 +1186,352 @@ mod tests {
     }
 
     #[test]
+    fn automation_repl_is_debug_only_and_native_capability_is_private() {
+        let mut repl = JavaScriptRepl::new().unwrap();
+        let result = call(
+            &mut repl,
+            "jsRepl.write([typeof waku, typeof globalThis.__wakuRpaCall, JSON.stringify(jsRepl.env)].join(':'))",
+        );
+        assert_eq!(
+            result["content"][0]["text"],
+            if cfg!(debug_assertions) {
+                "object:undefined:{}"
+            } else {
+                "undefined:undefined:{}"
+            }
+        );
+        assert!(repl.bridge.lock().connection.is_none());
+        repl.reset().unwrap();
+        assert!(repl.bridge.lock().connection.is_none());
+        assert_eq!(
+            tool_definitions()[0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("waku.rpa"),
+            cfg!(debug_assertions)
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn automation_repl_wait_for_build_verifies_targeted_description() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mode = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let clock = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        context.with(|ctx| {
+            let commands = commands.clone();
+            let fixture_mode = mode.clone();
+            let fixture_clock = clock.clone();
+            ctx.globals().set("fixtureNow", Function::new(ctx.clone(), move || fixture_clock.load(Ordering::Acquire) as u32).unwrap()).unwrap();
+            ctx.eval::<(), _>("Date.now = fixtureNow;").unwrap();
+            let clock = clock.clone();
+            ctx.globals().set("__wakuRpaCall", Function::new(ctx.clone(), move |_: String, args: String| {
+                let command: JsonValue = serde_json::from_str(&args).unwrap();
+                commands.lock().push(command["type"].as_str().unwrap().to_owned());
+                let instance = json!({"instanceId":"fixture", "checkout":"/target", "build":"fresh", "executorConnected":true});
+                let mode = fixture_mode.load(Ordering::Acquire);
+                let value = match command["type"].as_str().unwrap() {
+                    "instances" if mode == 2 => json!({"instances":[instance.clone(), instance]}),
+                    "instances" => json!({"instances":[{"checkout":"/other","build":"new","executorConnected":true}, instance]}),
+                    "attach" => json!({"type":"attached", "session":{"sessionId":"session", "instance":instance}}),
+                    "call" => {
+                        let mut observed = instance;
+                        if mode == 1 {
+                            observed["build"] = json!("raced-build");
+                            clock.store(1, Ordering::Release);
+                        }
+                        json!({"type":"called", "result":{"value":{"instance":observed}}})
+                    },
+                    "detach" => json!({"type":"detached"}),
+                    _ => panic!("unexpected fixture operation"),
+                };
+                json!({"ok":true,"value":value}).to_string()
+            }).unwrap()).unwrap();
+            ctx.eval::<(), _>(KERNEL_BOOTSTRAP).unwrap();
+            let promise: Promise<'_> = ctx.eval("(async () => (await waku.rpa.waitForBuild('/target', 'old')).build)()").unwrap();
+            assert_eq!(promise.finish::<String>().unwrap(), "fresh");
+            mode.store(1, Ordering::Release);
+            let promise: Promise<'_> = ctx.eval("(async () => {try { await waku.rpa.waitForBuild('/target','old',{timeoutMs:1}); } catch(e) {return e.code + ':' + e.lastError.code;} })()").unwrap();
+            assert_eq!(promise.finish::<String>().unwrap(), "timeout:executor_changed");
+            mode.store(2, Ordering::Release);
+            let promise: Promise<'_> = ctx.eval("(async () => {try { await waku.rpa.waitForBuild('/target','old'); } catch(e) {return e.code;} })()").unwrap();
+            assert_eq!(promise.finish::<String>().unwrap(), "ambiguous_instance");
+        });
+        assert_eq!(
+            *commands.lock(),
+            [
+                "instances",
+                "attach",
+                "call",
+                "detach",
+                "instances",
+                "attach",
+                "call",
+                "instances"
+            ]
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn automation_repl_wait_for_build_cleanup_preserves_results_and_deadline() {
+        for describe_fails in [false, true] {
+            for expire_after in ["", "instances", "attach", "call"] {
+                let runtime = Runtime::new().unwrap();
+                let context = Context::full(&runtime).unwrap();
+                let commands = Arc::new(Mutex::new(Vec::<(String, u32)>::new()));
+                let clock = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                context.with(|ctx| {
+                    let fixture_clock = clock.clone();
+                    ctx.globals().set("fixtureNow", Function::new(ctx.clone(), move || fixture_clock.load(Ordering::Acquire) as u32).unwrap()).unwrap();
+                    ctx.eval::<(), _>("Date.now = fixtureNow;").unwrap();
+                    let commands = commands.clone();
+                    let clock = clock.clone();
+                    ctx.globals().set("__wakuRpaCall", Function::new(ctx.clone(), move |_: String, args: String, timeout_ms: u32| {
+                        let command: JsonValue = serde_json::from_str(&args).unwrap();
+                        let kind = command["type"].as_str().unwrap();
+                        commands.lock().push((kind.to_owned(), timeout_ms));
+                        assert_eq!(timeout_ms as usize, 100 - clock.load(Ordering::Acquire));
+                        if kind == expire_after {
+                            clock.store(100, Ordering::Release);
+                        } else {
+                            clock.fetch_add(20, Ordering::AcqRel);
+                        }
+                        if kind == "detach" {
+                            return json!({"ok":false,"error":{"code":"cleanup_failed","message":"detach failed"}}).to_string();
+                        }
+                        if kind == "call" && describe_fails {
+                            return json!({"ok":false,"error":{"code":"describe_failed","message":"original failure","bundle":{"observed":{"frame":9}}}}).to_string();
+                        }
+                        let instance = json!({"instanceId":"fixture","checkout":"/target","build":"fresh","executorConnected":true});
+                        let value = match kind {
+                            "instances" => json!({"instances":[instance]}),
+                            "attach" => json!({"type":"attached","session":{"sessionId":"session","instance":instance}}),
+                            "call" => json!({"type":"called","result":{"value":{"instance":instance}}}),
+                            _ => panic!("unexpected fixture operation"),
+                        };
+                        json!({"ok":true,"value":value}).to_string()
+                    }).unwrap()).unwrap();
+                    ctx.eval::<(), _>(KERNEL_BOOTSTRAP).unwrap();
+                    let promise: Promise<'_> = ctx.eval(r#"(async () => {
+                        try {
+                            const instance = await waku.rpa.waitForBuild('/target', 'old', {timeoutMs:100});
+                            return JSON.stringify({build:instance.build});
+                        } catch (error) {
+                            return JSON.stringify({code:error.code, bundle:error.bundle});
+                        }
+                    })()"#).unwrap();
+                    let result: String = promise.finish().unwrap();
+                    let expected = if matches!(expire_after, "instances" | "attach") {
+                        json!({"code":"timeout"})
+                    } else if describe_fails {
+                        json!({"code":"describe_failed","bundle":{"observed":{"frame":9}}})
+                    } else {
+                        json!({"build":"fresh"})
+                    };
+                    assert_eq!(serde_json::from_str::<JsonValue>(&result).unwrap(), expected, "describe_fails={describe_fails}, expire_after={expire_after}");
+                });
+                let expected_commands = match expire_after {
+                    "instances" => vec![("instances".to_owned(), 100)],
+                    "attach" => vec![("instances".to_owned(), 100), ("attach".to_owned(), 80)],
+                    "call" => vec![
+                        ("instances".to_owned(), 100),
+                        ("attach".to_owned(), 80),
+                        ("call".to_owned(), 60),
+                    ],
+                    _ => vec![
+                        ("instances".to_owned(), 100),
+                        ("attach".to_owned(), 80),
+                        ("call".to_owned(), 60),
+                        ("detach".to_owned(), 40),
+                    ],
+                };
+                assert_eq!(*commands.lock(), expected_commands);
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn automation_repl_wait_for_build_does_not_poll_after_deadline() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        context.with(|ctx| {
+            let reads = reads.clone();
+            ctx.globals().set("__wakuScheduleTimer", Function::new(ctx.clone(), |delay: u32, _: bool| {
+                assert_eq!(delay, 100);
+                1_u32
+            }).unwrap()).unwrap();
+            ctx.globals().set("__wakuRpaCall", Function::new(ctx.clone(), move |_: String, args: String, timeout_ms: u32| {
+                let command: JsonValue = serde_json::from_str(&args).unwrap();
+                assert_eq!(command["type"], "instances");
+                assert_eq!(timeout_ms, 100);
+                reads.fetch_add(1, Ordering::AcqRel);
+                json!({"ok":true,"value":{"instances":[]}}).to_string()
+            }).unwrap()).unwrap();
+            ctx.eval::<(), _>(KERNEL_BOOTSTRAP).unwrap();
+            ctx.eval::<(), _>("var fixtureClock = 0; Date.now = () => fixtureClock;").unwrap();
+            let promise: Promise<'_> = ctx.eval("(async () => {try { await waku.rpa.waitForBuild('/target','old',{timeoutMs:100}); } catch(e) {return e.code + ':' + e.lastError.code;} })()").unwrap();
+            while ctx.execute_pending_job() {}
+            assert!(promise.result::<String>().is_none());
+            ctx.eval::<(), _>("fixtureClock = 100; __wakuRunTimer(1)").unwrap();
+            assert_eq!(promise.finish::<String>().unwrap(), "timeout:instance_not_found");
+        });
+        assert_eq!(reads.load(Ordering::Acquire), 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn automation_repl_wait_for_build_follows_a_new_process_identity() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        context.with(|ctx| {
+            let reads = reads.clone();
+            ctx.globals().set("__wakuScheduleTimer", Function::new(ctx.clone(), |_: u32, _: bool| 1_u32).unwrap()).unwrap();
+            ctx.globals().set("__wakuRpaCall", Function::new(ctx.clone(), move |_: String, args: String| {
+                let command: JsonValue = serde_json::from_str(&args).unwrap();
+                let fresh = json!({"instanceId":"new-id","checkout":"/target","build":"new-build","executorConnected":true});
+                let value = match command["type"].as_str().unwrap() {
+                    "instances" => if reads.fetch_add(1, Ordering::AcqRel) == 0 {
+                        json!({"instances":[{"instanceId":"old-id","checkout":"/target","build":"old-build","executorConnected":true}]})
+                    } else {
+                        json!({"instances":[{"instanceId":"old-id","checkout":"/target","build":"old-build","executorConnected":false},fresh]})
+                    },
+                    "attach" => {
+                        assert_eq!(command["instanceId"], "new-id");
+                        json!({"type":"attached","session":{"sessionId":"session", "instance":fresh}})
+                    },
+                    "call" => json!({"type":"called","result":{"value":{"instance":fresh}}}),
+                    "detach" => json!({"type":"detached"}),
+                    _ => panic!("unexpected fixture operation"),
+                };
+                json!({"ok":true,"value":value}).to_string()
+            }).unwrap()).unwrap();
+            ctx.eval::<(), _>(KERNEL_BOOTSTRAP).unwrap();
+            let promise: Promise<'_> = ctx.eval("(async () => (await waku.rpa.waitForBuild('/target','old-build')).instanceId)()").unwrap();
+            while ctx.execute_pending_job() {}
+            assert!(promise.result::<String>().is_none());
+            ctx.eval::<(), _>("__wakuRunTimer(1)").unwrap();
+            assert_eq!(promise.finish::<String>().unwrap(), "new-id");
+        });
+        assert_eq!(reads.load(Ordering::Acquire), 2);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn automation_repl_bindings_use_shared_protocol_and_preserve_failure_bundle() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<(String, JsonValue)>::new()));
+        context.with(|ctx| {
+            let captured = calls.clone();
+            ctx.globals().set("__wakuRpaCall", Function::new(ctx.clone(), move |method: String, args: String| {
+                let args: JsonValue = serde_json::from_str(&args).unwrap();
+                if method == "automation" {
+                    let _: waku_protocol::AutomationCommand = serde_json::from_value(args.clone()).unwrap();
+                } else if method == "logs" {
+                    let _: waku_protocol::DiagnosticQuery = serde_json::from_value(args.clone()).unwrap();
+                } else if method == "timeline" {
+                    let _: waku_protocol::DiagnosticTimelineQuery = serde_json::from_value(args.clone()).unwrap();
+                }
+                captured.lock().push((method.clone(), args));
+                if method == "counters" {
+                    json!({"ok":false,"error":{"code":"fixtureFailure","message":"failed","bundle":{"observed":{"frame":9}}}}).to_string()
+                } else { json!({"ok":true,"value":{"type":"fixtureResult"}}).to_string() }
+            }).unwrap()).unwrap();
+            ctx.eval::<(), _>(KERNEL_BOOTSTRAP).unwrap();
+            let promise: Promise<'_> = ctx.eval(r#"(async () => {
+                const r = waku.rpa;
+                const id = '00000000-0000-0000-0000-000000000001';
+                const cursor = { epoch: id, sequence: 1 };
+                await r.instances(); await r.scratchCreate(); await r.scratchRemove(id);
+                await r.attach(id); await r.resume(id, cursor); await r.detach(id);
+                await r.describe(id); await r.snapshot(id, ['tree']);
+                await r.act(id, 'focus', {id:'composer'}); await r.click(id, 'send');
+                await r.type(id, 'hello'); await r.key(id, 'enter'); await r.invoke(id, 'openTask', {});
+                await r.diff(id, cursor); await r.subscribe(id); await r.events(id);
+                await r.wait(id, {on:'node', id:'send', present:true}); await r.waitResult(id, id);
+                await r.scenarioStart(id, {name:'fixture', steps:[]}); await r.scenarioResult(id, id); await r.scenarioAbort(id, id);
+                const conversation = '00000000-0000-0000-0000-000000000002';
+                await r.logs({sessionId:conversation}); await r.timeline({sessionId:conversation}); await r.verbosity();
+                try { await r.counters(); } catch (error) { return JSON.stringify({code:error.code, bundle:error.bundle}); }
+            })()"#).unwrap();
+            let result: String = promise.finish().unwrap();
+            assert_eq!(serde_json::from_str::<JsonValue>(&result).unwrap(), json!({"code":"fixtureFailure", "bundle":{"observed":{"frame":9}}}));
+            assert!(ctx.globals().get::<_, Value<'_>>("__wakuRpaCall").unwrap().is_undefined());
+        });
+        assert_eq!(calls.lock().len(), 25);
+        for method in ["logs", "timeline"] {
+            let calls = calls.lock();
+            let (_, query) = calls.iter().find(|(name, _)| name == method).unwrap();
+            assert_eq!(query["sessionId"], "00000000-0000-0000-0000-000000000002");
+            assert!(query.get("taskId").is_none());
+        }
+        assert_eq!(calls.lock()[9].1["call"]["target"], json!({"id":"send"}));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn automation_repl_compact_reads_and_transcript_use_shared_protocol() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<JsonValue>::new()));
+        context.with(|ctx| {
+            let captured = calls.clone();
+            ctx.globals().set("__wakuRpaCall", Function::new(ctx.clone(), move |_: String, args: String| {
+                let command: JsonValue = serde_json::from_str(&args).unwrap();
+                let _: waku_protocol::AutomationCommand = serde_json::from_value(command.clone()).unwrap();
+                captured.lock().push(command);
+                json!({"ok":true,"value":{"type":"called","result":{"value":{"state":{"composer":{"text":"kept draft"}}}}}}).to_string()
+            }).unwrap()).unwrap();
+            ctx.eval::<(), _>(KERNEL_BOOTSTRAP).unwrap();
+            let promise: Promise<'_> = ctx.eval(r#"(async () => {
+                const id = '00000000-0000-0000-0000-000000000001';
+                await waku.rpa.inspect(id); await waku.rpa.tree(id);
+                const draft = await waku.rpa.state(id, '/composer/text');
+                await waku.rpa.transcript(id, id, {type:'index',collection:'messages'});
+                try { await waku.rpa.state(id, '/bad~2pointer'); } catch (error) { return draft + ':' + error.name; }
+            })()"#).unwrap();
+            assert_eq!(promise.finish::<String>().unwrap(), "kept draft:TypeError");
+        });
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 4);
+        assert!(
+            !calls[0]["call"]["sections"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("session"))
+        );
+        assert_eq!(calls[1]["call"]["sections"], json!(["tree"]));
+        assert_eq!(calls[2]["call"]["sections"], json!(["composer"]));
+        assert_eq!(calls[3]["call"]["type"], "transcript");
+    }
+
+    #[test]
+    fn automation_repl_opencode_session_does_not_initialize_computer_use() {
+        let directory =
+            std::env::temp_dir().join(format!("waku-repl-rpa-session-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(session_config_path(&directory, "rpa-only"), serde_json::to_vec(&json!({
+            "server_path":"", "process_directory":"", "cwd":directory, "registration_id":"fixture",
+        })).unwrap()).unwrap();
+        let mut host = ReplHost::new(Some(directory.clone())).unwrap();
+        let result = host.call(&json!({"name":"js", "arguments":{"code":"try { await setupComputerUseRuntime(); } catch (error) { jsRepl.write(error.message); }"}, "_meta":{"sessionID":"rpa-only"}})).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not enabled") || text.contains("not available"));
+        let ReplHost::Sessions { kernels, .. } = &host else {
+            panic!("session host required")
+        };
+        assert!(kernels["rpa-only"].1.bridge.lock().connection.is_none());
+        drop(host);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn opencode_sessions_isolate_bindings_reset_and_registration_lifetime() {
         let root =
             std::env::temp_dir().join(format!("waku-repl-sessions-{}", uuid::Uuid::new_v4()));
@@ -1230,7 +1612,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["js", "js_reset"]
         );
-        assert_eq!(tools[0]["description"], JS_TOOL_DESCRIPTION.trim());
+        assert_eq!(
+            tools[0]["description"],
+            format!("{}{RPA_DESCRIPTION}", JS_TOOL_DESCRIPTION.trim())
+        );
         assert!(SERVER_INSTRUCTIONS.contains("`waku_js_repl`"));
         assert!(!SERVER_INSTRUCTIONS.contains("`node_repl`"));
         assert!(!SERVER_INSTRUCTIONS.contains("jsRepl.write"));

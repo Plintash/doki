@@ -15,6 +15,21 @@ import {
 } from './mobile-runtime';
 
 describe('mobile runtime projection', () => {
+  test('submit, queue, and option changes retain a newer issue metadata revision', () => {
+    let id = 0;
+    const clock = { nowSeconds: () => 42, randomUUID: () => `id-${++id}` };
+    const filed = session({ task_id: 'filed-issue', updated_at: 43 });
+    const started = beginTurn(filed, 'Continue this issue', clock);
+    const queued = queueSubmission(started, 'Follow up', clock);
+    const changed = applySessionOptions(queued, { model: 'new-model' }, clock);
+    expect(started.updated_at).toBe(43);
+    expect(queued.updated_at).toBe(43);
+    expect(changed.updated_at).toBe(43);
+    expect(changed.task_id).toBe('filed-issue');
+    expect(changed.last_reply_at).toBe(42);
+    expect(changed.queued_messages?.[0]?.created_at).toBe(42);
+  });
+
   test('imports provider history with the native resume cursor and project context', () => {
     const existing = session();
     const resumed = createResumedSession('project', {

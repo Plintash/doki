@@ -719,20 +719,24 @@ export function WakuApp() {
     const previousState = queryClient.getQueryData<TaskState>(stateKey)
     const previousSummary = previousState?.sessions.find((session) => session.id === sessionId)
     const previousHydrated = queryClient.getQueryData<AgentSession>(sessionKey)
-    const updatedAt = Math.floor(Date.now() / 1_000)
+    const updatedAt = Math.max(
+      Math.floor(Date.now() / 1_000),
+      previousSummary?.updated_at ?? 0,
+      previousHydrated?.updated_at ?? 0,
+    )
     queryClient.setQueryData<TaskState>(stateKey, (currentState) => currentState && ({
       ...currentState,
       sessions: currentState.sessions.map((session) => session.id === sessionId
-        ? { ...session, title, updated_at: updatedAt }
+        ? { ...session, title, updated_at: Math.max(session.updated_at, updatedAt) }
         : session),
     }))
     queryClient.setQueryData<AgentSession>(sessionKey, (session) => session
-      ? { ...session, title, updated_at: updatedAt }
+      ? { ...session, title, updated_at: Math.max(session.updated_at, updatedAt) }
       : session)
     try {
       const hydrated = await hydrateSession(client, sessionId)
       if (!hydrated) throw new Error(t('errors.task_not_found'))
-      await saveSession({ ...hydrated, title, updated_at: updatedAt })
+      await saveSession({ ...hydrated, title, updated_at: Math.max(hydrated.updated_at, updatedAt) })
     } catch (error) {
       if (previousSummary) {
         queryClient.setQueryData<TaskState>(stateKey, (currentState) => currentState && ({

@@ -6,6 +6,7 @@ description = "Rust client and daemon process supervisor for Waku"
 license = "GPL-3.0-only"
 
 [dependencies]
+arc-swap = "1.9.2"
 anyhow = "1.0"
 crossbeam-channel = "0.5"
 dirs = "6.0"

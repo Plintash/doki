@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::md::highlight::{self, Lang, TokenClass};
+use crate::ui::SemanticControlExt;
 use crate::ui::menu::{ContextMenuHandle, MenuItem, context_menu};
 use crate::ui::scrollbar::{self, ScrollbarState};
 use gpui::{
@@ -636,6 +637,7 @@ const AUTO_HEIGHT_MAX: Pixels = px(300.);
 /// editing and IME composition, grouped undo history, mouse selection, and
 /// paint-only syntax colouring, specialised through config rather than forks.
 pub struct TextInput {
+    semantic_id: SharedString,
     focus_handle: FocusHandle,
     mode: FieldMode,
     read_only: bool,
@@ -742,6 +744,7 @@ impl TextInput {
             cx.on_blur(&focus_handle, window, Self::on_blur),
         ];
         Self {
+            semantic_id: format!("text-input-{}", cx.entity_id().as_u64()).into(),
             focus_handle,
             mode: FieldMode::SingleLine,
             read_only: false,
@@ -795,6 +798,13 @@ impl TextInput {
         self.focus_handle.clone()
     }
 
+    /// Opt an input into native Tab traversal without changing the behavior
+    /// of editor-style fields that consume Tab themselves.
+    pub fn tab_stop(mut self, enabled: bool) -> Self {
+        self.focus_handle = self.focus_handle.tab_stop(enabled);
+        self
+    }
+
     pub fn is_visually_focused(&self, window: &Window) -> bool {
         self.focus_handle.is_focused(window) || self.context_menu_preserves_visual_focus()
     }
@@ -833,6 +843,13 @@ impl TextInput {
 
     fn context_menu_preserves_visual_focus(&self) -> bool {
         self.external_context_menu_focus_holds > 0
+    }
+
+    /// Feature controls use a stable domain identity instead of the fallback
+    /// entity identity, so several fields can be observed without ambiguity.
+    pub fn semantic_id(mut self, id: impl Into<SharedString>) -> Self {
+        self.semantic_id = id.into();
+        self
     }
 
     /// Placeholder shown while the field is empty.
@@ -2778,7 +2795,7 @@ impl Element for InputElement {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::current(cx);
         let input = cx.entity();
         let context_menu_input = input.clone();
@@ -2789,7 +2806,11 @@ impl Render for TextInput {
             .then(|| scrollbar::vertical(&self.scroll_handle, &self.scrollbar_state));
         let field = div()
             .key_context("TextInput")
-            .id("composer-field")
+            .id(self.semantic_id.clone())
+            .semantic_control(gpui::Role::TextInput, self.read_only)
+            .when(window.is_a11y_active(), |field| {
+                field.aria_value(self.content().to_owned())
+            })
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
@@ -2972,7 +2993,7 @@ pub enum ComposerEvent {
 pub struct ComposerAttachmentPaste(pub Vec<ClipboardEntry>);
 
 /// The prompt composer, built on [`TextInput`]: a self-sizing multi-line
-/// field where Enter submits the trimmed prompt and clears, the primary
+/// field where Enter requests submission of the trimmed prompt, the primary
 /// modifier + Enter steers it into the running turn instead, and image or
 /// file pastes surface as attachments rather than text. Everything textual —
 /// editing, IME, undo, selection — is the embedded field's; this component
@@ -2988,6 +3009,7 @@ impl ComposerInput {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             TextInput::new(window, cx)
+                .semantic_id("composer-field")
                 .multi_line()
                 .submit_on_enter()
                 .auto_height()
@@ -2996,15 +3018,12 @@ impl ComposerInput {
         });
         let focus_handle = input.read(cx).focus();
         let _subscriptions = vec![
-            cx.subscribe(&input, |composer, _, event: &InputEvent, cx| match event {
+            cx.subscribe(&input, |_, _, event: &InputEvent, cx| match event {
                 InputEvent::Submit(raw) => {
-                    // The prompt is consumed by sending it, and whitespace
-                    // alone is nothing to send.
-                    let value = raw.trim().to_owned();
-                    if !value.is_empty() {
-                        composer.input.update(cx, |input, cx| input.clear(cx));
-                        cx.emit(ComposerEvent::Submit(value));
-                    }
+                    // The owner knows about attachments and annotations, so
+                    // even an empty field can carry a draft. Let it consume
+                    // the text only after accepting the submission.
+                    cx.emit(ComposerEvent::Submit(raw.trim().to_owned()));
                 }
                 InputEvent::Focus => cx.emit(ComposerEvent::Focus),
                 InputEvent::Edited => cx.emit(ComposerEvent::Edited),
@@ -3105,7 +3124,6 @@ impl Render for ComposerInput {
                     cx.emit(ComposerEvent::SteerQueued);
                     return;
                 }
-                composer.input.update(cx, |input, cx| input.clear(cx));
                 cx.emit(ComposerEvent::SubmitOpposite(value));
             }))
             .child(self.input.clone())
@@ -3200,6 +3218,93 @@ mod tests {
     }
 
     #[gpui::test]
+    fn simultaneous_fields_have_distinct_semantic_identity(cx: &mut TestAppContext) {
+        struct Fields {
+            title: Entity<TextInput>,
+            description: Entity<TextInput>,
+            fallback: Entity<TextInput>,
+            composer: Entity<ComposerInput>,
+        }
+        impl Render for Fields {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(self.title.clone())
+                    .child(self.description.clone())
+                    .child(self.fallback.clone())
+                    .child(self.composer.clone())
+            }
+        }
+        cx.update(super::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            window.set_a11y_automation(true);
+            Fields {
+                title: cx.new(|cx| TextInput::new(window, cx).semantic_id("issue-title-fixture")),
+                description: cx
+                    .new(|cx| TextInput::new(window, cx).semantic_id("issue-description-fixture")),
+                fallback: cx.new(|cx| TextInput::new(window, cx)),
+                composer: cx.new(|cx| ComposerInput::new(window, cx)),
+            }
+        });
+        cx.run_until_parked();
+        let raw = cx
+            .update(|window, _| window.a11y_automation_snapshot())
+            .unwrap();
+        let tree: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let inputs = tree["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|node| node["role"] == "TextInput")
+            .filter_map(|node| node["element_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 4);
+        assert_eq!(
+            inputs.iter().filter(|id| **id == "composer-field").count(),
+            1
+        );
+        assert!(inputs.contains(&"issue-title-fixture"));
+        assert!(inputs.contains(&"issue-description-fixture"));
+        assert!(inputs.iter().any(|id| id.starts_with("text-input-")));
+    }
+
+    #[gpui::test]
+    fn enter_emits_submit_intent_for_empty_text_and_keeps_the_draft_until_accepted(
+        cx: &mut TestAppContext,
+    ) {
+        let (composer, cx) = setup_composer(cx);
+        let events: Rc<RefCell<Vec<ComposerEvent>>> = Rc::default();
+        let sink = events.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&composer, move |_, event: &ComposerEvent, _| {
+                sink.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+
+        for draft in ["", "  ", "keep this draft"] {
+            composer.update(cx, |composer, cx| composer.set_content(draft, cx));
+            events.borrow_mut().clear();
+            cx.simulate_keystrokes("enter");
+            assert!(
+                events.borrow().iter().any(
+                    |event| matches!(event, ComposerEvent::Submit(text) if text == draft.trim())
+                ),
+                "the owner must decide whether staged context makes an empty prompt sendable"
+            );
+            cx.read_entity(&composer, |composer, cx| {
+                assert_eq!(
+                    composer.content(cx),
+                    draft,
+                    "a refused submission keeps its draft"
+                )
+            });
+        }
+    }
+
+    #[gpui::test]
     fn secondary_enter_submits_the_opposite_follow_up(cx: &mut TestAppContext) {
         let (composer, cx) = setup_composer(cx);
         let events: Rc<RefCell<Vec<ComposerEvent>>> = Rc::default();
@@ -3224,7 +3329,7 @@ mod tests {
             |event| matches!(event, ComposerEvent::SubmitOpposite(text) if text == "hold on")
         ));
         cx.read_entity(&composer, |composer, cx| {
-            assert_eq!(composer.content(cx), "")
+            assert_eq!(composer.content(cx), "hold on")
         });
     }
 

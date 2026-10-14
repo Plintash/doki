@@ -13,13 +13,14 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ClientCapabilities, ContentBlock, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectOptions, SessionId, SessionModeId, SessionModeState, SessionNotification,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent,
+    CancelNotification, ClientCapabilities, ContentBlock, EnvVariable, Implementation,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, McpServer, McpServerStdio,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse, RequestId,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOptions, SessionId,
+    SessionModeId, SessionModeState, SessionNotification, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, StopReason, TextContent,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo, Handled, LineDirection, Responder,
@@ -63,6 +64,7 @@ pub struct AcpDriver {
     supports_steer: bool,
     mode: RuntimeMode,
     computer_use: Option<super::support::HeadlessComputerUseRuntime>,
+    _automation_repl: Option<Arc<super::automation_repl::AutomationReplConfig>>,
 }
 
 /// Per-provider launch details. Everything after process launch is ACP.
@@ -142,9 +144,15 @@ impl AcpDriver {
         };
 
         let launch = launch_for(provider, reasoning_effort.as_deref())?;
+        let automation_repl = super::automation_repl::AutomationReplConfig::load()?;
+
         let computer_use = (provider == ProviderKind::Grok && computer_use_enabled)
             .then(|| super::support::HeadlessComputerUseRuntime::start(provider, events.clone()))
             .transpose()?;
+        let mcp_servers = automation_repl_servers(
+            automation_repl.as_deref(),
+            computer_use.as_ref().map(|runtime| &runtime.config),
+        );
         let grok_title_home = computer_use
             .as_ref()
             .and_then(super::support::HeadlessComputerUseRuntime::grok_home)
@@ -156,6 +164,7 @@ impl AcpDriver {
             launch,
             computer_use.as_ref().map(|runtime| &runtime.config),
             stderr_lines.clone(),
+            Some(events.clone()),
         )?;
         let (commands, command_rx) = smol::channel::unbounded();
         let provider_name = provider.display_name();
@@ -183,6 +192,7 @@ impl AcpDriver {
                     resume_session_id,
                     fork_context,
                     grok_title_home,
+                    mcp_servers,
                     command_rx,
                     thread_events.clone(),
                 ));
@@ -201,8 +211,35 @@ impl AcpDriver {
             supports_steer: provider != ProviderKind::Fx,
             mode,
             computer_use,
+            _automation_repl: automation_repl,
         })
     }
+}
+
+fn automation_repl_servers(
+    config: Option<&super::automation_repl::AutomationReplConfig>,
+    computer_use: Option<&super::support::HeadlessComputerUseConfig>,
+) -> Vec<McpServer> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    let mut env = vec![EnvVariable::new(
+        super::automation_repl::ENV_FILE,
+        config.env_file.display().to_string(),
+    )];
+    if let Some(super::support::HeadlessComputerUseConfig::Grok { base, .. }) = computer_use {
+        env.push(EnvVariable::new(
+            "WAKU_COMPUTER_USE_SERVER",
+            base.server_path.display().to_string(),
+        ));
+        env.push(EnvVariable::new(
+            "WAKU_COMPUTER_USE_PROCESS_DIRECTORY",
+            base.process_directory.display().to_string(),
+        ));
+    }
+    vec![McpServer::Stdio(
+        McpServerStdio::new("waku_js_repl", &config.repl_path).env(env),
+    )]
 }
 
 fn sdk_agent(
@@ -211,6 +248,7 @@ fn sdk_agent(
     mut launch: AcpLaunch,
     computer_use: Option<&super::support::HeadlessComputerUseConfig>,
     stderr_lines: Arc<Mutex<Vec<String>>>,
+    events: Option<DriverEventSender>,
 ) -> anyhow::Result<AcpAgent> {
     let binary = binary
         .to_str()
@@ -245,6 +283,9 @@ fn sdk_agent(
         if direction != LineDirection::Stderr || line.trim().is_empty() {
             return;
         }
+        if let Some(events) = &events {
+            events.record_stderr(line);
+        }
         let mut lines = stderr_lines.lock();
         if lines.len() == 128 {
             lines.remove(0);
@@ -265,7 +306,14 @@ pub(crate) fn catalog_agent(
     cwd: &Path,
 ) -> anyhow::Result<AcpAgent> {
     let launch = launch_for(provider, None)?;
-    sdk_agent(binary, cwd, launch, None, Arc::new(Mutex::new(Vec::new())))
+    sdk_agent(
+        binary,
+        cwd,
+        launch,
+        None,
+        Arc::new(Mutex::new(Vec::new())),
+        None,
+    )
 }
 
 type PermissionResponder = Responder<RequestPermissionResponse>;
@@ -347,6 +395,7 @@ async fn run_sdk_connection(
     resume_session_id: Option<String>,
     fork_context: Option<String>,
     grok_title_home: Option<std::path::PathBuf>,
+    mcp_servers: Vec<McpServer>,
     commands: smol::channel::Receiver<CommandMessage>,
     events: DriverEventSender,
 ) -> agent_client_protocol::Result<()> {
@@ -503,6 +552,7 @@ async fn run_sdk_connection(
                 resume_session_id.as_deref(),
                 &cwd,
                 &suppress_session_updates,
+                &mcp_servers,
             )
             .await?;
 
@@ -679,6 +729,7 @@ async fn establish_session(
     resume_session_id: Option<&str>,
     cwd: &Path,
     suppress_session_updates: &AtomicBool,
+    mcp_servers: &[McpServer],
 ) -> agent_client_protocol::Result<(
     SessionId,
     Option<SessionModeState>,
@@ -691,7 +742,10 @@ async fn establish_session(
             .resume
             .is_some()
             && let Ok(response) = connection
-                .send_request(ResumeSessionRequest::new(existing.to_owned(), cwd))
+                .send_request(
+                    ResumeSessionRequest::new(existing.to_owned(), cwd)
+                        .mcp_servers(mcp_servers.to_vec()),
+                )
                 .block_task()
                 .await
         {
@@ -705,7 +759,10 @@ async fn establish_session(
         if initialize.agent_capabilities.load_session {
             suppress_session_updates.store(true, Ordering::Release);
             let response = connection
-                .send_request(LoadSessionRequest::new(existing.to_owned(), cwd))
+                .send_request(
+                    LoadSessionRequest::new(existing.to_owned(), cwd)
+                        .mcp_servers(mcp_servers.to_vec()),
+                )
                 .block_task()
                 .await;
             suppress_session_updates.store(false, Ordering::Release);
@@ -720,7 +777,7 @@ async fn establish_session(
     }
 
     let response = connection
-        .send_request(NewSessionRequest::new(cwd))
+        .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers.to_vec()))
         .block_task()
         .await?;
     Ok((response.session_id, response.modes, response.config_options))
@@ -2106,6 +2163,22 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .category(category)
+    }
+
+    #[test]
+    fn automation_repl_acp_configuration_is_nonsecret_and_session_scoped() {
+        let config = super::super::automation_repl::AutomationReplConfig {
+            repl_path: "/fixture/waku_js_repl".into(),
+            env_file: std::env::temp_dir().join("nonexistent-rpa-acp-fixture/endpoint.json"),
+        };
+        assert!(automation_repl_servers(None, None).is_empty());
+        let servers = automation_repl_servers(Some(&config), None);
+        let value = serde_json::to_value(&servers).unwrap();
+        assert_eq!(value[0]["name"], "waku_js_repl");
+        assert_eq!(value[0]["env"].as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["env"][0]["name"], "WAKU_RPA_REPL_ENV_FILE");
+        assert!(!value.to_string().contains("TOKEN"));
+        assert!(!value.to_string().contains("WAKU_COMPUTER_USE"));
     }
 
     #[test]

@@ -167,6 +167,9 @@ enum CommandMessage {
     Prompt(String),
     Steer(String),
     Cancel,
+    /// A locally handled command can start a run whose preflight is still
+    /// waiting in an extension. Ask Pi before declaring that command finished.
+    CheckHandledPrompt(String),
     /// Take back whatever the provider's queue still holds without waiting for
     /// its answer; the reader owns stdout and cannot block on a response.
     RetractQueuedMessages,
@@ -189,6 +192,10 @@ enum CommandMessage {
 
 enum PendingResponse {
     Request(Sender<Result<Value, String>>),
+    HandledPromptState {
+        prompt_id: String,
+        response: Sender<Result<(), String>>,
+    },
     /// A prompt whose answer may arrive long after the write — Pi holds it
     /// until compaction or another built-in finishes. `converted_steer`
     /// carries the transport text when this prompt was a steer the run could
@@ -197,6 +204,9 @@ enum PendingResponse {
     /// settlement for a run that does not exist.
     Prompt {
         converted_steer: Option<String>,
+        /// A custom-message startup can fail before its first busy state
+        /// observation. Keep that error with the submission it belongs to.
+        startup_error: Option<String>,
     },
 }
 
@@ -206,6 +216,7 @@ pub struct PiDriver {
     flavor: PiFlavor,
     commands: Sender<CommandMessage>,
     computer_use: Option<computer_use_runtime::ComputerUseRuntime>,
+    _automation_repl: Option<Arc<super::automation_repl::AutomationReplConfig>>,
     /// The dialogs still waiting for the user, keyed by the provider's request
     /// id, shared with the reader thread that opened them. The stored method is
     /// what tells the answer which `extension_ui_response` shape it must take.
@@ -345,6 +356,22 @@ fn configure_pi_computer_use_command(
     }
 }
 
+fn configure_pi_automation_repl_command(
+    command: &mut std::process::Command,
+    config: Option<&super::automation_repl::AutomationReplConfig>,
+    extension: Option<&Path>,
+    computer_use: bool,
+) {
+    let Some(config) = config else { return };
+    if !computer_use {
+        if let Some(extension) = extension {
+            command.arg("--extension").arg(extension);
+        }
+        command.env("WAKU_JS_REPL_SERVER", &config.repl_path);
+    }
+    command.env(super::automation_repl::ENV_FILE, &config.env_file);
+}
+
 impl PiDriver {
     pub fn start(
         flavor: PiFlavor,
@@ -406,13 +433,29 @@ impl PiDriver {
             parse_model_slug(model)?;
         }
 
-        let computer_use = (computer_use_enabled && flavor.supports_waku_computer_use())
-            .then(|| computer_use_runtime::ComputerUseRuntime::start(events.clone()))
-            .transpose()?;
-        let pi_extension = computer_use
-            .as_ref()
-            .map(|_| crate::computer_use::pi_extension_path())
-            .transpose()?;
+        let computer_use = computer_use_runtime::ComputerUseRuntime::start_if_enabled(
+            computer_use_enabled && flavor.supports_waku_computer_use(),
+            events.clone(),
+        )?;
+        let mut automation_repl = if flavor.supports_waku_computer_use() {
+            super::automation_repl::AutomationReplConfig::load()?
+        } else {
+            None
+        };
+        let pi_extension = if computer_use.is_some() {
+            Some(crate::computer_use::pi_extension_path()?)
+        } else if automation_repl.is_some() {
+            match crate::computer_use::pi_extension_path() {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    eprintln!("waku-daemon: debug RPA Pi extension is unavailable: {error}");
+                    automation_repl = None;
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut command = crate::command_env::command(&binary);
         command.args(["--mode", "rpc", flavor.full_access_arg()]);
         for extension in extensions {
@@ -428,6 +471,13 @@ impl PiDriver {
                 .zip(pi_extension.as_deref())
                 .map(|(runtime, extension)| (&runtime.config, extension)),
         );
+        configure_pi_automation_repl_command(
+            &mut command,
+            automation_repl.as_deref(),
+            pi_extension.as_deref(),
+            computer_use.is_some(),
+        );
+
         let command = command
             .current_dir(&cwd)
             .stdin(Stdio::piped())
@@ -711,6 +761,20 @@ impl PiDriver {
                                 prompt,
                             );
                         }
+                        CommandMessage::CheckHandledPrompt(prompt_id) => {
+                            if let Err(error) = check_handled_prompt(
+                                &mut stdin,
+                                &writer_pending,
+                                &mut next_request_id,
+                                &prompt_id,
+                                RPC_TIMEOUT,
+                            ) {
+                                // An observation failure does not prove the
+                                // run ended. The reader still owns its eventual
+                                // reply or lifecycle events.
+                                let _ = writer_events.send(DriverEvent::Error(error));
+                            }
+                        }
                         CommandMessage::Cancel => {
                             if stop_session(&mut stdin, &writer_events, flavor).is_err() {
                                 break;
@@ -853,13 +917,14 @@ impl PiDriver {
             thread::Builder::new()
                 .name("waku-pi-stderr".into())
                 .spawn(move || {
-                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let error_events = stderr_events.clone();
+                    super::support::read_stderr_lines(stderr, &stderr_events, move |line| {
                         if line.to_ascii_lowercase().contains("error") {
                             let error = format!("{}: {}", flavor.display_name(), line.trim());
                             *stderr_last_error.lock() = Some(error.clone());
-                            let _ = stderr_events.send(DriverEvent::Error(error));
+                            let _ = error_events.send(DriverEvent::Error(error));
                         }
-                    }
+                    });
                 })?;
 
         // Nothing signals or kills the agent process: it exits when the writer
@@ -895,6 +960,7 @@ impl PiDriver {
             flavor,
             commands,
             computer_use,
+            _automation_repl: automation_repl,
             dialogs,
         })
     }
@@ -1056,6 +1122,39 @@ fn send_request_with_timeout(
     }
 }
 
+/// Correlates the observation with the original prompt or the custom startup
+/// it began. The reader owns the resulting run-start/settlement ordering.
+fn check_handled_prompt(
+    stdin: &mut impl Write,
+    pending: &PendingResponses,
+    next_request_id: &mut u64,
+    prompt_id: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    *next_request_id += 1;
+    let id = format!("waku-{}", next_request_id);
+    let (response, receiver) = bounded(1);
+    {
+        let mut pending = pending.lock();
+        pending.insert(
+            id.clone(),
+            PendingResponse::HandledPromptState {
+                prompt_id: prompt_id.to_owned(),
+                response,
+            },
+        );
+    }
+    if let Err(error) = write_json_line(stdin, &json!({"id": id, "type": "get_state"})) {
+        pending.lock().remove(&id);
+        return Err(format!("transport write failed: {error}"));
+    }
+    // Keep the correlation after a timeout: a late reply can still resolve a
+    // custom startup that failed without emitting agent_settled. EOF drains it.
+    receiver
+        .recv_timeout(timeout)
+        .map_err(|_| "get_state timed out while checking a handled Pi command".to_owned())?
+}
+
 fn send_prompt(
     stdin: &mut impl Write,
     pending: &PendingResponses,
@@ -1089,11 +1188,17 @@ fn write_prompt(
     {
         let mut pending = pending.lock();
         // A response from an older prompt cannot settle the next turn.
-        pending.retain(|_, response| matches!(response, PendingResponse::Request(_)));
+        pending.retain(|_, response| {
+            matches!(
+                response,
+                PendingResponse::Request(_) | PendingResponse::HandledPromptState { .. }
+            )
+        });
         pending.insert(
             id.clone(),
             PendingResponse::Prompt {
                 converted_steer: converted_steer.then(|| prompt.to_owned()),
+                startup_error: None,
             },
         );
     }
@@ -1307,8 +1412,14 @@ fn stop_session(
 
 fn fail_pending(pending: &PendingResponses, message: &str) {
     for (_, response) in pending.lock().drain() {
-        if let PendingResponse::Request(response) = response {
-            let _ = response.send(Err(message.to_owned()));
+        match response {
+            PendingResponse::Request(response) => {
+                let _ = response.send(Err(message.to_owned()));
+            }
+            PendingResponse::HandledPromptState { response, .. } => {
+                let _ = response.send(Err(message.to_owned()));
+            }
+            PendingResponse::Prompt { .. } => {}
         }
     }
 }
@@ -1706,6 +1817,13 @@ struct PiStreamState {
     /// The provider's run. Shared with the writer thread, so a reset of the
     /// per-run stream state keeps the same handle rather than a fresh one.
     run: RunLiveness,
+    /// The first acknowledged local command still awaiting its state check.
+    /// Keep its identity across replacement so an old uncorrelated extension
+    /// error cannot be assigned to the newer submission.
+    handled_prompt: Option<String>,
+    /// A custom run observed busy before its first agent_start. A failed
+    /// before_agent_start setup can return idle without emitting a settlement.
+    starting_prompt: Option<String>,
     /// The extension dialogs still unanswered, shared with the driver handle
     /// that answers them; like the run handle it outlives a run's reset.
     dialogs: PiDialogs,
@@ -1713,6 +1831,10 @@ struct PiStreamState {
     message_saw_reasoning: bool,
     failed: bool,
     tools: HashMap<String, (ActivityKind, String)>,
+    /// Automatic retries update one activity until recovery or settlement.
+    open_retry: Option<ActivityItem>,
+    /// Text or reasoning after that row moved the visible activity tail.
+    retry_has_output_after: bool,
     /// The messages the provider's last queue report still held, in the order
     /// it reported them. Empty on a provider that reports no queue.
     queued: Vec<String>,
@@ -1762,6 +1884,211 @@ impl PiStreamState {
             ..Self::default()
         };
     }
+
+    fn finish_retry(&mut self, events: &impl DriverEventSink) {
+        self.retry_has_output_after = false;
+        if let Some(mut item) = self.open_retry.take() {
+            item.complete = true;
+            // A completion can mean recovery, exhaustion, or cancellation.
+            // Keep its cause in the disclosure without claiming success or
+            // leaving the live header saying that we are still retrying.
+            item.title = tr!("activity.provider_retry_finished");
+            let _ = events.send(DriverEvent::RichActivity(item));
+        }
+    }
+}
+
+/// Both ordinary settlement and failed custom-run preparation return queued
+/// input and finish the same turn. Only the reader owns this transition.
+fn finish_pi_run(
+    flavor: PiFlavor,
+    interrupted: bool,
+    pending: &PendingResponses,
+    commands: &Sender<CommandMessage>,
+    events: &impl DriverEventSink,
+    state: &mut PiStreamState,
+) {
+    state.finish_retry(events);
+    if state.run.is_live() {
+        pending.lock().retain(|_, response| {
+            matches!(
+                response,
+                PendingResponse::Request(_) | PendingResponse::HandledPromptState { .. }
+            )
+        });
+        // A settlement must not leave text parked in the provider's queue.
+        // Measured against pi 1.0.0: an aborted run settles without
+        // draining its queue, and pi does not run that message afterwards
+        // — it splices it into whatever the user sends next. So the queue
+        // is taken back and its text handed to the user, and the turn
+        // still settles here, once and at once.
+        let retracted = std::mem::take(&mut state.queued);
+        if !retracted.is_empty() {
+            let _ = commands.send(CommandMessage::RetractQueuedMessages);
+            let _ = events.send(DriverEvent::QueuedMessagesRetracted {
+                messages: retracted,
+            });
+        }
+        let success = !state.failed;
+        let _ = events.send(DriverEvent::TurnFinished {
+            interrupted,
+            success,
+            summary: (!success).then(|| {
+                tr!(
+                    "errors.provider_complete_turn",
+                    provider = flavor.display_name()
+                )
+            }),
+        });
+    }
+    // The run is over, so a steering message has nothing left to join,
+    // and a dialog that was still unanswered belonged to it: the provider
+    // resolves an abandoned dialog on its own timeout, and that request is
+    // no longer answerable.
+    state.run.close();
+    state.dialogs.lock().clear();
+    state.reset();
+}
+
+/// Applies a prompt acknowledgement on the reader thread. A handled-state
+/// waiter is released only after this transition, so the writer cannot steer
+/// against stale liveness or replace the completion token midway through it.
+#[allow(clippy::too_many_arguments)]
+fn handle_prompt_response(
+    flavor: PiFlavor,
+    value: &Value,
+    id: &str,
+    pending: &PendingResponses,
+    commands: &Sender<CommandMessage>,
+    events: &impl DriverEventSink,
+    state: &mut PiStreamState,
+    checked_state: bool,
+) {
+    let success = value.get("success").and_then(Value::as_bool) == Some(true);
+    if checked_state && !success {
+        let _ = events.send(DriverEvent::Error(pi_error_message(flavor, value)));
+        return;
+    }
+    if checked_state
+        && success
+        && state.starting_prompt.as_deref() == Some(id)
+        && value.pointer("/data/isStreaming").and_then(Value::as_bool) == Some(false)
+    {
+        state.failed = true;
+        finish_pi_run(flavor, false, pending, commands, events, state);
+        return;
+    }
+    let prompt_response = match pending.lock().get(id) {
+        Some(PendingResponse::Prompt {
+            converted_steer,
+            startup_error,
+        }) => Some((converted_steer.clone(), startup_error.clone())),
+        _ => None,
+    };
+    let Some((converted_steer, startup_error)) = prompt_response else {
+        return;
+    };
+    // Pi answers a prompt with what became of it: `started` and
+    // `queued` mean the work is on its way and the run settles the
+    // turn. `handled` means an extension consumed the prompt; Pi may
+    // still be starting a custom run, so query its state before settling
+    // an apparently idle command. Oh My Pi says the last part in two steps — an
+    // acknowledgement, then a second response carrying
+    // `agentInvoked: false` — which keeps that field as one more
+    // locally-handled signal.
+    let handled_locally = checked_state
+        || value.pointer("/data/disposition").and_then(Value::as_str) == Some("handled")
+        || value.pointer("/data/agentInvoked").and_then(Value::as_bool) == Some(false);
+    // Pi 1.2 runs before_agent_start for custom-message wakes. That
+    // async hook can still be pending when the command answers
+    // "handled", before agent_start. Its state already reports busy.
+    if checked_state
+        && success
+        && value.pointer("/data/isStreaming").and_then(Value::as_bool) == Some(true)
+    {
+        let responses = pending.lock();
+        if !responses.contains_key(id) {
+            return;
+        }
+        let newly_started = !state.run.is_live();
+        if newly_started {
+            state.starting_prompt = Some(id.to_owned());
+            state.run.open();
+        }
+        drop(responses);
+        if newly_started {
+            let _ = events.send(DriverEvent::TurnStarted);
+        }
+        return;
+    }
+    if (checked_state && state.run.is_live())
+        || (success && (!handled_locally || state.run.is_live()))
+    {
+        return;
+    }
+    if success && flavor == PiFlavor::Pi && !checked_state {
+        if state.handled_prompt.is_none() {
+            state.handled_prompt = Some(id.to_owned());
+        }
+        let _ = commands.send(CommandMessage::CheckHandledPrompt(id.to_owned()));
+        return;
+    }
+    let startup_error = checked_state.then_some(startup_error).flatten();
+    let success = success && startup_error.is_none();
+    if !matches!(
+        pending.lock().remove(id),
+        Some(PendingResponse::Prompt { .. })
+    ) {
+        return;
+    }
+    // A prompt answer never opens a turn. A run announces itself with
+    // `agent_start`/`turn_start`, and the two answers that settle here
+    // — a refusal and a locally handled command — have no run behind
+    // them at all.
+    //
+    // A refusal is the delivery failure of the message that asked for
+    // the run: it never reached the conversation, so the provider's
+    // own reason travels with it — as the settlement's summary for an
+    // ordinary prompt, as the steer's rejection for a converted one —
+    // and that is what marks the message undelivered. Sending it as a
+    // transport error instead would have the client store it as an
+    // answer to a message the agent never saw.
+    let refusal_reason = || {
+        startup_error
+            .as_deref()
+            .or_else(|| value.get("error").and_then(Value::as_str))
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                tr!(
+                    "errors.provider_rejected_prompt",
+                    provider = flavor.display_name()
+                )
+            })
+    };
+    if let Some(message) = converted_steer {
+        // The steer was already reported accepted when its prompt was
+        // written, so only a refusal is news: it says the provider
+        // never added the message to the conversation, and the app
+        // needs to hear it as that steer's rejection rather than as a
+        // settlement of a run the steer never joined.
+        if !success {
+            let _ = events.send(DriverEvent::SteerRejected {
+                message,
+                reason: refusal_reason(),
+            });
+        }
+    } else {
+        let _ = events.send(DriverEvent::TurnFinished {
+            interrupted: false,
+            success,
+            summary: (!success).then(refusal_reason),
+        });
+    }
+    // No run stands behind this answer — a refusal, or an extension
+    // command that consumed the prompt — so nothing is live until the
+    // provider announces a run of its own.
+    state.run.close();
+    state.reset();
 }
 
 fn handle_pi_message(
@@ -1780,80 +2107,33 @@ fn handle_pi_message(
         let Some(id) = value.get("id").and_then(Value::as_str) else {
             return;
         };
-        let prompt_response = match pending.lock().get(id) {
-            Some(PendingResponse::Prompt { converted_steer }) => Some(converted_steer.clone()),
-            _ => None,
-        };
-        if let Some(converted_steer) = prompt_response {
-            let success = value.get("success").and_then(Value::as_bool) == Some(true);
-            // Pi answers a prompt with what became of it: `started` and
-            // `queued` mean the work is on its way and the run settles the
-            // turn, while `handled` means an extension command or an input
-            // handler consumed the prompt and no run will start for it, so the
-            // turn settles here. Oh My Pi says the last part in two steps — an
-            // acknowledgement, then a second response carrying
-            // `agentInvoked: false` — which keeps that field as one more
-            // locally-handled signal.
-            let handled_locally = value.pointer("/data/disposition").and_then(Value::as_str)
-                == Some("handled")
-                || value.pointer("/data/agentInvoked").and_then(Value::as_bool) == Some(false);
-            // A command that starts a run of its own — the shape an extension
-            // uses to wake the session — has already announced that run by the
-            // time this answer arrives, and the run settles its own turn.
-            // Settling here would end a turn the run is still writing into and
-            // then open a second one for the same work.
-            if success && (!handled_locally || state.run.is_live()) {
-                return;
-            }
-            pending.lock().remove(id);
-            // A prompt answer never opens a turn. A run announces itself with
-            // `agent_start`/`turn_start`, and the two answers that settle here
-            // — a refusal and a locally handled command — have no run behind
-            // them at all.
-            //
-            // A refusal is the delivery failure of the message that asked for
-            // the run: it never reached the conversation, so the provider's
-            // own reason travels with it — as the settlement's summary for an
-            // ordinary prompt, as the steer's rejection for a converted one —
-            // and that is what marks the message undelivered. Sending it as a
-            // transport error instead would have the client store it as an
-            // answer to a message the agent never saw.
-            let refusal_reason = || {
-                value
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        tr!(
-                            "errors.provider_rejected_prompt",
-                            provider = flavor.display_name()
-                        )
-                    })
-            };
-            if let Some(message) = converted_steer {
-                // The steer was already reported accepted when its prompt was
-                // written, so only a refusal is news: it says the provider
-                // never added the message to the conversation, and the app
-                // needs to hear it as that steer's rejection rather than as a
-                // settlement of a run the steer never joined.
-                if !success {
-                    let _ = events.send(DriverEvent::SteerRejected {
-                        message,
-                        reason: refusal_reason(),
-                    });
-                }
+        let state_response = {
+            let mut pending = pending.lock();
+            if matches!(
+                pending.get(id),
+                Some(PendingResponse::HandledPromptState { .. })
+            ) {
+                pending.remove(id)
             } else {
-                let _ = events.send(DriverEvent::TurnFinished {
-                    interrupted: false,
-                    success,
-                    summary: (!success).then(refusal_reason),
-                });
+                None
             }
-            // No run stands behind this answer — a refusal, or an extension
-            // command that consumed the prompt — so nothing is live until the
-            // provider announces a run of its own.
-            state.run.close();
-            state.reset();
+        };
+        if let Some(PendingResponse::HandledPromptState {
+            prompt_id,
+            response,
+        }) = state_response
+        {
+            handle_prompt_response(
+                flavor, &value, &prompt_id, pending, commands, events, state, true,
+            );
+            if state.handled_prompt.as_deref() == Some(&prompt_id) {
+                state.handled_prompt = None;
+            }
+            let _ = response.send(Ok(()));
+            return;
+        }
+        if matches!(pending.lock().get(id), Some(PendingResponse::Prompt { .. })) {
+            handle_prompt_response(flavor, &value, id, pending, commands, events, state, false);
             return;
         }
         let Some(PendingResponse::Request(response)) = pending.lock().remove(id) else {
@@ -1898,42 +2178,11 @@ fn handle_pi_message(
         if value.get("isTerminal").and_then(Value::as_bool) == Some(false) {
             return;
         }
-        if state.run.is_live() {
-            pending
-                .lock()
-                .retain(|_, response| matches!(response, PendingResponse::Request(_)));
-            // A settlement must not leave text parked in the provider's queue.
-            // Measured against pi 1.0.0: an aborted run settles without
-            // draining its queue, and pi does not run that message afterwards
-            // — it splices it into whatever the user sends next. So the queue
-            // is taken back and its text handed to the user, and the turn
-            // still settles here, once and at once.
-            let retracted = std::mem::take(&mut state.queued);
-            if !retracted.is_empty() {
-                let _ = commands.send(CommandMessage::RetractQueuedMessages);
-                let _ = events.send(DriverEvent::QueuedMessagesRetracted {
-                    messages: retracted,
-                });
-            }
-            let success = !state.failed;
-            let _ = events.send(DriverEvent::TurnFinished {
-                interrupted: false,
-                success,
-                summary: (!success).then(|| {
-                    tr!(
-                        "errors.provider_complete_turn",
-                        provider = flavor.display_name()
-                    )
-                }),
-            });
-        }
-        // The run is over, so a steering message has nothing left to join,
-        // and a dialog that was still unanswered belonged to it: the provider
-        // resolves an abandoned dialog on its own timeout, and that request is
-        // no longer answerable.
-        state.run.close();
-        state.dialogs.lock().clear();
-        state.reset();
+        // Pi 1.1+ reports startup and in-run aborts here. Older Pi omits
+        // the field; Oh My Pi keeps its own lifecycle contract.
+        let interrupted =
+            flavor == PiFlavor::Pi && value.get("aborted").and_then(Value::as_bool) == Some(true);
+        finish_pi_run(flavor, interrupted, pending, commands, events, state);
         return;
     }
 
@@ -2029,6 +2278,7 @@ fn handle_pi_message(
             }
         }
         "agent_start" | "turn_start" => {
+            state.starting_prompt = None;
             if !state.run.is_live() {
                 state.run.open();
                 state.failed = false;
@@ -2051,6 +2301,7 @@ fn handle_pi_message(
                         .filter(|delta| !delta.is_empty())
                     {
                         state.message_saw_text = true;
+                        state.retry_has_output_after = state.open_retry.is_some();
                         let _ = events.send(DriverEvent::TextDelta(delta.to_owned()));
                     }
                 }
@@ -2061,6 +2312,7 @@ fn handle_pi_message(
                         .filter(|delta| !delta.is_empty())
                     {
                         state.message_saw_reasoning = true;
+                        state.retry_has_output_after = state.open_retry.is_some();
                         let _ = events.send(DriverEvent::ReasoningDelta(delta.to_owned()));
                     }
                 }
@@ -2155,7 +2407,60 @@ fn handle_pi_message(
                 state.tools.remove(&id);
             }
         }
+        "auto_retry_start" => {
+            // Retry frames describe an existing run, never create one. A
+            // late start after settlement must not reopen its activity.
+            if !state.run.is_live() {
+                return;
+            }
+            // A retryable response can contain partial text or reasoning.
+            // Updating its earlier row would leave the current retry hidden
+            // behind that output. Finish the old activity where it occurred
+            // and begin a new one at the tail; adjacent attempts still upsert.
+            if state.retry_has_output_after {
+                state.finish_retry(events);
+            }
+            let id = if let Some(item) = state.open_retry.as_ref() {
+                item.source_id.clone()
+            } else {
+                // Activity lookup spans saved history, including earlier
+                // driver processes, so a local counter would reuse old rows.
+                Some(format!("pi-retry-{}", uuid::Uuid::new_v4()))
+            };
+            let mut title = tr!("activity.provider_retrying");
+            if let Some((attempt, maximum)) = value
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .zip(value.get("maxAttempts").and_then(Value::as_u64))
+            {
+                title.push_str(&format!(" ({attempt}/{maximum})"));
+            }
+            let mut item = activity::tool_activity(
+                id,
+                ActivityKind::Tool,
+                title,
+                None,
+                value.get("errorMessage"),
+                None,
+                false,
+                false,
+            );
+            // Both the native row and its collapsed live header use the
+            // title. An output-only cause would stay hidden in disclosure.
+            // Use the shared normalizer's bounded output, keeping multiline
+            // details there and the first nonempty line on the row.
+            if let Some(cause) = item
+                .output
+                .as_deref()
+                .and_then(|output| output.lines().map(str::trim).find(|line| !line.is_empty()))
+            {
+                item.title.push_str(&format!(" — {cause}"));
+            }
+            state.open_retry = Some(item.clone());
+            let _ = events.send(DriverEvent::RichActivity(item));
+        }
         "auto_retry_end" => {
+            state.finish_retry(events);
             if value.get("success").and_then(Value::as_bool) == Some(true) {
                 state.failed = false;
             } else {
@@ -2272,7 +2577,24 @@ fn handle_pi_message(
             }
         }
         "extension_error" => {
-            let _ = events.send(DriverEvent::Error(pi_error_message(flavor, &value)));
+            let error = pi_error_message(flavor, &value);
+            let _ = events.send(DriverEvent::Error(error.clone()));
+            if flavor == PiFlavor::Pi
+                && value.get("event").and_then(Value::as_str) == Some("send_message")
+            {
+                if let Some(prompt_id) = state.starting_prompt.as_ref() {
+                    let _ = commands.send(CommandMessage::CheckHandledPrompt(prompt_id.clone()));
+                } else if !state.run.is_live()
+                    && let Some(prompt_id) = state.handled_prompt.as_ref()
+                    && let Some(PendingResponse::Prompt { startup_error, .. }) =
+                        pending.lock().get_mut(prompt_id)
+                {
+                    // Pi's runtime error has no request ID. Attribute it only
+                    // to the acknowledged command awaiting this observation,
+                    // never whichever newer submission happens to be pending.
+                    *startup_error = Some(error);
+                }
+            }
         }
         _ => {}
     }
@@ -2738,6 +3060,7 @@ fn emit_completed_message_fallback(
                     .filter(|text| !text.is_empty())
                 {
                     state.message_saw_text = true;
+                    state.retry_has_output_after = state.open_retry.is_some();
                     let _ = events.send(DriverEvent::TextDelta(text.to_owned()));
                 }
             }
@@ -2748,6 +3071,7 @@ fn emit_completed_message_fallback(
                     .filter(|thinking| !thinking.is_empty())
                 {
                     state.message_saw_reasoning = true;
+                    state.retry_has_output_after = state.open_retry.is_some();
                     let _ = events.send(DriverEvent::ReasoningDelta(thinking.to_owned()));
                 }
             }
@@ -2788,10 +3112,440 @@ fn tool_title(name: &str) -> String {
     }
 }
 
+#[cfg(all(test, unix))]
+mod compatibility_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossbeam_channel::TryRecvError;
+
+    #[test]
+    fn pi_settlement_preserves_aborts_and_legacy_frames() {
+        for (flavor, settlement, interrupted) in [
+            (
+                PiFlavor::Pi,
+                json!({"type": "agent_settled", "aborted": true}),
+                true,
+            ),
+            (
+                PiFlavor::Pi,
+                json!({"type": "agent_settled", "aborted": false}),
+                false,
+            ),
+            (PiFlavor::Pi, json!({"type": "agent_settled"}), false),
+            (
+                PiFlavor::OhMyPi,
+                json!({"type": "agent_end", "aborted": true}),
+                false,
+            ),
+        ] {
+            let (pending, commands, _command_rx, mut state) = harness();
+            let (events, event_rx) = unbounded();
+            for frame in [
+                json!({"type": "agent_start"}),
+                settlement.clone(),
+                settlement,
+            ] {
+                handle_pi_message(flavor, frame, &pending, &commands, &events, &mut state);
+            }
+            assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+            assert!(matches!(
+                event_rx.recv().unwrap(),
+                DriverEvent::TurnFinished { interrupted: actual, success: true, .. }
+                    if actual == interrupted
+            ));
+            assert!(event_rx.try_recv().is_err(), "a run settles only once");
+            assert!(!state.run.is_live());
+        }
+    }
+
+    /// Installs the same pending state request as the writer, without a
+    /// process. Each test controls when the provider answers it.
+    fn handled_state_request(pending: &PendingResponses, prompt_id: &str) {
+        let (response, _receiver) = bounded(1);
+        pending.lock().insert(
+            "state-check".into(),
+            PendingResponse::HandledPromptState {
+                prompt_id: prompt_id.into(),
+                response,
+            },
+        );
+    }
+
+    #[test]
+    fn pi_late_handled_state_reply_survives_the_writer_timeout() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let mut next = 0;
+        send_prompt(&mut Vec::new(), &pending, &mut next, "/command").unwrap();
+        let mut wire = Vec::new();
+        assert!(
+            check_handled_prompt(&mut wire, &pending, &mut next, "waku-1", Duration::ZERO).is_err()
+        );
+        assert_eq!(
+            wire_lines(&wire),
+            [json!({"id": "waku-2", "type": "get_state"})]
+        );
+        assert_eq!(
+            pending.lock().len(),
+            2,
+            "timeout retains reader correlation"
+        );
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-2", "success": true, "data": {"isStreaming": false}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn pi_state_waiter_is_released_after_the_reader_publishes_liveness() {
+        struct ObserveAck(crossbeam_channel::Receiver<Result<(), String>>);
+        impl DriverEventSink for ObserveAck {
+            fn send(
+                &self,
+                event: DriverEvent,
+            ) -> Result<(), crossbeam_channel::SendError<DriverEvent>> {
+                assert!(matches!(event, DriverEvent::TurnStarted));
+                assert!(
+                    self.0.try_recv().is_err(),
+                    "the writer must still be waiting"
+                );
+                Ok(())
+            }
+        }
+        let (pending, commands, _command_rx, mut state) = harness();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "/command").unwrap();
+        let (response, receiver) = bounded(1);
+        pending.lock().insert(
+            "state-check".into(),
+            PendingResponse::HandledPromptState {
+                prompt_id: "waku-1".into(),
+                response,
+            },
+        );
+        let observer = ObserveAck(receiver);
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "state-check", "success": true, "data": {"isStreaming": true}}),
+            &pending,
+            &commands,
+            &observer,
+            &mut state,
+        );
+        assert_eq!(observer.0.try_recv().unwrap(), Ok(()));
+        assert!(state.run.is_live());
+    }
+
+    #[test]
+    fn pi_custom_startup_stays_open_until_its_aborted_settlement() {
+        let (pending, commands, command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "/custom-wake").unwrap();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "waku-1", "success": true, "data": {"disposition": "handled"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(
+            matches!(command_rx.recv().unwrap(), CommandMessage::CheckHandledPrompt(id) if id == "waku-1")
+        );
+        assert!(event_rx.try_recv().is_err(), "handled does not prove idle");
+        handled_state_request(&pending, "waku-1");
+        for frame in [
+            json!({"type": "response", "id": "state-check", "success": true, "data": {"isStreaming": true}}),
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "agent_settled", "aborted": true}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished {
+                interrupted: true,
+                ..
+            }
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "one custom run stays in one turn"
+        );
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn pi_handled_state_cannot_settle_a_newer_prompt_or_an_already_settled_run() {
+        for newer_prompt in [false, true] {
+            let (pending, commands, _command_rx, mut state) = harness();
+            let (events, event_rx) = unbounded();
+            let mut next = 0;
+            send_prompt(&mut Vec::new(), &pending, &mut next, "/old-command").unwrap();
+            handled_state_request(&pending, "waku-1");
+            if newer_prompt {
+                send_prompt(&mut Vec::new(), &pending, &mut next, "new submission").unwrap();
+            } else {
+                handle_pi_message(
+                    PiFlavor::Pi,
+                    json!({"type": "agent_start"}),
+                    &pending,
+                    &commands,
+                    &events,
+                    &mut state,
+                );
+                assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+                handle_pi_message(
+                    PiFlavor::Pi,
+                    json!({"type": "agent_settled", "aborted": true}),
+                    &pending,
+                    &commands,
+                    &events,
+                    &mut state,
+                );
+                assert!(matches!(
+                    event_rx.recv().unwrap(),
+                    DriverEvent::TurnFinished {
+                        interrupted: true,
+                        ..
+                    }
+                ));
+            }
+            for busy in [false, true] {
+                handled_state_request(&pending, "waku-1");
+                handle_pi_message(
+                    PiFlavor::Pi,
+                    json!({"type": "response", "id": "state-check", "success": true, "data": {"isStreaming": busy}}),
+                    &pending,
+                    &commands,
+                    &events,
+                    &mut state,
+                );
+            }
+            assert!(
+                event_rx.try_recv().is_err(),
+                "stale checks own no completion"
+            );
+            assert!(!state.run.is_live());
+            assert_eq!(pending.lock().len(), usize::from(newer_prompt));
+        }
+    }
+
+    #[test]
+    fn pi_failed_custom_preparation_rechecks_idle_without_waiting_for_settlement() {
+        let (pending, commands, command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "/custom-wake").unwrap();
+        handled_state_request(&pending, "waku-1");
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "state-check", "success": true, "data": {"isStreaming": true}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        send_prompt(&mut Vec::new(), &pending, &mut 1, "next message").unwrap();
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "queue_update", "steering": [], "followUp": ["next message"]}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::ProviderQueue { .. }
+        ));
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "extension_error", "event": "send_message", "error": "invalid prompt section"}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::Error(_)));
+        assert!(
+            matches!(command_rx.recv().unwrap(), CommandMessage::CheckHandledPrompt(id) if id == "waku-1")
+        );
+        handled_state_request(&pending, "waku-1");
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "state-check", "success": true, "data": {"isStreaming": false}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(
+            matches!(event_rx.recv().unwrap(), DriverEvent::QueuedMessagesRetracted { messages }
+            if messages == ["next message"])
+        );
+        assert!(matches!(
+            command_rx.recv().unwrap(),
+            CommandMessage::RetractQueuedMessages
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: false, .. }
+        ));
+        assert!(!state.run.is_live());
+        assert!(state.starting_prompt.is_none());
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn pi_handled_state_refusal_cannot_falsely_finish_a_run() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        send_prompt(&mut Vec::new(), &pending, &mut 0, "/command").unwrap();
+        handled_state_request(&pending, "waku-1");
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "state-check", "success": false, "error": "state unavailable"}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(
+            matches!(event_rx.recv().unwrap(), DriverEvent::Error(reason) if reason == "state unavailable")
+        );
+        assert!(pending.lock().contains_key("waku-1"));
+        assert!(!state.run.is_live());
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({"type": "agent_settled", "aborted": true}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                frame,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished {
+                interrupted: true,
+                ..
+            }
+        ));
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn pi_fast_startup_error_survives_handled_idle_but_ordinary_hook_errors_do_not() {
+        for error_event in ["send_message", "before_agent_start"] {
+            let (pending, commands, command_rx, mut state) = harness();
+            let (events, event_rx) = unbounded();
+            send_prompt(&mut Vec::new(), &pending, &mut 0, "/custom-wake").unwrap();
+            for frame in [
+                json!({"type": "response", "id": "waku-1", "success": true, "data": {"disposition": "handled"}}),
+                json!({"type": "extension_error", "event": error_event, "error": "invalid section"}),
+            ] {
+                handle_pi_message(
+                    PiFlavor::Pi,
+                    frame,
+                    &pending,
+                    &commands,
+                    &events,
+                    &mut state,
+                );
+            }
+            assert!(matches!(event_rx.recv().unwrap(), DriverEvent::Error(_)));
+            assert!(matches!(
+                command_rx.recv().unwrap(),
+                CommandMessage::CheckHandledPrompt(_)
+            ));
+            handled_state_request(&pending, "waku-1");
+            handle_pi_message(
+                PiFlavor::Pi,
+                json!({"type": "response", "id": "state-check", "success": true, "data": {"isStreaming": false}}),
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+            assert!(
+                matches!(event_rx.recv().unwrap(), DriverEvent::TurnFinished { success, .. }
+                if success == (error_event != "send_message"))
+            );
+            assert!(pending.lock().is_empty());
+            assert!(!state.run.is_live());
+        }
+    }
+
+    #[test]
+    fn pi_superseded_custom_error_cannot_fail_a_newer_handled_command() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let mut next = 0;
+        for text in ["/old-wake", "/new-command"] {
+            send_prompt(&mut Vec::new(), &pending, &mut next, text).unwrap();
+            handle_pi_message(
+                PiFlavor::Pi,
+                json!({"type": "response", "id": format!("waku-{next}"), "success": true, "data": {"disposition": "handled"}}),
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert_eq!(state.handled_prompt.as_deref(), Some("waku-1"));
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "extension_error", "event": "send_message", "error": "old startup failed"}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::Error(_)));
+        for prompt_id in ["waku-1", "waku-2"] {
+            handled_state_request(&pending, prompt_id);
+            handle_pi_message(
+                PiFlavor::Pi,
+                json!({"type": "response", "id": "state-check", "success": true, "data": {"isStreaming": false}}),
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(event_rx.try_recv().is_err());
+        assert!(pending.lock().is_empty());
+        assert!(state.handled_prompt.is_none());
+    }
 
     #[test]
     fn live_command_updates_reach_the_composer_and_clear_removed_commands() {
@@ -2902,6 +3656,22 @@ mod tests {
         handle_pi_message(
             PiFlavor::Pi,
             json!({"type": "response", "id": "waku-1", "command": "prompt", "success": true, "data": {"disposition": "handled"}}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        let (response, _receiver) = bounded(1);
+        pending.lock().insert(
+            "state-1".into(),
+            PendingResponse::HandledPromptState {
+                prompt_id: "waku-1".into(),
+                response,
+            },
+        );
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "response", "id": "state-1", "success": true, "data": {"isStreaming": false}}),
             &pending,
             &commands,
             &events,
@@ -3641,6 +4411,7 @@ mod tests {
                 flavor: PiFlavor::Pi,
                 commands: commands.clone(),
                 computer_use: None,
+                _automation_repl: None,
                 dialogs: dialogs.clone(),
             };
             Self {
@@ -4512,6 +5283,7 @@ mod tests {
             flavor: PiFlavor::Pi,
             commands,
             computer_use: None,
+            _automation_repl: None,
             dialogs: PiDialogs::default(),
         };
         let options = |mode| SessionOptions {
@@ -4531,6 +5303,43 @@ mod tests {
         // Pi has no permission setter and only runs with Full access.
         assert!(!driver.apply_options(options(RuntimeMode::Ask)));
         assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn automation_repl_pi_configuration_does_not_enable_computer_use() {
+        let config = super::super::automation_repl::AutomationReplConfig {
+            repl_path: "/fixture/waku_js_repl".into(),
+            env_file: std::env::temp_dir().join("nonexistent-rpa-pi-fixture/endpoint.json"),
+        };
+        let mut command = std::process::Command::new("pi");
+        configure_pi_computer_use_command(&mut command, None);
+        configure_pi_automation_repl_command(
+            &mut command,
+            Some(&config),
+            Some(Path::new("/fixture/pi-extension.ts")),
+            false,
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["--extension", "/fixture/pi-extension.ts"]);
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(env.len(), 2);
+        assert!(env.contains_key("WAKU_JS_REPL_SERVER"));
+        assert!(env.contains_key("WAKU_RPA_REPL_ENV_FILE"));
+        assert!(
+            !env.keys()
+                .any(|key| key.starts_with("WAKU_COMPUTER_USE") || key.contains("TOKEN"))
+        );
     }
 
     #[test]
@@ -5077,6 +5886,352 @@ mod tests {
             event_rx.recv().unwrap(),
             DriverEvent::TurnFinished { success: true, .. }
         ));
+    }
+
+    #[test]
+    fn automatic_retry_start_reports_attempt_and_cause() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for value in [
+            json!({"type": "agent_start"}),
+            json!({
+                "type": "auto_retry_start",
+                "attempt": 2,
+                "maxAttempts": 3,
+                "delayMs": 4000,
+                "errorMessage": "ai: system cpu overloaded"
+            }),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                value,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::TurnStarted
+        ));
+        let DriverEvent::RichActivity(retry) = event_rx
+            .try_recv()
+            .expect("a retry start must immediately report visible activity")
+        else {
+            panic!("expected a retry activity");
+        };
+        assert!(retry.title.contains("(2/3)"));
+        assert!(retry.title.contains("ai: system cpu overloaded"));
+        assert!(!retry.complete);
+        assert!(!retry.failed);
+        assert!(
+            event_rx.is_empty(),
+            "retry control frames are not transcript text"
+        );
+    }
+
+    #[test]
+    fn automatic_retry_attempts_update_one_row_and_end_before_settlement() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        // Both pinned Pi 1.0.4 and 1.2 emit retry starts before backoff,
+        // then the successful message_end before auto_retry_end. The end
+        // need not coincide with settlement: a run can continue with tools.
+        for value in [
+            json!({"type": "agent_start"}),
+            json!({"type": "message_update", "assistantMessageEvent": {
+                "type": "error", "error": "temporary"
+            }}),
+            json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3,
+                "delayMs": 2000, "errorMessage": "connection lost"}),
+            json!({"type": "auto_retry_start", "attempt": 2, "maxAttempts": 3,
+                "delayMs": 4000, "errorMessage": "system cpu overloaded"}),
+            json!({"type": "message_end", "message": {"role": "assistant",
+                "stopReason": "stop", "content": [{"type": "text", "text": "Recovered"}]}}),
+            json!({"type": "auto_retry_end", "success": true, "attempt": 2}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                value,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+        let emitted: Vec<_> = event_rx.try_iter().collect();
+        let activities: Vec<_> = emitted
+            .iter()
+            .filter_map(|event| match event {
+                DriverEvent::RichActivity(item) => Some(item),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(activities.len(), 3);
+        assert!(
+            activities
+                .iter()
+                .all(|item| item.source_id == activities[0].source_id)
+        );
+        assert!(activities[0].title.contains("(1/3) — connection lost"));
+        assert!(
+            activities[1]
+                .title
+                .contains("(2/3) — system cpu overloaded")
+        );
+        assert!(!activities[0].complete && !activities[1].complete);
+        assert!(activities[2].complete);
+        assert_eq!(activities[2].title, tr!("activity.provider_retry_finished"));
+        assert_eq!(
+            activities[2].output.as_deref(),
+            Some("system cpu overloaded")
+        );
+        assert!(matches!(&emitted[4], DriverEvent::TextDelta(text) if text == "Recovered"));
+        assert!(matches!(&emitted[5], DriverEvent::RichActivity(item) if item.complete));
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, DriverEvent::TurnFinished { .. }))
+        );
+        assert!(state.run.is_live() && !state.failed && state.open_retry.is_none());
+        handle_pi_message(
+            PiFlavor::Pi,
+            json!({"type": "agent_settled"}),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(event_rx.is_empty());
+    }
+
+    #[test]
+    fn automatic_retry_settlement_exhaustion_and_abort_close_the_row() {
+        for flavor in [PiFlavor::Pi, PiFlavor::OhMyPi] {
+            for (final_error, aborted) in [
+                (None, false),
+                (None, true),
+                (Some("ai: 502 Bad Gateway"), false),
+                (Some("Retry cancelled"), true),
+            ] {
+                let (pending, commands, _command_rx, mut state) = harness();
+                let (events, event_rx) = unbounded();
+                let mut frames = vec![
+                    json!({"type": "agent_start"}),
+                    json!({"type": "auto_retry_start", "attempt": 3, "maxAttempts": 3,
+                        "delayMs": 8000, "errorMessage": "ai: 502 Bad Gateway"}),
+                ];
+                if let Some(error) = final_error {
+                    frames.push(json!({"type": "auto_retry_end", "success": false,
+                        "attempt": 3, "finalError": error}));
+                }
+                frames.push(json!({"type": flavor.settled_event(), "aborted": aborted}));
+                for frame in frames {
+                    handle_pi_message(flavor, frame, &pending, &commands, &events, &mut state);
+                }
+                let emitted: Vec<_> = event_rx.try_iter().collect();
+                let activities: Vec<_> = emitted
+                    .iter()
+                    .filter_map(|event| match event {
+                        DriverEvent::RichActivity(item) => Some(item),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(activities.len(), 2);
+                assert_eq!(activities[0].source_id, activities[1].source_id);
+                assert!(!activities[0].complete && activities[1].complete);
+                assert_eq!(activities[1].title, tr!("activity.provider_retry_finished"));
+                assert!(
+                    matches!(emitted.last(), Some(DriverEvent::TurnFinished { success, interrupted, .. })
+                    if *success == final_error.is_none() && *interrupted == (aborted && flavor == PiFlavor::Pi))
+                );
+                assert!(!state.run.is_live() && state.open_retry.is_none());
+                assert!(
+                    !emitted
+                        .iter()
+                        .any(|event| matches!(event, DriverEvent::TextDelta(_)))
+                );
+                // A late retry start cannot reopen a settled run.
+                for frame in [
+                    json!({"type": "auto_retry_start", "attempt": 3, "maxAttempts": 3,
+                        "errorMessage": "late start"}),
+                    json!({"type": flavor.settled_event()}),
+                ] {
+                    handle_pi_message(flavor, frame, &pending, &commands, &events, &mut state);
+                }
+                assert!(event_rx.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_retry_after_partial_output_starts_a_new_tail_activity() {
+        for thinking in [false, true] {
+            for streamed in [false, true] {
+                let (pending, commands, _command_rx, mut state) = harness();
+                let (events, event_rx) = unbounded();
+                let mut frames = vec![
+                    json!({"type": "agent_start"}),
+                    json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3,
+                        "delayMs": 2000, "errorMessage": "connection lost"}),
+                    json!({"type": "message_start", "message": {"role": "assistant"}}),
+                ];
+                if streamed {
+                    frames.push(json!({"type": "message_update", "assistantMessageEvent": {
+                        "type": if thinking { "thinking_delta" } else { "text_delta" },
+                        "delta": "Partial output"
+                    }}));
+                }
+                let content = if thinking {
+                    json!({"type": "thinking", "thinking": "Partial output"})
+                } else {
+                    json!({"type": "text", "text": "Partial output"})
+                };
+                frames.extend([
+                    json!({"type": "message_end", "message": {"role": "assistant",
+                        "stopReason": "error", "errorMessage": "temporary", "content": [content]}}),
+                    json!({"type": "auto_retry_start", "attempt": 2, "maxAttempts": 3,
+                        "delayMs": 4000, "errorMessage": "system cpu overloaded"}),
+                    // Repeated starts without more content update the new tail row.
+                    json!({"type": "auto_retry_start", "attempt": 3, "maxAttempts": 3,
+                        "delayMs": 8000, "errorMessage": "502 Bad Gateway"}),
+                ]);
+                for frame in frames {
+                    handle_pi_message(
+                        PiFlavor::Pi,
+                        frame,
+                        &pending,
+                        &commands,
+                        &events,
+                        &mut state,
+                    );
+                }
+                let emitted: Vec<_> = event_rx.try_iter().collect();
+                assert_eq!(
+                    emitted.len(),
+                    6,
+                    "fallback must not duplicate streamed output"
+                );
+                assert!(
+                    matches!(&emitted[2], DriverEvent::TextDelta(text) | DriverEvent::ReasoningDelta(text)
+                    if text == "Partial output")
+                );
+                let activities: Vec<_> = emitted
+                    .iter()
+                    .filter_map(|event| match event {
+                        DriverEvent::RichActivity(item) => Some(item),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(activities.len(), 4);
+                assert_eq!(activities[0].source_id, activities[1].source_id);
+                assert!(activities[1].complete);
+                assert_ne!(activities[1].source_id, activities[2].source_id);
+                assert_eq!(activities[2].source_id, activities[3].source_id);
+                assert!(
+                    activities[2]
+                        .title
+                        .contains("(2/3) — system cpu overloaded")
+                );
+                assert!(!activities[2].complete && !activities[3].complete);
+                assert!(!state.retry_has_output_after);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_retry_cycles_do_not_reuse_saved_activity_ids() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let mut ids = HashSet::new();
+        for cycle in 0..4 {
+            if cycle == 3 {
+                state = PiStreamState::default(); // Reattached driver, same saved transcript.
+            }
+            for frame in [
+                json!({"type": "agent_start"}),
+                json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3,
+                    "errorMessage": "temporary"}),
+                json!({"type": "auto_retry_end", "success": true, "attempt": 1}),
+            ] {
+                handle_pi_message(
+                    PiFlavor::Pi,
+                    frame,
+                    &pending,
+                    &commands,
+                    &events,
+                    &mut state,
+                );
+            }
+            let activities: Vec<_> = event_rx
+                .try_iter()
+                .filter_map(|event| match event {
+                    DriverEvent::RichActivity(item) => Some(item),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(activities.len(), 2);
+            assert_eq!(activities[0].source_id, activities[1].source_id);
+            assert!(ids.insert(activities[0].source_id.clone().unwrap()));
+            // First two cycles share a run; the next starts after reset.
+            if cycle > 0 {
+                handle_pi_message(
+                    PiFlavor::Pi,
+                    json!({"type": "agent_settled"}),
+                    &pending,
+                    &commands,
+                    &events,
+                    &mut state,
+                );
+                event_rx.try_iter().for_each(drop);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_retry_normalizes_detail_without_requiring_optional_fields() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        let frame = json!({"type": "auto_retry_start", "errorMessage":
+            format!("\n  Temporary overload  \n{}", "x".repeat(20_000))});
+        handle_pi_message(
+            PiFlavor::Pi,
+            frame.clone(),
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        assert!(event_rx.is_empty(), "a retry cannot start a run");
+        state.run.open();
+        handle_pi_message(
+            PiFlavor::Pi,
+            frame,
+            &pending,
+            &commands,
+            &events,
+            &mut state,
+        );
+        let DriverEvent::RichActivity(item) = event_rx.try_recv().unwrap() else {
+            panic!("expected a retry activity");
+        };
+        assert_eq!(
+            item.title,
+            format!("{} — Temporary overload", tr!("activity.provider_retrying"))
+        );
+        assert!(item.output.as_ref().unwrap().chars().count() < 16_100);
+        assert!(
+            item.output
+                .as_ref()
+                .unwrap()
+                .ends_with(&tr!("activity.output_truncated"))
+        );
     }
 
     #[test]

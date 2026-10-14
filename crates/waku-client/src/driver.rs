@@ -122,6 +122,15 @@ impl DriverHandle {
     pub fn close(&self) {
         self.inner.close();
     }
+
+    /// Blocking, bounded shutdown acknowledgment. Run off the UI thread.
+    pub fn close_and_wait(&self) -> anyhow::Result<()> {
+        self.inner.close_and_wait()
+    }
+
+    pub fn same_runtime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 pub trait DriverControl: Send + Sync {
@@ -158,6 +167,9 @@ pub trait DriverControl: Send + Sync {
         anyhow::bail!("conversation forking is not supported by this provider transport")
     }
     fn close(&self) {}
+    fn close_and_wait(&self) -> anyhow::Result<()> {
+        anyhow::bail!("this transport cannot confirm runtime shutdown")
+    }
 }
 
 pub struct DriverStartOptions {

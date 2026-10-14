@@ -131,6 +131,7 @@ impl BackgroundRpcState {
 }
 
 pub struct CodexDriver {
+    _automation_repl: Option<Arc<super::automation_repl::AutomationReplConfig>>,
     commands: Sender<CommandMessage>,
     binary: PathBuf,
     cwd: PathBuf,
@@ -209,6 +210,29 @@ fn configure_computer_use_command(command: &mut Command, config: Option<&CodexCo
     }
 }
 
+fn configure_automation_repl_command(
+    command: &mut Command,
+    config: Option<&super::automation_repl::AutomationReplConfig>,
+    computer_use: bool,
+) {
+    let Some(config) = config else { return };
+    if !computer_use {
+        command
+            .arg("-c")
+            .arg(format!(
+                "mcp_servers.waku_js_repl.command={}",
+                toml_string(&config.repl_path.display().to_string())
+            ))
+            .arg("-c")
+            .arg("mcp_servers.waku_js_repl.args=[]");
+    }
+    command.arg("-c").arg(format!(
+        "mcp_servers.waku_js_repl.env.{}={}",
+        super::automation_repl::ENV_FILE,
+        toml_string(&config.env_file.display().to_string())
+    ));
+}
+
 impl CodexDriver {
     pub fn start(options: DriverStartOptions, events: DriverEventSender) -> anyhow::Result<Self> {
         let DriverStartOptions {
@@ -250,6 +274,12 @@ impl CodexDriver {
         let mut command = crate::command_env::command(&binary);
         command.args(["app-server", "--stdio"]);
         configure_computer_use_command(&mut command, computer_use.as_ref());
+        let automation_repl = super::automation_repl::AutomationReplConfig::load()?;
+        configure_automation_repl_command(
+            &mut command,
+            automation_repl.as_deref(),
+            computer_use.is_some(),
+        );
         let command = command
             .current_dir(&cwd)
             .stdin(Stdio::piped())
@@ -825,13 +855,14 @@ impl CodexDriver {
         let stderr_thread = thread::Builder::new()
             .name("waku-codex-stderr".into())
             .spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let error_events = stderr_events.clone();
+                super::support::read_stderr_lines(stderr, &stderr_events, move |line| {
                     if is_visible_stderr_notice(&line) {
                         let error = clean_stderr(&line);
                         *stderr_last_error.lock() = Some(error.clone());
-                        let _ = stderr_events.send(DriverEvent::Error(error));
+                        let _ = error_events.send(DriverEvent::Error(error));
                     }
-                }
+                });
             })?;
 
         thread::Builder::new()
@@ -868,6 +899,7 @@ impl CodexDriver {
             computer_use_process_directory,
             computer_use_server_path,
             computer_use_preview_monitor,
+            _automation_repl: automation_repl,
         })
     }
 }
@@ -2977,6 +3009,7 @@ mod tests {
             computer_use_process_directory: None,
             computer_use_server_path: None,
             computer_use_preview_monitor: None,
+            _automation_repl: None,
         };
 
         assert!(driver.apply_options(session_options(RuntimeMode::FullAccess, "gpt-5-codex")));
@@ -3002,6 +3035,33 @@ mod tests {
         assert!(is_visible_stderr_notice(
             "Error: error loading default config after config error: invalid transport"
         ));
+    }
+
+    #[test]
+    fn automation_repl_codex_configuration_does_not_enable_computer_use() {
+        let config = super::super::automation_repl::AutomationReplConfig {
+            repl_path: "/fixture/waku_js_repl".into(),
+            env_file: std::env::temp_dir().join("nonexistent-rpa-codex-fixture/endpoint.json"),
+        };
+        let mut command = Command::new("codex");
+        configure_computer_use_command(&mut command, None);
+        configure_automation_repl_command(&mut command, Some(&config), false);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.iter()
+                .any(|arg| arg.contains("mcp_servers.waku_js_repl.command"))
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.contains("WAKU_RPA_REPL_ENV_FILE"))
+        );
+        assert!(!args.iter().any(|arg| arg.contains("TOKEN")
+            || arg.contains("WAKU_COMPUTER_USE")
+            || arg.contains("skill")));
+        assert!(command.get_envs().next().is_none());
     }
 
     #[test]
