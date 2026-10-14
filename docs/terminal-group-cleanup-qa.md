@@ -1,5 +1,11 @@
 # Terminal-owned process-group cleanup
 
+Candidate-branch note: the implementation/verification below records the PR95
+baseline. The separate [teardown-order diagnostic](terminal-drop-diagnostic.md)
+now has a native captured child-wait stack and tests keeping the output reader
+alive through explicit PTY destruction/reaping. That candidate is not yet a
+verified production fix; the original ownership guarantees remain unchanged.
+
 This is a narrow follow-up to [#44](https://github.com/Plintash/doki/issues/44),
 not a claim that its macOS PTY-destructor stall is resolved.
 
@@ -28,8 +34,10 @@ its producers are being stopped.
 - Drop sends SIGHUP to the original shell group, gives the direct shell the
   existing 250 ms grace, then SIGKILLs remaining group members even if the
   shell has already exited
-- The reader keeps draining during this phase, then is stopped and joined;
-  Alacritty's final destructor reaps the direct child
+- In the PR95 baseline, the reader drains during signaling, then stops/joins
+  before Alacritty's final destructor reaps the direct child. The isolated
+  candidate instead explicitly destroys/reaps the PTY before stopping/joining
+  its reader; see the diagnostic above for captured evidence and limits
 
 A naturally exited shell intentionally remains waitable until the terminal
 owner closes. This retains its exit status/PID (a zombie, not a running shell),

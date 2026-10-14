@@ -163,7 +163,9 @@ mod platform {
     }
 
     pub struct DaemonTerminal {
-        pty: Mutex<tty::Pty>,
+        // Taken only by Drop, so the child can be reaped before its reader
+        // is stopped. Ordinary methods always observe Some while &self lives.
+        pty: Mutex<Option<tty::Pty>>,
         stopped: Arc<AtomicBool>,
         retained: Arc<Mutex<RetainedOutput>>,
         /// The last size applied to the PTY, so an attach can report the grid
@@ -251,7 +253,7 @@ mod platform {
                 .with_context(|| format!("spawn terminal in {}", cwd.display()))?;
             let mut output = pty.file().try_clone().context("clone terminal output")?;
             let child_pid = pty.child().id() as libc::pid_t;
-            let pty = Mutex::new(pty);
+            let pty = Mutex::new(Some(pty));
             let stopped = Arc::new(AtomicBool::new(false));
             let retained = Arc::new(Mutex::new(RetainedOutput::new(retained_bytes)));
             let reader_stopped = stopped.clone();
@@ -365,6 +367,7 @@ mod platform {
                 return Ok(());
             }
             let mut pty = self.pty.lock();
+            let pty = pty.as_mut().context("terminal PTY already closed")?;
             pty.writer()
                 .write_all(&data)
                 .context("write terminal input")?;
@@ -373,24 +376,36 @@ mod platform {
 
         pub fn resize(&self, cols: u16, rows: u16) {
             *self.size.lock() = normalized_size(cols, rows);
-            self.pty.lock().on_resize(window_size(cols, rows));
+            if let Some(pty) = self.pty.lock().as_mut() {
+                pty.on_resize(window_size(cols, rows));
+            }
         }
     }
 
     impl Drop for DaemonTerminal {
         fn drop(&mut self) {
-            // Keep draining while the group is terminating: stopping output
-            // first can leave pipeline children blocked on a full PTY.
+            // Keep draining through the child's final wait, not just signal
+            // delivery. A killed macOS session leader can still need its
+            // queued terminal output drained before it finishes exiting.
             #[cfg(test)]
             self.teardown_trace.record("DaemonTerminal::drop entered");
-            terminate_shell_group(
-                self.pty.get_mut(),
+            if let Some(pty) = self.pty.get_mut().take() {
+                terminate_shell_group(
+                    &pty,
+                    #[cfg(test)]
+                    &self.teardown_trace,
+                );
                 #[cfg(test)]
-                &self.teardown_trace,
-            );
-            #[cfg(test)]
-            self.teardown_trace
-                .record("group termination returned; stopping reader");
+                self.teardown_trace
+                    .record("owned Pty destructor entered; reader stop not requested");
+                // Pty::drop reaps its direct child before closing its master.
+                // Taking the owner guarantees this is the only Pty destructor
+                // and keeps the original PGID pinned until signaling is done.
+                drop(pty);
+                #[cfg(test)]
+                self.teardown_trace
+                    .record("owned Pty destructor returned; stopping reader");
+            }
             self.stopped.store(true, Ordering::Release);
             if let Some(reader) = self.reader.take() {
                 #[cfg(test)]
@@ -404,7 +419,7 @@ mod platform {
             }
             #[cfg(test)]
             self.teardown_trace
-                .record("drop body returning; implicit Pty destructor next");
+                .record("drop body returning; owned Pty already destroyed");
         }
     }
 

@@ -2,7 +2,7 @@ name: Terminal drop diagnosis
 
 on:
   push:
-    branches: [diagnostic/terminal-drop-phases]
+    branches: [diagnostic/terminal-drop-drain-order]
 
 permissions:
   contents: read
