@@ -376,6 +376,19 @@ impl DriverControl for RemoteDriverControl {
     fn close(&self) {
         self.notify(waku_client::Command::CloseSession);
     }
+
+    fn close_and_wait(&self) -> anyhow::Result<()> {
+        let client = self.client.lock().clone();
+        match client.request_with_timeout(
+            self.session_id,
+            self.runtime_id,
+            waku_client::Command::CloseSessionAndWait,
+            std::time::Duration::from_secs(15),
+        )? {
+            waku_client::ResponsePayload::Ack => Ok(()),
+            _ => anyhow::bail!("Waku daemon returned an invalid shutdown acknowledgment"),
+        }
+    }
 }
 
 impl Drop for RemoteDriverControl {

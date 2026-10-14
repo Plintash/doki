@@ -490,11 +490,8 @@ impl ClaudeDriver {
         let stderr_thread = thread::Builder::new()
             .name("waku-claude-stderr".into())
             .spawn(move || {
-                let lines = BufReader::new(stderr)
-                    .lines()
-                    .map_while(Result::ok)
-                    .filter(|line| !line.trim().is_empty())
-                    .collect::<Vec<_>>();
+                let mut lines = Vec::new();
+                super::support::read_stderr_lines(stderr, &stderr_events, |line| lines.push(line));
                 if let Some(message) = super::support::provider_stderr_error(lines) {
                     let error = format!("Claude Code: {message}");
                     *stderr_last_error.lock() = Some(error.clone());

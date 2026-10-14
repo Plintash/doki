@@ -29,6 +29,34 @@
       "when": 1789720053549,
       "tag": "0003_amazing_paibok",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1791778481284,
+      "tag": "0004_broad_yellowjacket",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1791914400000,
+      "tag": "0005_issue_details",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1791916920000,
+      "tag": "0006_session_workspace",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1791918081807,
+      "tag": "0007_planned_issue_worktree",
+      "breakpoints": true
     }
   ]
 }

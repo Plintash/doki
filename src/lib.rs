@@ -33,6 +33,7 @@ mod assets;
 mod browser;
 mod computer_use;
 pub mod daemon;
+mod diagnostics;
 mod driver;
 mod input;
 mod instance;
@@ -42,6 +43,7 @@ mod md;
 mod platform;
 mod query;
 mod review_diff;
+mod rpa;
 mod startup_trace;
 mod terminal;
 mod theme;
@@ -67,6 +69,7 @@ actions!(
         About,
         CloseWindow,
         NewSession,
+        NewTask,
         NewProject,
         OpenSettings,
         CheckForUpdates,
@@ -122,10 +125,17 @@ pub fn run() {
     // The earliest point the app can measure from; every trace milestone is
     // relative to it.
     crate::startup_trace::mark_process_start();
+    // Debug builds publish the local RPA endpoint before the first window
+    // exists, so a client that starts waiting never races the listener.
+    let rpa = crate::rpa::service::start();
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
         .with_main_window_reopen()
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
+            crate::app::rpa::daemon::init(cx);
+            if rpa.is_some() {
+                crate::app::rpa::start_pump(cx);
+            }
             // Linux uses this for Wayland app_id/X11 WM_CLASS and notification
             // attribution. Other platforms also benefit from one stable
             // process identity.
@@ -134,6 +144,8 @@ pub fn run() {
             crate::input::init(cx);
             crate::ui::menu::init(cx);
             crate::app::init_composer_autocomplete(cx);
+            crate::app::init_board_keys(cx);
+            crate::app::init_workspace_keys(cx);
             crate::app::init_settings_keys(cx);
             crate::app::init_command_palette(cx);
             crate::app::init_commit_dialog_keys(cx);
@@ -169,7 +181,8 @@ pub fn run() {
                 // `secondary` is Command on macOS and Control elsewhere.
                 KeyBinding::new("secondary-q", Quit, None),
                 KeyBinding::new("secondary-w", CloseWindow, None),
-                KeyBinding::new("secondary-n", NewSession, None),
+                KeyBinding::new("secondary-n", NewTask, None),
+                KeyBinding::new("secondary-shift-n", NewSession, None),
                 KeyBinding::new("secondary-o", NewProject, None),
                 KeyBinding::new("secondary-,", OpenSettings, None),
                 KeyBinding::new("secondary-b", ToggleSidebar, None),
@@ -328,7 +341,8 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
             name: tr!("menu.file").into(),
             disabled: false,
             items: vec![
-                MenuItem::action(tr!("menu.new_task"), NewSession),
+                MenuItem::action(tr!("menu.new_task"), NewTask),
+                MenuItem::action(tr!("menu.new_session"), NewSession),
                 MenuItem::action(tr!("menu.new_project"), NewProject),
             ],
         },

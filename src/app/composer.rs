@@ -4,7 +4,26 @@ use anyhow::Context as _;
 use base64::Engine as _;
 use std::borrow::Cow;
 
-use crate::ui::ActivationExt;
+use crate::ui::{ActivationExt, SemanticControlExt};
+
+gpui::actions!(workspace_controls, [ToggleWorktreeCreation]);
+
+const WORKTREE_CHOICE_CONTEXT: &str = "WorktreeChoice";
+
+pub fn init_workspace_keys(cx: &mut App) {
+    cx.bind_keys([
+        gpui::KeyBinding::new(
+            "enter",
+            ToggleWorktreeCreation,
+            Some(WORKTREE_CHOICE_CONTEXT),
+        ),
+        gpui::KeyBinding::new(
+            "space",
+            ToggleWorktreeCreation,
+            Some(WORKTREE_CHOICE_CONTEXT),
+        ),
+    ]);
+}
 
 const COMPUTER_USE_PREVIEW_WIDTH: f32 = 304.0;
 const COMPUTER_USE_PREVIEW_HEIGHT: f32 = 172.0;
@@ -60,6 +79,49 @@ pub(super) fn composer_submit_action(
     } else {
         ComposerSubmitAction::Send
     }
+}
+
+/// The issue's concrete worktree remains available when a draft opts in to
+/// creating another one. Never borrow a workspace from a different project
+/// (or an unrelated issue) while an issue binding is changing.
+fn composer_inherited_worktree(
+    session: &AgentSession,
+    task: Option<&Task>,
+) -> Option<SessionWorkspace> {
+    let task = task.filter(|task| session.task_id == Some(task.id))?;
+    match &task.workspace {
+        Some(TaskWorkspace::Worktree {
+            project_id,
+            path,
+            branch,
+        }) if *project_id == session.project_id => Some(SessionWorkspace::Worktree {
+            path: path.clone(),
+            branch: branch.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// A checkbox changes only the draft intent. The submission preparation owns
+/// creating its directory and branch, so toggling or closing a draft cannot
+/// leave an unused worktree behind.
+fn composer_toggled_worktree(
+    session: &AgentSession,
+    task: Option<&Task>,
+    preparing: bool,
+) -> Option<SessionWorkspace> {
+    if session.has_started() || session.is_busy() || preparing {
+        return None;
+    }
+    Some(match &session.workspace {
+        SessionWorkspace::NewWorktree { .. } => {
+            composer_inherited_worktree(session, task).unwrap_or_default()
+        }
+        SessionWorkspace::Worktree { branch, .. } => SessionWorkspace::NewWorktree {
+            base_branch: Some(branch.clone()),
+        },
+        SessionWorkspace::Local => SessionWorkspace::NewWorktree { base_branch: None },
+    })
 }
 
 /// The stored form of a comment field's text. A blank field is the absence of a
@@ -3254,6 +3316,8 @@ impl Waku {
                 div().w_full().max_w(px(CONTENT_MAX_WIDTH)).mx_auto().child(
                     div()
                         .id("subagent-runs")
+                        .role(gpui::Role::Group)
+                        .aria_label(SharedString::from(title.clone()))
                         .w_full()
                         .min_w_0()
                         .rounded(px(13.0))
@@ -3680,6 +3744,9 @@ impl Waku {
                         .child(match submit_action {
                             ComposerSubmitAction::Preparing => div()
                                 .id("send-or-stop")
+                                .role(gpui::Role::Button)
+                                .aria_label(tr!("composer.preparing_task"))
+                                .semantic_control(gpui::Role::Button, true)
                                 .w(px(26.0))
                                 .h(px(26.0))
                                 .rounded_full()
@@ -3702,6 +3769,8 @@ impl Waku {
                                 .child(
                                     div()
                                         .id("send-or-stop")
+                                        .role(gpui::Role::Button)
+                                        .aria_label(tr!("composer.stop"))
                                         .w(px(26.0))
                                         .h(px(26.0))
                                         .rounded_full()
@@ -3767,6 +3836,9 @@ impl Waku {
                                 }),
                             ComposerSubmitAction::Send => div()
                                 .id("send-or-stop")
+                                .role(gpui::Role::Button)
+                                .aria_label(tr!("common.send"))
+                                .semantic_control(gpui::Role::Button, !can_send)
                                 .w(px(26.0))
                                 .h(px(26.0))
                                 .rounded_full()
@@ -4244,19 +4316,35 @@ impl Waku {
                 }
             })
             .unwrap_or_else(|| tr!("project.choose_project"));
-        let can_configure_workspace = self
+        let is_draft = self
             .selected_session()
-            .is_some_and(|session| !session.has_started() && !session.is_busy());
+            .is_some_and(|session| !session.has_started());
+        let preparing_workspace = self.selected_session().is_some_and(|session| {
+            self.submission_preparations.contains(&session.id)
+                || self.goal_runtime_starts.contains(&session.id)
+                || self.response_fork_preparations.contains_key(&session.id)
+        });
+        let can_configure_workspace = is_draft
+            && !preparing_workspace
+            && self
+                .selected_session()
+                .is_some_and(|session| !session.is_busy());
 
+        // An issue owns its project. Edit that binding from its details;
+        // the conversation may still choose its own worktree below.
+        let can_choose_project = can_configure_workspace
+            && self
+                .selected_session()
+                .is_some_and(|session| session.task_id.is_none());
         let project_handle = self.menu_handle("workspace-project", cx);
         let project_trigger = MenuChip::new("workspace-project")
             .icon("icons/folder.svg", theme.text_tertiary)
             .label(project_name)
             .caret(false)
-            .disabled(!can_configure_workspace)
-            .selected(can_configure_workspace && project_handle.is_open())
+            .disabled(!can_choose_project)
+            .selected(can_choose_project && project_handle.is_open())
             .max_w(px(190.0));
-        let project_selector = if can_configure_workspace {
+        let project_selector = if can_choose_project {
             let project_options = self
                 .state
                 .projects
@@ -4291,6 +4379,7 @@ impl Waku {
                                     });
                                 }
                             })
+                            .semantic_id(format!("composer-project-{project_id}"))
                             .selected(Some(project_id) == selected_project_id)
                         })
                         .collect::<Vec<_>>();
@@ -4327,6 +4416,16 @@ impl Waku {
             .selected_session()
             .map(|session| session.workspace.clone())
             .unwrap_or_default();
+        let inherited_worktree = self.selected_session().and_then(|session| {
+            composer_inherited_worktree(
+                session,
+                self.state
+                    .tasks
+                    .iter()
+                    .find(|task| Some(task.id) == session.task_id),
+            )
+        });
+        let planned_worktree = matches!(workspace, SessionWorkspace::NewWorktree { .. });
         let workspace_label = match &workspace {
             SessionWorkspace::Local => SharedString::from(tr!("workspace.local")),
             SessionWorkspace::NewWorktree { .. } => {
@@ -4349,7 +4448,7 @@ impl Waku {
             .max_w(px(180.0));
         let worktree_selector = if can_configure_workspace {
             let local_selected = workspace.is_local();
-            let worktree_selected = workspace.is_worktree();
+            let inherited_selected = inherited_worktree.as_ref() == Some(&workspace);
             let weak = cx.entity().downgrade();
             dropdown_menu(
                 worktree_trigger,
@@ -4359,27 +4458,45 @@ impl Waku {
                 move |_| {
                     let local = weak.clone();
                     let worktree = weak.clone();
-                    vec![
+                    let mut items = vec![
                         MenuItem::Header(tr!("workspace.work_in").into()),
                         MenuItem::new(tr!("workspace.local"), move |_, cx| {
                             let _ = local.update(cx, |this, cx| {
                                 this.select_workspace(SessionWorkspace::Local, cx);
                             });
                         })
+                        .semantic_id("composer-workspace-local")
                         .icon("icons/laptop.svg")
                         .selected(local_selected),
-                        MenuItem::new(tr!("workspace.new_worktree"), move |_, cx| {
+                    ];
+                    if let Some(inherited) = inherited_worktree.clone()
+                        && let SessionWorkspace::Worktree { branch, path } = &inherited
+                    {
+                        let inherited_weak = weak.clone();
+                        let label = branch.clone();
+                        let identity = format!("composer-workspace-{}", path.display());
+                        items.push(
+                            MenuItem::new(label, move |_, cx| {
+                                let _ = inherited_weak.update(cx, |this, cx| {
+                                    this.select_workspace(inherited.clone(), cx);
+                                });
+                            })
+                            .semantic_id(identity)
+                            .icon("icons/fork.svg")
+                            .selected(inherited_selected),
+                        );
+                    }
+                    items.push(
+                        MenuItem::new(tr!("workspace.create_worktree"), move |_, cx| {
                             let _ = worktree.update(cx, |this, cx| {
-                                this.select_workspace(
-                                    SessionWorkspace::NewWorktree { base_branch: None },
-                                    cx,
-                                );
+                                this.toggle_composer_worktree(cx);
                             });
                         })
+                        .semantic_id("composer-workspace-create")
                         .icon("icons/fork.svg")
-                        .selected(worktree_selected)
                         .disabled(projectless_selected),
-                    ]
+                    );
+                    items
                 },
             )
         } else {
@@ -4387,6 +4504,14 @@ impl Waku {
         };
 
         let branch_selector = self.render_branch_selector(cx);
+        let create_worktree = is_draft.then(|| {
+            self.render_composer_worktree_option(
+                planned_worktree,
+                can_configure_workspace && !projectless_selected,
+                projectless_selected,
+                cx,
+            )
+        });
 
         let usage_meter = self.render_usage_meter(cx);
         div()
@@ -4413,17 +4538,135 @@ impl Waku {
                     .text_size(sp(12.5))
                     .line_height(sp(14.0))
                     .child(project_selector)
-                    .child(worktree_selector)
+                    // Once creation is selected the checkbox states the mode;
+                    // a second "New worktree" chip would repeat that choice.
+                    .when(!is_draft || !planned_worktree, |element| {
+                        element.child(worktree_selector)
+                    })
                     .children(branch_selector)
                     .child(div().flex_1())
+                    .children(create_worktree)
                     .children(usage_meter),
             )
+    }
+
+    fn toggle_composer_worktree(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        if self.selected_project().is_none_or(Project::is_projectless) {
+            return;
+        }
+        let preparing = self.submission_preparations.contains(&session.id)
+            || self.goal_runtime_starts.contains(&session.id)
+            || self.response_fork_preparations.contains_key(&session.id);
+        let task = self
+            .state
+            .tasks
+            .iter()
+            .find(|task| Some(task.id) == session.task_id);
+        if let Some(workspace) = composer_toggled_worktree(session, task, preparing) {
+            self.select_workspace(workspace, cx);
+        }
+    }
+
+    fn render_composer_worktree_option(
+        &self,
+        checked: bool,
+        enabled: bool,
+        projectless: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::current(cx);
+        let focus = self
+            .transcript_control_focus("composer-create-worktree", cx)
+            .tab_stop(enabled);
+        div()
+            .id("composer-create-worktree")
+            .semantic_control(gpui::Role::CheckBox, !enabled)
+            .aria_label(tr!("workspace.create_worktree"))
+            .aria_toggled(if checked {
+                gpui::accesskit::Toggled::True
+            } else {
+                gpui::accesskit::Toggled::False
+            })
+            .key_context(WORKTREE_CHOICE_CONTEXT)
+            .track_focus(&focus)
+            .tab_index(0)
+            .tab_stop(enabled)
+            .h(px(26.0))
+            .px(px(7.0))
+            .rounded(px(6.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_default()
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .when(enabled, |element| {
+                element.hover(|style| style.bg(theme.overlay))
+            })
+            .when(!enabled, |element| element.opacity(0.7))
+            // Match the commit dialog's checkbox, rather than introducing a
+            // second switch style into the composer footer.
+            .child(
+                div()
+                    .size(px(15.0))
+                    .flex_none()
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(if checked {
+                        theme.border_strong
+                    } else {
+                        theme.text_ghost
+                    })
+                    .bg(if checked {
+                        theme.composer
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(checked, |element| {
+                        element.child(icon("icons/check.svg", 12.0, theme.text))
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(sp(13.0))
+                    .line_height(sp(16.0))
+                    .text_color(theme.text_secondary)
+                    .child(tr!("workspace.create_worktree")),
+            )
+            .tooltip(Tooltip::text(if projectless {
+                tr!("workspace.create_worktree_requires_project")
+            } else {
+                tr!("workspace.create_worktree_hint")
+            }))
+            .when(enabled, |element| {
+                let click_focus = focus.clone();
+                element
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        window.focus(&click_focus, cx);
+                        this.toggle_composer_worktree(cx);
+                        cx.stop_propagation();
+                    }))
+                    .on_action(cx.listener(|this, _: &ToggleWorktreeCreation, _, cx| {
+                        this.toggle_composer_worktree(cx);
+                        cx.stop_propagation();
+                    }))
+            })
+            .into_any_element()
     }
 }
 
 /// One row of the composer's live-subagent card: a child, or a run with no
 /// children to stand for it.
 pub(super) struct SubagentRunRow<'a> {
+    /// The provider's id for this row's run or child, used as the row's
+    /// semantic identity.
+    pub(super) id: &'a str,
     pub(super) depth: usize,
     pub(super) label: &'a str,
     pub(super) state: waku_protocol::subagent::SubagentState,
@@ -4478,6 +4721,7 @@ pub(super) fn subagent_card_rows(
         for child in children {
             rows.push(
                 SubagentRunRow {
+                    id: &child.id,
                     depth,
                     label: &child.label,
                     state: child.state,
@@ -4507,6 +4751,7 @@ pub(super) fn subagent_card_rows(
         } else {
             rows.push(
                 SubagentRunRow {
+                    id: &run.id,
                     depth: 0,
                     label: &run.label,
                     state: run.state,
@@ -4551,6 +4796,17 @@ fn subagent_run_row(row: &SubagentRunRow<'_>, theme: Theme, now_ms: i64) -> AnyE
         .filter(|_| row.state == waku_protocol::subagent::SubagentState::Running)
         .map(|start| format_working_elapsed(((now_ms - start).max(0) / 1_000) as u64));
     div()
+        .id(SharedString::from(format!("subagent-row-{}", row.id)))
+        .role(gpui::Role::ListItem)
+        .aria_label(SharedString::from(format!(
+            "{} — {}{}",
+            row.label,
+            subagent_state_label(row.state),
+            match &detail {
+                detail if detail.is_empty() => String::new(),
+                detail => format!(" · {detail}"),
+            }
+        )))
         .w_full()
         .min_w_0()
         .h(px(24.0))
@@ -5099,4 +5355,115 @@ pub(super) fn visible_picker_models(
         });
     }
     models
+}
+
+#[cfg(test)]
+mod worktree_option_tests {
+    use super::*;
+
+    fn issue_draft() -> (AgentSession, Task) {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        let mut task = Task::new("Improve issue workflow", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local {
+            project_id: session.project_id,
+        });
+        session.task_id = Some(task.id);
+        (session, task)
+    }
+
+    #[test]
+    fn create_worktree_checkbox_only_records_deferred_intent() {
+        let (mut session, task) = issue_draft();
+        session.workspace = composer_toggled_worktree(&session, Some(&task), false).unwrap();
+        assert_eq!(
+            session.workspace,
+            SessionWorkspace::NewWorktree { base_branch: None }
+        );
+        assert!(session.workspace.path().is_none());
+        assert!(!session.has_started());
+        assert_eq!(
+            composer_toggled_worktree(&session, Some(&task), false),
+            Some(SessionWorkspace::Local)
+        );
+    }
+
+    #[test]
+    fn opting_out_changes_only_this_draft_not_the_issues_default() {
+        let (mut session, mut task) = issue_draft();
+        task.workspace = Some(TaskWorkspace::NewWorktree {
+            project_id: session.project_id,
+        });
+        session.workspace = SessionWorkspace::NewWorktree { base_branch: None };
+        session.workspace = composer_toggled_worktree(&session, Some(&task), false).unwrap();
+        assert_eq!(session.workspace, SessionWorkspace::Local);
+        assert_eq!(
+            task.workspace,
+            Some(TaskWorkspace::NewWorktree {
+                project_id: session.project_id,
+            })
+        );
+        assert_eq!(session.task_id, Some(task.id));
+    }
+
+    #[test]
+    fn inherited_worktree_is_restored_when_creation_is_unchecked() {
+        let (mut session, mut task) = issue_draft();
+        let inherited = SessionWorkspace::Worktree {
+            path: PathBuf::from("/project-worktrees/issue-one"),
+            branch: "issue-one".into(),
+        };
+        task.workspace = Some(TaskWorkspace::Worktree {
+            project_id: session.project_id,
+            path: inherited.path().unwrap().to_path_buf(),
+            branch: "issue-one".into(),
+        });
+        session.workspace = inherited.clone();
+        session.workspace = composer_toggled_worktree(&session, Some(&task), false).unwrap();
+        assert_eq!(
+            session.workspace,
+            SessionWorkspace::NewWorktree {
+                base_branch: Some("issue-one".into())
+            }
+        );
+        assert_eq!(
+            composer_toggled_worktree(&session, Some(&task), false),
+            Some(inherited)
+        );
+    }
+
+    #[test]
+    fn unchecking_never_inherits_another_project_or_issue_workspace() {
+        let (mut session, mut task) = issue_draft();
+        session.workspace = SessionWorkspace::NewWorktree { base_branch: None };
+        task.workspace = Some(TaskWorkspace::Worktree {
+            project_id: Uuid::new_v4(),
+            path: PathBuf::from("/other-project"),
+            branch: "other-issue".into(),
+        });
+        assert_eq!(
+            composer_toggled_worktree(&session, Some(&task), false),
+            Some(SessionWorkspace::Local)
+        );
+        if let Some(TaskWorkspace::Worktree { project_id, .. }) = &mut task.workspace {
+            *project_id = session.project_id;
+        }
+        session.task_id = Some(Uuid::new_v4());
+        assert_eq!(
+            composer_toggled_worktree(&session, Some(&task), false),
+            Some(SessionWorkspace::Local)
+        );
+    }
+
+    #[test]
+    fn checkbox_cannot_change_preparing_busy_or_started_sessions() {
+        let (mut session, task) = issue_draft();
+        assert!(composer_toggled_worktree(&session, Some(&task), true).is_none());
+        session.status = SessionStatus::Working;
+        assert!(composer_toggled_worktree(&session, Some(&task), false).is_none());
+        session.status = SessionStatus::Idle;
+        session
+            .messages
+            .push(Message::new(MessageRole::User, "already sent"));
+        assert!(composer_toggled_worktree(&session, Some(&task), false).is_none());
+    }
 }

@@ -44,7 +44,7 @@ export function beginTurn(
         ? promptTitle(visiblePrompt || attachments[0]?.name || '')
         : session.auto_title,
     status: 'connecting',
-    updated_at: now,
+    updated_at: Math.max(session.updated_at, now),
     last_reply_at: now,
     messages: [
       ...session.messages,
@@ -151,7 +151,7 @@ export function queueSubmission(
     : providerPromptOverride.trim();
   return {
     ...session,
-    updated_at: now,
+    updated_at: Math.max(session.updated_at, now),
     queued_messages: [
       ...(session.queued_messages ?? []),
       {
@@ -232,7 +232,7 @@ export function applySessionOptions(
     context_window:
       changes.contextWindow !== undefined ? changes.contextWindow : session.context_window,
     runtime_mode: changes.runtimeMode ?? session.runtime_mode,
-    updated_at: clock.nowSeconds(),
+    updated_at: Math.max(session.updated_at, clock.nowSeconds()),
   };
 }
 

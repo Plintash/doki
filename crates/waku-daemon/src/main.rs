@@ -50,6 +50,13 @@ fn main() -> anyhow::Result<()> {
     )
     .context("could not load daemon settings")?;
     let task_store = waku_core::persistence::StateStore::daemon(task_path);
+    // Diagnostic files are debug-build behavior; a release daemon keeps the
+    // in-memory stream but writes nothing and exposes no query surface.
+    let diagnostics_directory = if cfg!(debug_assertions) {
+        task_store.path().parent().map(std::path::Path::to_path_buf)
+    } else {
+        None
+    };
     waku_core::serve(
         listener,
         token,
@@ -58,6 +65,7 @@ fn main() -> anyhow::Result<()> {
         waku_core::ServerOptions {
             allowed_origins: arguments.allowed_origins.into_iter().collect(),
             allow_shutdown: arguments.parent_pid.is_some(),
+            diagnostics_directory,
         },
     )
 }

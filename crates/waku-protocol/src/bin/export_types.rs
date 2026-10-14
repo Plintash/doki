@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use ts_rs::{Config, TS};
 use waku_protocol::{
-    ClientMessage, DaemonReady, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, ServerMessage,
+    ClientMessage, DaemonReady, MAX_AUTOMATION_EVENTS, MAX_AUTOMATION_OBSERVATION_BYTES,
+    MAX_DIAGNOSTIC_EVENTS, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, ServerMessage,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,7 +43,10 @@ fn export_to(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
         format!(
             "// Generated from waku-protocol. Do not edit.\n\
              export const PROTOCOL_VERSION = {PROTOCOL_VERSION} as const;\n\
-             export const MAX_WIRE_MESSAGE_BYTES = {MAX_WIRE_MESSAGE_BYTES} as const;\n"
+             export const MAX_WIRE_MESSAGE_BYTES = {MAX_WIRE_MESSAGE_BYTES} as const;\n\
+             export const MAX_DIAGNOSTIC_EVENTS = {MAX_DIAGNOSTIC_EVENTS} as const;\n\
+             export const MAX_AUTOMATION_EVENTS = {MAX_AUTOMATION_EVENTS} as const;\n\
+             export const MAX_AUTOMATION_OBSERVATION_BYTES = {MAX_AUTOMATION_OBSERVATION_BYTES} as const;\n"
         ),
     )?;
     write_index(output)?;
@@ -129,7 +133,7 @@ fn write_index(output: &Path) -> std::io::Result<()> {
         .map(|module| format!("export type {{ {module} }} from \"./{module}\";\n"))
         .collect::<String>();
     let contents = format!(
-        "export {{ MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION }} from \"./constants\";\n\
+        "export {{ MAX_AUTOMATION_EVENTS, MAX_AUTOMATION_OBSERVATION_BYTES, MAX_DIAGNOSTIC_EVENTS, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION }} from \"./constants\";\n\
          export type {{ JsonValue }} from \"./serde_json/JsonValue\";\n\
          {type_exports}"
     );

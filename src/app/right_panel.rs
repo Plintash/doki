@@ -3019,6 +3019,7 @@ impl Waku {
         // not apply to it: shown mid-slide it would hang over the transcript
         // at full width. Keep it down until the panel has finished moving.
         let active_browser = if self.settings_page.is_none()
+            && !self.board_open
             && self.right_panel_visible
             && self.right_panel_slide.is_none()
         {

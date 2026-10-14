@@ -1,5 +1,8 @@
+use chrono::Datelike;
+
 use super::composer::next_picker_highlight;
 use super::*;
+use crate::ui::SemanticControlExt;
 
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
 
@@ -10,6 +13,25 @@ const SETTINGS_USAGE_MAX_WIDTH: f32 = 1024.0;
 /// Key context the settings sidebar declares around its search field.
 const SETTINGS_SIDEBAR_CONTEXT: &str = "SettingsSidebar";
 
+/// First-guess height of one archive row; the list measures the real rows.
+const ARCHIVE_ROW_ESTIMATED_HEIGHT: f32 = 66.0;
+
+/// The archive's virtualized row list. Held across frames so measured heights
+/// and the scroll position survive; `ids` is what the list renders.
+pub(super) struct ArchiveRows {
+    pub(super) ids: Vec<Uuid>,
+    pub(super) list: ListState,
+}
+
+impl ArchiveRows {
+    pub(super) fn new() -> Self {
+        Self {
+            ids: Vec::new(),
+            list: ListState::new(0, ListAlignment::Top, px(256.0)),
+        }
+    }
+}
+
 /// The search field while focused inside the sidebar. The field holds real
 /// focus the whole time — the sidebar's selection is only drawn — so `up` and
 /// `down` have to be claimed from under it, and only a binding can do that:
@@ -19,7 +41,7 @@ const SETTINGS_SEARCH_CONTEXT: &str = "SettingsSidebar > TextInput";
 
 /// The sidebar's rows in display order, each with the keyword haystack the
 /// search field filters against.
-const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 7] = [
+const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 8] = [
     (
         SettingsPage::General,
         "settings.general",
@@ -61,6 +83,12 @@ const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 7] = [
         "settings.computer_use",
         "icons/cursor-spark.svg",
         "settings.computer_use_keywords",
+    ),
+    (
+        SettingsPage::Archive,
+        "settings.archive",
+        "icons/columns.svg",
+        "settings.archive_keywords",
     ),
 ];
 
@@ -327,11 +355,12 @@ impl Waku {
         // The Monthly and Projects list views own their own scrolling, so
         // their pages fill the viewport instead of riding the shared scroll
         // container.
-        let fills_viewport = page == SettingsPage::Usage
-            && matches!(
-                self.usage_view,
-                UsageViewMode::Monthly | UsageViewMode::Projects
-            );
+        let fills_viewport = page == SettingsPage::Archive
+            || (page == SettingsPage::Usage
+                && matches!(
+                    self.usage_view,
+                    UsageViewMode::Monthly | UsageViewMode::Projects
+                ));
         // The titlebar strip is transparent; once content slides under it, a
         // hairline marks the boundary so the clip edge reads as a header
         // rather than a glitch.
@@ -362,6 +391,7 @@ impl Waku {
                         SettingsPage::Daemon => tr!("settings.daemon"),
                         SettingsPage::ComputerUse => tr!("settings.computer_use"),
                         SettingsPage::Appearance => tr!("settings.appearance"),
+                        SettingsPage::Archive => tr!("settings.archive"),
                     }),
             )
             .child(match page {
@@ -372,6 +402,7 @@ impl Waku {
                 SettingsPage::Daemon => self.render_daemon_settings(cx),
                 SettingsPage::ComputerUse => self.render_computer_use_settings(cx),
                 SettingsPage::Appearance => self.render_appearance_settings(cx),
+                SettingsPage::Archive => self.render_archive_settings(cx),
             });
 
         div()
@@ -680,6 +711,193 @@ impl Waku {
             updater.set_automatically_checks_for_updates(enabled);
         }
         cx.notify();
+    }
+
+    /// The archive: completed tasks and their conversations, which the task
+    /// view keeps out of the sidebar. Restoring puts a task back on the board
+    /// and brings its conversations back with it.
+    fn render_archive_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::current(cx);
+        let mut tasks = self
+            .state
+            .tasks
+            .iter()
+            .filter(|task| task.state.is_done())
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.completed_at.unwrap_or(task.updated_at)));
+
+        if tasks.is_empty() {
+            return div()
+                .flex_1()
+                .min_h_0()
+                .mt(px(15.0))
+                .track_focus(&self.archive_focus)
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(20.0))
+                        .py(px(18.0))
+                        .rounded(px(13.0))
+                        .bg(theme.raised)
+                        .text_size(sp(13.0))
+                        .text_color(theme.text_secondary)
+                        .child(tr!("archive.empty")),
+                )
+                .into_any_element();
+        }
+
+        let ids = tasks.iter().map(|task| task.id).collect::<Vec<_>>();
+        // One virtualized list for the whole archive: a long history of
+        // completed tasks builds only the rows on screen.
+        let list_state = {
+            let mut rows = self.archive_rows.borrow_mut();
+            let list = rows.list.clone();
+            sync_virtual_ids(&list, &mut rows.ids, &ids, px(ARCHIVE_ROW_ESTIMATED_HEIGHT));
+            list
+        };
+        let ids = Rc::new(ids);
+        let entity = cx.entity().downgrade();
+        div()
+            .flex_1()
+            .min_h_0()
+            .mt(px(15.0))
+            .track_focus(&self.archive_focus)
+            .child(
+                list(list_state, move |index, _window, cx| {
+                    let Some(task_id) = ids.get(index).copied() else {
+                        return div().into_any_element();
+                    };
+                    entity
+                        .upgrade()
+                        .map(|entity| {
+                            div()
+                                .pb(px(8.0))
+                                .child(
+                                    entity.update(cx, |this, cx| {
+                                        this.render_archive_row(task_id, cx)
+                                    }),
+                                )
+                                .into_any_element()
+                        })
+                        .unwrap_or_else(|| div().into_any_element())
+                })
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
+    /// One completed task's row in the archive.
+    fn render_archive_row(&self, task_id: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::current(cx);
+        let Some(task) = self.state.tasks.iter().find(|task| task.id == task_id) else {
+            return div().into_any_element();
+        };
+        let conversations = self
+            .task_stats()
+            .conversations
+            .get(&task_id)
+            .copied()
+            .unwrap_or(0);
+        let completed = archive_time_label(task.completed_at.unwrap_or(task.updated_at));
+        let open_focus = self
+            .archive_control_focuses
+            .borrow_mut()
+            .entry(format!("open-{task_id}"))
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
+            .clone();
+        let restore_focus = self
+            .archive_control_focuses
+            .borrow_mut()
+            .entry(format!("restore-{task_id}"))
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
+            .clone();
+        div()
+            .id(SharedString::from(format!("archive-task-{task_id}")))
+            .semantic_control(gpui::Role::Button, false)
+            .aria_label(task.title.clone())
+            .w_full()
+            .px(px(16.0))
+            .py(px(12.0))
+            .rounded(px(13.0))
+            .bg(theme.raised)
+            .border_1()
+            .border_color(theme.border)
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .cursor_default()
+            .hover(|element| element.border_color(theme.border_strong))
+            .track_focus(&open_focus)
+            .tab_index(0)
+            .tab_stop(true)
+            .focus_visible(|style| style.border_color(theme.accent))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_archived_task(task_id, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.open_archived_task(task_id, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .text_size(sp(13.5))
+                            .text_color(theme.text)
+                            .truncate()
+                            .child(task.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(sp(11.5))
+                            .text_color(theme.text_tertiary)
+                            .child(format!(
+                                "{} · {}",
+                                tr!("archive.completed_at", time = completed),
+                                super::board::conversations_label(conversations)
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("archive-restore-{task_id}")))
+                    .semantic_control(gpui::Role::Button, false)
+                    .aria_label(tr!("archive.restore"))
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(theme.border_strong)
+                    .flex()
+                    .items_center()
+                    .text_size(sp(12.0))
+                    .text_color(theme.text_secondary)
+                    .cursor_default()
+                    .hover(|element| element.bg(theme.overlay))
+                    .track_focus(&restore_focus)
+                    .tab_index(0)
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_color(theme.accent))
+                    .child(tr!("archive.restore"))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.restore_archived_task(task_id, window, cx);
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.restore_archived_task(task_id, window, cx);
+                            cx.stop_propagation();
+                        }
+                    })),
+            )
+            .into_any_element()
     }
 
     fn render_daemon_settings(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2610,6 +2828,27 @@ impl Waku {
 /// hold values outside this list; they render as-is and simply select
 /// nothing here.
 const FONT_SIZES: [f32; 8] = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0];
+
+/// The archive's completion stamp, in the user's local time — East Asian
+/// locales read it the way the rest of the app writes dates.
+fn archive_time_label(at: u64) -> String {
+    DateTime::<Utc>::from_timestamp(at as i64, 0)
+        .map(|timestamp| {
+            let timestamp = timestamp.with_timezone(&Local);
+            if crate::i18n::uses_east_asian_date_format() {
+                format!(
+                    "{}年{}月{}日 {}",
+                    timestamp.year(),
+                    timestamp.month(),
+                    timestamp.day(),
+                    timestamp.format("%H:%M")
+                )
+            } else {
+                timestamp.format("%Y-%m-%d %H:%M").to_string()
+            }
+        })
+        .unwrap_or_default()
+}
 
 fn font_size_label(size: f32) -> String {
     if size.fract() == 0.0 {

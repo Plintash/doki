@@ -717,7 +717,7 @@ export function beginTurn(
     ...session,
     auto_title: autoTitle,
     status: 'connecting',
-    updated_at: now,
+    updated_at: Math.max(session.updated_at, now),
     last_reply_at: now,
     messages: [
       ...session.messages,

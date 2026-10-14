@@ -20,7 +20,7 @@ use waku_protocol::i18n::AppLanguage;
 use waku_protocol::identity::data_directory_name;
 use waku_protocol::model::{
     AgentSession, FavoriteModel, Project, ProviderKind, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, RuntimeMode,
+    ProviderSessionHistory, ProviderSessionSummary, RuntimeMode, Task,
 };
 use waku_protocol::theme::ThemePreference;
 use waku_protocol::workspace::ReviewDiffSource;
@@ -48,6 +48,9 @@ pub enum SidebarGrouping {
     #[default]
     Project,
     Updated,
+    /// Tasks and the conversations filed under them. The new view: only
+    /// sessions bound to a task appear, and Done tasks drop out of the list.
+    Task,
 }
 
 /// Direction of task history inside the sidebar's current grouping.
@@ -441,6 +444,9 @@ pub struct PersistedState {
     pub version: u32,
     pub projects: Vec<Project>,
     pub sessions: Vec<AgentSession>,
+    /// User-declared tasks, daemon-owned like projects and sessions.
+    #[serde(default)]
+    pub tasks: Vec<Task>,
     pub selected_project: Option<Uuid>,
     pub selected_session: Option<Uuid>,
     pub last_provider: ProviderKind,
@@ -537,6 +543,7 @@ impl PersistedState {
             version: STATE_VERSION,
             projects: Vec::new(),
             sessions: Vec::new(),
+            tasks: Vec::new(),
             selected_project: None,
             selected_session: None,
             last_provider: ProviderKind::Codex,
@@ -744,6 +751,7 @@ impl PersistedState {
         self.sidebar_grouping = sidebar_grouping_for(
             app_state.sidebar_grouping_chosen,
             app_state.sidebar_grouping,
+            !self.tasks.is_empty(),
         );
         self.sidebar_grouping_chosen = app_state.sidebar_grouping_chosen;
         self.sidebar_ordering = app_state.sidebar_ordering;
@@ -755,9 +763,9 @@ impl PersistedState {
 
     fn persistable_selected_session(&self) -> Option<Uuid> {
         self.selected_session.filter(|selected| {
-            self.sessions
-                .iter()
-                .any(|session| session.id == *selected && session.has_started())
+            self.sessions.iter().any(|session| {
+                session.id == *selected && (session.has_started() || session.task_id.is_some())
+            })
         })
     }
 
@@ -838,9 +846,14 @@ impl PersistedState {
 /// An unchosen grouping is whatever the default was in the build that wrote
 /// the document, so this build's default replaces it; a chosen one is the
 /// user's and survives every launch, including a switch back to date headings.
-fn sidebar_grouping_for(chosen: bool, stored: SidebarGrouping) -> SidebarGrouping {
+/// Once any task exists, the task view is the home an unchosen document opens
+/// in — otherwise a user who declared tasks would relaunch into a list that
+/// no longer shows them.
+fn sidebar_grouping_for(chosen: bool, stored: SidebarGrouping, has_tasks: bool) -> SidebarGrouping {
     if chosen {
         stored
+    } else if has_tasks {
+        SidebarGrouping::Task
     } else {
         SidebarGrouping::default()
     }
@@ -973,6 +986,9 @@ pub struct StateStore {
 impl StateStore {
     pub fn default_path() -> PathBuf {
         if cfg!(debug_assertions) {
+            if let Some(directory) = std::env::var_os("WAKU_RPA_DATA_DIR") {
+                return PathBuf::from(directory).join("app.db");
+            }
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .and_then(Path::parent)
@@ -1111,7 +1127,7 @@ impl StateStore {
     }
 
     pub fn load(&self) -> io::Result<PersistedState> {
-        let (projects, mut sessions, default_cwd) = match self
+        let (projects, mut sessions, tasks, default_cwd) = match self
             .daemon
             .client()
             .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
@@ -1120,11 +1136,12 @@ impl StateStore {
             ResponsePayload::TaskState {
                 projects,
                 sessions,
+                tasks,
                 default_cwd,
                 projectless_root,
             } => {
                 waku_protocol::projectless::set_workspace_root(projectless_root);
-                (projects, sessions, default_cwd)
+                (projects, sessions, tasks, default_cwd)
             }
             _ => {
                 return Err(io::Error::other(
@@ -1137,6 +1154,7 @@ impl StateStore {
         let mut state = PersistedState::empty();
         state.projects = projects;
         state.sessions = sessions;
+        state.tasks = tasks;
         let app_settings_missing = !self.app_settings_path.is_file();
         let settings = hydration_app_settings(self.preloaded_app_settings.as_ref(), || {
             self.read_app_settings()
@@ -1148,6 +1166,11 @@ impl StateStore {
         let app_state_missing = app_state.is_none();
         if let Some(app_state) = app_state {
             state.apply_app_state(app_state);
+        } else {
+            // No navigation document yet: the task view is still the default
+            // for a history that already has tasks.
+            state.sidebar_grouping =
+                sidebar_grouping_for(false, state.sidebar_grouping, !state.tasks.is_empty());
         }
         state.migrate_loaded();
         if app_settings_missing {
@@ -1176,6 +1199,44 @@ impl StateStore {
     }
 
     pub fn save(&self, state: &mut PersistedState) -> io::Result<()> {
+        let (_, command) = self.prepare_save_command(state)?;
+        self.daemon
+            .client()
+            .notify(Uuid::nil(), Uuid::nil(), command)
+            .map_err(to_io_error)?;
+        state.dirty_sessions.clear();
+        Ok(())
+    }
+
+    /// Prepare a durable, acknowledged save for explicit issue actions.
+    /// The caller runs the closure on a worker, reports a failure, and marks
+    /// the returned session ids dirty again so the next change can retry.
+    /// Streaming saves keep their existing nonblocking notification path.
+    pub fn prepare_confirmed_save(
+        &self,
+        state: &mut PersistedState,
+    ) -> io::Result<(
+        Vec<Uuid>,
+        impl FnOnce() -> io::Result<()> + Send + 'static + use<>,
+    )> {
+        let (dirty_ids, command) = self.prepare_save_command(state)?;
+        let daemon = self.daemon.clone();
+        state.dirty_sessions.clear();
+        Ok((dirty_ids, move || {
+            match daemon
+                .client()
+                .request(Uuid::nil(), Uuid::nil(), command)
+                .map_err(to_io_error)?
+            {
+                ResponsePayload::TaskStateSaved { .. } => Ok(()),
+                _ => Err(io::Error::other(
+                    "Waku daemon returned an invalid task-save response",
+                )),
+            }
+        }))
+    }
+
+    fn prepare_save_command(&self, state: &PersistedState) -> io::Result<(Vec<Uuid>, Command)> {
         self.write_app_settings(&state.app_settings())?;
         self.write_app_state(&state.app_state())?;
         if !self.task_state_loaded.load(Ordering::Acquire) {
@@ -1184,11 +1245,11 @@ impl StateStore {
                 "task state was not loaded; refusing to overwrite daemon data",
             ));
         }
-        let dirty_ids = state.dirty_sessions.clone();
+        let dirty_ids = state.dirty_sessions.iter().copied().collect();
         let sessions = state
             .sessions
             .iter()
-            .filter(|session| dirty_ids.contains(&session.id))
+            .filter(|session| state.dirty_sessions.contains(&session.id))
             .cloned()
             .collect::<Vec<AgentSession>>();
         // `detail_loaded` is process-local and does not cross the wire, so a
@@ -1201,21 +1262,16 @@ impl StateStore {
             .map(|session| session.id)
             .collect();
         let live_session_ids = state.sessions.iter().map(|session| session.id).collect();
-        self.daemon
-            .client()
-            .notify(
-                Uuid::nil(),
-                Uuid::nil(),
-                Command::SaveTaskState {
-                    projects: state.projects.clone(),
-                    live_session_ids,
-                    skeleton_session_ids,
-                    sessions,
-                },
-            )
-            .map_err(to_io_error)?;
-        state.dirty_sessions.clear();
-        Ok(())
+        Ok((
+            dirty_ids,
+            Command::SaveTaskState {
+                projects: state.projects.clone(),
+                tasks: state.tasks.clone(),
+                live_session_ids,
+                skeleton_session_ids,
+                sessions,
+            },
+        ))
     }
 
     pub fn remove_session(&self, session_id: Uuid) -> io::Result<()> {
@@ -1430,13 +1486,23 @@ mod tests {
     #[test]
     fn date_grouping_stored_before_the_default_changed_adopts_project_grouping() {
         assert_eq!(
-            sidebar_grouping_for(false, SidebarGrouping::Updated),
+            sidebar_grouping_for(false, SidebarGrouping::Updated, false),
             SidebarGrouping::Project
         );
         assert_eq!(
-            sidebar_grouping_for(true, SidebarGrouping::Updated),
+            sidebar_grouping_for(true, SidebarGrouping::Updated, false),
             SidebarGrouping::Updated,
             "a switch back to date headings survives the next launch"
+        );
+        assert_eq!(
+            sidebar_grouping_for(false, SidebarGrouping::Updated, true),
+            SidebarGrouping::Task,
+            "an unchosen grouping opens in the task view once tasks exist"
+        );
+        assert_eq!(
+            sidebar_grouping_for(true, SidebarGrouping::Project, true),
+            SidebarGrouping::Project,
+            "an explicit project grouping still wins over the task view"
         );
     }
 
@@ -1582,6 +1648,24 @@ mod tests {
     }
 
     #[test]
+    fn persisted_issue_draft_remains_unstarted_and_selected_on_the_client() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let session = &mut state.sessions[0];
+        session.task_id = Some(Uuid::new_v4());
+        let id = session.id;
+        let encoded = serde_json::to_value(session.list_projection()).unwrap();
+        let mut restored = vec![serde_json::from_value(encoded).unwrap()];
+        restore_task_state_skeletons(&mut restored);
+        assert!(!restored[0].has_started());
+        state.sessions = restored;
+        state.selected_session = Some(id);
+        assert_eq!(state.persistable_selected_session(), Some(id));
+        state.ensure_runtime_session();
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.selected_session, Some(id));
+    }
+
+    #[test]
     fn daemon_task_state_becomes_list_only_after_crossing_the_client_boundary() {
         let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
         session.detail_loaded = false;
@@ -1593,6 +1677,7 @@ mod tests {
         let encoded = serde_json::to_vec(&ResponsePayload::TaskState {
             projects: Vec::new(),
             sessions: vec![session],
+            tasks: Vec::new(),
             default_cwd: PathBuf::from("/daemon/project"),
             projectless_root: None,
         })

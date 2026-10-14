@@ -9,6 +9,8 @@ use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
+#[cfg(debug_assertions)]
+use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -300,6 +302,10 @@ impl ExecutableStamp {
 struct SupervisorInner {
     executable: Option<PathBuf>,
     target: Mutex<DaemonTarget>,
+    // Handle-only snapshot: lifecycle transitions must never prevent the UI
+    // from forwarding a milestone through its existing connection.
+    #[cfg(debug_assertions)]
+    cached_client: ArcSwap<DaemonClient>,
     exposure: Mutex<Option<DaemonExposureSettings>>,
     restart: Mutex<()>,
     settings: Mutex<DaemonSettings>,
@@ -400,6 +406,8 @@ impl DaemonSupervisor {
         let (settings_updates, settings_update_rx) = unbounded();
         let inner = Arc::new(SupervisorInner {
             executable,
+            #[cfg(debug_assertions)]
+            cached_client: ArcSwap::from_pointee(target.client()),
             target: Mutex::new(target),
             exposure: Mutex::new(exposure),
             restart: Mutex::new(()),
@@ -421,6 +429,28 @@ impl DaemonSupervisor {
 
     pub fn client(&self) -> DaemonClient {
         self.inner.target.lock().client()
+    }
+
+    /// Debug diagnostics read the latest published transport handle without
+    /// a lifecycle lock. Release builds retain ordinary `client()` behavior
+    /// and allocate no diagnostic cache. A disconnected handle still reports
+    /// the ordinary send error; no records are buffered across disconnection.
+    pub fn cached_client(&self) -> DaemonClient {
+        #[cfg(debug_assertions)]
+        {
+            self.inner.cached_client.load().as_ref().clone()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.client()
+        }
+    }
+
+    /// Sample the current connection for optional UI-thread diagnostics.
+    /// A supervisor transition may hold the target lock; skip that sample
+    /// instead of waiting on lifecycle work from the frame/event pump.
+    pub fn try_client(&self) -> Option<DaemonClient> {
+        self.inner.target.try_lock().map(|target| target.client())
     }
 
     /// Subscribe to the active daemon connection. The current client is sent
@@ -542,16 +572,24 @@ fn monitor_daemon(
             if !still_current {
                 continue;
             }
-            let Ok(replacement) =
-                DaemonClient::connect_with_resume(&address, token.clone(), resume_from)
-            else {
+            let Ok(replacement) = DaemonClient::connect_with_cursors(
+                &address,
+                token.clone(),
+                resume_from,
+                disconnected.last_diagnostic_cursor(),
+            ) else {
                 continue;
             };
-            *inner.target.lock() = DaemonTarget::Remote {
-                client: replacement.clone(),
-                address,
-                token,
-            };
+            {
+                let mut target = inner.target.lock();
+                *target = DaemonTarget::Remote {
+                    client: replacement.clone(),
+                    address,
+                    token,
+                };
+                #[cfg(debug_assertions)]
+                inner.cached_client.store(Arc::new(replacement.clone()));
+            }
             inner
                 .client_updates
                 .lock()
@@ -620,7 +658,12 @@ fn replace_local_daemon(
     drop(previous);
     let replacement = DaemonProcess::spawn_configured(executable, exposure.clone())?;
     let client = replacement.client();
-    *inner.target.lock() = DaemonTarget::Local(replacement);
+    {
+        let mut target = inner.target.lock();
+        *target = DaemonTarget::Local(replacement);
+        #[cfg(debug_assertions)]
+        inner.cached_client.store(Arc::new(client.clone()));
+    }
     inner
         .client_updates
         .lock()
@@ -689,6 +732,125 @@ fn persist_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn optional_client_sample_never_waits_for_the_supervisor_target() {
+        use std::net::TcpListener;
+        use tungstenite::Message;
+        use waku_protocol::{
+            ClientMessage, DiagnosticCorrelation, DiagnosticLevel, DiagnosticOrigin,
+            DiagnosticRecord, ServerMessage,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (delivered, received) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let Message::Text(hello) = socket.read().unwrap() else {
+                panic!("expected the client handshake");
+            };
+            assert!(matches!(
+                serde_json::from_str::<ClientMessage>(&hello).unwrap(),
+                ClientMessage::Hello { .. }
+            ));
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&ServerMessage::Hello {
+                        protocol_version: PROTOCOL_VERSION,
+                        daemon_version: "test".into(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .unwrap();
+            while let Ok(Message::Text(text)) = socket.read() {
+                match serde_json::from_str::<ClientMessage>(&text).unwrap() {
+                    ClientMessage::Diagnostic(record) => delivered.send(record).unwrap(),
+                    ClientMessage::Shutdown => break,
+                    _ => {}
+                }
+            }
+        });
+        let client = DaemonClient::connect(&address, "test".into()).unwrap();
+        let supervisor = DaemonSupervisor::from_target(
+            DaemonTarget::Remote {
+                client: client.clone(),
+                address,
+                token: "test".into(),
+            },
+            None,
+            None,
+            DaemonSettings::default(),
+        )
+        .unwrap();
+        let target = supervisor.inner.target.lock();
+        let correlation = DiagnosticCorrelation {
+            session_id: Some(Uuid::new_v4()),
+            turn_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let expected: Vec<_> = ["submitted", "streaming", "settled", "failed"]
+            .into_iter()
+            .map(|message| {
+                DiagnosticRecord::new(
+                    if message == "failed" {
+                        DiagnosticLevel::Error
+                    } else {
+                        DiagnosticLevel::Info
+                    },
+                    DiagnosticOrigin::App {
+                        pid: 1,
+                        version: "test".into(),
+                    },
+                    "turn",
+                    message,
+                )
+                .with_correlation(correlation.clone())
+            })
+            .collect();
+        // Required milestones use the cached handle: contention must not
+        // block their producer or silently discard any default-level record.
+        let sending_supervisor = supervisor.clone();
+        let emitted = expected.clone();
+        let emitter = std::thread::spawn(move || {
+            for record in emitted {
+                sending_supervisor
+                    .cached_client()
+                    .record_diagnostic(record)
+                    .unwrap();
+            }
+        });
+        let delivered_while_locked = (0..expected.len())
+            .map(|_| received.recv_timeout(Duration::from_secs(1)))
+            .collect::<Result<Vec<_>, _>>();
+        let (sampled, sample) = mpsc::channel();
+        let sampling_supervisor = supervisor.clone();
+        let sampler = std::thread::spawn(move || {
+            sampled.send(sampling_supervisor.try_client()).unwrap();
+        });
+        // The sample must finish while the actual supervisor mutex is held.
+        // A timeout detects an accidental blocking lock without hanging the
+        // suite: release the guard and clean up before asserting the result.
+        let contended = sample.recv_timeout(Duration::from_secs(1));
+        drop(target);
+        emitter.join().unwrap();
+        sampler.join().unwrap();
+        let available = supervisor.try_client();
+        client.shutdown();
+        server.join().unwrap();
+        assert!(
+            matches!(contended, Ok(None)),
+            "contended sample waited for the target lock"
+        );
+        assert!(available.is_some_and(|sample| sample.same_connection(&client)));
+        assert_eq!(
+            delivered_while_locked.expect("milestones must arrive while the target lock is held"),
+            expected
+        );
+    }
 
     #[test]
     fn browser_origins_are_exact_and_deduplicated() {

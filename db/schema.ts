@@ -29,6 +29,12 @@ export const sessions = sqliteTable(
   {
     id: text("id").primaryKey(),
     projectId: text("project_id").notNull(),
+    /** The task this conversation is filed under, when the user filed it. */
+    taskId: text("task_id"),
+    /** Distinguishes persisted issue drafts from unloaded history. */
+    isDraft: integer("is_draft", { mode: "boolean" }).notNull().default(false),
+    /** Compact SessionWorkspace JSON for accurate unloaded conversation rows. */
+    workspace: text("workspace").notNull().default('{"kind":"local"}'),
     /** Explicit user title; "New task" means the automatic fallback is active. */
     title: text("title").notNull(),
     /** Provider-generated title, with the first prompt as a local fallback. */
@@ -47,7 +53,40 @@ export const sessions = sqliteTable(
     index("sessions_by_project").on(table.projectId, table.updatedAt),
     index("sessions_by_updated_at").on(table.updatedAt),
     index("sessions_by_last_reply_at").on(table.lastReplyAt),
+    index("sessions_by_task").on(table.taskId),
   ],
+);
+
+/**
+ * User-declared tasks: the board's cards.
+ *
+ * A task exists on its own (it may have no conversations yet), groups any
+ * number of sessions, and moves between the fixed board states by user
+ * action. The daemon owns the rows so every client sees the same board.
+ */
+export const tasks = sqliteTable(
+  "tasks",
+  {
+    id: text("id").primaryKey(),
+    title: text("title").notNull(),
+    description: text("description").notNull().default(""),
+    state: text("state").notNull(),
+    /** Order within the column, ascending. */
+    position: integer("position").notNull(),
+    /** Bound workspace, inferred from the first conversation filed under it. */
+    projectId: text("project_id"),
+    path: text("path"),
+    branch: text("branch"),
+    worktree: integer("worktree", { mode: "boolean" }).notNull().default(false),
+    /** Deferred creation intent; preserves an explicitly selected local checkout. */
+    newWorktree: integer("new_worktree", { mode: "boolean" }).notNull().default(false),
+    createdAt: integer("created_at").notNull(),
+    /** Any mutation, including state moves and title edits. */
+    updatedAt: integer("updated_at").notNull(),
+    /** When the task moved to `done`. */
+    completedAt: integer("completed_at"),
+  },
+  (table) => [index("tasks_by_state").on(table.state, table.position)],
 );
 
 /**

@@ -23,11 +23,21 @@ fn instance() -> &'static Instance {
         let database = crate::persistence::StateStore::default_path();
         Instance {
             label: cfg!(debug_assertions)
-                .then(|| label_for(&database))
+                .then(|| {
+                    scratch_label(std::env::var("WAKU_RPA_SCRATCH_NAME").ok().as_deref())
+                        .or_else(|| label_for(&database))
+                })
                 .flatten(),
             database: database.display().to_string(),
         }
     })
+}
+
+/// A disposable instance identifies its purpose in the existing debug badge.
+fn scratch_label(name: Option<&str>) -> Option<String> {
+    name.map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("scratch · {name}"))
 }
 
 /// `waku-streaming · temp/app.db` for a `<checkout>/temp/app.db` path.
@@ -60,6 +70,16 @@ pub fn window_title() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disposable_instances_have_a_distinct_human_name() {
+        assert_eq!(
+            scratch_label(Some(" core smoke ")),
+            Some("scratch · core smoke".into())
+        );
+        assert_eq!(scratch_label(Some(" ")), None);
+        assert_eq!(scratch_label(None), None);
+    }
 
     #[test]
     fn the_label_names_the_checkout_and_its_database() {

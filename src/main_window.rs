@@ -115,6 +115,16 @@ enum WindowContent {
 }
 
 impl MainWindow {
+    /// The daemon-backed workspace, once the daemon has answered. The debug
+    /// RPA bridge reaches the workspace through this rather than holding a
+    /// second handle that could outlive the window.
+    pub(crate) fn workspace(&self) -> Option<Entity<Waku>> {
+        match &self.content {
+            WindowContent::Workspace(workspace) => Some(workspace.clone()),
+            WindowContent::Connecting | WindowContent::Failed(_) => None,
+        }
+    }
+
     /// A window with no workspace yet: it paints skeleton content while the
     /// daemon connection runs, using the persisted preferences it was opened
     /// with.

@@ -147,6 +147,7 @@ impl PaletteIdentifier {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PaletteAction {
     NewTask,
+    NewSession,
     Resume,
     ChooseResumeProvider,
     SelectResumeProvider(ProviderKind),
@@ -159,6 +160,7 @@ enum PaletteAction {
     CollapseSidebarGroups,
     ToggleSidebar,
     ToggleRightPanel,
+    ToggleBoard,
     OpenSettings(SettingsPage),
     SelectTask(Uuid),
 }
@@ -703,6 +705,15 @@ impl Waku {
                 next(),
             ),
             CommandPaletteItem::command(
+                display_section(PaletteSection::Commands),
+                tr!("menu.new_session"),
+                "icons/pencil.svg",
+                Some(crate::platform::primary_shortcut("⌘⇧N", "Ctrl+Shift+N")),
+                PaletteAction::NewSession,
+                "new standalone session chat conversation draft",
+                next(),
+            ),
+            CommandPaletteItem::command(
                 display_section(PaletteSection::Suggested),
                 tr!("command_palette.resume"),
                 "icons/rotate-cw.svg",
@@ -806,6 +817,19 @@ impl Waku {
                 "toggle show hide right panel files diff terminal browser",
                 next(),
             ),
+            CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!(if self.board_open && self.selected_task.is_none() {
+                    "command_palette.hide_board"
+                } else {
+                    "command_palette.show_board"
+                }),
+                "icons/columns.svg",
+                None,
+                PaletteAction::ToggleBoard,
+                "toggle show hide task board kanban tasks columns",
+                next(),
+            ),
         ]);
 
         for (page, label_key, icon, keywords) in [
@@ -850,6 +874,12 @@ impl Waku {
                 "settings.computer_use",
                 "icons/cursor-spark.svg",
                 "settings preferences computer use accessibility screen recording",
+            ),
+            (
+                SettingsPage::Archive,
+                "settings.archive",
+                "icons/columns.svg",
+                "settings preferences archive completed done tasks conversations restore",
             ),
         ] {
             if !page.is_visible_in_navigation() {
@@ -1570,7 +1600,8 @@ impl Waku {
 
         self.close_command_palette(window, cx);
         match action {
-            PaletteAction::NewTask => self.new_session_action(&NewSession, window, cx),
+            PaletteAction::NewTask => self.new_task_action(&NewTask, window, cx),
+            PaletteAction::NewSession => self.new_session_action(&NewSession, window, cx),
             PaletteAction::OpenProject => self.new_project_action(&NewProject, window, cx),
             PaletteAction::FocusComposer => self.focus_composer_action(&FocusComposer, window, cx),
             PaletteAction::CopyIdentifier(identifier) => {
@@ -1585,6 +1616,7 @@ impl Waku {
             PaletteAction::ToggleRightPanel => {
                 self.toggle_right_panel_action(&ToggleRightPanel, window, cx)
             }
+            PaletteAction::ToggleBoard => self.toggle_board(cx),
             PaletteAction::OpenSettings(page) => {
                 self.open_settings_action(&OpenSettings, window, cx);
                 self.open_settings_page(page, cx);

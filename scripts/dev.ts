@@ -569,6 +569,13 @@ function launchApp(): ReturnType<typeof Bun.spawn> {
   const launchEnvironment: Array<[string, string]> = [
     ["WAKU_DAEMON_PATH", daemonPath],
   ];
+  // An explicitly supplied external daemon survives app-only rebuilds. macOS
+  // LaunchServices does not inherit Bun's environment, so forward the existing
+  // connection just like the daemon path. Never log these values.
+  for (const key of ["WAKU_DAEMON_ADDRESS", "WAKU_DAEMON_TOKEN"]) {
+    const value = process.env[key];
+    if (value) launchEnvironment.push([key, value]);
+  }
   if (flavor) {
     launchEnvironment.push(
       ["WAKU_APP_NAME", appName],

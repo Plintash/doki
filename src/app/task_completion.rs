@@ -1,0 +1,949 @@
+//! Task completion waits for running and detached work to settle.
+
+use super::board::{TaskCompletionConfirm, focus_overlay_control};
+use super::*;
+
+/// One completion attempt owns its absence evidence; it is never a general
+/// cache of daemon liveness and is consumed when that attempt begins stopping.
+#[derive(Default)]
+struct CompletionRuntimeEvidence {
+    attempt: Uuid,
+    sessions: HashSet<Uuid>,
+    pending: HashSet<Uuid>,
+    absent: HashSet<Uuid>,
+}
+
+impl CompletionRuntimeEvidence {
+    fn new(sessions: HashSet<Uuid>, attached: &HashSet<Uuid>) -> Self {
+        let pending = sessions.difference(attached).copied().collect();
+        Self {
+            attempt: Uuid::new_v4(),
+            sessions,
+            pending,
+            absent: HashSet::new(),
+        }
+    }
+
+    fn record(&mut self, attempt: Uuid, session_id: Uuid, absent: bool) -> bool {
+        if self.attempt != attempt || !self.pending.remove(&session_id) {
+            return false;
+        }
+        if absent {
+            self.absent.insert(session_id);
+        }
+        self.pending.is_empty()
+    }
+
+    fn ready_for(&self, sessions: &HashSet<Uuid>) -> bool {
+        self.pending.is_empty() && self.sessions == *sessions
+    }
+
+    fn controls_known(&self, attached: impl Fn(&Uuid) -> bool) -> bool {
+        self.sessions
+            .iter()
+            .all(|id| attached(id) || self.absent.contains(id))
+    }
+}
+
+pub(super) struct TaskCompletionPreflight {
+    evidence: CompletionRuntimeEvidence,
+    window: gpui::AnyWindowHandle,
+}
+
+#[derive(Default)]
+pub(super) struct TaskCompletionStop {
+    pub(super) dirty: bool,
+    pub(super) failed: bool,
+    attempt: Uuid,
+    runtime_drivers: HashMap<Uuid, (Uuid, DriverHandle)>,
+    closing: bool,
+    pending_closes: HashSet<Uuid>,
+}
+
+impl TaskCompletionStop {
+    fn acknowledge_close(&mut self, attempt: Uuid, session_id: Uuid, success: bool) {
+        if self.attempt != attempt || !self.pending_closes.remove(&session_id) {
+            return;
+        }
+        self.failed |= !success;
+        self.dirty = true;
+    }
+
+    fn runtime_state(&self) -> BackgroundCompletionState {
+        if self.failed {
+            BackgroundCompletionState::Failed
+        } else if !self.pending_closes.is_empty()
+            || (!self.closing && !self.runtime_drivers.is_empty())
+        {
+            BackgroundCompletionState::Stopping
+        } else {
+            BackgroundCompletionState::Settled
+        }
+    }
+}
+
+/// Roll back only a rejected Done transition, never the issue's edited content.
+#[derive(Clone, Copy)]
+pub(super) struct TaskCompletionSaveRollback {
+    attempt: Uuid,
+    state: TaskState,
+    position: i64,
+}
+
+impl TaskCompletionSaveRollback {
+    fn begin(task: &mut Task) -> Self {
+        let rollback = Self {
+            attempt: Uuid::new_v4(),
+            state: task.state,
+            position: task.position,
+        };
+        task.set_state(TaskState::Done);
+        rollback
+    }
+
+    fn apply(&self, attempt: Uuid, task: &mut Task) -> bool {
+        if self.attempt != attempt || !task.state.is_done() {
+            return false;
+        }
+        task.set_state(self.state);
+        task.position = self.position;
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BackgroundCompletionState {
+    Settled,
+    Stopping,
+    Failed,
+}
+
+fn completion_can_finish(
+    states: impl IntoIterator<Item = BackgroundCompletionState>,
+) -> BackgroundCompletionState {
+    states
+        .into_iter()
+        .fold(BackgroundCompletionState::Settled, |current, next| {
+            match (current, next) {
+                (BackgroundCompletionState::Failed, _) | (_, BackgroundCompletionState::Failed) => {
+                    BackgroundCompletionState::Failed
+                }
+                (BackgroundCompletionState::Stopping, _)
+                | (_, BackgroundCompletionState::Stopping) => BackgroundCompletionState::Stopping,
+                _ => BackgroundCompletionState::Settled,
+            }
+        })
+}
+
+/// An idle snapshot and an empty event queue do not establish that a
+/// connected runtime is idle: attachment/reconnect replay may still be in flight.
+fn completion_requires_stop_confirmation(
+    status: SessionStatus,
+    has_background_work: bool,
+    has_runtime: bool,
+) -> bool {
+    status.is_busy() || has_background_work || has_runtime
+}
+
+impl Waku {
+    /// The dialog count and decision share the same live in-memory evidence.
+    pub(super) fn task_completion_stop_count(&self, task_id: Uuid) -> usize {
+        self.state
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.task_id == Some(task_id)
+                    && completion_requires_stop_confirmation(
+                        session.status,
+                        self.session_has_live_background_work(session.id),
+                        self.runtimes.contains_key(&session.id),
+                    )
+            })
+            .count()
+    }
+
+    /// Every path to Done shares the same stop/acknowledgment boundary.
+    pub(super) fn move_task(
+        &mut self,
+        task_id: Uuid,
+        state: TaskState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self
+            .state
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .map(|task| task.state)
+        else {
+            return;
+        };
+        if state.is_done() {
+            if current != state {
+                self.request_task_completion(task_id, window, cx);
+            }
+            return;
+        }
+        self.task_completion_save_rollbacks.remove(&task_id);
+        self.task_completion_preflights.remove(&task_id);
+        // Choosing an active state also cancels a pending archive intent. Stops
+        // already sent to a provider cannot be undone, but no later ack archives it.
+        let cancelled = self.task_completion_stops.remove(&task_id).is_some();
+        if current == state {
+            if cancelled {
+                cx.notify();
+            }
+            return;
+        }
+        let position = self.next_task_position(state);
+        let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) else {
+            return;
+        };
+        task.set_state(state);
+        task.position = position;
+        self.sidebar_rows_fingerprint.set(None);
+        self.save_task_changes(cx);
+        cx.notify();
+    }
+
+    fn task_completion_session_ids(&self, task_id: Uuid) -> HashSet<Uuid> {
+        self.state
+            .sessions
+            .iter()
+            .filter(|session| session.task_id == Some(task_id))
+            .map(|session| session.id)
+            .collect()
+    }
+
+    fn begin_task_completion_preflight(
+        &mut self,
+        task_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self
+            .task_completion_preflights
+            .get(&task_id)
+            .is_some_and(|preflight| !preflight.evidence.pending.is_empty())
+        {
+            return true;
+        }
+        self.task_completion_preflights.remove(&task_id);
+        let sessions = self.task_completion_session_ids(task_id);
+        let attached = self.runtimes.keys().copied().collect();
+        let evidence = CompletionRuntimeEvidence::new(sessions, &attached);
+        let pending = evidence.pending.iter().copied().collect::<Vec<_>>();
+        self.task_completion_preflights.insert(
+            task_id,
+            TaskCompletionPreflight {
+                evidence,
+                window: window.window_handle(),
+            },
+        );
+        if pending.is_empty() {
+            return false;
+        }
+        for session_id in pending {
+            self.start_runtime_attachment(session_id, cx);
+        }
+        self.show_toast(tr!("board.completion_waiting_for_runtime"));
+        cx.notify();
+        true
+    }
+
+    pub(super) fn task_completion_attachment_attempts(
+        &self,
+        session_id: Uuid,
+    ) -> Vec<(Uuid, Uuid)> {
+        self.task_completion_preflights
+            .iter()
+            .filter_map(|(id, preflight)| {
+                preflight
+                    .evidence
+                    .pending
+                    .contains(&session_id)
+                    .then_some((*id, preflight.evidence.attempt))
+            })
+            .collect()
+    }
+
+    /// A preflight can join a normal attachment already in flight, or replace
+    /// a canceled attempt. Old None evidence cannot settle the newer attempt.
+    pub(super) fn resume_task_completion_attachment(
+        &mut self,
+        session_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        let attempts = self.task_completion_attachment_attempts(session_id);
+        if attempts.is_empty() {
+            return;
+        }
+        if self.runtimes.contains_key(&session_id) {
+            // An installed control is current local evidence, independent of
+            // the old request's liveness snapshot.
+            self.note_task_completion_attachment(session_id, Some(false), &attempts, cx);
+        } else {
+            self.start_runtime_attachment(session_id, cx);
+        }
+    }
+
+    pub(super) fn task_completion_waits_for_attachment(&self, session_id: Uuid) -> bool {
+        self.task_completion_preflights
+            .values()
+            .any(|preflight| preflight.evidence.pending.contains(&session_id))
+    }
+
+    pub(super) fn note_task_completion_attachment(
+        &mut self,
+        session_id: Uuid,
+        absent: Option<bool>,
+        attempts: &[(Uuid, Uuid)],
+        cx: &mut Context<Self>,
+    ) {
+        for &(task_id, attempt) in attempts {
+            if self
+                .task_completion_preflights
+                .get(&task_id)
+                .is_none_or(|preflight| preflight.evidence.attempt != attempt)
+            {
+                continue;
+            }
+            if absent.is_none() || self.task_has_unstoppable_work(task_id) {
+                self.task_completion_preflights.remove(&task_id);
+                self.show_toast(tr!("board.completion_stop_failed"));
+                cx.notify();
+                continue;
+            }
+            let Some(preflight) = self.task_completion_preflights.get_mut(&task_id) else {
+                continue;
+            };
+            if !preflight
+                .evidence
+                .record(attempt, session_id, absent.unwrap())
+            {
+                continue;
+            }
+            let attempt = preflight.evidence.attempt;
+            let window = preflight.window;
+            cx.spawn(async move |waku, cx| {
+                let updated = window.update(cx, |_, window, cx| {
+                    let _ = waku.update(cx, |this, cx| {
+                        let sessions = this.task_completion_session_ids(task_id);
+                        let current = this
+                            .task_completion_preflights
+                            .get(&task_id)
+                            .is_some_and(|preflight| preflight.evidence.attempt == attempt);
+                        if !current {
+                            return;
+                        }
+                        let valid = this
+                            .task_completion_preflights
+                            .get(&task_id)
+                            .is_some_and(|preflight| preflight.evidence.ready_for(&sessions));
+                        if !valid || this.task_has_unstoppable_work(task_id) {
+                            this.task_completion_preflights.remove(&task_id);
+                            this.show_toast(tr!("board.completion_stop_failed"));
+                            cx.notify();
+                            return;
+                        }
+                        // Apply events already available, without treating an
+                        // empty queue as proof that attachment replay is ready.
+                        this.drain_driver_events(cx);
+                        this.request_task_completion_ready(task_id, window, cx);
+                    });
+                });
+                if updated.is_err() {
+                    let _ = waku.update(cx, |this, cx| {
+                        if this
+                            .task_completion_preflights
+                            .get(&task_id)
+                            .is_some_and(|preflight| preflight.evidence.attempt == attempt)
+                        {
+                            this.task_completion_preflights.remove(&task_id);
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
+    }
+
+    fn task_has_unstoppable_work(&self, task_id: Uuid) -> bool {
+        self.state.sessions.iter().any(|session| {
+            session.task_id == Some(task_id)
+                && self.session_has_local_runtime_preparation(session.id)
+        })
+    }
+
+    fn request_task_completion(
+        &mut self,
+        task_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.task_completion_stops.contains_key(&task_id) {
+            self.show_toast(tr!("board.completion_stopping"));
+            cx.notify();
+            return;
+        }
+        if self.task_has_unstoppable_work(task_id) {
+            self.show_toast(tr!("board.completion_waiting_for_setup"));
+            cx.notify();
+            return;
+        }
+        if self.begin_task_completion_preflight(task_id, window, cx) {
+            return;
+        }
+        self.drain_driver_events(cx);
+        self.request_task_completion_ready(task_id, window, cx);
+    }
+
+    fn request_task_completion_ready(
+        &mut self,
+        task_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .state
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .is_none_or(|task| task.state.is_done())
+        {
+            self.task_completion_preflights.remove(&task_id);
+            return;
+        }
+        if self.task_has_unstoppable_work(task_id) {
+            self.task_completion_preflights.remove(&task_id);
+            self.show_toast(tr!("board.completion_waiting_for_setup"));
+            cx.notify();
+            return;
+        }
+        if self.task_completion_stop_count(task_id) > 0 {
+            let confirm_focus = cx.focus_handle().tab_stop(true);
+            let cancel_focus = cx.focus_handle().tab_stop(true);
+            self.pending_task_completion = Some(TaskCompletionConfirm {
+                task_id,
+                confirm_focus,
+                cancel_focus: cancel_focus.clone(),
+            });
+            focus_overlay_control(window, cx, cancel_focus, move |this| {
+                this.pending_task_completion
+                    .as_ref()
+                    .is_some_and(|pending| pending.task_id == task_id)
+            });
+            cx.notify();
+            return;
+        }
+        self.finish_task_completion(task_id, cx);
+    }
+
+    fn finish_task_completion(&mut self, task_id: Uuid, cx: &mut Context<Self>) {
+        if self
+            .task_completion_preflights
+            .get(&task_id)
+            .is_some_and(|preflight| {
+                !preflight
+                    .evidence
+                    .ready_for(&self.task_completion_session_ids(task_id))
+            })
+        {
+            self.task_completion_preflights.remove(&task_id);
+            self.show_toast(tr!("board.completion_stop_failed"));
+            cx.notify();
+            return;
+        }
+        if self.task_has_unstoppable_work(task_id) {
+            self.task_completion_preflights.remove(&task_id);
+            self.show_toast(tr!("board.completion_waiting_for_setup"));
+            cx.notify();
+            return;
+        }
+        // A control can disappear while the confirmation is open. Do not
+        // silently replace this intent with ordinary orphan-attachment probes.
+        let controls_known =
+            self.task_completion_preflights
+                .get(&task_id)
+                .is_some_and(|preflight| {
+                    preflight
+                        .evidence
+                        .controls_known(|session_id| self.runtimes.contains_key(session_id))
+                });
+        if !controls_known {
+            self.task_completion_preflights.remove(&task_id);
+            self.show_toast(tr!("board.completion_stop_failed"));
+            cx.notify();
+            return;
+        }
+        let sessions = self
+            .state
+            .sessions
+            .iter()
+            .filter(|session| session.task_id == Some(task_id))
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        // Preflight all detached work before issuing any stop. An absent control
+        // channel is not evidence that a detached process has actually ended.
+        let requests = sessions
+            .iter()
+            .map(|id| {
+                self.task_background_stop_requests(*id)
+                    .map(|keys| (*id, keys))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(requests) = requests else {
+            self.show_toast(tr!("board.completion_cannot_stop"));
+            cx.notify();
+            return;
+        };
+        // Keep the exact controls even if normal foreground cleanup removes
+        // a runtime. Only explicit shutdown acknowledgments release this gate.
+        let mut runtime_drivers = self
+            .unconfirmed_task_closes
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_default();
+        for id in &sessions {
+            if let Some(runtime) = self.runtimes.get(id) {
+                if !runtime_drivers.values().any(|(session_id, driver)| {
+                    session_id == id && driver.same_runtime(&runtime.driver)
+                }) {
+                    runtime_drivers.insert(Uuid::new_v4(), (*id, runtime.driver.clone()));
+                }
+            }
+        }
+        self.unconfirmed_task_closes
+            .insert(task_id, runtime_drivers.clone());
+        self.task_completion_preflights.remove(&task_id);
+        self.task_completion_stops.insert(
+            task_id,
+            TaskCompletionStop {
+                dirty: true,
+                attempt: Uuid::new_v4(),
+                runtime_drivers,
+                ..TaskCompletionStop::default()
+            },
+        );
+        for (session_id, keys) in requests {
+            for key in keys {
+                self.stop_background_work(session_id, key, cx);
+            }
+        }
+        for session_id in sessions {
+            if self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .is_some_and(|session| session.status.is_busy())
+            {
+                self.stop_session_turn_for_completion(session_id, cx);
+            }
+        }
+        self.reconcile_task_completions(cx);
+        if self.task_completion_stops.contains_key(&task_id) {
+            self.show_toast(tr!("board.completion_stopping"));
+            cx.notify();
+        }
+    }
+
+    /// Called while applying provider events. The actual transition is deferred
+    /// to the event-pump boundary, when all temporarily removed runtimes are back.
+    pub(super) fn note_task_completion_background_event(&mut self, session_id: Uuid, failed: bool) {
+        if self.task_completion_stops.is_empty() {
+            return;
+        }
+        let task_id = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.task_id);
+        if let Some(progress) = task_id.and_then(|id| self.task_completion_stops.get_mut(&id)) {
+            progress.dirty = true;
+            progress.failed |= failed;
+        }
+    }
+
+    pub(super) fn reconcile_task_completions(&mut self, cx: &mut Context<Self>) {
+        let dirty = self
+            .task_completion_stops
+            .iter_mut()
+            .filter_map(|(id, progress)| {
+                std::mem::take(&mut progress.dirty).then_some((*id, progress.failed))
+            })
+            .collect::<Vec<_>>();
+        for (task_id, failed) in dirty {
+            let sessions = self
+                .state
+                .sessions
+                .iter()
+                .filter(|session| session.task_id == Some(task_id))
+                .map(|session| session.id)
+                .collect::<Vec<_>>();
+            let outcome = if failed || self.task_has_unstoppable_work(task_id) {
+                BackgroundCompletionState::Failed
+            } else {
+                completion_can_finish(
+                    sessions
+                        .iter()
+                        .map(|id| self.session_background_completion_state(*id)),
+                )
+            };
+            match outcome {
+                BackgroundCompletionState::Stopping => {}
+                BackgroundCompletionState::Failed => {
+                    self.task_completion_stops.remove(&task_id);
+                    self.show_toast(tr!("board.completion_stop_failed"));
+                    cx.notify();
+                }
+                BackgroundCompletionState::Settled => {
+                    let Some(progress) = self.task_completion_stops.get_mut(&task_id) else {
+                        continue;
+                    };
+                    // A replacement belongs to newer work. Never close it or
+                    // let an acknowledgment for its predecessor archive it.
+                    if sessions.iter().any(|id| {
+                        self.runtimes.get(id).is_some_and(|runtime| {
+                            !progress
+                                .runtime_drivers
+                                .values()
+                                .any(|(session_id, driver)| {
+                                    session_id == id && runtime.driver.same_runtime(driver)
+                                })
+                        })
+                    }) {
+                        self.task_completion_stops.remove(&task_id);
+                        self.show_toast(tr!("board.completion_stop_failed"));
+                        cx.notify();
+                        continue;
+                    }
+                    if !progress.closing {
+                        progress.closing = true;
+                        progress.pending_closes =
+                            progress.runtime_drivers.keys().copied().collect();
+                        let attempt = progress.attempt;
+                        for (control_id, (_, driver)) in progress.runtime_drivers.clone() {
+                            cx.spawn(async move |waku, cx| {
+                                let (driver, result) = cx
+                                    .background_executor()
+                                    .spawn(async move {
+                                        let result = driver.close_and_wait();
+                                        (driver, result)
+                                    })
+                                    .await;
+                                let _ = waku.update(cx, |this, cx| {
+                                    if result.is_ok() {
+                                        if let Some(unconfirmed) =
+                                            this.unconfirmed_task_closes.get_mut(&task_id)
+                                        {
+                                            if unconfirmed.get(&control_id).is_some_and(
+                                                |(_, current)| current.same_runtime(&driver),
+                                            ) {
+                                                unconfirmed.remove(&control_id);
+                                            }
+                                            if unconfirmed.is_empty() {
+                                                this.unconfirmed_task_closes.remove(&task_id);
+                                            }
+                                        }
+                                    }
+                                    if let Some(progress) =
+                                        this.task_completion_stops.get_mut(&task_id)
+                                    {
+                                        progress.acknowledge_close(
+                                            attempt,
+                                            control_id,
+                                            result.is_ok(),
+                                        );
+                                    }
+                                    this.reconcile_task_completions(cx);
+                                });
+                            })
+                            .detach();
+                        }
+                    }
+                    if progress.runtime_state() != BackgroundCompletionState::Settled {
+                        continue;
+                    }
+                    // Remove the intent before stopping any provider wake that
+                    // arrived along with its final background-work event.
+                    self.task_completion_stops.remove(&task_id);
+                    for session_id in &sessions {
+                        if self
+                            .state
+                            .sessions
+                            .iter()
+                            .find(|session| session.id == *session_id)
+                            .is_some_and(|session| session.status.is_busy())
+                        {
+                            self.stop_session_turn(*session_id, cx);
+                        }
+                    }
+                    // Stopping a wake drains queued provider events. Recheck in
+                    // case those events revealed another detached process.
+                    if sessions
+                        .iter()
+                        .any(|id| self.session_has_live_background_work(*id))
+                    {
+                        self.show_toast(tr!("board.completion_stop_failed"));
+                        cx.notify();
+                        continue;
+                    }
+                    for session_id in sessions {
+                        // No live detached work remains; closing now prevents an
+                        // automatic provider wake from restarting an archived issue.
+                        self.reset_session_runtime(session_id);
+                    }
+                    let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id)
+                    else {
+                        continue;
+                    };
+                    let rollback = TaskCompletionSaveRollback::begin(task);
+                    self.task_completion_save_rollbacks
+                        .insert(task_id, rollback);
+                    self.unconfirmed_task_closes.remove(&task_id);
+                    self.hide_toast();
+                    self.sidebar_rows_fingerprint.set(None);
+                    self.save_task_changes(cx);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    pub(super) fn task_completion_save_attempts(&self) -> Vec<(Uuid, Uuid)> {
+        self.task_completion_save_rollbacks
+            .iter()
+            .map(|(id, rollback)| (*id, rollback.attempt))
+            .collect()
+    }
+
+    pub(super) fn settle_task_completion_save(&mut self, attempts: &[(Uuid, Uuid)], saved: bool) {
+        for (task_id, attempt) in attempts {
+            let Some(rollback) = self
+                .task_completion_save_rollbacks
+                .get(task_id)
+                .copied()
+                .filter(|rollback| rollback.attempt == *attempt)
+            else {
+                continue;
+            };
+            self.task_completion_save_rollbacks.remove(task_id);
+            if !saved
+                && let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == *task_id)
+            {
+                if rollback.apply(*attempt, task) {
+                    super::rpa::daemon::model_changed();
+                    self.sidebar_rows_fingerprint.set(None);
+                }
+            }
+        }
+    }
+
+    pub(super) fn confirm_task_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_task_completion.take() else {
+            return;
+        };
+        let focus = self.board_dialog_focus(cx);
+        window.focus(&focus, cx);
+        self.finish_task_completion(pending.task_id, cx);
+    }
+
+    /// Cancel only the archive intent; already-sent process stops remain valid.
+    pub(super) fn cancel_task_completion_stop(&mut self, task_id: Uuid, cx: &mut Context<Self>) {
+        if self.task_completion_stops.remove(&task_id).is_some() {
+            self.hide_toast();
+            cx.notify();
+        }
+    }
+
+    pub(super) fn cancel_task_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_task_completion.take() else {
+            return;
+        };
+        self.task_completion_preflights.remove(&pending.task_id);
+        let focus = self.board_dialog_focus(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BackgroundCompletionState::*, CompletionRuntimeEvidence, TaskCompletionSaveRollback,
+        TaskCompletionStop, completion_can_finish, completion_requires_stop_confirmation,
+    };
+    use crate::model::{AgentSession, ProviderKind, SessionStatus, Task, TaskState};
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    #[test]
+    fn resident_runtime_with_idle_snapshot_requires_confirmation_before_replay() {
+        assert!(completion_requires_stop_confirmation(
+            SessionStatus::Idle,
+            false,
+            true
+        ));
+        // The decision remains the same when delayed running state arrives.
+        assert!(completion_requires_stop_confirmation(
+            SessionStatus::Working,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn idle_history_without_runtime_or_background_work_needs_no_confirmation() {
+        assert!(!completion_requires_stop_confirmation(
+            SessionStatus::Idle,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn busy_or_detached_work_requires_stop_confirmation() {
+        assert!(completion_requires_stop_confirmation(
+            SessionStatus::Working,
+            false,
+            false
+        ));
+        assert!(completion_requires_stop_confirmation(
+            SessionStatus::Idle,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn lost_attached_control_is_not_replaced_with_absence_evidence() {
+        let session = Uuid::new_v4();
+        let sessions = HashSet::from([session]);
+        let evidence = CompletionRuntimeEvidence::new(sessions.clone(), &sessions);
+        assert!(evidence.ready_for(&sessions));
+        assert!(evidence.controls_known(|id| *id == session));
+        assert!(!evidence.controls_known(|_| false));
+    }
+
+    #[test]
+    fn idle_catalog_session_is_included_in_completion_runtime_preflight() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        session.status = SessionStatus::Idle;
+        let sessions = HashSet::from([session.id]);
+        let evidence = CompletionRuntimeEvidence::new(sessions.clone(), &HashSet::new());
+        assert!(evidence.pending.contains(&session.id));
+        assert!(!evidence.ready_for(&sessions));
+    }
+
+    #[test]
+    fn no_runtime_preflight_evidence_resumes_once_without_repeating_the_probe() {
+        let session = Uuid::new_v4();
+        let sessions = HashSet::from([session]);
+        let mut evidence = CompletionRuntimeEvidence::new(sessions.clone(), &HashSet::new());
+        assert!(evidence.record(evidence.attempt, session, true));
+        assert!(evidence.absent.contains(&session));
+        assert!(evidence.ready_for(&sessions));
+        assert!(!evidence.record(evidence.attempt, session, true));
+        assert!(!evidence.ready_for(&HashSet::from([session, Uuid::new_v4()])));
+    }
+
+    #[test]
+    fn old_attachment_absence_cannot_settle_a_new_completion_attempt() {
+        let session = Uuid::new_v4();
+        let sessions = HashSet::from([session]);
+        let old = CompletionRuntimeEvidence::new(sessions.clone(), &HashSet::new());
+        let mut current = CompletionRuntimeEvidence::new(sessions.clone(), &HashSet::new());
+        assert!(!current.record(old.attempt, session, true));
+        assert!(current.pending.contains(&session));
+        assert!(current.absent.is_empty());
+        assert!(!current.ready_for(&sessions));
+        assert!(current.record(current.attempt, session, false));
+        assert!(current.ready_for(&sessions));
+    }
+
+    #[test]
+    fn rejected_completion_save_restores_active_state_and_preserves_inflight_edits() {
+        let mut task = Task::new("Original title", TaskState::Doing, 7);
+        let rollback = TaskCompletionSaveRollback::begin(&mut task);
+        task.title = "Edited during save".into();
+        task.description = "Keep this detail".into();
+        task.touch();
+        assert!(rollback.apply(rollback.attempt, &mut task));
+        assert_eq!(task.state, TaskState::Doing);
+        assert_eq!(task.position, 7);
+        assert_eq!(task.title, "Edited during save");
+        assert_eq!(task.description, "Keep this detail");
+        assert!(task.completed_at.is_none());
+    }
+
+    #[test]
+    fn stale_completion_save_cannot_undo_reopened_and_recompleted_issue() {
+        let mut task = Task::new("Task", TaskState::Backlog, 2);
+        let old = TaskCompletionSaveRollback::begin(&mut task);
+        task.set_state(TaskState::Doing);
+        let current = TaskCompletionSaveRollback::begin(&mut task);
+        assert!(!current.apply(old.attempt, &mut task));
+        assert_eq!(task.state, TaskState::Done);
+        assert!(current.apply(current.attempt, &mut task));
+        assert_eq!(task.state, TaskState::Doing);
+    }
+
+    #[test]
+    fn foreground_only_completion_waits_for_delayed_close_acknowledgment() {
+        let session = Uuid::new_v4();
+        let attempt = Uuid::new_v4();
+        let mut progress = TaskCompletionStop {
+            attempt,
+            closing: true,
+            pending_closes: [session].into_iter().collect(),
+            ..TaskCompletionStop::default()
+        };
+        // An empty background registry cannot discharge foreground shutdown.
+        assert_eq!(
+            completion_can_finish([Settled, progress.runtime_state()]),
+            Stopping
+        );
+        progress.acknowledge_close(Uuid::new_v4(), session, true);
+        assert_eq!(progress.runtime_state(), Stopping);
+        progress.acknowledge_close(attempt, session, true);
+        assert_eq!(progress.runtime_state(), Settled);
+    }
+
+    #[test]
+    fn rejected_foreground_close_keeps_completion_failed_without_background_work() {
+        let session = Uuid::new_v4();
+        let attempt = Uuid::new_v4();
+        let mut progress = TaskCompletionStop {
+            attempt,
+            closing: true,
+            pending_closes: [session].into_iter().collect(),
+            ..TaskCompletionStop::default()
+        };
+        progress.acknowledge_close(attempt, session, false);
+        assert_eq!(
+            completion_can_finish([Settled, progress.runtime_state()]),
+            Failed
+        );
+        progress.acknowledge_close(attempt, session, true);
+        assert_eq!(progress.runtime_state(), Failed);
+    }
+
+    #[test]
+    fn completion_waits_for_every_background_acknowledgment() {
+        assert_eq!(completion_can_finish([]), Settled);
+        assert_eq!(completion_can_finish([Settled, Settled]), Settled);
+        assert_eq!(completion_can_finish([Settled, Stopping]), Stopping);
+        assert_eq!(completion_can_finish([Stopping, Settled]), Stopping);
+    }
+
+    #[test]
+    fn failed_stop_never_archives_an_issue() {
+        assert_eq!(completion_can_finish([Failed, Settled]), Failed);
+        assert_eq!(completion_can_finish([Stopping, Failed]), Failed);
+        assert_eq!(completion_can_finish([Failed, Stopping]), Failed);
+    }
+}

@@ -833,7 +833,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           ...currentSession,
           messages: [...currentSession.messages],
           turns: [...currentSession.turns],
-          updated_at: now,
+          updated_at: Math.max(currentSession.updated_at, now),
         }
         if (objective) {
           if (
@@ -1362,7 +1362,7 @@ function queueSubmission(
 ): AgentSession {
   return {
     ...session,
-    updated_at: Math.floor(Date.now() / 1_000),
+    updated_at: Math.max(session.updated_at, Math.floor(Date.now() / 1_000)),
     queued_messages: [
       ...(session.queued_messages ?? []),
       {

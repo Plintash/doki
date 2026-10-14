@@ -688,6 +688,127 @@ impl Project {
     }
 }
 
+/// Where a task sits on the board.
+///
+/// The three columns are fixed for now; user-defined columns come later. The
+/// state is the user's own declaration — runtime activity never moves a task
+/// on its own.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskState {
+    #[default]
+    Backlog,
+    Doing,
+    Done,
+}
+
+impl TaskState {
+    /// Stable name for element ids.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Doing => "doing",
+            Self::Done => "done",
+        }
+    }
+
+    /// Stable ordinal for fingerprints and column order.
+    pub fn ordinal(self) -> u64 {
+        match self {
+            Self::Backlog => 1,
+            Self::Doing => 2,
+            Self::Done => 3,
+        }
+    }
+
+    pub fn is_done(self) -> bool {
+        self == Self::Done
+    }
+}
+
+/// A user-declared unit of work that groups conversations.
+///
+/// A task exists on its own: it may have no conversations yet, and several
+/// conversations (attempts, follow-ups, reviews) can belong to the same task.
+/// It is the unit the board arranges and the unit that survives archiving.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct Task {
+    pub id: Uuid,
+    pub title: String,
+    /// The issue brief, separate from any conversation or execution prompt.
+    #[serde(default)]
+    pub description: String,
+    pub state: TaskState,
+    /// Order within its column, ascending. Ties fall back to recency.
+    pub position: i64,
+    /// Where this task's work happens by default, inferred from the first
+    /// conversation filed under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<TaskWorkspace>,
+    pub created_at: u64,
+    /// Any mutation, including state moves and title edits.
+    pub updated_at: u64,
+    /// When the user moved the task to [`TaskState::Done`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+}
+
+/// An issue's default workspace, including deferred worktree creation intent.
+/// Creation happens only when its first session is submitted.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+pub enum TaskWorkspace {
+    /// Create an isolated worktree on first submission, then reuse that path.
+    NewWorktree { project_id: Uuid },
+    /// Work in the project's ordinary checkout.
+    Local { project_id: Uuid },
+    /// Work in an isolated Git worktree.
+    Worktree {
+        project_id: Uuid,
+        path: PathBuf,
+        branch: String,
+    },
+}
+
+impl Task {
+    pub fn new(title: impl Into<String>, state: TaskState, position: i64) -> Self {
+        let now = unix_time();
+        Self {
+            id: Uuid::new_v4(),
+            title: title.into(),
+            description: String::new(),
+            state,
+            position,
+            workspace: None,
+            created_at: now,
+            updated_at: now,
+            completed_at: state.is_done().then(unix_time),
+        }
+    }
+
+    /// Applies a user-driven state change, stamping the times it implies.
+    pub fn set_state(&mut self, state: TaskState) {
+        if self.state == state {
+            return;
+        }
+        self.state = state;
+        self.touch();
+        self.completed_at = state.is_done().then(unix_time);
+    }
+
+    /// Marks any other user-driven mutation (a rename, an inferred workspace)
+    /// so the daemon and every other client agree this copy is the newest.
+    pub fn touch(&mut self) {
+        // Retain Unix-second compatibility for recency/archive displays while
+        // guaranteeing a later revision, even for rapid edits or clock skew.
+        self.updated_at = unix_time().max(self.updated_at.saturating_add(1));
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionStatus {
@@ -966,6 +1087,9 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_title: Option<String>,
     pub project_id: Uuid,
+    /// The task this conversation is filed under, when the user has filed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     /// Local project checkout or an isolated Git worktree for this task.
     #[serde(default, skip_serializing_if = "SessionWorkspace::is_local")]
     pub workspace: SessionWorkspace,
@@ -1045,6 +1169,11 @@ pub struct AgentSession {
     pub turns: Vec<AgentTurn>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<QueuedMessage>,
+    /// Distinguishes a persisted, unstarted issue session from unloaded history.
+    /// This marker is meaningful for list projections; loaded sessions derive
+    /// their started state from the transcript and provider cursor.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_draft: bool,
     /// Whether the transcript has been read from the database.
     ///
     /// Startup loads only the columns the session list needs, so a session
@@ -1071,6 +1200,7 @@ impl AgentSession {
             title: Self::DEFAULT_TITLE.to_owned(),
             auto_title: None,
             project_id,
+            task_id: None,
             workspace: SessionWorkspace::Local,
             provider,
             model: None,
@@ -1084,6 +1214,7 @@ impl AgentSession {
             updated_at: now,
             last_reply_at: None,
             detail_loaded: true,
+            is_draft: false,
             provider_cursor: None,
             available_commands: Vec::new(),
             thread_goal: None,
@@ -1117,7 +1248,9 @@ impl AgentSession {
             title: self.title.clone(),
             auto_title: self.auto_title.clone(),
             project_id: self.project_id,
-            workspace: SessionWorkspace::Local,
+            task_id: self.task_id,
+            is_draft: !self.has_started(),
+            workspace: self.workspace.clone(),
             provider: self.provider,
             model: self.model.clone(),
             runtime_mode: self.runtime_mode,
@@ -1147,6 +1280,14 @@ impl AgentSession {
         }
     }
 
+    /// Stamp a normal session mutation without lowering a revision advanced
+    /// by a same-second metadata edit or a clock that moved backwards.
+    /// Streaming stays on wall-clock time; conversation recency uses
+    /// `last_reply_at` instead of this metadata-conflict revision.
+    pub fn touch(&mut self) {
+        self.updated_at = self.updated_at.max(unix_time());
+    }
+
     pub fn is_busy(&self) -> bool {
         self.status.is_busy()
     }
@@ -1166,9 +1307,9 @@ impl AgentSession {
     }
 
     pub fn has_started(&self) -> bool {
-        // A skeleton came from a stored row, and only started sessions are
-        // stored, so it has started even though its transcript is not loaded.
-        !self.detail_loaded
+        // Ordinary skeletons are stored history; issue-owned drafts also
+        // have durable identities, but must remain unstarted after reload.
+        (!self.detail_loaded && !self.is_draft)
             || !self.turns.is_empty()
             || !self.messages.is_empty()
             || self.provider_cursor.is_some()
@@ -1183,6 +1324,7 @@ impl AgentSession {
     /// its list columns and cursors, and a later save of the skeleton only
     /// touches those columns, never the untouched detail row.
     pub fn release_transcript(&mut self) {
+        self.is_draft = !self.has_started();
         self.messages = Vec::new();
         self.transcript_blocks = Vec::new();
         self.turns = Vec::new();
@@ -1219,7 +1361,7 @@ impl AgentSession {
             return false;
         }
         self.title = title.to_owned();
-        self.updated_at = unix_time();
+        self.touch();
         true
     }
 
@@ -1238,6 +1380,7 @@ impl AgentSession {
                 title = format!("{}…", title.chars().take(53).collect::<String>());
             }
             self.auto_title = Some(title);
+            self.touch();
         }
     }
 
@@ -1252,7 +1395,7 @@ impl AgentSession {
             return false;
         }
         self.auto_title = title;
-        self.updated_at = unix_time();
+        self.touch();
         true
     }
 
@@ -1404,6 +1547,7 @@ impl AgentSession {
                 .with_annotations(annotations),
         );
         self.last_reply_at = Some(now);
+        self.touch();
         id
     }
 
@@ -1427,7 +1571,7 @@ impl AgentSession {
             checkpoint: None,
         });
         self.last_reply_at = Some(now);
-        self.updated_at = now;
+        self.touch();
         id
     }
 
@@ -1459,7 +1603,7 @@ impl AgentSession {
             let mut prompt = Message::new_for_turn(MessageRole::User, message, active);
             prompt.id = message_id;
             self.messages.push(prompt);
-            self.updated_at = now;
+            self.touch();
             return true;
         }
         self.set_title_from_prompt(message);
@@ -1478,7 +1622,7 @@ impl AgentSession {
         self.messages.push(prompt);
         self.status = SessionStatus::Connecting;
         self.last_reply_at = Some(now);
-        self.updated_at = now;
+        self.touch();
         true
     }
 
@@ -1507,6 +1651,21 @@ impl AgentSession {
             .map(|turn| turn.id)
     }
 
+    /// The user message that opened one of the session's turns, when the
+    /// transcript holds it.
+    pub fn user_message_id_for_turn(&self, turn_id: Uuid) -> Option<Uuid> {
+        self.messages
+            .iter()
+            .find(|message| message.turn_id == Some(turn_id) && message.role == MessageRole::User)
+            .map(|message| message.id)
+    }
+
+    /// The user message that opened the session's active turn, when one is
+    /// open and carries a prompt.
+    pub fn active_turn_user_message_id(&self) -> Option<Uuid> {
+        self.user_message_id_for_turn(self.active_turn_id()?)
+    }
+
     /// Undo [`Self::begin_turn`] for a turn whose provider never started —
     /// the submission-preparation failure path, where the prompt returns to
     /// the composer. The turn and its messages leave the transcript, and a
@@ -1526,6 +1685,7 @@ impl AgentSession {
         if self.messages.is_empty() {
             self.auto_title = None;
         }
+        self.touch();
     }
 
     /// Marks the user messages the provider reports it is still holding. Each
@@ -1559,7 +1719,7 @@ impl AgentSession {
             }
         }
         if changed {
-            self.updated_at = unix_time();
+            self.touch();
         }
         changed
     }
@@ -1625,7 +1785,7 @@ impl AgentSession {
             self.unwind_unstarted_turn(turn);
             self.status = SessionStatus::Idle;
         }
-        self.updated_at = unix_time();
+        self.touch();
         taken
     }
 
@@ -1663,7 +1823,7 @@ impl AgentSession {
         }
         self.turns.pop();
         self.status = SessionStatus::Idle;
-        self.updated_at = unix_time();
+        self.touch();
         true
     }
 
@@ -1688,7 +1848,7 @@ impl AgentSession {
         message.turn_id = None;
         message.pending = false;
         message.undelivered_reason = Some(reason.to_owned());
-        self.updated_at = unix_time();
+        self.touch();
         true
     }
 
@@ -1696,9 +1856,10 @@ impl AgentSession {
         if let Some(turn) = self
             .turns
             .last_mut()
-            .filter(|turn| turn.status == TurnStatus::Running)
+            .filter(|turn| turn.status == TurnStatus::Running && !turn.provider_turn_started)
         {
             turn.provider_turn_started = true;
+            self.touch();
         }
     }
 
@@ -1708,7 +1869,10 @@ impl AgentSession {
             .last_mut()
             .filter(|turn| turn.status == TurnStatus::Running)
         {
-            turn.provider_resume_at = Some(message_id);
+            if turn.provider_resume_at.as_ref() != Some(&message_id) {
+                turn.provider_resume_at = Some(message_id);
+                self.touch();
+            }
         }
     }
 
@@ -1730,6 +1894,7 @@ impl AgentSession {
         turn.completed_at = Some(completed_at);
         let result = (turn.id, turn.turn_count);
         self.last_reply_at = Some(completed_at);
+        self.touch();
         Some(result)
     }
 
@@ -1740,6 +1905,7 @@ impl AgentSession {
         };
         let id = message.id;
         self.messages.push(message);
+        self.touch();
         id
     }
 
@@ -1758,6 +1924,7 @@ impl AgentSession {
         .with_annotations(annotations);
         let id = message.id;
         self.messages.push(message);
+        self.touch();
         id
     }
 
@@ -1783,7 +1950,7 @@ impl AgentSession {
         for block in &mut self.transcript_blocks {
             block.after_message = block.after_message.min(message_count);
         }
-        self.updated_at = unix_time();
+        self.touch();
     }
 
     pub fn fork_through_turn(
@@ -3985,6 +4152,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn issue_description_defaults_for_older_saved_tasks() {
+        let task = Task::new("Fix parser", TaskState::Backlog, 0);
+        assert!(task.description.is_empty());
+        let mut json = serde_json::to_value(&task).unwrap();
+        json.as_object_mut().unwrap().remove("description");
+        let restored: Task = serde_json::from_value(json).unwrap();
+        assert!(restored.description.is_empty());
+    }
+
+    #[test]
+    fn issue_edits_advance_even_within_one_clock_tick() {
+        let mut task = Task::new("Fix parser", TaskState::Backlog, 0);
+        task.updated_at = unix_time() + 100;
+        let previous = task.updated_at;
+        task.touch();
+        assert_eq!(task.updated_at, previous + 1);
+        task.set_state(TaskState::Done);
+        assert_eq!(task.updated_at, previous + 2);
+        assert!(task.completed_at.is_some());
+        task.set_state(TaskState::Doing);
+        assert_eq!(task.updated_at, previous + 3);
+        assert!(task.completed_at.is_none());
+    }
+
+    #[test]
+    fn session_mutations_preserve_an_advanced_metadata_revision() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        let revision = unix_time() + 100;
+        session.updated_at = revision;
+        session.set_title_from_prompt("Continue filed work");
+        assert_eq!(session.updated_at, revision);
+        session.begin_turn("Continue filed work");
+        assert_eq!(session.updated_at, revision);
+        assert!(session.last_reply_at.unwrap() < revision);
+        session.set_title("Renamed work");
+        assert_eq!(session.updated_at, revision);
+        session.set_auto_title(Some("Provider title".into()));
+        assert_eq!(session.updated_at, revision);
+        session.push_user_message_with_presentation("A follow-up", None, vec![], vec![]);
+        assert_eq!(session.updated_at, revision);
+        assert!(session.mark_provider_queue(&[], &["A follow-up".into()]));
+        assert_eq!(session.updated_at, revision);
+        session.take_retracted_queue_messages(&["A follow-up".into()]);
+        assert_eq!(session.updated_at, revision);
+        session.push_message(MessageRole::Assistant, "A reply");
+        assert_eq!(session.updated_at, revision);
+        session.finish_active_turn(TurnStatus::Completed);
+        assert_eq!(session.updated_at, revision);
+        assert!(session.last_reply_at.unwrap() < revision);
+        session.truncate_after_turn(0);
+        assert_eq!(session.updated_at, revision);
+        session.begin_provider_turn();
+        assert_eq!(session.updated_at, revision);
+        session.adopt_submitted_prompt("New prompt", Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(session.updated_at, revision);
+    }
+
+    #[test]
+    fn issue_draft_stays_unstarted_through_projection_and_release() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.task_id = Some(Uuid::new_v4());
+        let projection = session.list_projection();
+        assert!(projection.is_draft);
+        assert!(!projection.has_started());
+        session.release_transcript();
+        assert!(!session.has_started());
+        session.detail_loaded = true;
+        session.begin_turn("Start work");
+        let projection = session.list_projection();
+        assert!(!projection.is_draft);
+        assert!(projection.has_started());
+        session.release_transcript();
+        assert!(session.has_started());
+    }
+
+    #[test]
     fn legacy_plan_access_mode_loads_as_supervised() {
         let mode: RuntimeMode = serde_json::from_str(r#""plan""#).unwrap();
 
@@ -5487,6 +5730,20 @@ mod tests {
     }
 
     #[test]
+    fn list_projection_preserves_each_conversations_workspace() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.workspace = SessionWorkspace::Worktree {
+            path: PathBuf::from("/tmp/feature"),
+            branch: "feature/fix".into(),
+        };
+        assert_eq!(session.list_projection().workspace, session.workspace);
+        session.workspace = SessionWorkspace::NewWorktree {
+            base_branch: Some("develop".into()),
+        };
+        assert_eq!(session.list_projection().workspace, session.workspace);
+    }
+
+    #[test]
     fn list_projection_never_copies_session_detail() {
         let project = Project::from_path(PathBuf::from("/tmp/waku"));
         let mut session = AgentSession::new(project.id, ProviderKind::Codex);
@@ -5588,5 +5845,22 @@ mod tests {
             "the turn the steer missed is not the steer's to unwind"
         );
         assert!(!session.mark_message_undelivered(Uuid::new_v4(), "missing"));
+    }
+    #[test]
+    fn issue_workspace_intent_round_trips_without_changing_explicit_local() {
+        let project_id = Uuid::new_v4();
+        let planned = TaskWorkspace::NewWorktree { project_id };
+        let json = serde_json::to_value(&planned).unwrap();
+        assert_eq!(json["kind"], "newWorktree");
+        assert_eq!(json["projectId"], project_id.to_string());
+        assert_eq!(
+            serde_json::from_value::<TaskWorkspace>(json).unwrap(),
+            planned
+        );
+        let legacy = serde_json::json!({"kind": "local", "projectId": project_id});
+        assert_eq!(
+            serde_json::from_value::<TaskWorkspace>(legacy).unwrap(),
+            TaskWorkspace::Local { project_id }
+        );
     }
 }

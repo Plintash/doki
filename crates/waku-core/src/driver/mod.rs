@@ -2,6 +2,10 @@
 
 mod acp;
 mod activity;
+mod automation_repl;
+
+#[cfg(debug_assertions)]
+pub(crate) use automation_repl::set_endpoint as set_automation_repl_endpoint;
 mod amp;
 mod claude;
 mod codex;
@@ -35,6 +39,7 @@ use crate::model::{
 pub struct DriverEventSender {
     events: Sender<DriverEvent>,
     wake: smol::channel::Sender<()>,
+    diagnostics: Option<crate::diagnostics::ProviderDiagnostics>,
 }
 
 impl DriverEventSender {
@@ -42,6 +47,14 @@ impl DriverEventSender {
         self.events.send(event)?;
         let _ = self.wake.try_send(());
         Ok(())
+    }
+
+    /// Record one raw provider stderr line into the instance's diagnostic
+    /// stream, attributed to this driver's provider and runtime.
+    pub fn record_stderr(&self, line: &str) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.stderr(line);
+        }
     }
 }
 
@@ -65,8 +78,24 @@ impl DriverEventSink for Sender<DriverEvent> {
 pub fn event_channel(
     wake: smol::channel::Sender<()>,
 ) -> (DriverEventSender, Receiver<DriverEvent>) {
+    event_channel_with_diagnostics(wake, None)
+}
+
+/// The daemon's channel: as [`event_channel`], with provider stderr and driver
+/// events attributed to the runtime that produced them.
+pub(crate) fn event_channel_with_diagnostics(
+    wake: smol::channel::Sender<()>,
+    diagnostics: Option<crate::diagnostics::ProviderDiagnostics>,
+) -> (DriverEventSender, Receiver<DriverEvent>) {
     let (events, receiver) = unbounded();
-    (DriverEventSender { events, wake }, receiver)
+    (
+        DriverEventSender {
+            events,
+            wake,
+            diagnostics,
+        },
+        receiver,
+    )
 }
 
 #[cfg(test)]
@@ -105,6 +134,13 @@ impl DriverHandle {
 
     pub fn cancel_computer_use(&self) {
         self.inner.cancel_computer_use();
+    }
+
+    /// Shared services acknowledge their owned session's settlement without
+    /// terminating the service. Process-owned transports return None and use
+    /// their existing ProcessExited signal instead. Runs off the UI thread.
+    pub fn confirm_session_shutdown(&self) -> Option<anyhow::Result<()>> {
+        self.inner.confirm_session_shutdown()
     }
 
     pub fn refresh_background_work(&self) {
@@ -173,6 +209,9 @@ pub trait DriverControl: Send + Sync {
     fn steer(&self, _prompt: String) {}
     fn cancel(&self);
     fn cancel_computer_use(&self) {}
+    fn confirm_session_shutdown(&self) -> Option<anyhow::Result<()>> {
+        None
+    }
     fn refresh_background_work(&self) {}
     fn stop_background_work(&self, _key: BackgroundWorkKey, _control_id: String) {}
     fn respond(&self, request_id: String, option_id: String);

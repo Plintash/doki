@@ -1095,6 +1095,51 @@ annotation.select_reply: 请在一条回复内选择要标注的文字
 annotation.select_one_reply: 一条标注只能落在同一条回复里，请重新选择
 annotation.wait_for_reply: 回复结束后才能标注
 
+sidebar.board: 任务板
+sidebar.grouping_task: 任务
+board.title: 任务板
+board.backlog: 待办
+board.doing: 进行中
+board.done: 完成
+board.new_task: 新任务
+board.new_task_placeholder: 这件任务要做什么？
+board.new_task_hint: 只写名字就行；项目、工作区和对话都之后再定。
+board.needs_you: "%{count} 条需要你"
+board.needs_you_short: 需要你
+board.running: 运行中
+board.conversations_one: 1 条对话
+board.conversations_many: "%{count} 条对话"
+board.open_latest: 打开最近对话
+board.move_backlog: 移到待办
+board.move_doing: 移到进行中
+board.complete: 完成
+board.reopen: 重新打开
+board.completed_toast: 任务已完成，对话已从左侧收起
+board.complete_confirm_title: 完成「%{title}」？
+board.complete_confirm_body: "完成会停止并关闭 %{count} 个已连接或运行中的会话，然后将该任务的会话从侧栏归档。"
+board.archive_not_delete: 归档不是删除，内容都在。
+board.complete_and_stop: 完成并停止
+board.untitled_task: 未命名任务
+task.bind: 归入任务
+task.new_from_session: 用这条对话新建任务
+task.unbind: 移出任务
+settings.archive: 归档
+settings.archive_keywords: 设置 偏好 归档 完成 任务 对话 恢复
+archive.empty: 还没有完成的任务
+archive.restore: 恢复
+archive.completed_at: 完成于 %{time}
+board.reopened_toast: 任务已重新打开，对话回到左侧
+
+activity.background_shell: 后台 Shell
+activity.provider_retrying: 正在重试请求
+computer_use.desktop_access: 桌面访问
+computer_use.linux_access_description: 控制当前 Linux 桌面会话中的应用。截图与输入支持取决于你的合成器与无障碍服务。
+computer_use.windows_access_description: 控制当前 Windows 桌面会话中的应用。Windows 可能限制对提权应用和安全桌面的访问。
+errors.provider_catalogue_unavailable: "%{provider} 无法读取它的 %{catalogue} 目录：%{error}"
+command_palette.show_board: 打开任务板
+command_palette.hide_board: 收起任务板
+board.completion_waiting_for_setup: 还有对话正在准备中，稳定后再完成任务
+
 subagent.running_count: "%{count} 个子代理运行中"
 subagent.running_count_one: 1 个子代理运行中
 subagent.more_rows: "另有 %{count} 个"
@@ -1108,3 +1153,68 @@ subagent.state.partial: 部分完成
 subagent.state.detached: 已分离
 
 subagent.title: 子代理
+
+# Issue detail workflow
+menu.new_session: "新建会话"
+session.new_session: "新建会话"
+sidebar.unfiled_sessions: "未归类会话"
+board.open_task: "打开任务"
+board.back_to_board: "← 看板"
+board.description: "描述"
+board.description_placeholder: "描述目标、要求和相关背景…"
+board.saved_automatically: "更改自动保存"
+board.project_workspace: "项目与默认工作区"
+board.choose_project: "选择项目…"
+board.choose_project_first: "先选择项目，再开始会话"
+board.project_locked: "移除已关联会话后可更换项目"
+board.session_new_worktree: "在新工作树中开始会话…"
+board.attach_session: "关联现有会话"
+board.no_unfiled_sessions: "没有可关联的未归类会话"
+board.new_session: "新建会话"
+board.reopen_new_session: "重新打开并开始会话"
+board.continue_session: "打开会话"
+board.open_draft: "继续草稿"
+board.detach_session: "移除关联"
+board.draft_session: "未发送的草稿"
+board.session_failed: "失败"
+board.archived: "已归档"
+board.session_idle: "空闲"
+board.loading_workspace: "正在加载工作区…"
+board.archived_hint: "已完成。会话保留在此处，并从活跃侧边栏中归档。重新打开任务即可继续工作。"
+board.title_required: "任务标题不能为空"
+board.no_sessions: "还没有会话"
+board.session_context_hint: "新会话会继承此任务的描述和工作区，也可以关联现有会话。"
+board.session_project_mismatch: "该会话属于其他项目"
+board.create_task: "创建任务"
+board.empty_backlog: "规划下一个任务"
+board.empty_doing: "进行中的工作会显示在这里"
+board.empty_done: "已完成的任务保留在这里"
+
+board.back_to_task: "← 任务"
+board.detach_draft_hint: "未发送的草稿属于此任务。发送后可移除关联，不再需要时可删除草稿。"
+board.completion_stopping: "正在停止工作…"
+board.completion_cannot_stop: "无法停止全部后台工作。任务仍保持进行中，请在会话中停止后重试。"
+board.completion_stop_failed: "部分工作未能停止。Issue 仍保持进行中，请打开会话检查后重试。"
+
+board.cancel_completion: 取消完成操作
+
+board.completion_waiting_for_runtime: "正在连接会话…"
+
+board.retry_save: "更改未保存 · 重试"
+board.saving: "正在保存…"
+
+# Board scope and live session signals
+board.all_projects: "全部项目"
+board.search_issues: "搜索 issue"
+board.running_count: "运行中 %{count}"
+board.attention_count: "待处理 %{count}"
+board.new_issue: "新建 issue"
+board.no_matching_issues: "没有匹配的 issue"
+board.awaiting_permission: "等待授权"
+board.awaiting_input: "等待输入"
+board.running_sessions: "%{count} 个运行中"
+board.more_attention: "另外 %{count} 个待处理"
+board.latest_progress: "最近：%{progress}"
+workspace.create_worktree: "创建工作树"
+workspace.create_worktree_hint: "发送第一条消息时创建独立工作树"
+workspace.create_worktree_requires_project: "选择项目以创建工作树"

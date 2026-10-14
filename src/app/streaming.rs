@@ -265,7 +265,7 @@ impl Waku {
             .find(|activity| activity.reasoning.is_some() && !activity.complete);
         if let Some(reasoning) = reasoning {
             reasoning.complete = true;
-            session.updated_at = unix_time();
+            session.touch();
         }
     }
 
@@ -311,7 +311,7 @@ impl Waku {
                     ),
                 );
             }
-            session.updated_at = unix_time();
+            session.touch();
         }
         runtime.stream_phase = Some(StreamPhase::Reasoning);
     }
@@ -386,7 +386,7 @@ impl Waku {
                     if item.reasoning.is_some() {
                         activity.reasoning = item.reasoning;
                     }
-                    session.updated_at = unix_time();
+                    session.touch();
                     runtime.stream_phase = Some(StreamPhase::Activity);
                     if replaces_changes {
                         // The rows this activity's diff was built from are gone;
@@ -398,7 +398,7 @@ impl Waku {
             }
 
             push_transcript_activity(session, item, continuing_work);
-            session.updated_at = unix_time();
+            session.touch();
         }
         runtime.stream_phase = Some(StreamPhase::Activity);
     }
@@ -472,6 +472,23 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> bool {
         runtime.last_active_at = Instant::now();
+        // Classify before resolving the session: a delta is not a milestone,
+        // and the streaming path must not pay an O(sessions) scan per chunk
+        // for a record that is never built. The app records its own view of
+        // the event before applying it, so the record explains what the app
+        // was told when the handler applies it; output the handler will reject
+        // as stale is not recorded against the newer turn. The release build
+        // skips the classification entirely.
+        crate::diagnostics::record(cx, || {
+            let milestone = waku_client::driver_milestone(&event)?;
+            if !crate::diagnostics::milestone_applies(&event, || {
+                self.accepts_turn_output(session_id)
+            }) {
+                return None;
+            }
+            self.session(session_id)
+                .map(|session| crate::diagnostics::milestone_record(session, milestone))
+        });
         match event {
             DriverEvent::RuntimeEventCursorAdvanced(cursor) => {
                 if let Some(session) = self.state.session_mut(session_id) {
@@ -589,7 +606,7 @@ impl Waku {
                 runtime.park_announced = true;
                 if let Some(session) = self.state.session_mut(session_id) {
                     session.status = SessionStatus::Background;
-                    session.updated_at = unix_time();
+                    session.touch();
                 }
                 if let Some(previous_kinds) = previous_kinds.as_deref() {
                     self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
@@ -605,12 +622,23 @@ impl Waku {
             }
             DriverEvent::TextDelta(delta) => {
                 if self.accepts_turn_output(session_id) {
+                    let first = runtime.stream_phase.is_none();
                     self.append_text_delta(session_id, runtime, delta);
+                    if first && runtime.stream_phase == Some(StreamPhase::Text) {
+                        self.record_streaming(session_id, StreamPhase::Text, cx);
+                    }
                 }
             }
             DriverEvent::ReasoningDelta(delta) => {
                 if self.accepts_turn_output(session_id) {
+                    let first = runtime.stream_phase.is_none();
                     self.append_reasoning_delta(session_id, runtime, delta);
+                    // An empty non-continuing delta leaves the phase unset, so
+                    // it must not record a "streaming" milestone that has not
+                    // started.
+                    if first && runtime.stream_phase == Some(StreamPhase::Reasoning) {
+                        self.record_streaming(session_id, StreamPhase::Reasoning, cx);
+                    }
                 }
             }
             DriverEvent::Activity {
@@ -780,7 +808,7 @@ impl Waku {
                         submission.attachments,
                         submission.annotations,
                     );
-                    session.updated_at = unix_time();
+                    session.touch();
                     runtime.delivered_steers.push_back((message, message_id));
                 }
             }
@@ -1023,7 +1051,7 @@ impl Waku {
                         session.push_message(MessageRole::Assistant, fallback);
                     }
                 }
-                self.finish_active_turn(session_id, turn_status);
+                self.finish_active_turn(session_id, turn_status, cx);
                 // A settlement that left detached work behind is not a finish
                 // on Pi: the child the reply started still runs, and the wake
                 // it will produce continues the session. Only the turn closes.
@@ -1124,7 +1152,7 @@ impl Waku {
                     && session.status.is_busy()
                 {
                     session.status = SessionStatus::Failed;
-                    session.updated_at = unix_time();
+                    session.touch();
                     if needs_fallback {
                         session.push_message(MessageRole::Assistant, failure_message);
                     }
@@ -1134,7 +1162,7 @@ impl Waku {
                 };
                 let finished_turn = should_finish_turn
                     && self
-                        .finish_active_turn(session_id, TurnStatus::Failed)
+                        .finish_active_turn(session_id, TurnStatus::Failed, cx)
                         .is_some();
                 if finished_turn {
                     self.capture_latest_turn_checkpoint_for(session_id);
@@ -1634,5 +1662,5 @@ pub(super) fn append_text_delta_to_session(
         message.streaming = true;
         session.messages.push(message);
     }
-    session.updated_at = unix_time();
+    session.touch();
 }

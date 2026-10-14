@@ -1146,6 +1146,51 @@ annotation.select_reply: 返信の中のテキストを選択してください
 annotation.select_one_reply: 注釈は 1 つの返信にしか付けられません
 annotation.wait_for_reply: 返信が終わってから注釈を付けられます
 
+sidebar.board: ボード
+sidebar.grouping_task: タスク
+board.title: ボード
+board.backlog: 未着手
+board.doing: 進行中
+board.done: 完了
+board.new_task: 新規タスク
+board.new_task_placeholder: このタスクは何をしますか？
+board.new_task_hint: 名前だけで十分です。プロジェクト、ワークスペース、会話は後で決められます。
+board.needs_you: "%{count} 件が対応待ち"
+board.needs_you_short: 対応待ち
+board.running: 実行中
+board.conversations_one: 1 件の会話
+board.conversations_many: "%{count} 件の会話"
+board.open_latest: 最新の会話を開く
+board.move_backlog: 未着手に移動
+board.move_doing: 進行中に移動
+board.complete: 完了にする
+board.reopen: 再開
+board.completed_toast: タスクを完了しました。会話はサイドバーから片付きました
+board.complete_confirm_title: 「%{title}」を完了しますか？
+board.complete_confirm_body: "完了すると、接続中または実行中の %{count} 件の会話を停止して閉じ、このタスクの会話をサイドバーからアーカイブします。"
+board.archive_not_delete: アーカイブは削除ではありません。
+board.complete_and_stop: 完了して停止
+board.untitled_task: 無題のタスク
+task.bind: タスクに割り当て
+task.new_from_session: この会話で新しいタスクを作成
+task.unbind: タスクから外す
+settings.archive: アーカイブ
+settings.archive_keywords: 設定 環境設定 アーカイブ 完了 タスク 会話 復元
+archive.empty: 完了したタスクはまだありません
+archive.restore: 復元
+archive.completed_at: "%{time} に完了"
+board.reopened_toast: タスクを再開しました。会話がサイドバーに戻ります
+
+activity.background_shell: バックグラウンドシェル
+activity.provider_retrying: リクエストを再試行しています
+computer_use.desktop_access: デスクトップアクセス
+computer_use.linux_access_description: 現在の Linux デスクトップセッションのアプリを操作します。キャプチャと入力の対応はコンポジタとアクセシビリティサービスに依存します。
+computer_use.windows_access_description: 現在の Windows デスクトップセッションのアプリを操作します。Windows は昇格したアプリとセキュアデスクトップへのアクセスを制限する場合があります。
+errors.provider_catalogue_unavailable: "%{provider} は %{catalogue} カタログを読み取れませんでした: %{error}"
+command_palette.show_board: ボードを開く
+command_palette.hide_board: ボードを閉じる
+board.completion_waiting_for_setup: 準備中の会話があります。落ち着いてから完了してください
+
 subagent.running_count: "%{count} サブエージェント実行中"
 subagent.running_count_one: 1 サブエージェント実行中
 subagent.more_rows: "他 %{count} 件"
@@ -1159,3 +1204,68 @@ subagent.state.partial: 一部完了
 subagent.state.detached: デタッチ
 
 subagent.title: サブエージェント
+
+# Issue detail workflow
+menu.new_session: "新しい会話"
+session.new_session: "新しい会話"
+sidebar.unfiled_sessions: "未分類の会話"
+board.open_task: "タスクを開く"
+board.back_to_board: "← ボード"
+board.description: "説明"
+board.description_placeholder: "目標、要件、参考情報を記入…"
+board.saved_automatically: "変更は自動保存されます"
+board.project_workspace: "プロジェクトと既定のワークスペース"
+board.choose_project: "プロジェクトを選択…"
+board.choose_project_first: "会話を開始する前にプロジェクトを選択してください"
+board.project_locked: "プロジェクト変更には会話の関連付けを解除してください"
+board.session_new_worktree: "新しいワークツリーで会話を開始…"
+board.attach_session: "既存の会話を関連付け"
+board.no_unfiled_sessions: "関連付けられる未分類の会話はありません"
+board.new_session: "新しい会話"
+board.reopen_new_session: "再開して会話を開始"
+board.continue_session: "会話を開く"
+board.open_draft: "下書きを続ける"
+board.detach_session: "関連付けを解除"
+board.draft_session: "未送信の下書き"
+board.session_failed: "失敗"
+board.archived: "アーカイブ済み"
+board.session_idle: "待機中"
+board.loading_workspace: "ワークスペースを読み込み中…"
+board.archived_hint: "完了しました。会話はここに保存され、サイドバーから非表示になります。作業を続けるにはタスクを再開してください。"
+board.title_required: "タイトルを入力してください"
+board.no_sessions: "まだ会話がありません"
+board.session_context_hint: "説明とワークスペースを引き継いで会話を開始するか、既存の会話を関連付けてください。"
+board.session_project_mismatch: "その会話は別のプロジェクトに属しています"
+board.create_task: "タスクを作成"
+board.empty_backlog: "次のタスクを計画"
+board.empty_doing: "進行中の作業はここに表示されます"
+board.empty_done: "完了したタスクはここに残ります"
+
+board.back_to_task: "← タスク"
+board.detach_draft_hint: "この未送信の下書きはタスクに属しています。送信後に関連付けを解除するか、不要なら下書きを削除してください。"
+board.completion_stopping: "作業を停止中…"
+board.completion_cannot_stop: "バックグラウンド作業をすべて停止できません。タスクは有効のままです。会話から停止して再試行してください。"
+board.completion_stop_failed: "一部の作業が停止しませんでした。課題は有効のままです。会話を確認して再試行してください。"
+
+board.cancel_completion: 完了操作をキャンセル
+
+board.completion_waiting_for_runtime: "会話に接続しています…"
+
+board.retry_save: "変更を保存できません · 再試行"
+board.saving: "保存中…"
+
+# Board scope and live session signals
+board.all_projects: "すべてのプロジェクト"
+board.search_issues: "課題を検索"
+board.running_count: "実行中 %{count}"
+board.attention_count: "要対応 %{count}"
+board.new_issue: "新しい課題"
+board.no_matching_issues: "一致する課題はありません"
+board.awaiting_permission: "承認待ち"
+board.awaiting_input: "入力待ち"
+board.running_sessions: "%{count} 件実行中"
+board.more_attention: "ほか %{count} 件の要対応"
+board.latest_progress: "直近: %{progress}"
+workspace.create_worktree: "ワークツリーを作成"
+workspace.create_worktree_hint: "最初のメッセージ送信時に独立したワークツリーを作成します"
+workspace.create_worktree_requires_project: "ワークツリーを作成するプロジェクトを選択してください"

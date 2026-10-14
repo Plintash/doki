@@ -50,6 +50,11 @@ impl Waku {
         transition: SessionActivationTransition,
         cx: &mut Context<Self>,
     ) {
+        // Selecting a conversation always closes the board: the chat column
+        // shows the session the user asked for.
+        self.board_open = false;
+        self.selected_task = None;
+        self.task_detail = None;
         if !self
             .state
             .sessions
@@ -148,11 +153,17 @@ impl Waku {
                             .iter_mut()
                             .find(|existing| existing.id == session_id)
                         {
-                            *existing = session;
+                            super::runtime::replace_hydrated_session(existing, session);
                             true
                         } else {
                             false
                         };
+                        if replaced {
+                            super::rpa::daemon::model_changed();
+                            if waku.sync_task_workspace_from_session(session_id, false) {
+                                waku.save_task_changes(cx);
+                            }
+                        }
                         let pending = waku
                             .pending_session_activation
                             .filter(|pending| pending.session_id == session_id);
@@ -281,7 +292,11 @@ impl Waku {
             .state
             .sessions
             .iter()
-            .find(|session| session.project_id == project_id && !session.has_started())
+            .find(|session| {
+                session.project_id == project_id
+                    && session.task_id.is_none()
+                    && !session.has_started()
+            })
             .map(|session| session.id)
         {
             self.select_session(draft_id, cx);
@@ -307,7 +322,13 @@ impl Waku {
             return;
         }
         session.workspace = workspace;
-        self.save(cx);
+        session.updated_at = session.updated_at.max(unix_time()).saturating_add(1);
+        let issue_owned = session.task_id.is_some();
+        if issue_owned {
+            self.save_task_changes(cx);
+        } else {
+            self.save(cx);
+        }
         cx.notify();
     }
 
@@ -416,6 +437,16 @@ impl Waku {
         cx.background_executor()
             .spawn(async move { sweep() })
             .detach();
+    }
+
+    pub(super) fn new_task_action(
+        &mut self,
+        _: &NewTask,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_page = None;
+        self.open_new_task_dialog(TaskState::Backlog, window, cx);
     }
 
     pub(super) fn new_session_action(
@@ -724,6 +755,10 @@ impl Waku {
             return;
         }
 
+        if self.board_open && self.selected_task.is_some() {
+            self.show_task_board(window, cx);
+            return;
+        }
         let Some(current) = self.state.selected_session else {
             return;
         };
@@ -805,6 +840,20 @@ impl Waku {
             return;
         }
         if self.settings_page.take().is_some() {
+            let focus_handle = self.composer_focus(cx);
+            window.focus(&focus_handle, cx);
+            cx.notify();
+            return;
+        }
+        // The board covers the chat column, so Escape's job there is to close
+        // it — never to stop the conversation it is hiding.
+        if self.board_open {
+            if self.selected_task.is_some() {
+                self.show_task_board(window, cx);
+                return;
+            }
+            self.board_open = false;
+            self.task_detail = None;
             let focus_handle = self.composer_focus(cx);
             window.focus(&focus_handle, cx);
             cx.notify();
@@ -924,6 +973,7 @@ impl Waku {
             if let Some(session) = self.state.session_mut(session_id) {
                 session.subagent_runs.clear();
             }
+            super::rpa::daemon::model_changed();
         }
     }
 
@@ -1197,6 +1247,31 @@ impl Waku {
         let Some(session_id) = self.state.selected_session else {
             return;
         };
+        self.stop_session_turn(session_id, cx);
+    }
+
+    /// Stops one session's running turn through the app's full stop sequence:
+    /// clear the provider's queue, take back the messages it held, settle the
+    /// turn as interrupted, and leave the session idle. Issue completion
+    /// separately waits for a positive provider shutdown acknowledgment.
+    pub(super) fn stop_session_turn(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        self.stop_session_turn_inner(session_id, false, cx);
+    }
+
+    pub(super) fn stop_session_turn_for_completion(
+        &mut self,
+        session_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_session_turn_inner(session_id, true, cx);
+    }
+
+    fn stop_session_turn_inner(
+        &mut self,
+        session_id: Uuid,
+        await_close: bool,
+        cx: &mut Context<Self>,
+    ) {
         // Worktree/checkpoint preparation has no safe interrupt contract. The
         // composer deliberately shows a spinner rather than Stop until the
         // provider runtime exists, and the keyboard action follows the same
@@ -1204,12 +1279,13 @@ impl Waku {
         if self.submission_preparations.contains(&session_id) {
             return;
         }
-        let retain_runtime = self
-            .state
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .is_some_and(|session| retain_runtime_after_cancel(session.provider))
+        let retain_runtime = await_close
+            || self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .is_some_and(|session| retain_runtime_after_cancel(session.provider))
             || self.session_has_live_detached_work(session_id);
         // Goal operations queued behind a starting runtime would set the
         // objective after this stop and begin pursuing it; the user asked to
@@ -1276,7 +1352,7 @@ impl Waku {
                     session.push_message(MessageRole::Assistant, tr!("session.stopped"));
                 }
             }
-            self.finish_active_turn(session_id, TurnStatus::Interrupted);
+            self.finish_active_turn(session_id, TurnStatus::Interrupted, cx);
         }
         if has_active_turn {
             self.capture_latest_turn_checkpoint_for(session_id);
@@ -1567,6 +1643,7 @@ impl Waku {
             && session.active_turn_id().is_some()
         {
             session.status = SessionStatus::Working;
+            super::rpa::daemon::model_changed();
         }
         self.user_input_answer
             .update(cx, |input, cx| input.clear(cx));
@@ -1636,6 +1713,7 @@ impl Waku {
             session.status = SessionStatus::Working;
         }
         self.runtimes.insert(session_id, runtime);
+        super::rpa::daemon::model_changed();
         cx.notify();
     }
 
@@ -1717,6 +1795,7 @@ impl Waku {
             .iter()
             .find(|session| {
                 !session.has_started()
+                    && session.task_id.is_none()
                     && self.state.projects.iter().any(|project| {
                         project.id == session.project_id
                             && project.is_projectless()
@@ -1796,6 +1875,16 @@ mod tests {
             navigation.remembered_new_task(&[draft.clone(), started], project_id),
             Some(draft.id)
         );
+    }
+
+    #[test]
+    fn standalone_new_session_never_reuses_an_issue_draft() {
+        let project_id = Uuid::new_v4();
+        let mut draft = AgentSession::new(project_id, ProviderKind::Pi);
+        draft.task_id = Some(Uuid::new_v4());
+        let mut navigation = SessionNavigation::default();
+        navigation.remember_new_task(draft.id);
+        assert_eq!(navigation.remembered_new_task(&[draft], project_id), None);
     }
 
     #[test]

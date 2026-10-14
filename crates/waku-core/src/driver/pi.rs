@@ -206,6 +206,7 @@ pub struct PiDriver {
     flavor: PiFlavor,
     commands: Sender<CommandMessage>,
     computer_use: Option<computer_use_runtime::ComputerUseRuntime>,
+    _automation_repl: Option<Arc<super::automation_repl::AutomationReplConfig>>,
     /// The dialogs still waiting for the user, keyed by the provider's request
     /// id, shared with the reader thread that opened them. The stored method is
     /// what tells the answer which `extension_ui_response` shape it must take.
@@ -345,6 +346,22 @@ fn configure_pi_computer_use_command(
     }
 }
 
+fn configure_pi_automation_repl_command(
+    command: &mut std::process::Command,
+    config: Option<&super::automation_repl::AutomationReplConfig>,
+    extension: Option<&Path>,
+    computer_use: bool,
+) {
+    let Some(config) = config else { return };
+    if !computer_use {
+        if let Some(extension) = extension {
+            command.arg("--extension").arg(extension);
+        }
+        command.env("WAKU_JS_REPL_SERVER", &config.repl_path);
+    }
+    command.env(super::automation_repl::ENV_FILE, &config.env_file);
+}
+
 impl PiDriver {
     pub fn start(
         flavor: PiFlavor,
@@ -406,13 +423,29 @@ impl PiDriver {
             parse_model_slug(model)?;
         }
 
-        let computer_use = (computer_use_enabled && flavor.supports_waku_computer_use())
-            .then(|| computer_use_runtime::ComputerUseRuntime::start(events.clone()))
-            .transpose()?;
-        let pi_extension = computer_use
-            .as_ref()
-            .map(|_| crate::computer_use::pi_extension_path())
-            .transpose()?;
+        let computer_use = computer_use_runtime::ComputerUseRuntime::start_if_enabled(
+            computer_use_enabled && flavor.supports_waku_computer_use(),
+            events.clone(),
+        )?;
+        let mut automation_repl = if flavor.supports_waku_computer_use() {
+            super::automation_repl::AutomationReplConfig::load()?
+        } else {
+            None
+        };
+        let pi_extension = if computer_use.is_some() {
+            Some(crate::computer_use::pi_extension_path()?)
+        } else if automation_repl.is_some() {
+            match crate::computer_use::pi_extension_path() {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    eprintln!("waku-daemon: debug RPA Pi extension is unavailable: {error}");
+                    automation_repl = None;
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut command = crate::command_env::command(&binary);
         command.args(["--mode", "rpc", flavor.full_access_arg()]);
         for extension in extensions {
@@ -428,6 +461,13 @@ impl PiDriver {
                 .zip(pi_extension.as_deref())
                 .map(|(runtime, extension)| (&runtime.config, extension)),
         );
+        configure_pi_automation_repl_command(
+            &mut command,
+            automation_repl.as_deref(),
+            pi_extension.as_deref(),
+            computer_use.is_some(),
+        );
+
         let command = command
             .current_dir(&cwd)
             .stdin(Stdio::piped())
@@ -853,13 +893,14 @@ impl PiDriver {
             thread::Builder::new()
                 .name("waku-pi-stderr".into())
                 .spawn(move || {
-                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let error_events = stderr_events.clone();
+                    super::support::read_stderr_lines(stderr, &stderr_events, move |line| {
                         if line.to_ascii_lowercase().contains("error") {
                             let error = format!("{}: {}", flavor.display_name(), line.trim());
                             *stderr_last_error.lock() = Some(error.clone());
-                            let _ = stderr_events.send(DriverEvent::Error(error));
+                            let _ = error_events.send(DriverEvent::Error(error));
                         }
-                    }
+                    });
                 })?;
 
         // Nothing signals or kills the agent process: it exits when the writer
@@ -895,6 +936,7 @@ impl PiDriver {
             flavor,
             commands,
             computer_use,
+            _automation_repl: automation_repl,
             dialogs,
         })
     }
@@ -3641,6 +3683,7 @@ mod tests {
                 flavor: PiFlavor::Pi,
                 commands: commands.clone(),
                 computer_use: None,
+                _automation_repl: None,
                 dialogs: dialogs.clone(),
             };
             Self {
@@ -4512,6 +4555,7 @@ mod tests {
             flavor: PiFlavor::Pi,
             commands,
             computer_use: None,
+            _automation_repl: None,
             dialogs: PiDialogs::default(),
         };
         let options = |mode| SessionOptions {
@@ -4531,6 +4575,43 @@ mod tests {
         // Pi has no permission setter and only runs with Full access.
         assert!(!driver.apply_options(options(RuntimeMode::Ask)));
         assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn automation_repl_pi_configuration_does_not_enable_computer_use() {
+        let config = super::super::automation_repl::AutomationReplConfig {
+            repl_path: "/fixture/waku_js_repl".into(),
+            env_file: std::env::temp_dir().join("nonexistent-rpa-pi-fixture/endpoint.json"),
+        };
+        let mut command = std::process::Command::new("pi");
+        configure_pi_computer_use_command(&mut command, None);
+        configure_pi_automation_repl_command(
+            &mut command,
+            Some(&config),
+            Some(Path::new("/fixture/pi-extension.ts")),
+            false,
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["--extension", "/fixture/pi-extension.ts"]);
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(env.len(), 2);
+        assert!(env.contains_key("WAKU_JS_REPL_SERVER"));
+        assert!(env.contains_key("WAKU_RPA_REPL_ENV_FILE"));
+        assert!(
+            !env.keys()
+                .any(|key| key.starts_with("WAKU_COMPUTER_USE") || key.contains("TOKEN"))
+        );
     }
 
     #[test]

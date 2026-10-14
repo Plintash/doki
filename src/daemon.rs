@@ -75,7 +75,10 @@ pub fn request(cx: &mut App, connector: DaemonConnector) {
             .await;
         cx.update(|cx| {
             cx.set_global(match answer {
-                Ok(daemon) => DaemonState::Ready(daemon),
+                Ok(daemon) => {
+                    crate::app::rpa::daemon::connect(daemon.clone());
+                    DaemonState::Ready(daemon)
+                }
                 Err(error) => DaemonState::Failed(error.to_string()),
             });
             crate::main_window::attach_main_windows(cx);

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,8 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::computer_use::{ComputerUseConfig, ComputerUseRuntime, create_process_directory};
+use super::automation_repl::AutomationReplConfig;
+use super::computer_use::{ComputerUseRuntime, create_process_directory};
 use crate::driver::DriverEventSender;
 use crate::opencode_api;
 use crate::opencode_service::OpenCodeService;
@@ -41,13 +42,23 @@ struct McpBridge {
     sessions_directory: PathBuf,
     config: Value,
     registration: Mutex<()>,
+    _automation_repl: Option<Arc<AutomationReplConfig>>,
+}
+
+fn mcp_configuration(repl_path: &Path, directory: &str, environment: Value) -> Value {
+    json!({
+        "type": "local", "command": [repl_path], "cwd": directory,
+        "codemode": false, "environment": environment,
+        "timeout": {"startup":10000, "catalog":10000, "execution":300000},
+    })
 }
 
 impl McpBridge {
     fn acquire(
         service: &Arc<OpenCodeService>,
         directory: &str,
-        config: &ComputerUseConfig,
+        repl_path: &Path,
+        automation_repl: Option<Arc<AutomationReplConfig>>,
     ) -> anyhow::Result<Arc<Self>> {
         let key = (Arc::as_ptr(service) as usize, directory.to_owned());
         let mut bridges = BRIDGES.get_or_init(Default::default).lock();
@@ -56,24 +67,18 @@ impl McpBridge {
             return Ok(bridge);
         }
         let sessions_directory = create_process_directory()?;
+        let mut environment = json!({ "WAKU_COMPUTER_USE_SESSIONS_DIRECTORY": sessions_directory });
+        if let Some(config) = automation_repl.as_ref() {
+            environment[super::automation_repl::ENV_FILE] = json!(config.env_file);
+        }
         let bridge = Arc::new(Self {
             service: service.clone(),
             directory: directory.to_owned(),
             server: format!("waku_js_repl_{}", Uuid::new_v4().simple()),
-            config: json!({
-                "type": "local",
-                "command": [config.repl_path],
-                "cwd": directory,
-                // This is already a JavaScript tool. Keep OpenCode's extra
-                // execute/codemode wrapper out of the agent-facing API.
-                "codemode": false,
-                "environment": {
-                    "WAKU_COMPUTER_USE_SESSIONS_DIRECTORY": sessions_directory,
-                },
-                "timeout": {"startup": 10000, "catalog": 10000, "execution": 300000},
-            }),
+            config: mcp_configuration(repl_path, directory, environment),
             sessions_directory,
             registration: Mutex::new(()),
+            _automation_repl: automation_repl,
         });
         bridge.ensure_connected()?;
         bridges.insert(key, Arc::downgrade(&bridge));
@@ -135,7 +140,8 @@ impl Drop for McpBridge {
 }
 
 pub(super) struct OpenCodeComputerUse {
-    runtime: ComputerUseRuntime,
+    runtime: Option<ComputerUseRuntime>,
+    registration_id: String,
     bridge: Arc<McpBridge>,
     session_id: String,
 }
@@ -146,11 +152,23 @@ impl OpenCodeComputerUse {
         directory: &str,
         session_id: &str,
         events: DriverEventSender,
+        computer_use_enabled: bool,
+        automation_repl: Option<Arc<AutomationReplConfig>>,
     ) -> anyhow::Result<Self> {
-        let runtime = ComputerUseRuntime::start(events)?;
-        let bridge = McpBridge::acquire(service, directory, &runtime.config)?;
+        let runtime = ComputerUseRuntime::start_if_enabled(computer_use_enabled, events)?;
+        let repl_path = runtime
+            .as_ref()
+            .map(|runtime| runtime.config.repl_path.clone())
+            .or_else(|| {
+                automation_repl
+                    .as_ref()
+                    .map(|config| config.repl_path.clone())
+            })
+            .ok_or_else(|| anyhow!("no Waku REPL capability is enabled"))?;
+        let bridge = McpBridge::acquire(service, directory, &repl_path, automation_repl)?;
         let this = Self {
             runtime,
+            registration_id: Uuid::new_v4().to_string(),
             bridge,
             session_id: session_id.to_owned(),
         };
@@ -162,17 +180,28 @@ impl OpenCodeComputerUse {
         fs::write(
             &temporary,
             serde_json::to_vec(&json!({
-                "server_path": this.runtime.config.server_path,
-                "process_directory": this.runtime.config.process_directory,
+                "server_path": this.runtime.as_ref().map(|runtime| runtime.config.server_path.clone()).unwrap_or_default(),
+                "process_directory": this.runtime.as_ref().map(|runtime| runtime.config.process_directory.clone()).unwrap_or_default(),
+                "registration_id": this.registration_id,
                 "cwd": directory,
             }))?,
         )?;
         fs::rename(&temporary, &path)?;
-        let instructions = format!(
-            "Computer Use is enabled for this Waku session. Use the `js` and `js_reset` tools from MCP server `{}`. These are direct MCP tools; call them directly. The host routes calls to this session automatically. Before using Computer Use, read the bundled skill at {} for the complete native API and operating instructions. Initialize with `await setupComputerUseRuntime({{ globals: globalThis }})`, then call methods such as `cua.list_apps()` directly. Use `jsRepl.write(...)` for output and `await jsRepl.emitImage(...)` for images. Bindings persist until `js_reset`. The skill documents all available methods; there is no public tool-discovery or generic dispatch API.",
-            this.bridge.server,
-            this.runtime.config.skill_path.display(),
-        );
+        let mut instructions = if let Some(runtime) = this.runtime.as_ref() {
+            format!(
+                "Computer Use is enabled for this Waku session. Use the `js` and `js_reset` tools from MCP server `{}`. These are direct MCP tools; call them directly. The host routes calls to this session automatically. Before using Computer Use, read the bundled skill at {} for the complete native API and operating instructions. Initialize with `await setupComputerUseRuntime({{ globals: globalThis }})`, then call methods such as `cua.list_apps()` directly. Use `jsRepl.write(...)` for output and `await jsRepl.emitImage(...)` for images. Bindings persist until `js_reset`. The skill documents all available methods; there is no public tool-discovery or generic dispatch API.",
+                this.bridge.server,
+                runtime.config.skill_path.display(),
+            )
+        } else {
+            format!(
+                "Use the `js` and `js_reset` tools from MCP server `{}` for this Waku session. Bindings persist until reset. Use jsRepl.write(...) for output.",
+                this.bridge.server
+            )
+        };
+        if this.bridge._automation_repl.is_some() {
+            instructions.push_str(" Debug app automation is available through waku.rpa. Start with await waku.rpa.instances(), then await waku.rpa.attach(instanceId). Use the returned session.sessionId for snapshot, actions, waits, diffs, diagnostics and scenarios. Calls return the shared daemon protocol result envelopes.");
+        }
         let attached = opencode_api::put_instruction_entry(
             &service.endpoint(),
             session_id,
@@ -190,7 +219,9 @@ impl OpenCodeComputerUse {
     }
 
     pub(super) fn stop(&self) {
-        self.runtime.stop();
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.stop();
+        }
     }
 }
 
@@ -204,15 +235,7 @@ impl Drop for OpenCodeComputerUse {
         let owns_registration = fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|config| {
-                config["process_directory"]
-                    == self
-                        .runtime
-                        .config
-                        .process_directory
-                        .to_string_lossy()
-                        .as_ref()
-            });
+            .is_some_and(|config| config["registration_id"] == self.registration_id);
         if owns_registration {
             let _ = fs::remove_file(path);
             let _ = opencode_api::remove_instruction_entry(
@@ -221,5 +244,27 @@ impl Drop for OpenCodeComputerUse {
                 INSTRUCTION_KEY,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rpa_tests {
+    use super::*;
+
+    #[test]
+    fn automation_repl_opencode_configuration_only_transmits_nonsecret_paths() {
+        let config = mcp_configuration(
+            Path::new("/fixture/waku_js_repl"),
+            "/fixture",
+            json!({
+                "WAKU_COMPUTER_USE_SESSIONS_DIRECTORY": "/fixture/sessions",
+                super::super::automation_repl::ENV_FILE: "/fixture/endpoint.json",
+            }),
+        );
+        assert_eq!(config["command"], json!(["/fixture/waku_js_repl"]));
+        assert_eq!(config["environment"].as_object().unwrap().len(), 2);
+        assert!(!config.to_string().contains("TOKEN"));
+        assert!(!config.to_string().contains("WAKU_COMPUTER_USE_SERVER"));
+        assert!(!config.to_string().contains("skill"));
     }
 }

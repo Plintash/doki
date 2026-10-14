@@ -19,6 +19,19 @@ const SUBMISSION = {
   messageId: '20000000-0000-4000-8000-000000000002',
 }
 
+describe('session revision', () => {
+  test('submission and streamed events preserve a newer issue metadata revision', () => {
+    const session = { ...idleSession(), task_id: 'filed-issue', updated_at: 201 }
+    const submitted = apply(session, 'promptSubmitted', SUBMISSION)
+    const started = apply(submitted, 'turnStarted', null)
+    const replied = apply(started, 'textDelta', 'Sure.')
+    expect(replied.updated_at).toBe(201)
+    expect(replied.task_id).toBe('filed-issue')
+    expect(replied.last_reply_at).toBe(200)
+    expect(replied.messages.at(-1)?.content).toBe('Sure.')
+  })
+})
+
 describe('promptSubmitted', () => {
   test('a client following the runtime mirrors another client’s submission under its ids', () => {
     // The desktop stayed attached to the idle runtime after the first turn;

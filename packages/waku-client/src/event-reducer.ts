@@ -298,7 +298,7 @@ export function reduceRuntimeEvent(
       break
   }
 
-  session.updated_at = clock.nowSeconds()
+  session.updated_at = Math.max(session.updated_at, clock.nowSeconds())
   return result
 }
 

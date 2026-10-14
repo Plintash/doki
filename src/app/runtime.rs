@@ -1,5 +1,51 @@
 use super::*;
 
+/// Local workspace/provider preparation owns this session until its callback
+/// installs or rejects the runtime. An attachment miss cannot prove it orphaned.
+fn local_runtime_preparation_pending(
+    session_id: Uuid,
+    submissions: &HashSet<Uuid>,
+    goals: &HashSet<Uuid>,
+    forks: &HashMap<Uuid, usize>,
+) -> bool {
+    submissions.contains(&session_id)
+        || goals.contains(&session_id)
+        || forks.contains_key(&session_id)
+}
+
+/// Keep a failed preparation's input with its owning session even when the
+/// user has opened another issue. Work typed while preparation was pending
+/// stays behind the restored submission instead of being overwritten.
+fn restore_failed_preparation_draft(
+    drafts: &mut crate::persistence::ComposerDrafts,
+    session: &AgentSession,
+    submission: ComposerSubmission,
+) -> bool {
+    let key = crate::persistence::ComposerDraftKey::for_session(session);
+    let mut restored = crate::persistence::ComposerDraft {
+        text: submission.display_content.unwrap_or(submission.prompt),
+        attachments: submission
+            .attachments
+            .iter()
+            .map(super::drafts::draft_attachment)
+            .collect(),
+        annotations: submission.annotations,
+    };
+    if let Some(existing) = drafts.get(key) {
+        if !restored.text.is_empty() && !existing.text.is_empty() {
+            restored.text.push_str("\n\n");
+        }
+        restored.text.push_str(&existing.text);
+        restored
+            .attachments
+            .extend(existing.attachments.iter().cloned());
+        restored
+            .annotations
+            .extend(existing.annotations.iter().cloned());
+    }
+    drafts.set(key, restored)
+}
+
 /// Whether a driver event only changes live provider state.
 ///
 /// Such events repaint the surfaces they feed and never dirty a session save:
@@ -56,9 +102,6 @@ fn attach_driver(
     session_id: Uuid,
     event_wake: smol::channel::Sender<()>,
 ) -> anyhow::Result<Option<(AgentSession, PreparedDriver)>> {
-    let Some(session) = waku_client::persistence::hydrate_session(&daemon, session_id)? else {
-        return Ok(None);
-    };
     let client = daemon.client();
     let response = client.request(session_id, Uuid::nil(), waku_client::Command::AttachSession)?;
     let waku_client::ResponsePayload::SessionRuntime {
@@ -71,6 +114,8 @@ fn attach_driver(
     let Some(runtime_id) = runtime_id else {
         return Ok(None);
     };
+    let session = waku_client::persistence::hydrate_session(&daemon, session_id)?
+        .ok_or_else(|| anyhow::anyhow!("the live daemon runtime has no stored session details"))?;
     let (event_tx, events) = driver::event_channel(event_wake);
     let handle = driver::attach_remote(
         daemon,
@@ -84,6 +129,20 @@ fn attach_driver(
     Ok(Some((session, PreparedDriver { handle, events })))
 }
 
+/// Merge the daemon's task catalog into desktop state the way the daemon
+/// merges saves: by id, newest `updated_at` wins. A local edit that has not
+/// reached the daemon yet is newer than the broadcast that raced it, so it
+/// survives the reload.
+fn merge_remote_tasks(local: &mut Vec<Task>, remote: Vec<Task>) {
+    for task in remote {
+        match local.iter_mut().find(|candidate| candidate.id == task.id) {
+            Some(candidate) if candidate.updated_at > task.updated_at => {}
+            Some(candidate) => *candidate = task,
+            None => local.push(task),
+        }
+    }
+}
+
 fn load_remote_task_state(
     client: &waku_client::DaemonClient,
 ) -> anyhow::Result<RemoteTaskStateSnapshot> {
@@ -95,6 +154,7 @@ fn load_remote_task_state(
     let waku_client::ResponsePayload::TaskState {
         projects,
         mut sessions,
+        tasks,
         ..
     } = response
     else {
@@ -103,7 +163,11 @@ fn load_remote_task_state(
     for session in &mut sessions {
         session.detail_loaded = false;
     }
-    Ok(RemoteTaskStateSnapshot { projects, sessions })
+    Ok(RemoteTaskStateSnapshot {
+        projects,
+        sessions,
+        tasks,
+    })
 }
 
 /// The running turn and the user message that opened it — the identity other
@@ -112,12 +176,7 @@ pub(super) fn submitted_prompt_identity(session: &AgentSession) -> (Option<Uuid>
     let Some(turn_id) = session.active_turn_id() else {
         return (None, None);
     };
-    let message_id = session
-        .messages
-        .iter()
-        .find(|message| message.turn_id == Some(turn_id) && message.role == MessageRole::User)
-        .map(|message| message.id);
-    (Some(turn_id), message_id)
+    (Some(turn_id), session.active_turn_user_message_id())
 }
 
 pub(super) fn session_has_active_provider_turn(session: &AgentSession) -> bool {
@@ -164,16 +223,26 @@ pub(super) fn merge_remote_session_catalog(
 
     for remote in remote {
         if let Some(local) = local.iter_mut().find(|session| session.id == remote.id) {
-            local.title = remote.title;
-            local.auto_title = remote.auto_title;
-            local.project_id = remote.project_id;
-            local.provider = remote.provider;
-            local.model = remote.model;
-            local.created_at = remote.created_at;
-            local.last_reply_at = remote.last_reply_at;
+            // A binding/project change may still be awaiting its save ack.
+            // Keep its revision as well as its values across repeated stale
+            // snapshots; lowering the stamp would undo it on the next reload.
+            if remote.updated_at >= local.updated_at {
+                local.title = remote.title;
+                local.auto_title = remote.auto_title;
+                local.project_id = remote.project_id;
+                local.workspace = remote.workspace;
+                local.task_id = remote.task_id;
+                local.provider = remote.provider;
+                local.model = remote.model;
+                local.created_at = remote.created_at;
+                local.last_reply_at = remote.last_reply_at;
+                if !local.detail_loaded {
+                    local.is_draft = remote.is_draft;
+                }
+            }
             if !has_local_runtime(local.id) {
                 local.status = remote.status;
-                local.updated_at = remote.updated_at;
+                local.updated_at = local.updated_at.max(remote.updated_at);
             }
         } else {
             local.push(remote);
@@ -181,6 +250,36 @@ pub(super) fn merge_remote_session_catalog(
     }
 
     removed
+}
+
+/// Hydrate transcript details without rolling back metadata changed while
+/// the request was in flight. The latest catalog revision owns list metadata;
+/// the response owns transcript and provider detail. Equal revisions favor the
+/// catalog already displayed, matching an edit's optimistic local ownership.
+pub(super) fn replace_hydrated_session(local: &mut AgentSession, mut hydrated: AgentSession) {
+    debug_assert_eq!(local.id, hydrated.id);
+    if local.updated_at >= hydrated.updated_at {
+        hydrated.title = std::mem::take(&mut local.title);
+        hydrated.auto_title = local.auto_title.take();
+        hydrated.project_id = local.project_id;
+        hydrated.task_id = local.task_id;
+        hydrated.workspace = std::mem::take(&mut local.workspace);
+        hydrated.provider = local.provider;
+        hydrated.model = local.model.take();
+        // Disk catalog skeletons carry placeholder provider options. Only a
+        // loaded local session can own newer choices for these detail fields.
+        if local.detail_loaded {
+            hydrated.runtime_mode = local.runtime_mode;
+            hydrated.reasoning_effort = local.reasoning_effort.take();
+            hydrated.service_tier = local.service_tier.take();
+            hydrated.context_window = local.context_window.take();
+            hydrated.agent_preset = local.agent_preset.take();
+        }
+        hydrated.created_at = local.created_at;
+        hydrated.last_reply_at = local.last_reply_at.max(hydrated.last_reply_at);
+        hydrated.updated_at = local.updated_at;
+    }
+    *local = hydrated;
 }
 
 /// Perform every blocking operation between accepting a submission and
@@ -1036,6 +1135,7 @@ impl Waku {
             self.task_switcher.remove(*session_id);
         }
         self.state.projects = snapshot.projects;
+        merge_remote_tasks(&mut self.state.tasks, snapshot.tasks);
 
         let attach = self
             .state
@@ -1095,21 +1195,44 @@ impl Waku {
         }
     }
 
+    pub(super) fn session_has_local_runtime_preparation(&self, session_id: Uuid) -> bool {
+        local_runtime_preparation_pending(
+            session_id,
+            &self.submission_preparations,
+            &self.goal_runtime_starts,
+            &self.response_fork_preparations,
+        )
+    }
+
     pub(super) fn start_runtime_attachment(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
-        if self.runtimes.contains_key(&session_id)
+        if self.session_has_local_runtime_preparation(session_id)
+            || self.runtimes.contains_key(&session_id)
             || !self.runtime_attach_pending.insert(session_id)
         {
             return;
         }
         let daemon = self.daemon.clone();
         let event_wake = self.event_wake_tx.clone();
+        let completion_attempts = self.task_completion_attachment_attempts(session_id);
         cx.spawn(async move |waku, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { attach_driver(daemon, session_id, event_wake) })
                 .await;
             let _ = waku.update(cx, move |waku, cx| {
-                waku.finish_runtime_attachment(session_id, result, cx);
+                let for_completion = !completion_attempts.is_empty()
+                    || waku.task_completion_waits_for_attachment(session_id);
+                let absent = result.as_ref().ok().map(Option::is_none);
+                waku.finish_runtime_attachment(session_id, result, for_completion, cx);
+                if for_completion {
+                    waku.note_task_completion_attachment(
+                        session_id,
+                        absent,
+                        &completion_attempts,
+                        cx,
+                    );
+                }
+                waku.resume_task_completion_attachment(session_id, cx);
             });
         })
         .detach();
@@ -1119,9 +1242,16 @@ impl Waku {
         &mut self,
         session_id: Uuid,
         result: anyhow::Result<Option<(AgentSession, PreparedDriver)>>,
+        for_completion: bool,
         cx: &mut Context<Self>,
     ) {
         if !self.runtime_attach_pending.remove(&session_id) {
+            return;
+        }
+        // A probe can have started before local preparation took ownership.
+        // Discard that raced result, including old miss counts.
+        if self.session_has_local_runtime_preparation(session_id) {
+            self.runtime_attach_misses.remove(&session_id);
             return;
         }
         match result {
@@ -1136,8 +1266,12 @@ impl Waku {
                     return;
                 };
                 if !self.runtimes.contains_key(&session_id) {
-                    self.state.sessions[index] = session;
+                    replace_hydrated_session(&mut self.state.sessions[index], session);
+                    if self.sync_task_workspace_from_session(session_id, false) {
+                        self.save_task_changes(cx);
+                    }
                     self.install_prepared_driver(session_id, prepared);
+                    super::rpa::daemon::model_changed();
                     if self.state.selected_session == Some(session_id) {
                         self.reset_visible_state();
                         self.reset_transcript_rows(self.transcript_row_count());
@@ -1146,6 +1280,12 @@ impl Waku {
                 }
             }
             Ok(None) => {
+                if for_completion {
+                    // This attempt consumes authoritative absence exactly once;
+                    // it must not start the ordinary orphan-retry loop.
+                    self.runtime_attach_misses.remove(&session_id);
+                    return;
+                }
                 let busy = self
                     .state
                     .sessions
@@ -1180,6 +1320,9 @@ impl Waku {
     }
 
     fn interrupt_orphaned_runtime(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        if self.session_has_local_runtime_preparation(session_id) {
+            return;
+        }
         let project_paths = self
             .state
             .projects
@@ -1253,20 +1396,43 @@ impl Waku {
     }
 
     pub(super) fn selected_session(&self) -> Option<&AgentSession> {
-        let id = self.state.selected_session?;
-        self.state.sessions.iter().find(|session| session.id == id)
+        self.session(self.state.selected_session?)
+    }
+
+    /// The session with this id, when the catalog holds it.
+    pub(super) fn session(&self, session_id: Uuid) -> Option<&AgentSession> {
+        self.state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
     }
 
     /// Completes a persisted turn exactly once. All production turn-settlement
-    /// paths go through this seam.
+    /// paths go through this seam, which also records the settlement into the
+    /// instance's diagnostic stream.
     pub(super) fn finish_active_turn(
         &mut self,
         session_id: Uuid,
         status: TurnStatus,
+        cx: &App,
     ) -> Option<(Uuid, usize)> {
-        self.state
-            .session_mut(session_id)?
-            .finish_active_turn(status)
+        let session = self.state.session_mut(session_id)?;
+        let finished = session.finish_active_turn(status)?;
+        crate::diagnostics::record(cx, || {
+            Some(crate::diagnostics::turn_settled(
+                session, finished.0, finished.1, status,
+            ))
+        });
+        Some(finished)
+    }
+
+    /// Record the first streamed output of a turn, once the delta has been
+    /// applied so the phase named is the one that is live.
+    pub(super) fn record_streaming(&self, session_id: Uuid, phase: StreamPhase, cx: &App) {
+        crate::diagnostics::record(cx, || {
+            self.session(session_id)
+                .map(|session| crate::diagnostics::turn_streaming(session, phase))
+        });
     }
 
     /// The directory every filesystem and provider operation for `session`
@@ -1292,6 +1458,7 @@ impl Waku {
     /// Marks the session for the next save; see `PersistedState::session_mut`.
     pub(super) fn selected_session_mut(&mut self) -> Option<&mut AgentSession> {
         let id = self.state.selected_session?;
+        super::rpa::daemon::model_changed();
         self.state.session_mut(id)
     }
 
@@ -1588,6 +1755,7 @@ impl Waku {
     }
 
     pub(super) fn save(&mut self, cx: &App) {
+        super::rpa::daemon::model_changed();
         self.last_stream_save = Instant::now();
         // Every write of `state.json` carries the right panel's current
         // identities, so a window rebuilt later restores them.
@@ -1756,6 +1924,9 @@ impl Waku {
                     {
                         turn.checkpoint = Some(checkpoint);
                         attached_turn_id = Some(turn.id);
+                    }
+                    if attached_turn_id.is_some() {
+                        super::rpa::daemon::model_changed();
                     }
                     if let Some(turn_id) = attached_turn_id
                         && selected
@@ -2366,7 +2537,7 @@ impl Waku {
             message.attachments = submission.attachments.clone();
             message.annotations = submission.annotations.clone();
             session.status = SessionStatus::Connecting;
-            session.updated_at = unix_time();
+            session.touch();
             Some(original)
         });
         let Some(original_message) = original_message else {
@@ -2382,6 +2553,7 @@ impl Waku {
         self.submission_preparations.insert(session_id);
         self.hide_toast();
         self.remeasure_transcript_message(edited_message_index);
+        super::rpa::daemon::model_changed();
         cx.notify();
 
         cx.spawn(async move |waku, cx| {
@@ -2453,6 +2625,7 @@ impl Waku {
                     self.remeasure_transcript_message(message_index);
                 }
                 self.show_toast(error);
+                super::rpa::daemon::model_changed();
                 cx.notify();
                 return;
             }
@@ -2901,6 +3074,9 @@ impl Waku {
             session.workspace = workspace;
             changed
         });
+        if self.sync_task_workspace_from_session(session_id, workspace_changed) {
+            self.save_task_changes(cx);
+        }
         if workspace_changed && self.state.selected_session == Some(session_id) {
             self.invalidate_workspace_queries(cx);
             self.reload_clean_right_panel_file_editors(cx);
@@ -3116,7 +3292,7 @@ impl Waku {
             session
                 .queued_messages
                 .push(submission.into_queued_message());
-            session.updated_at = unix_time();
+            session.touch();
         }
         self.save(cx);
         cx.notify();
@@ -3129,9 +3305,13 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         if let Some(session) = self.state.session_mut(session_id) {
+            let previous_len = session.queued_messages.len();
             session
                 .queued_messages
                 .retain(|message| message.id != message_id);
+            if session.queued_messages.len() != previous_len {
+                session.touch();
+            }
         }
         self.save(cx);
         cx.notify();
@@ -3151,7 +3331,9 @@ impl Waku {
                 .queued_messages
                 .iter()
                 .position(|message| message.id == message_id)?;
-            Some(session.queued_messages.remove(index))
+            let message = session.queued_messages.remove(index);
+            session.touch();
+            Some(message)
         }) else {
             return;
         };
@@ -3177,7 +3359,9 @@ impl Waku {
                 .queued_messages
                 .iter()
                 .position(|message| message.id == message_id)?;
-            Some(session.queued_messages.remove(index))
+            let message = session.queued_messages.remove(index);
+            session.touch();
+            Some(message)
         }) else {
             return;
         };
@@ -3319,6 +3503,7 @@ impl Waku {
         } else {
             Vec::new()
         };
+        let mut continued_task = None;
         let transcript_anchor = if let Some(session) = self.state.session_mut(session_id) {
             session.set_title_from_prompt(&human_prompt);
             let turn_id = session.begin_turn_with_presentation(
@@ -3328,7 +3513,8 @@ impl Waku {
                 submission.annotations.clone(),
             );
             session.status = SessionStatus::Connecting;
-            session.updated_at = unix_time();
+            session.touch();
+            continued_task = session.task_id;
             selected.then_some(TranscriptAnchor {
                 session_id,
                 turn_id,
@@ -3336,6 +3522,15 @@ impl Waku {
         } else {
             None
         };
+        // A prompt is work: sending one to a finished task reopens it, so the
+        // task's state never lags behind the conversation it owns.
+        if let Some(task_id) = continued_task {
+            self.reopen_task_for_continued_work(task_id, cx);
+        }
+        crate::diagnostics::record(cx, || {
+            self.session(session_id)
+                .map(crate::diagnostics::turn_submitted)
+        });
         self.submission_preparations.insert(session_id);
         if selected {
             self.activities_expanded.clear();
@@ -3362,6 +3557,7 @@ impl Waku {
             self.splice_transcript_rows_after_visibility_change(&previous_kinds);
             self.scroll_transcript_to_anchor();
         }
+        super::rpa::daemon::model_changed();
         cx.notify();
 
         let preparation_prompt = human_prompt;
@@ -3403,6 +3599,7 @@ impl Waku {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.submission_preparations.remove(&session_id);
+                super::rpa::daemon::model_changed();
                 if selected {
                     self.sync_transcript_rows();
                 }
@@ -3411,6 +3608,10 @@ impl Waku {
                 } else {
                     Vec::new()
                 };
+                crate::diagnostics::record(cx, || {
+                    self.session(session_id)
+                        .map(|session| crate::diagnostics::turn_unwound(session, &error))
+                });
                 if let Some(session) = self.state.session_mut(session_id)
                     && session.status == SessionStatus::Connecting
                 {
@@ -3423,6 +3624,22 @@ impl Waku {
                     session.status = SessionStatus::Idle;
                 }
                 if selected {
+                    self.capture_current_composer_draft(cx);
+                }
+                if let Some(session) = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    && restore_failed_preparation_draft(
+                        &mut self.composer_drafts,
+                        session,
+                        submission,
+                    )
+                {
+                    self.schedule_composer_draft_save(cx);
+                }
+                if selected {
                     if self
                         .transcript_anchor
                         .get()
@@ -3432,9 +3649,10 @@ impl Waku {
                         self.transcript_anchor_following.set(false);
                     }
                     self.splice_transcript_rows_after_visibility_change(&previous_kinds);
-                    self.restore_composer_submission(submission, cx);
+                    self.restore_selected_composer_draft(cx);
                     self.show_toast(tr!("errors.create_worktree", error = error));
                 }
+                self.save(cx);
                 cx.notify();
                 return;
             }
@@ -3470,6 +3688,9 @@ impl Waku {
             session.workspace = workspace;
             changed
         });
+        if self.sync_task_workspace_from_session(session_id, workspace_changed) {
+            self.save_task_changes(cx);
+        }
         if selected && workspace_changed {
             self.invalidate_workspace_queries(cx);
             self.reload_clean_right_panel_file_editors(cx);
@@ -3547,13 +3768,14 @@ impl Waku {
                     session.status = SessionStatus::Failed;
                     session.push_message(MessageRole::Assistant, message);
                 }
-                self.finish_active_turn(session_id, TurnStatus::Failed);
+                self.finish_active_turn(session_id, TurnStatus::Failed, cx);
             }
         }
         // From this point onward `cancel_turn` has either a live driver to
         // cancel or a settled startup failure. The next frame must therefore
         // show Stop (or Send after failure), never the preparation spinner.
         self.submission_preparations.remove(&session_id);
+        super::rpa::daemon::model_changed();
         if failed_to_start {
             self.capture_latest_turn_checkpoint_for(session_id);
             self.start_pending_checkpoint_captures(cx);
@@ -3586,6 +3808,8 @@ impl Waku {
             | self.drain_plan_usage_events()
             | self.drain_task_state_sync_events(cx)
         {
+            crate::diagnostics::pump_committed(cx);
+            super::rpa::daemon::model_changed();
             cx.notify();
         }
         if std::mem::take(&mut self.workspace_queries_stale) {
@@ -3598,6 +3822,14 @@ impl Waku {
         // A finished turn asks for a checkpoint from a handler with no
         // `Context`; this is where that `git` work leaves the UI thread.
         self.start_pending_checkpoint_captures(cx);
+
+        #[cfg(debug_assertions)]
+        crate::diagnostics::set_event_backlog(
+            self.runtimes
+                .values()
+                .map(|runtime| runtime.events.len() + runtime.pending_events.len())
+                .sum(),
+        );
 
         if self
             .runtimes
@@ -3751,6 +3983,169 @@ impl Waku {
             self.save(cx);
         }
         changed || selected_changed
+    }
+}
+
+#[cfg(test)]
+mod runtime_preparation_guard_tests {
+    use super::*;
+
+    #[test]
+    fn goal_only_preparation_guard_tracks_membership_and_release() {
+        let session = Uuid::new_v4();
+        let submissions = HashSet::new();
+        let mut goals = HashSet::from([session]);
+        let forks = HashMap::new();
+        assert!(local_runtime_preparation_pending(
+            session,
+            &submissions,
+            &goals,
+            &forks
+        ));
+        assert!(!local_runtime_preparation_pending(
+            Uuid::new_v4(),
+            &submissions,
+            &goals,
+            &forks
+        ));
+        goals.remove(&session);
+        assert!(!local_runtime_preparation_pending(
+            session,
+            &submissions,
+            &goals,
+            &forks
+        ));
+    }
+
+    #[test]
+    fn submission_and_response_fork_preparations_share_the_same_guard() {
+        let session = Uuid::new_v4();
+        assert!(local_runtime_preparation_pending(
+            session,
+            &HashSet::from([session]),
+            &HashSet::new(),
+            &HashMap::new()
+        ));
+        assert!(local_runtime_preparation_pending(
+            session,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::from([(session, 1)])
+        ));
+    }
+}
+
+#[cfg(test)]
+mod failed_preparation_tests {
+    use super::*;
+    use crate::persistence::{ComposerDraft, ComposerDraftKey, ComposerDrafts};
+
+    #[test]
+    fn offscreen_issue_preparation_keeps_its_draft_and_workspace_intent() {
+        let project_id = Uuid::new_v4();
+        let mut failed = AgentSession::new(project_id, ProviderKind::Pi);
+        failed.task_id = Some(Uuid::new_v4());
+        failed.workspace = SessionWorkspace::NewWorktree {
+            base_branch: Some("main".into()),
+        };
+        let issue_id = failed.task_id;
+        let intended_workspace = failed.workspace.clone();
+        let turn = failed.begin_turn("Original issue request");
+        failed.unwind_unstarted_turn(turn);
+        let mut other_issue = AgentSession::new(project_id, ProviderKind::Pi);
+        other_issue.task_id = Some(Uuid::new_v4());
+        let other_draft = ComposerDraft {
+            text: "Unrelated issue input".into(),
+            ..Default::default()
+        };
+        let mut drafts = ComposerDrafts::default();
+        drafts.set(
+            ComposerDraftKey::for_session(&other_issue),
+            other_draft.clone(),
+        );
+
+        assert!(restore_failed_preparation_draft(
+            &mut drafts,
+            &failed,
+            ComposerSubmission::plain("Original issue request".into())
+        ));
+        assert_eq!(
+            drafts.get_for(&failed).unwrap().text,
+            "Original issue request"
+        );
+        assert_eq!(drafts.get_for(&other_issue), Some(&other_draft));
+        assert_eq!(failed.task_id, issue_id);
+        assert_eq!(failed.workspace, intended_workspace);
+        assert!(!failed.has_started());
+        assert!(drafts.new_sessions.is_empty());
+    }
+
+    #[test]
+    fn failed_preparation_preserves_typed_content_attachments_and_new_edits() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        session.task_id = Some(Uuid::new_v4());
+        let attachment = MessageAttachment {
+            path: PathBuf::from("/attachments/context.txt"),
+            mention: "@context.txt".into(),
+            name: "context.txt".into(),
+            is_dir: false,
+            is_image: false,
+            blob_reference: Some("context-blob".into()),
+        };
+        let annotation = MessageAnnotation {
+            id: Uuid::new_v4(),
+            target: AnnotationTarget::MessageSpan {
+                message_id: Uuid::new_v4(),
+                spans: Vec::new(),
+                quote: "context".into(),
+                block: "block".into(),
+            },
+            comment: Some("keep this context".into()),
+        };
+        let mut drafts = ComposerDrafts::default();
+        drafts.set(
+            ComposerDraftKey::for_session(&session),
+            ComposerDraft {
+                text: "A newer edit".into(),
+                ..Default::default()
+            },
+        );
+        restore_failed_preparation_draft(
+            &mut drafts,
+            &session,
+            ComposerSubmission {
+                prompt: "expanded provider transport".into(),
+                display_content: Some("  /my-command  ".into()),
+                attachments: vec![attachment],
+                annotations: vec![annotation.clone()],
+            },
+        );
+        let recovered = drafts.get_for(&session).unwrap();
+        assert_eq!(recovered.text, "  /my-command  \n\nA newer edit");
+        assert_eq!(
+            recovered.attachments[0].blob_reference.as_deref(),
+            Some("context-blob")
+        );
+        assert_eq!(recovered.annotations, vec![annotation]);
+    }
+
+    #[test]
+    fn ordinary_unstarted_failure_restores_the_project_draft_slot() {
+        let session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        let mut drafts = ComposerDrafts::default();
+        restore_failed_preparation_draft(
+            &mut drafts,
+            &session,
+            ComposerSubmission::plain("Retry me".into()),
+        );
+        assert_eq!(
+            drafts
+                .get(ComposerDraftKey::NewSession(session.project_id))
+                .unwrap()
+                .text,
+            "Retry me"
+        );
+        assert!(drafts.sessions.is_empty());
     }
 }
 

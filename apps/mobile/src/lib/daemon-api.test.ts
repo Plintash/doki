@@ -1,9 +1,34 @@
 import { describe, expect, test } from 'bun:test';
 import type { WakuClient } from '@waku/client';
 
-import { browseDaemonDirectory, createProject, daemonKeys, discoverComposerCommands, listComposerFiles, persistProject, providerSessionKey } from './daemon-api';
+import { browseDaemonDirectory, createProject, daemonKeys, discoverComposerCommands, listComposerFiles, persistProject, persistSession, providerSessionKey } from './daemon-api';
+import { createSession } from './mobile-runtime';
 
 describe('mobile daemon API', () => {
+  test.each([undefined, false, true])('preserves optional draft marker %p and issue membership', async (isDraft) => {
+    const clock = { nowSeconds: () => 100, randomUUID: () => 'session' };
+    const session = {
+      ...createSession('project', 'pi', false, clock),
+      task_id: 'issue',
+      ...(isDraft === undefined ? {} : { is_draft: isDraft }),
+    };
+    let command: unknown;
+    const client = {
+      request: async (next: unknown) => {
+        command = next;
+        return { type: 'taskStateSaved', sessions: [session] };
+      },
+    } as unknown as WakuClient;
+
+    await expect(persistSession(client, session)).resolves.toEqual(session);
+    expect(command).toEqual({
+      type: 'saveTaskState', projects: [], liveSessionIds: [session.id], sessions: [session],
+    });
+    // Mobile checkpoints must not replace the desktop's issue catalog.
+    expect(command).not.toHaveProperty('tasks');
+    if (isDraft === undefined) expect(session).not.toHaveProperty('is_draft');
+  });
+
   test('requests composer catalogs from the selected daemon workspace and provider override', async () => {
     const commands: unknown[] = [];
     const files = [{ path: 'src/', is_dir: true }];

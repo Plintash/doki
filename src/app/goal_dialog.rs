@@ -131,6 +131,21 @@ impl Waku {
         operation: GoalOperation,
         cx: &mut Context<Self>,
     ) {
+        if matches!(
+            &operation,
+            GoalOperation::Set {
+                status: Some(ThreadGoalStatus::Active),
+                ..
+            }
+        ) && let Some(task_id) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.task_id)
+        {
+            self.reopen_task_for_continued_work(task_id, cx);
+        }
         self.record_goal_submission(session_id, &operation, cx);
         self.begin_goal_pursuit_turn(session_id, &operation, cx);
         if let Some(runtime) = self.runtimes.get(&session_id) {
@@ -167,8 +182,8 @@ impl Waku {
         session.set_title_from_prompt(objective);
         let notice = tr!("goal.set_notice", objective = notice_objective(objective));
         session.push_message(MessageRole::System, notice);
-        session.updated_at = crate::model::unix_time();
         self.state.mark_session_dirty(session_id);
+        super::rpa::daemon::model_changed();
         cx.notify();
     }
 
@@ -203,6 +218,7 @@ impl Waku {
         let turn_id = session.begin_provider_turn();
         session.status = SessionStatus::Connecting;
         self.state.mark_session_dirty(session_id);
+        super::rpa::daemon::model_changed();
         cx.notify();
         // Continuation can legitimately never come — an inherited deferral,
         // or a goal feature disabled provider-side. Do not let the working
@@ -249,6 +265,7 @@ impl Waku {
             session.status = SessionStatus::Idle;
         }
         self.state.mark_session_dirty(session_id);
+        super::rpa::daemon::model_changed();
     }
 
     /// Flush operations accepted before the runtime existed. Called after

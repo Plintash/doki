@@ -27,6 +27,10 @@ title: string,
  */
 auto_title?: string | null, project_id: string,
 /**
+ * The task this conversation is filed under, when the user has filed it.
+ */
+task_id?: string | null,
+/**
  * Local project checkout or an isolated Git worktree for this task.
  */
 workspace?: SessionWorkspace, provider: ProviderKind, model?: string | null, runtime_mode: RuntimeMode, reasoning_effort?: string | null, service_tier?: string | null,
@@ -90,4 +94,10 @@ extension_window_title?: string | null,
  * Not stored in the session JSON — these are rows in the `messages`
  * table, reattached when the session is hydrated.
  */
-messages: Array<Message>, transcript_blocks: Array<TranscriptBlock>, turns: Array<AgentTurn>, queued_messages?: Array<QueuedMessage>, };
+messages: Array<Message>, transcript_blocks: Array<TranscriptBlock>, turns: Array<AgentTurn>, queued_messages?: Array<QueuedMessage>,
+/**
+ * Distinguishes a persisted, unstarted issue session from unloaded history.
+ * This marker is meaningful for list projections; loaded sessions derive
+ * their started state from the transcript and provider cursor.
+ */
+is_draft?: boolean, };

@@ -6,7 +6,7 @@ use gpui::{
 use crate::input::TextInput;
 use crate::theme::{Theme, sp};
 
-use super::icon;
+use super::{SemanticControlExt, icon};
 
 /// The one-line text box shell: a fixed-height bordered field around a
 /// [`TextInput`], with an optional leading icon and an accent border
@@ -63,6 +63,7 @@ impl RenderOnce for TextField {
         let theme = Theme::current(cx);
         let focused = self.input.read(cx).is_visually_focused(window);
         self.base
+            .semantic_control(gpui::Role::Group, false)
             .h(px(28.0))
             .px(px(8.0))
             .rounded(px(6.0))
