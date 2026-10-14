@@ -266,6 +266,9 @@ visible.
 
 ## Pi and Oh My Pi
 
+See [Pi compatibility](pi-compatibility.md) for the exact 1.0.4/1.2.0 matrix,
+startup/abort semantics, and reproducible provider-free checks.
+
 Oh My Pi is a fork of Pi that kept the RPC transport and renamed part of its
 surface, so one driver serves both. `PiFlavor`
 ([pi.rs:59](../crates/waku-core/src/driver/pi.rs#L52)) carries every divergence,
@@ -313,8 +316,8 @@ which Pi itself budgets 15 s for, so the live-process timeout there would fail
 a session that was merely slow to start.
 
 **Lifetime** — long-lived, and unlike Codex it survives Stop: cancelling sends
-`abort` over the existing connection. It ends when the runtime is dropped, by
-stdin EOF; nothing reaps it afterwards.
+`abort` over the existing connection. Dropping the runtime closes stdin; the
+process thread waits for exit and announces `ProcessExited`.
 
 **Handshake** — `get_state` → optional `switch_session {sessionPath}` when
 resuming → `set_model {provider, modelId}` → `set_thinking_level {level}` →
@@ -335,9 +338,11 @@ drains its steering and follow-up queues before it settles — so it neither ope
 a turn nor settles one. `handled` means an extension command or input handler
 consumed the prompt, so it settles at once, unless a run is already live: an
 extension command that wakes the session by appending a message with
-`{triggerTurn: true}` starts that run inside the handler, and since Pi emits
-`agent_start` before it writes the answer, the turn belongs to the run and the
-run's own settle ends it. Settlement never depends on the answer at all: a
+`{triggerTurn: true}` starts that run inside the handler. On Pi 1.2, its
+`before_agent_start` hook may still be pending when the command answers, so a
+handled response without an observed run triggers a `get_state` check. Busy
+state keeps the same turn open until the run's own settlement. A local command
+is finished only after idle is confirmed. Settlement never depends on the answer at all: a
 prompt answer is written only from the prompt's preflight, so a prompt submitted
 while Pi is emitting `agent_settled` is deferred and never answered, and a
 prompt refused before acceptance settles as that message's delivery failure
