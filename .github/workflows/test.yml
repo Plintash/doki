@@ -1,84 +1,88 @@
-name: Tests
+name: Terminal drop diagnosis
 
 on:
   push:
-  pull_request:
+    branches: [diagnostic/terminal-drop-phases]
 
 permissions:
   contents: read
 
 concurrency:
-  group: tests-${{ github.workflow }}-${{ github.ref }}
+  group: terminal-drop-diagnosis-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Rust (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-24.04, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-
+  diagnose:
+    name: Flooded PTY drop (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
     steps:
-      - name: Check out repository
+      - name: Check out diagnostic source
         uses: actions/checkout@v6
 
-      - name: Install Rust
+      - name: Install pinned Rust
         run: |
           rustup toolchain install 1.96.0 --profile minimal
           rustup default 1.96.0
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            clang \
-            cmake \
-            libfontconfig-dev \
-            libvulkan1 \
-            libwayland-dev \
-            libx11-xcb-dev \
-            libxi-dev \
-            libxtst-dev \
-            libxkbcommon-x11-dev \
-            pkg-config \
-            xdg-desktop-portal
-
-      - name: Cache Cargo
+      - name: Cache core-test dependencies
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.os }}-rust-1.96.0-cargo-${{ hashFiles('Cargo.lock') }}
+          key: macos-terminal-drop-rust-1.96.0-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.os }}-rust-1.96.0-cargo-
+            macos-terminal-drop-rust-1.96.0-
+            macos-latest-rust-1.96.0-cargo-
 
-      - name: Run tests
-        run: cargo test --locked
-
-      - name: Verify in-process Cua SDK and REPL lifecycle
+      - name: Build only core tests
         run: |
-          cargo build --locked --package waku --bin waku_js_repl --package waku-computer-use --bin waku_computer_use
-          bun scripts/cua-driver.ts bundle target/debug target/debug/resources debug
-          bun scripts/test-computer-use.ts
+          mkdir -p terminal-drop-evidence
+          cargo test --locked --package waku-core --lib --no-run --message-format=json > terminal-drop-evidence/build.jsonl
 
-      # The generated protocol and browser client are platform-independent, so
-      # one runner is enough to catch a drifted checked-in artifact.
-      - name: Install JavaScript dependencies
-        if: runner.os == 'Linux'
-        run: bun install --frozen-lockfile
-
-      - name: Check generated protocol and browser client
-        if: runner.os == 'Linux'
+      - name: Repeat original flood deadline and check server interactions
         run: |
-          bun run protocol:check
-          bun run --filter @waku/client check
-          bun run --filter @waku/client test
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          evidence = pathlib.Path("terminal-drop-evidence")
+          artifacts = [json.loads(line) for line in (evidence / "build.jsonl").read_text().splitlines() if line.startswith("{")]
+          binaries = [item["executable"] for item in artifacts if item.get("reason") == "compiler-artifact" and item.get("target", {}).get("name") == "waku_core" and item.get("profile", {}).get("test") and item.get("executable")]
+          assert len(binaries) == 1, binaries
+          binary = binaries[0]
+          test = "server::tests::dropping_flooding_terminal_terminates_pipeline_group"
+
+          def run(label, args, budget):
+              with (evidence / f"{label}.log").open("w") as output:
+                  try:
+                      result = subprocess.run([binary, *args], stdout=output, stderr=subprocess.STDOUT, timeout=budget)
+                      code = result.returncode
+                  except subprocess.TimeoutExpired:
+                      output.write(f"\nOuter diagnostic process deadline exceeded: {budget}s\n")
+                      code = 124
+              print((evidence / f"{label}.log").read_text(), flush=True)
+              if code:
+                  sys.exit(code)
+
+          for attempt in range(1, 101):
+              print(f"Flood attempt {attempt}/100", flush=True)
+              run(f"flood-{attempt:03}", [test, "--exact", "--nocapture"], 30)
+          # A separate pass retains the runner's normal test parallelism and
+          # neighboring server activity without invoking provider-live tests.
+          # PR95's independent attach-boundary fixture is repaired in PR96;
+          # this diagnostic branch deliberately leaves both PR heads alone.
+          run("server-tests", ["server::tests::", "--nocapture", "--skip", "websocket_terminal_attach_boundary_has_no_duplicates_or_gaps"], 180)
+          PY
+
+      - name: Preserve phase and native stack evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-drop-evidence
+          path: terminal-drop-evidence
+          if-no-files-found: warn

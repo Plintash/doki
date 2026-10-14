@@ -113,6 +113,55 @@ mod platform {
         }
     }
 
+    /// Test-only milestones; the reader's hot path stores only its current phase.
+    /// The report is printed after the original completion wait, never used
+    /// to extend it or to decide whether teardown succeeded.
+    #[cfg(test)]
+    pub(crate) struct TeardownTrace {
+        started: Instant,
+        milestones: Mutex<Vec<(Duration, String)>>,
+        reader_phase: std::sync::atomic::AtomicU8,
+    }
+
+    #[cfg(test)]
+    impl TeardownTrace {
+        fn new() -> Self {
+            Self {
+                started: Instant::now(),
+                milestones: Mutex::new(Vec::new()),
+                reader_phase: std::sync::atomic::AtomicU8::new(0),
+            }
+        }
+
+        pub(crate) fn record(&self, phase: impl Into<String>) {
+            self.milestones
+                .lock()
+                .push((self.started.elapsed(), phase.into()));
+        }
+
+        fn reader_phase(&self, phase: u8) {
+            self.reader_phase.store(phase, Ordering::Relaxed);
+        }
+
+        pub(crate) fn report(&self) -> String {
+            let phase = match self.reader_phase.load(Ordering::Relaxed) {
+                0 => "not started",
+                1 => "PTY read",
+                2 => "output push/flush",
+                3 => "retry sleep/flush",
+                4 => "observe child exit",
+                5 => "exit/error event",
+                6 => "reader closure returning",
+                _ => "unknown",
+            };
+            format!(
+                "elapsed={:?}, reader={phase}, milestones={:?}",
+                self.started.elapsed(),
+                self.milestones.lock()
+            )
+        }
+    }
+
     pub struct DaemonTerminal {
         pty: Mutex<tty::Pty>,
         stopped: Arc<AtomicBool>,
@@ -121,6 +170,8 @@ mod platform {
         /// a reconnecting client should emulate before it resizes.
         size: Mutex<(u16, u16)>,
         reader: Option<JoinHandle<()>>,
+        #[cfg(test)]
+        teardown_trace: Arc<TeardownTrace>,
     }
 
     impl DaemonTerminal {
@@ -205,18 +256,32 @@ mod platform {
             let retained = Arc::new(Mutex::new(RetainedOutput::new(retained_bytes)));
             let reader_stopped = stopped.clone();
             let reader_retained = retained.clone();
+            #[cfg(test)]
+            let teardown_trace = Arc::new(TeardownTrace::new());
+            #[cfg(test)]
+            let reader_trace = teardown_trace.clone();
             let reader = std::thread::Builder::new()
                 .name("waku-daemon-terminal-output".into())
                 .spawn(move || {
                     let mut output_events = TerminalOutput::new(events, reader_retained);
                     let mut buffer = [0_u8; READ_CHUNK_BYTES];
+                    #[cfg(test)]
+                    reader_trace.record("reader started");
                     while !reader_stopped.load(Ordering::Acquire) {
+                        #[cfg(test)]
+                        reader_trace.reader_phase(1);
                         match output.read(&mut buffer) {
                             Ok(0) => {
+                                #[cfg(test)]
+                                reader_trace.reader_phase(5);
                                 output_events.exited();
                                 break;
                             }
-                            Ok(read) => output_events.push(&buffer[..read]),
+                            Ok(read) => {
+                                #[cfg(test)]
+                                reader_trace.reader_phase(2);
+                                output_events.push(&buffer[..read]);
+                            }
                             Err(error)
                                 if matches!(
                                     error.kind(),
@@ -225,6 +290,8 @@ mod platform {
                                         | std::io::ErrorKind::Interrupted
                                 ) =>
                             {
+                                #[cfg(test)]
+                                reader_trace.reader_phase(3);
                                 std::thread::sleep(READ_RETRY_INTERVAL);
                                 output_events.flush_if_due();
                             }
@@ -234,18 +301,31 @@ mod platform {
                                 // Observe exit without reaping: keeping the PID
                                 // owned also keeps its process-group identity
                                 // safe to signal when the terminal is closed.
+                                #[cfg(test)]
+                                reader_trace.reader_phase(4);
                                 if child_has_exited(child_pid) {
+                                    #[cfg(test)]
+                                    reader_trace.reader_phase(5);
                                     output_events.exited();
                                     break;
                                 }
+                                #[cfg(test)]
+                                reader_trace.reader_phase(3);
                                 std::thread::sleep(READ_RETRY_INTERVAL);
                                 output_events.flush_if_due();
                             }
                             Err(error) => {
+                                #[cfg(test)]
+                                reader_trace.reader_phase(5);
                                 output_events.failed(error);
                                 break;
                             }
                         }
+                    }
+                    #[cfg(test)]
+                    {
+                        reader_trace.reader_phase(6);
+                        reader_trace.record("reader closure returning");
                     }
                 })
                 .context("start terminal output thread")?;
@@ -256,7 +336,14 @@ mod platform {
                 retained,
                 size: Mutex::new(normalized_size(cols, rows)),
                 reader: Some(reader),
+                #[cfg(test)]
+                teardown_trace,
             })
+        }
+
+        #[cfg(test)]
+        pub(crate) fn teardown_trace(&self) -> Arc<TeardownTrace> {
+            self.teardown_trace.clone()
         }
 
         /// The retained bytes and the cumulative output offset at the last
@@ -294,23 +381,49 @@ mod platform {
         fn drop(&mut self) {
             // Keep draining while the group is terminating: stopping output
             // first can leave pipeline children blocked on a full PTY.
-            terminate_shell_group(self.pty.get_mut());
+            #[cfg(test)]
+            self.teardown_trace.record("DaemonTerminal::drop entered");
+            terminate_shell_group(
+                self.pty.get_mut(),
+                #[cfg(test)]
+                &self.teardown_trace,
+            );
+            #[cfg(test)]
+            self.teardown_trace
+                .record("group termination returned; stopping reader");
             self.stopped.store(true, Ordering::Release);
             if let Some(reader) = self.reader.take() {
-                let _ = reader.join();
+                #[cfg(test)]
+                self.teardown_trace.record("reader join entered");
+                let _result = reader.join();
+                #[cfg(test)]
+                self.teardown_trace.record(format!(
+                    "reader join returned: panicked={}",
+                    _result.is_err()
+                ));
             }
+            #[cfg(test)]
+            self.teardown_trace
+                .record("drop body returning; implicit Pty destructor next");
         }
     }
 
-    fn terminate_shell_group(pty: &tty::Pty) {
+    fn terminate_shell_group(pty: &tty::Pty, #[cfg(test)] trace: &TeardownTrace) {
         let child_pid = pty.child().id() as libc::pid_t;
         // Alacritty creates the shell with setsid(), so its PID owns this
         // process group. Exit observations use WNOWAIT: only Pty::drop reaps
         // the shell, preventing PID/group reuse until signaling is complete.
         // Signal even an exited shell's group, which can still own children.
-        unsafe {
-            libc::kill(-child_pid, libc::SIGHUP);
-        }
+        #[cfg(test)]
+        trace.record("SIGHUP entered");
+        let _result = unsafe { libc::kill(-child_pid, libc::SIGHUP) };
+        #[cfg(test)]
+        trace.record(format!(
+            "SIGHUP returned: result={_result}, error={:?}",
+            (_result == -1).then(std::io::Error::last_os_error)
+        ));
+        #[cfg(test)]
+        trace.record("grace wait entered");
         let deadline = Instant::now() + SHELL_SHUTDOWN_GRACE;
         while !child_has_exited(child_pid) && Instant::now() < deadline {
             std::thread::sleep(READ_RETRY_INTERVAL);
@@ -318,9 +431,14 @@ mod platform {
         // A shell exiting does not imply its pipeline children exited. They
         // can inherit ignored SIGHUP, so finish the group before Pty::drop's
         // direct-child wait and before closing the reader's master handle.
-        unsafe {
-            libc::kill(-child_pid, libc::SIGKILL);
-        }
+        #[cfg(test)]
+        trace.record("grace wait returned; SIGKILL entered");
+        let _result = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
+        #[cfg(test)]
+        trace.record(format!(
+            "SIGKILL returned: result={_result}, error={:?}",
+            (_result == -1).then(std::io::Error::last_os_error)
+        ));
     }
 
     fn child_has_exited(child_pid: libc::pid_t) -> bool {

@@ -4800,12 +4800,45 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(4));
             }
         }
+        let trace = terminal.teardown_trace();
+        trace.record("fixture ready; spawning drop worker");
+        let worker_trace = trace.clone();
         let (dropped, finished) = bounded(1);
-        std::thread::spawn(move || {
-            drop(terminal);
-            let _ = dropped.send(());
+        let worker = std::thread::spawn(move || {
+            worker_trace.record("drop worker started");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(terminal)));
+            worker_trace.record(format!(
+                "drop(terminal) returned: panicked={}",
+                result.is_err()
+            ));
+            let _ = dropped.send(result.map_err(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|text| (*text).to_owned())
+                    })
+                    .unwrap_or_else(|| "non-string panic payload".to_owned())
+            }));
         });
-        let completed = finished.recv_timeout(Duration::from_secs(3)).is_ok();
+        // Keep the original verdict and deadline. Evidence collection occurs
+        // only after a failure, and cannot turn a late completion into a pass.
+        let completion = finished.recv_timeout(Duration::from_secs(3));
+        let completed = matches!(completion, Ok(Ok(())));
+        eprintln!(
+            "terminal drop completion={completion:?}; {}",
+            trace.report()
+        );
+        if !completed {
+            eprintln!(
+                "drop worker finished={}; shell={shell_pid}; child={child_pid}",
+                worker.is_finished()
+            );
+            terminal_drop_failure_evidence(&root, shell_pid, child_pid);
+            eprintln!("after evidence: {}", trace.report());
+        }
         // An orphan can briefly remain as a zombie until init reaps it. ps is
         // portable across the supported Unix platforms; kill(pid, 0) alone
         // would incorrectly count that already-terminated child as running.
@@ -4828,11 +4861,128 @@ mod tests {
         }
         let child_running = running();
         std::fs::remove_dir_all(root).unwrap();
-        assert!(completed, "terminal drop did not finish");
+        assert!(completed, "terminal drop did not finish: {completion:?}");
         assert!(
             !child_running,
             "terminal drop left its HUP-ignoring child running"
         );
+    }
+
+    /// Capture only this fixture and this test process; never invoke sudo or
+    /// extend the completion verdict while waiting for diagnostic tools.
+    #[cfg(unix)]
+    fn terminal_drop_failure_evidence(
+        root: &std::path::Path,
+        shell: libc::pid_t,
+        child: libc::pid_t,
+    ) {
+        let mut ps = std::process::Command::new("/bin/ps");
+        ps.args(["-o", "pid,ppid,pgid,stat,wchan,command", "-p"])
+            .arg(format!("{},{shell},{child}", std::process::id()));
+        terminal_drop_diagnostic_command(ps, root, "process-state", Duration::from_secs(2));
+        #[cfg(target_os = "macos")]
+        {
+            let sample_path = root.join("test-process.sample.txt");
+            let mut sample = std::process::Command::new("/usr/bin/sample");
+            sample
+                .arg(std::process::id().to_string())
+                .args(["1", "10", "-file"])
+                .arg(&sample_path);
+            terminal_drop_diagnostic_command(sample, root, "sample", Duration::from_secs(5));
+            terminal_drop_print_evidence(&sample_path);
+        }
+    }
+
+    #[cfg(unix)]
+    fn terminal_drop_diagnostic_command(
+        mut command: std::process::Command,
+        root: &std::path::Path,
+        label: &str,
+        budget: Duration,
+    ) {
+        let path = root.join(format!("{label}.log"));
+        let output = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("{label}: cannot open evidence file: {error}");
+                return;
+            }
+        };
+        let stderr = match output.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("{label}: cannot clone evidence file: {error}");
+                return;
+            }
+        };
+        let mut process = match command.stdout(output).stderr(stderr).spawn() {
+            Ok(process) => process,
+            Err(error) => {
+                eprintln!("{label}: unavailable: {error}");
+                return;
+            }
+        };
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            match process.try_wait() {
+                Ok(Some(status)) => {
+                    eprintln!("{label}: {status}");
+                    break;
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => {
+                    eprintln!("{label}: timed out or wait failed: {result:?}");
+                    let _ = process.kill();
+                    // Reap if it exits promptly, without adding an unbounded
+                    // diagnostic wait to the original teardown regression.
+                    let reap_deadline = std::time::Instant::now() + Duration::from_millis(200);
+                    while matches!(process.try_wait(), Ok(None))
+                        && std::time::Instant::now() < reap_deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    break;
+                }
+            }
+        }
+        terminal_drop_print_evidence(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_drop_diagnostic_command_bounds_a_stalled_tool() {
+        let root = std::env::temp_dir().join(format!("waku-drop-evidence-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("5");
+        let started = std::time::Instant::now();
+        terminal_drop_diagnostic_command(command, &root, "stalled-tool", Duration::from_millis(20));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "diagnostic tool was not bounded"
+        );
+        assert!(root.join("stalled-tool.log").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn terminal_drop_print_evidence(path: &std::path::Path) {
+        use std::io::Read as _;
+        let evidence = std::fs::File::open(path).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(256 * 1024).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        match evidence {
+            Ok(bytes) => eprintln!(
+                "{} (at most 256 KiB):\n{}",
+                path.display(),
+                String::from_utf8_lossy(&bytes)
+            ),
+            Err(error) => eprintln!("{}: unavailable: {error}", path.display()),
+        }
     }
 
     #[cfg(unix)]
