@@ -287,18 +287,61 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     await wait({ on: "state", pointer: "/session/messages/0/content", equals: "Synthetic fixture history" });
     await wait({ on: "node", id: `session-${sessions[1]!.id}`, present: true });
 
+    // A menu opened in the old issue must not carry its cached callbacks
+    // into the full New task editor (Cmd-N uses this same handler).
+    await invoke("openTask", { id: issueId });
+    await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "task-detail-project" } });
     await invoke("newTask");
-    await wait({ on: "state", pointer: "/board/newTaskDialog", equals: true });
-    await client.automationCall(sessionId, { type: "key", chord: "escape" });
-    await wait({ on: "state", pointer: "/board/newTaskDialog", equals: false });
+    const brief = await client.automationCall(sessionId, { type: "snapshot", sections: ["tree", "task", "tasks", "board"] });
+    const draftIssueId = field(brief.observed, "state", "task", "id") as string;
+    expect(field(brief.observed, "state", "board", "newTaskDialog")).toBe(false);
+    expect(field(brief.observed, "state", "board", "newTaskDraft")).toBe(draftIssueId);
+    expect((field(brief.observed, "state", "tasks") as Task[]).some(task => task.id === draftIssueId)).toBe(false);
+    const briefNodes = field(brief.observed, "tree", "nodes") as { element_id?: string; disabled?: boolean }[];
+    expect(briefNodes.some(node => node.element_id === `issue-title-${draftIssueId}`)).toBe(true);
+    expect(briefNodes.some(node => node.element_id === `issue-description-${draftIssueId}`)).toBe(true);
+    expect(briefNodes.some(node => node.element_id === "new-task-layer")).toBe(false);
+    expect(briefNodes.some(node => node.element_id === `task-project-${projectId}`)).toBe(false);
+    expect(briefNodes.some(node => node.element_id === "task-detail-new-session")).toBe(false);
+    expect(briefNodes.find(node => node.element_id === "new-task-create")?.disabled).toBe(true);
+    await client.automationCall(sessionId, { type: "type", text: "   ", target: { id: `issue-title-${draftIssueId}` } });
+    const whitespace = await client.automationCall(sessionId, { type: "snapshot", sections: ["tree", "tasks", "sessions"] });
+    const whitespaceNodes = field(whitespace.observed, "tree", "nodes") as { element_id?: string; disabled?: boolean }[];
+    expect(whitespaceNodes.find(node => node.element_id === "new-task-create")?.disabled).toBe(true);
+    expect((field(whitespace.observed, "state", "tasks") as Task[]).length).toBe(1);
+    expect((field(whitespace.observed, "state", "sessions") as AgentSession[]).length).toBe(2);
+    await client.automationCall(sessionId, { type: "type", text: "Discard this unsaved brief", target: { id: `issue-title-${draftIssueId}` } });
+    await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "new-task-cancel" } });
+    await wait({ on: "state", pointer: "/board/newTaskDraft", equals: null });
+    const cancelled = await client.automationCall(sessionId, { type: "snapshot", sections: ["tasks"] });
+    expect((field(cancelled.observed, "state", "tasks") as Task[]).some(task => task.id === draftIssueId)).toBe(false);
+
+    await invoke("openTask", { id: issueId });
+    await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "task-detail-workspace" } });
+    await invoke("newTask");
+    const fresh = await client.automationCall(sessionId, { type: "snapshot", sections: ["task", "tree"] });
+    const freshNodes = field(fresh.observed, "tree", "nodes") as { element_id?: string }[];
+    expect(freshNodes.some(node => node.element_id === "task-workspace-local")).toBe(false);
+    const newIssueId = field(fresh.observed, "state", "task", "id") as string;
     const title = "Empty issue before any conversation";
-    const newIssue = await invoke("newTask", { title });
-    const newIssueId = field(newIssue.value, "opened") as string;
-    expect(newIssueId).toBeString();
-    expect(field(newIssue.observed, "state", "task", "id")).toBe(newIssueId);
-    expect(field(newIssue.observed, "state", "task", "workspace", "kind")).toBe("newWorktree");
+    const description = "Keep the title, description, and chosen workspace together.";
+    await client.automationCall(sessionId, { type: "type", text: title, target: { id: `issue-title-${newIssueId}` } });
+    await client.automationCall(sessionId, { type: "type", text: description, target: { id: `issue-description-${newIssueId}` } });
+    await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "task-detail-workspace" } });
+    await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "task-workspace-local" } });
+    // Navigating away and reopening New task retains the same uncommitted brief.
+    await invoke("openTask", { id: issueId });
+    await invoke("newTask");
+    await wait({ on: "state", pointer: "/task/id", equals: newIssueId });
+    await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "new-task-create" } });
+    await wait({ on: "state", pointer: "/board/newTaskDraft", equals: null });
     await wait({ on: "state", pointer: "/board/savePending", equals: false });
-    const empty = await client.automationCall(sessionId, { type: "snapshot", sections: ["tasks", "sessions", "board"] });
+    const empty = await client.automationCall(sessionId, { type: "snapshot", sections: ["task", "tasks", "sessions", "board"] });
+    expect(field(empty.observed, "state", "task", "id")).toBe(newIssueId);
+    expect(field(empty.observed, "state", "task", "title")).toBe(title);
+    expect(field(empty.observed, "state", "task", "description")).toBe(description);
+    expect(field(empty.observed, "state", "task", "workspace", "kind")).toBe("local");
+    expect((field(empty.observed, "state", "tasks") as Task[]).filter(task => task.id === newIssueId).length).toBe(1);
     expect((field(empty.observed, "state", "sessions") as AgentSession[]).some(session => session.task_id === newIssueId)).toBe(false);
     expect(field(empty.observed, "state", "board", "saveError")).toBeNull();
 
@@ -321,7 +364,7 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     await wait({ on: "state", pointer: "/session/id", equals: draftId });
     expect(field(drafted.observed, "state", "selection", "task_id")).toBe(newIssueId);
     expect(field(drafted.observed, "state", "selection", "workspace", "kind")).toBe("newWorktree");
-    expect(field(drafted.observed, "state", "composer", "text")).toBe(title);
+    expect(field(drafted.observed, "state", "composer", "text")).toBe(`${title}\n\n${description}`);
     await wait({ on: "node", id: "composer-create-worktree", present: true });
     const checkbox = await client.automationCall(sessionId, { type: "snapshot", sections: ["tree"] });
     const worktreeNode = (field(checkbox.observed, "tree", "nodes") as Record<string, unknown>[]).find(node => node.element_id === "composer-create-worktree");
@@ -338,7 +381,88 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     expect(field(standalone.observed, "state", "selection", "task_id") ?? null).toBeNull();
     expect(field(standalone.observed, "state", "composer", "text")).not.toBe(title);
     await invoke("openSession", { id: draftId });
-    await wait({ on: "state", pointer: "/composer/text", equals: title });
+    await wait({ on: "state", pointer: "/composer/text", equals: `${title}\n\n${description}` });
+  } finally {
+    events?.close();
+    if (sessionId) await client.automation({ type: "detach", sessionId }).catch(() => {});
+    if (scratchId) await client.automation({ type: "scratchRemove", instanceId: scratchId }).catch(() => {});
+    await client.disconnect();
+  }
+}, 90_000);
+
+liveTest("native attachment picker filters eligible conversations and keeps keyboard focus and distant rows usable", async () => {
+  const client = connect();
+  let scratchId: string | undefined;
+  let sessionId: string | undefined;
+  let events: ReturnType<typeof notifications> | undefined;
+  try {
+    await client.connect();
+    const projectId = crypto.randomUUID();
+    const otherProjectId = crypto.randomUUID();
+    const issueId = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+    const sessions: AgentSession[] = Array.from({ length: 1_000 }, (_, index) => ({
+      id: crypto.randomUUID(), title: `${index === 100 || index === 101 ? "needle " : ""}Conversation ${index}`,
+      project_id: projectId, provider: "pi", runtime_mode: "ask", status: "idle",
+      created_at: now, updated_at: now + index, provider_cursor: null, messages: [], transcript_blocks: [], turns: [],
+    }));
+    const otherProjectSession = { ...sessions[0]!, id: crypto.randomUUID(), project_id: otherProjectId, title: "needle wrong project" };
+    const filedSession = { ...sessions[0]!, id: crypto.randomUUID(), task_id: issueId, title: "needle already filed" };
+    const created = await client.automation({ type: "scratchCreate", headless: false, name: "Attachment picker keyboard acceptance", seed: {
+      projects: [
+        { id: projectId, name: "Attachment project", path: "/synthetic/attachment-project", created_at: now },
+        { id: otherProjectId, name: "Other project", path: "/synthetic/other-project", created_at: now },
+      ],
+      tasks: [{ id: issueId, title: "Attach the selected conversation", description: "Provider-free fixture", state: "backlog", position: 0,
+        workspace: { kind: "local", projectId }, created_at: now, updated_at: now }],
+      sessions: [...sessions, otherProjectSession, filedSession],
+    } }, { timeoutMs: 40_000 });
+    if (created.type !== "scratchCreated") throw new Error("unexpected scratch response");
+    scratchId = created.instance.instanceId;
+    sessionId = (await client.attachAutomation(scratchId)).sessionId;
+    events = notifications(client, sessionId);
+    const wait = async (condition: AutomationCondition) => {
+      const response = await client.automation({ type: "wait", sessionId: sessionId!, condition, timeoutMs: 10_000 });
+      if (response.type !== "wait") throw new Error("unexpected wait response");
+      const resolved = response.wait.status === "pending"
+        ? await events!.find(message => message.type === "waitResolved" && message.wait.waitId === response.wait.waitId)
+        : undefined;
+      expect(resolved?.type === "waitResolved" ? resolved.wait.status : response.wait.status).toBe("succeeded");
+    };
+    const call = (command: Parameters<WakuClient["automationCall"]>[1]) => client.automationCall(sessionId!, command);
+    const nodes = async () => field((await call({ type: "snapshot", sections: ["tree"] })).observed, "tree", "nodes") as { element_id?: string }[];
+    await call({ type: "invoke", verb: "openTask", args: { id: issueId } });
+    await call({ type: "act", action: "click", target: { id: "task-detail-attach" } });
+    await wait({ on: "node", id: "task-attach-search", present: true });
+    expect((await nodes()).filter(node => node.element_id?.startsWith("task-attach-")).length).toBeLessThan(30);
+    await call({ type: "key", chord: "end" });
+    await wait({ on: "node", id: `task-attach-${sessions[0]!.id}`, present: true });
+    await call({ type: "key", chord: "home" });
+    await wait({ on: "node", id: `task-attach-${sessions[999]!.id}`, present: true });
+    // No explicit target: opening must have placed real focus in the search field.
+    await call({ type: "type", text: "needle attachment" });
+    await wait({ on: "node", id: `task-attach-${sessions[101]!.id}`, present: true });
+    const filtered = await nodes();
+    expect(filtered.some(node => node.element_id === `task-attach-${sessions[100]!.id}`)).toBe(true);
+    expect(filtered.some(node => node.element_id === `task-attach-${otherProjectSession.id}`)).toBe(false);
+    expect(filtered.some(node => node.element_id === `task-attach-${filedSession.id}`)).toBe(false);
+    expect(filtered.filter(node => /^task-attach-[0-9a-f]{8}-/.test(node.element_id ?? "")).length).toBe(2);
+    await call({ type: "key", chord: "down" });
+    await call({ type: "key", chord: "enter" });
+    await wait({ on: "node", id: "task-attach-search", present: false });
+    await wait({ on: "state", pointer: "/board/savePending", equals: false });
+    const catalog = field((await call({ type: "snapshot", sections: ["sessions"] })).observed, "state", "sessions") as AgentSession[];
+    expect(catalog.find(session => session.id === sessions[100]!.id)?.task_id).toBe(issueId);
+    expect(catalog.find(session => session.id === sessions[101]!.id)?.task_id ?? null).toBeNull();
+    expect(catalog.find(session => session.id === otherProjectSession.id)?.task_id ?? null).toBeNull();
+    await call({ type: "act", action: "click", target: { id: "task-detail-attach" } });
+    await wait({ on: "node", id: "task-attach-search", present: true });
+    await call({ type: "key", chord: "escape" });
+    await wait({ on: "node", id: "task-attach-search", present: false });
+    // Escape must restore trigger focus; Enter can open the same picker again.
+    await call({ type: "key", chord: "enter" });
+    await wait({ on: "node", id: "task-attach-search", present: true });
+    await call({ type: "key", chord: "escape" });
   } finally {
     events?.close();
     if (sessionId) await client.automation({ type: "detach", sessionId }).catch(() => {});

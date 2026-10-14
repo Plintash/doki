@@ -693,13 +693,8 @@ impl Waku {
                 let title = new_task_title(args)?;
                 self.new_task_action(&crate::NewTask, window, cx);
                 if let Some(title) = title {
-                    // Use the dialog's own field and commit handler. This
-                    // preserves Board project scope and deferred worktree intent.
-                    if let Some(dialog) = self.new_task_dialog.as_ref() {
-                        dialog
-                            .input
-                            .update(cx, |input, cx| input.set_content(title, cx));
-                    }
+                    // Use the same draft editor and create boundary as the UI.
+                    self.set_task_draft_title(title, cx);
                     self.commit_new_task(cx);
                     Ok(json!({ "opened": self.selected_task }))
                 } else {
@@ -1057,7 +1052,7 @@ impl Waku {
             "providers" => self.rpa_providers(),
             "runtime" => self.rpa_runtime(),
             "workspace" => self.rpa_workspace(),
-            "task" => self.selected_task.and_then(|id| self.state.tasks.iter().find(|task| task.id == id)).map(json_of).unwrap_or(Value::Null),
+            "task" => self.selected_task.and_then(|id| self.task_for_editor(id)).map(json_of).unwrap_or(Value::Null),
             "tasks" => json_of(&self.state.tasks),
             "sessions" => observable_session_list(&self.state.sessions),
             "projects" => json_of(&self.state.projects),
@@ -1079,7 +1074,8 @@ impl Waku {
                     super::board::BoardActivityFilter::Running => "running",
                     super::board::BoardActivityFilter::Attention => "attention",
                 },
-                "newTaskDialog": self.new_task_dialog.is_some(),
+                "newTaskDialog": false,
+                "newTaskDraft": self.new_task_draft.as_ref().map(|task| task.id),
                 "completionTask": self.pending_task_completion.as_ref().map(|confirm| confirm.task_id),
                 "savePending": self.task_save_in_flight || self.task_save_pending,
                 "saveError": self.task_save_error,

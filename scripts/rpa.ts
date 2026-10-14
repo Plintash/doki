@@ -75,7 +75,7 @@ Commands:
                                  disable affects future runs; cancel also stops active work
   raw '<json>'                   send a shared AutomationCommand (legacy: P0 request)
 
-Issue verbs: openTask {id}, newTask {title?}; no title opens the New issue dialog.
+Issue verbs: openTask {id}, newTask {title?}; no title opens the full New issue draft editor.
 Conversation verbs: openSession {id}, newSession {taskId?}; omit taskId for standalone.
 Sections: task/tasks are Board issues; session/sessions are conversations; board is UI/save state.
 

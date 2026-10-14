@@ -7,6 +7,12 @@ use super::*;
 use crate::ui::SemanticControlExt;
 use crate::ui::menu::dropdown_menu_list;
 
+mod attach_picker;
+
+pub(super) fn init_attach_picker_keys(cx: &mut App) {
+    attach_picker::init(cx);
+}
+
 pub(super) struct TaskDetail {
     id: Uuid,
     title: Entity<TextInput>,
@@ -17,6 +23,9 @@ pub(super) struct TaskDetail {
     session_indices: Vec<usize>,
     session_focuses: HashMap<Uuid, FocusHandle>,
     editor_layout: Option<(u64, bool, bool, bool)>,
+    attach_picker: Entity<attach_picker::TaskAttachPicker>,
+    project_menu: ContextMenuHandle,
+    workspace_menu: ContextMenuHandle,
 }
 
 pub(super) fn task_project_id(task: &Task) -> Option<Uuid> {
@@ -63,6 +72,29 @@ fn task_session_navigation_index(index: usize, count: usize, key: &str) -> Optio
 }
 
 impl Waku {
+    pub(super) fn task_detail_values(&self, id: Uuid, cx: &App) -> Option<(String, String)> {
+        let detail = self.task_detail.as_ref().filter(|detail| detail.id == id)?;
+        Some((
+            detail.title.read(cx).content().to_owned(),
+            detail.description.read(cx).content().to_owned(),
+        ))
+    }
+
+    pub(super) fn set_task_draft_title(&mut self, title: String, cx: &mut Context<Self>) {
+        if let Some(task) = self.new_task_draft.as_mut() {
+            task.title = title.clone();
+            if let Some(detail) = self
+                .task_detail
+                .as_ref()
+                .filter(|detail| detail.id == task.id)
+            {
+                detail
+                    .title
+                    .update(cx, |input, cx| input.set_content(title, cx));
+            }
+        }
+    }
+
     /// Focus a concrete control after revealing its virtualized row. Ordinary
     /// Tab order only knows rendered elements, so crossing a row boundary must
     /// also be able to bring an off-screen conversation into the viewport.
@@ -144,7 +176,12 @@ impl Waku {
         cx.notify();
     }
 
-    fn ensure_task_detail(&mut self, task: &Task, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn ensure_task_detail(
+        &mut self,
+        task: &Task,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(detail) = self
             .task_detail
             .as_ref()
@@ -187,7 +224,14 @@ impl Waku {
         cx.subscribe(&title, move |this, input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Edited) {
                 let title = input.read(cx).content().trim().to_owned();
-                if !title.is_empty()
+                if let Some(draft) = this
+                    .new_task_draft
+                    .as_mut()
+                    .filter(|task| task.id == task_id)
+                {
+                    draft.title = title;
+                    draft.touch();
+                } else if !title.is_empty()
                     && let Some(task) = this.state.tasks.iter_mut().find(|task| task.id == task_id)
                     && task.title != title
                 {
@@ -202,7 +246,15 @@ impl Waku {
         cx.subscribe(&description, move |this, input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Edited) {
                 let description = input.read(cx).content().to_owned();
-                if let Some(task) = this.state.tasks.iter_mut().find(|task| task.id == task_id)
+                if let Some(draft) = this
+                    .new_task_draft
+                    .as_mut()
+                    .filter(|task| task.id == task_id)
+                {
+                    draft.description = description;
+                    draft.touch();
+                } else if let Some(task) =
+                    this.state.tasks.iter_mut().find(|task| task.id == task_id)
                     && task.description != description
                 {
                     task.description = description;
@@ -217,6 +269,9 @@ impl Waku {
         let editor_focus = cx.focus_handle();
         let list = ListState::new(0, ListAlignment::Top, px(256.0));
         list.splice_focusable(0..0, [Some(editor_focus.clone())]);
+        let owner = cx.entity().downgrade();
+        let attach_picker =
+            cx.new(|cx| attach_picker::TaskAttachPicker::new(task_id, owner, window, cx));
         self.task_detail = Some(TaskDetail {
             id: task.id,
             title,
@@ -227,6 +282,9 @@ impl Waku {
             session_indices: Vec::new(),
             session_focuses: HashMap::new(),
             editor_layout: None,
+            attach_picker,
+            project_menu: ContextMenuHandle::new(cx),
+            workspace_menu: ContextMenuHandle::new(cx),
         });
         let weak = cx.entity().downgrade();
         window.on_next_frame(move |window, cx| {
@@ -499,6 +557,16 @@ impl Waku {
             | TaskWorkspace::NewWorktree { project_id }
             | TaskWorkspace::Worktree { project_id, .. } => *project_id,
         };
+        if let Some(draft) = self
+            .new_task_draft
+            .as_mut()
+            .filter(|task| task.id == task_id)
+        {
+            draft.workspace = Some(workspace);
+            draft.touch();
+            cx.notify();
+            return;
+        }
         let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) else {
             return;
         };
@@ -546,7 +614,7 @@ impl Waku {
                 && let Some(path) = paths.into_iter().next()
             {
                 let _ = this.update(cx, |this, cx| {
-                    if !this.state.tasks.iter().any(|task| task.id == task_id) {
+                    if this.task_for_editor(task_id).is_none() {
                         return;
                     }
                     let project_id = if let Some(project) = this
@@ -623,7 +691,10 @@ impl Waku {
             .find(|project| Some(project.id) == project_id)
             .map(Project::display_name)
             .unwrap_or_else(|| tr!("board.choose_project"));
-        let handle = self.menu_handle("task-detail-project", cx);
+        let Some(detail) = self.task_detail.as_ref() else {
+            return div().into_any_element();
+        };
+        let handle = detail.project_menu.clone();
         let weak = cx.entity().downgrade();
         dropdown_menu_list(
             MenuChip::new("task-detail-project")
@@ -708,7 +779,10 @@ impl Waku {
             .find(|project| project.id == project_id)
             .is_some_and(Project::is_projectless);
         let selected = task.workspace.clone();
-        let handle = self.menu_handle("task-detail-workspace", cx);
+        let Some(detail) = self.task_detail.as_ref() else {
+            return div().into_any_element();
+        };
+        let handle = detail.workspace_menu.clone();
         let weak = cx.entity().downgrade();
         dropdown_menu_list(
             MenuChip::new("task-detail-workspace")
@@ -793,87 +867,13 @@ impl Waku {
         )
     }
 
-    fn render_task_attach_picker(&mut self, task: &Task, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::current(cx);
-        let task_id = task.id;
-        let project_id = task_project_id(task);
-        let handle = self.menu_handle("task-detail-attach", cx);
-        let weak = cx.entity().downgrade();
-        dropdown_menu_list(
-            MenuChip::new("task-detail-attach")
-                .icon("icons/plus.svg", theme.text_tertiary)
-                .label(tr!("board.attach_session")),
-            "task-detail-attach-menu",
-            &handle,
-            MenuAlign::BelowLeft,
-            move |cx| {
-                let Some(entity) = weak.upgrade() else {
-                    return Vec::new();
-                };
-                let this = entity.read(cx);
-                let projects = this
-                    .state
-                    .projects
-                    .iter()
-                    .map(|project| (project.id, project.display_name()))
-                    .collect::<HashMap<_, _>>();
-                let mut sessions = this
-                    .state
-                    .sessions
-                    .iter()
-                    .filter(|session| session.task_id.is_none())
-                    .map(|session| {
-                        (
-                            session.id,
-                            session.project_id,
-                            session.display_title().to_owned(),
-                            session.updated_at,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                sessions.sort_by_key(|(_, project, _, updated)| {
-                    (Some(*project) != project_id, std::cmp::Reverse(*updated))
-                });
-                if sessions.is_empty() {
-                    return vec![MenuItem::Header(tr!("board.no_unfiled_sessions").into())];
-                }
-                sessions
-                    .iter()
-                    .map(|(session_id, session_project, title, _)| {
-                        let session_id = *session_id;
-                        let weak = weak.clone();
-                        let label = format!(
-                            "{} · {}",
-                            title,
-                            projects.get(session_project).cloned().unwrap_or_default()
-                        );
-                        MenuItem::new(label, move |_, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                this.bind_session_to_task(session_id, task_id, cx);
-                                this.ensure_session_loaded(session_id, cx);
-                            });
-                        })
-                        .semantic_id(format!("task-attach-{session_id}"))
-                        .disabled(project_id.is_some_and(|id| id != *session_project))
-                    })
-                    .collect()
-            },
-        )
-    }
-
     pub(super) fn render_task_detail(
         &mut self,
         task_id: Uuid,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(task) = self
-            .state
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .cloned()
-        else {
+        let Some(task) = self.task_for_editor(task_id).cloned() else {
             self.selected_task = None;
             self.task_detail = None;
             return self.render_board(window, cx);
@@ -971,6 +971,7 @@ impl Waku {
     /// scrolls out naturally instead of leaving a nested conversation scroller.
     fn render_task_detail_editor(&mut self, task: &Task, cx: &mut Context<Self>) -> AnyElement {
         let task_id = task.id;
+        let is_draft = self.is_task_draft(task_id);
         let detail = self
             .task_detail
             .as_ref()
@@ -1066,7 +1067,7 @@ impl Waku {
                             .items_center()
                             .rounded(px(7.0))
                             .border_1()
-                            .border_color(if title_empty {
+                            .border_color(if title_empty && !is_draft {
                                 theme.warning
                             } else {
                                 theme.border
@@ -1076,7 +1077,7 @@ impl Waku {
                             .text_color(theme.text)
                             .child(title),
                     )
-                    .when(title_empty, |element| {
+                    .when(title_empty && !is_draft, |element| {
                         element.child(
                             div()
                                 .text_size(sp(11.0))
@@ -1150,50 +1151,53 @@ impl Waku {
                             .child(description),
                     ),
             )
-            .child(div().h(px(1.0)).bg(theme.border))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(8.0))
+            .when(!is_draft, |element| {
+                element
+                    .child(div().h(px(1.0)).bg(theme.border))
                     .child(
                         div()
-                            .text_size(sp(14.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .child(board::conversations_label(session_count)),
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(sp(14.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .child(board::conversations_label(session_count)),
+                            )
+                            .child(div().flex_1())
+                            .child(attach)
+                            .child(start),
                     )
-                    .child(div().flex_1())
-                    .child(attach)
-                    .child(start),
-            )
-            .when(session_count == 0, |element| {
-                element.child(
-                    div()
-                        .py(px(30.0))
-                        .px(px(18.0))
-                        .rounded(px(10.0))
-                        .bg(theme.overlay)
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(icon("icons/pencil.svg", 24.0, theme.text_tertiary))
-                        .child(
+                    .when(session_count == 0, |element| {
+                        element.child(
                             div()
-                                .text_size(sp(13.0))
-                                .text_color(theme.text_secondary)
-                                .child(tr!("board.no_sessions")),
+                                .py(px(30.0))
+                                .px(px(18.0))
+                                .rounded(px(10.0))
+                                .bg(theme.overlay)
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(icon("icons/pencil.svg", 24.0, theme.text_tertiary))
+                                .child(
+                                    div()
+                                        .text_size(sp(13.0))
+                                        .text_color(theme.text_secondary)
+                                        .child(tr!("board.no_sessions")),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(sp(12.0))
+                                        .text_color(theme.text_tertiary)
+                                        .text_center()
+                                        .child(tr!("board.session_context_hint")),
+                                ),
                         )
-                        .child(
-                            div()
-                                .text_size(sp(12.0))
-                                .text_color(theme.text_tertiary)
-                                .text_center()
-                                .child(tr!("board.session_context_hint")),
-                        ),
-                )
+                    })
             })
             .into_any_element();
         editor

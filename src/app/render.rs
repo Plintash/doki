@@ -283,7 +283,6 @@ impl Render for Waku {
                 .children(image_preview)
                 .children(task_switcher)
                 .children(close_confirmation)
-                .children(self.render_new_task_dialog(cx))
                 .children(self.render_task_completion_confirm(cx))
                 .into_any_element();
             return content;
@@ -457,7 +456,6 @@ impl Render for Waku {
             .children(image_preview)
             .children(task_switcher)
             .children(close_confirmation)
-            .children(self.render_new_task_dialog(cx))
             .children(self.render_task_completion_confirm(cx))
             .into_any_element();
 

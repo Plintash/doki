@@ -2275,8 +2275,6 @@ board.new_task:
   en: New task
 board.new_task_placeholder:
   en: What is this task about?
-board.new_task_hint:
-  en: Create a task, then add details and start or attach conversations.
 board.needs_you:
   en: "%{count} waiting on you"
 board.needs_you_short:
@@ -2481,3 +2479,15 @@ workspace.create_worktree_hint:
   en: "Creates an isolated worktree when you send your first message"
 workspace.create_worktree_requires_project:
   en: "Choose a project to create a worktree"
+
+# Searchable task conversation attachment
+board.attach_search:
+  en: "Search conversations or workspaces"
+board.attach_project_scope:
+  en: "Unfiled in %{project}"
+board.attach_all_scope:
+  en: "Unfiled across all projects"
+board.attach_no_matches:
+  en: "No matching conversations"
+board.attach_keyboard_hint:
+  en: "↑↓ Choose · Enter Attach · Esc Close"

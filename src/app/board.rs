@@ -17,27 +17,20 @@ use super::*;
 use crate::ui::SemanticControlExt;
 use crate::ui::menu::dropdown_menu_list;
 
-actions!(waku_board, [DismissNewTaskDialog, DismissTaskCompletion]);
+actions!(waku_board, [DismissTaskCompletion]);
 
-const NEW_TASK_DIALOG_CONTEXT: &str = "NewTaskDialog";
 const TASK_COMPLETION_DIALOG_CONTEXT: &str = "TaskCompletionDialog";
 
-/// Escape closes each board dialog through a key binding scoped to it — the
+/// Escape closes the completion dialog through a key binding scoped to it — the
 /// mechanism the commit and goal dialogs use. (A raw key listener on the
 /// deferred overlay would depend on the binding path not consuming the key.)
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new(
-            "escape",
-            DismissNewTaskDialog,
-            Some(NEW_TASK_DIALOG_CONTEXT),
-        ),
-        KeyBinding::new(
-            "escape",
-            DismissTaskCompletion,
-            Some(TASK_COMPLETION_DIALOG_CONTEXT),
-        ),
-    ]);
+    super::task_details::init_attach_picker_keys(cx);
+    cx.bind_keys([KeyBinding::new(
+        "escape",
+        DismissTaskCompletion,
+        Some(TASK_COMPLETION_DIALOG_CONTEXT),
+    )]);
 }
 
 /// A card being dragged. The payload carries everything the drag preview
@@ -70,13 +63,6 @@ impl Render for TaskCardDragPreview {
             .text_color(theme.text)
             .child(self.title.clone())
     }
-}
-
-/// The task-creation dialog. It exists between the trigger and Enter; the
-/// task itself is created by [`Waku::commit_new_task`].
-pub(super) struct NewTaskDialog {
-    pub input: Entity<TextInput>,
-    pub state: TaskState,
 }
 
 /// A move to Done that must confirm closing connected or running conversations.
@@ -187,6 +173,16 @@ impl TaskStats {
             }
         }
     }
+}
+
+fn ready_task_draft(mut task: Task) -> Option<Task> {
+    let title = task.title.trim();
+    if title.is_empty() {
+        return None;
+    }
+    task.title = title.to_owned();
+    task.touch();
+    Some(task)
 }
 
 /// First-guess card height for a column's virtualized list; the list measures
@@ -937,60 +933,77 @@ impl Waku {
 
     // ── Task creation ─────────────────────────────────────────────────────
 
-    pub(super) fn open_new_task_dialog(
+    /// New issues use the same editor as existing issues. Keep the draft out
+    /// of the persisted catalog until the user explicitly creates it.
+    pub(super) fn open_new_task(
         &mut self,
         state: TaskState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let input = cx.new(|cx| {
-            TextInput::new(window, cx)
-                .semantic_id("new-issue-title")
-                .tab_stop(true)
-                .placeholder(tr!("board.new_task_placeholder"))
-        });
-        let focus = input.read(cx).focus();
-        // Enter arrives through the field's own submit event, the same way the
-        // sidebar's inline rename commits.
-        cx.subscribe(&input, |this: &mut Self, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Submit(_)) {
-                this.commit_new_task(cx);
-            } else if matches!(event, InputEvent::Edited) {
-                cx.notify();
-            }
-        })
-        .detach();
-        self.new_task_dialog = Some(NewTaskDialog { input, state });
-        focus_overlay_control(window, cx, focus, |this| this.new_task_dialog.is_some());
+        self.capture_and_save_current_composer_draft(cx);
+        if self.new_task_draft.is_none() {
+            let mut task = Task::new("", state, 0);
+            task.workspace = self
+                .board_project_filter
+                .or_else(|| {
+                    self.selected_project()
+                        .filter(|project| !project.is_projectless())
+                        .map(|project| project.id)
+                })
+                .map(|project_id| TaskWorkspace::NewWorktree { project_id });
+            self.new_task_draft = Some(task);
+        }
+        let task = self
+            .new_task_draft
+            .as_ref()
+            .expect("draft initialized")
+            .clone();
+        self.settings_page = None;
+        self.board_open = true;
+        self.selected_task = Some(task.id);
+        self.ensure_task_detail(&task, window, cx);
         cx.notify();
     }
 
+    pub(super) fn task_for_editor(&self, task_id: Uuid) -> Option<&Task> {
+        self.new_task_draft
+            .as_ref()
+            .filter(|task| task.id == task_id)
+            .or_else(|| self.state.tasks.iter().find(|task| task.id == task_id))
+    }
+
+    pub(super) fn is_task_draft(&self, task_id: Uuid) -> bool {
+        self.new_task_draft
+            .as_ref()
+            .is_some_and(|task| task.id == task_id)
+    }
+
     pub(super) fn commit_new_task(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.new_task_dialog.as_ref() else {
+        let Some(draft) = self.new_task_draft.as_ref() else {
             return;
         };
-        let title = dialog.input.read(cx).content().trim().to_owned();
-        if title.is_empty() {
-            return;
+        let mut task = draft.clone();
+        if let Some((title, description)) = self.task_detail_values(task.id, cx) {
+            task.title = title;
+            task.description = description;
         }
-        let state = dialog.state;
-        let position = self.next_task_position(state);
-        let mut task = Task::new(title, state, position);
-        task.workspace = self
-            .board_project_filter
-            .or_else(|| {
-                self.selected_project()
-                    .filter(|project| !project.is_projectless())
-                    .map(|project| project.id)
-            })
-            .map(|project_id| TaskWorkspace::NewWorktree { project_id });
+        let Some(mut task) = ready_task_draft(task) else {
+            return;
+        };
+        task.position = self.next_task_position(task.state);
         let task_id = task.id;
         self.state.tasks.push(task);
-        self.new_task_dialog = None;
+        self.new_task_draft = None;
         self.reveal_new_task();
         self.sidebar_rows_fingerprint.set(None);
         self.save_task_changes(cx);
         self.open_task_from_card(task_id, cx);
+    }
+
+    pub(super) fn cancel_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_task_draft = None;
+        self.show_task_board(window, cx);
     }
 
     /// A declared task should be visible wherever the user is looking: the
@@ -1001,19 +1014,6 @@ impl Waku {
         } else if self.state.sidebar_grouping != SidebarGrouping::Task {
             self.board_open = true;
         }
-    }
-
-    pub(super) fn close_new_task_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.new_task_dialog.take().is_none() {
-            return;
-        }
-        let focus = if self.board_open {
-            self.board_dialog_focus(cx)
-        } else {
-            self.composer_focus(cx)
-        };
-        window.focus(&focus, cx);
-        cx.notify();
     }
 
     /// Focus that exists while the board is open: the sidebar's board row, or
@@ -1073,11 +1073,11 @@ impl Waku {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.open_new_task_dialog(state, window, cx);
+                this.open_new_task(state, window, cx);
             }))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    this.open_new_task_dialog(state, window, cx);
+                    this.open_new_task(state, window, cx);
                     cx.stop_propagation();
                 }
             }))
@@ -1327,131 +1327,6 @@ impl Waku {
         }
     }
 
-    pub(super) fn render_new_task_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let dialog = self.new_task_dialog.as_ref()?;
-        let theme = Theme::current(cx);
-        let state_label = task_state_label(dialog.state);
-        let input = dialog.input.clone();
-        let can_create = !input.read(cx).content().trim().is_empty();
-        let cancel = self.task_action_button(
-            "new-task-cancel",
-            tr!("common.cancel"),
-            false,
-            true,
-            |this, window, cx| this.close_new_task_dialog(window, cx),
-            cx,
-        );
-        let create = self.task_action_button(
-            "new-task-create",
-            tr!("board.create_task"),
-            true,
-            can_create,
-            |this, _, cx| this.commit_new_task(cx),
-            cx,
-        );
-        let card = div()
-            .id("new-task-card")
-            .w_full()
-            .max_w(px(430.0))
-            .rounded(px(14.0))
-            .bg(theme.composer)
-            .shadow_xl()
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .key_context(NEW_TASK_DIALOG_CONTEXT)
-            .on_action(cx.listener(|this, _: &DismissNewTaskDialog, window, cx| {
-                this.close_new_task_dialog(window, cx);
-            }))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .h(px(44.0))
-                    .px(px(14.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(9.0))
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(icon("icons/columns.svg", 15.0, theme.text_secondary))
-                    .child(
-                        div()
-                            .text_size(sp(14.0))
-                            .text_color(theme.text)
-                            .child(tr!("board.new_task")),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .px(px(7.0))
-                            .h(px(18.0))
-                            .flex()
-                            .items_center()
-                            .rounded(px(9.0))
-                            .bg(theme.overlay_strong)
-                            .text_size(sp(11.0))
-                            .text_color(theme.text_secondary)
-                            .child(state_label),
-                    ),
-            )
-            .child(
-                div()
-                    .m(px(12.0))
-                    .h(px(34.0))
-                    .px(px(10.0))
-                    .rounded(px(8.0))
-                    .bg(theme.inset)
-                    .border_1()
-                    .border_color(theme.border)
-                    .flex()
-                    .items_center()
-                    .text_size(sp(13.5))
-                    .text_color(theme.text)
-                    .child(input),
-            )
-            .child(
-                div()
-                    .mx(px(12.0))
-                    .mb(px(12.0))
-                    .text_size(sp(12.0))
-                    .text_color(theme.text_tertiary)
-                    .child(tr!("board.new_task_hint")),
-            )
-            .child(
-                div()
-                    .px(px(12.0))
-                    .pb(px(12.0))
-                    .flex()
-                    .justify_end()
-                    .gap(px(8.0))
-                    .child(cancel)
-                    .child(create),
-            )
-            .with_animation(
-                SharedString::from("new-task-dialog-enter"),
-                gpui::Animation::new(std::time::Duration::from_millis(150))
-                    .with_easing(ease_out_quint()),
-                |element, delta| element.opacity(delta),
-            );
-        let layer = div()
-            .id("new-task-layer")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(Self::scrim(&theme))
-            .p(px(24.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.close_new_task_dialog(window, cx)),
-            )
-            .child(card);
-        Some(gpui::deferred(layer).with_priority(6).into_any_element())
-    }
-
     pub(super) fn render_task_completion_confirm(
         &mut self,
         cx: &mut Context<Self>,
@@ -1685,6 +1560,31 @@ fn session_task_title(session: &AgentSession) -> String {
 mod filter_tests {
     use super::*;
     use crate::ui::SemanticControlExt;
+
+    #[test]
+    fn creating_a_task_preserves_the_whole_brief_and_workspace() {
+        let mut draft = Task::new("  Fix checkout  ", TaskState::Doing, 0);
+        draft.description = "Keep existing carts intact\nVerify guest checkout".into();
+        draft.workspace = Some(TaskWorkspace::NewWorktree {
+            project_id: Uuid::new_v4(),
+        });
+        let expected = draft.clone();
+        let created = ready_task_draft(draft).expect("valid title");
+        assert_eq!(created.id, expected.id);
+        assert_eq!(created.title, "Fix checkout");
+        assert_eq!(created.description, expected.description);
+        assert_eq!(created.workspace, expected.workspace);
+        assert_eq!(created.state, TaskState::Doing);
+    }
+
+    #[test]
+    fn blank_task_drafts_cannot_be_created() {
+        for title in ["", "   ", "\n\t", "\u{3000}"] {
+            let mut draft = Task::new(title, TaskState::Backlog, 0);
+            draft.description = "A description is not a substitute for a title".into();
+            assert!(ready_task_draft(draft).is_none());
+        }
+    }
 
     #[test]
     fn all_attention_sessions_remain_visible_alongside_running_work() {

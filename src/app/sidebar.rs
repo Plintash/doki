@@ -848,11 +848,11 @@ impl Waku {
             cx,
         )
         .on_click(cx.listener(|this, _, window, cx| {
-            this.open_new_task_dialog(TaskState::Backlog, window, cx);
+            this.open_new_task(TaskState::Backlog, window, cx);
         }))
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                this.open_new_task_dialog(TaskState::Backlog, window, cx);
+                this.open_new_task(TaskState::Backlog, window, cx);
                 cx.stop_propagation();
             }
         }))

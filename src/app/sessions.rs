@@ -446,7 +446,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.settings_page = None;
-        self.open_new_task_dialog(TaskState::Backlog, window, cx);
+        self.open_new_task(TaskState::Backlog, window, cx);
     }
 
     pub(super) fn new_session_action(

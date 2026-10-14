@@ -79,7 +79,10 @@ test("Board controls expose semantic identity and disabled state", () => {
   expect(button).toContain("semantic_control(gpui::Role::Button, !enabled)");
   expect(button).toContain(".aria_label(label.clone())");
   expect(details).toContain('format!("task-session-{id}")');
-  expect(details).toContain('format!("task-attach-{session_id}")');
+  const attachPicker = read("src/app/task_details/attach_picker.rs");
+  expect(attachPicker).toContain('format!("task-attach-{id}")');
+  expect(attachPicker).toContain("semantic_control(gpui::Role::Button, false)");
+  expect(attachPicker).toContain('.semantic_id("task-attach-search")');
   const board = read("src/app/board.rs");
   for (const id of ["task-complete-cancel", "task-complete-confirm"]) {
     const position = board.indexOf(`.id("${id}")`);

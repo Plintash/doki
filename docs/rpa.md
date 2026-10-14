@@ -239,8 +239,8 @@ High-level `invoke` verbs use the app's existing handlers:
 
 - `openTask {"id":"ISSUE_UUID"}` opens a real Board issue's detail. Conversation
   UUIDs are rejected, including conversations belonging to that issue.
-- `newTask {}` opens the New issue dialog. `newTask {"title":"Issue title"}`
-  fills and commits that same dialog, then returns the issue UUID as `opened`.
+- `newTask {}` opens the full New issue draft editor. `newTask {"title":"Issue title"}`
+  fills and commits that same draft, then returns the issue UUID as `opened`.
   It creates no conversation and inherits the Board's project scope/default
   isolated-worktree intent. Empty or non-string titles are rejected.
 - `openSession {"id":"SESSION_UUID"}` opens a conversation.
