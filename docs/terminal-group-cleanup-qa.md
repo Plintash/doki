@@ -1,7 +1,8 @@
 # Terminal-owned process-group cleanup
 
-This is a narrow follow-up to [#44](https://github.com/Plintash/doki/issues/44),
-not a claim that its macOS PTY-destructor stall is resolved.
+This follow-up to [#44](https://github.com/Plintash/doki/issues/44) covers
+original-process-group cleanup and the captured flooded-terminal teardown
+ordering defect. It does not promise a universal bounded child wait.
 
 ## Reproduced ownership defect and contract
 
@@ -14,8 +15,8 @@ ignored SIGHUP; the orphan remained sleeping with PPID 1 after terminal drop.
 Closing the terminal must terminate remaining members of the shell's original
 process group, whether its shell is still running or already exited. Signaling
 must not race reuse of a reaped shell PID. Output must keep draining through
-the existing graceful-termination interval, rather than filling the PTY while
-its producers are being stopped.
+the existing graceful-termination interval and the final child reap, rather
+than stopping the reader while a killed session leader is still exiting.
 
 ## Implementation
 
@@ -28,8 +29,10 @@ its producers are being stopped.
 - Drop sends SIGHUP to the original shell group, gives the direct shell the
   existing 250 ms grace, then SIGKILLs remaining group members even if the
   shell has already exited
-- The reader keeps draining during this phase, then is stopped and joined;
-  Alacritty's final destructor reaps the direct child
+- Drop takes the sole PTY owner from an `Option` and explicitly destroys it
+  while the reader can still drain. Alacritty reaps the child before closing
+  its master; only afterward is the reader stopped/joined. The emptied owner
+  prevents a duplicate destructor, and all group signals precede reaping
 
 A naturally exited shell intentionally remains waitable until the terminal
 owner closes. This retains its exit status/PID (a zombie, not a running shell),
@@ -42,7 +45,7 @@ Output batching and retained-buffer limits are unchanged.
 Original baseline: `0437fb6e1cc3b00565a4a35021bb712737ea83d6`.
 Final validation is stacked on the separately reviewed PR94 acknowledgment fix,
 local commit `d4a08f373585005029d04d91bac461b24a28a608`.
-Tested source blobs:
+Original process-group-fix source blobs:
 
 - `terminal.rs`: `c7b3bb0c2b58ae08055c23b2d84bb8b7973895c5`
 - `server.rs`: `2219f841b8fcc116e8eb59a32ecd1cb272d7048c`
@@ -56,8 +59,9 @@ Tested source blobs:
   reader reports exit (polling for waitability because EOF can precede it), and
   is reaped once the terminal closes
 
-Final Linux results: 28 terminal-related tests passed; 55 server tests passed,
-one opt-in real-Pi test ignored; 100 repeated flood-delivery fixtures passed.
+Original group-fix Linux results: 28 terminal-related tests passed; 55 server
+tests passed, one opt-in real-Pi test ignored; 100 repeated flood-delivery
+fixtures passed.
 Formatting and diff whitespace checks passed. No full-workspace result is
 claimed.
 
@@ -84,18 +88,61 @@ The isolated unchanged-source flood probe completed 30 Linux runs in roughly
 254 ms per drop, so it did not reproduce the reported macOS hang. Its separate
 orphan probe failed before and succeeded after the candidate. Syscall tracing
 was unavailable because the executor denied ptrace; no blocked stack was
-captured. No native macOS execution or paid provider calls occurred.
+captured. At that stage, no native macOS execution or paid provider calls
+occurred.
 
 Build uses the existing shared dependencies, with
 `CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_BUILD_JOBS=1 cargo test --locked --offline
 -p waku-core --lib --no-run` to fit the constrained cloud memory. Production
 source/build configuration is unchanged by that verification override.
 
+## Captured macOS failure and order-change verification
+
+The isolated [baseline diagnostic](https://github.com/Plintash/doki/actions/runs/38614620073/job/116026402067)
+failed on its first flood attempt under the unchanged three-second verdict.
+The worker started promptly, HUP/KILL succeeded, and the reader joined without
+panic after about 253 ms. All 81 native samples of the drop worker were in
+Alacritty `Pty::drop` -> `Child::wait` -> `__wait4`, after the reader had ended.
+The shell was still exiting and its pipeline child was a zombie.
+
+That establishes the user-space blocked wait. The precise kernel dependency
+remains inferred: Apple's published
+[session-leader exit path](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_exit.c#L2093-L2140)
+drains its controlling terminal before revocation. The order change keeps a
+functioning reader available through Alacritty's final wait instead of stopping
+it immediately after SIGKILL delivery.
+
+The independently reviewed [candidate macOS run](https://github.com/Plintash/doki/actions/runs/38618460416/job/116039504396)
+passed all 100 exact flood repetitions with the same three-second verdict.
+Every trace showed PTY destruction return before reader stop/join. Drop-worker
+duration was 258–751 ms (median 299 ms); PTY destruction itself took at most
+39 ms. The diagnostic-branch server suite passed 55/55 with one opt-in Pi test
+ignored; this includes the diagnostic-tool timeout test and deliberately
+excludes the independently repaired attach-boundary fixture.
+The candidate was an optimized hosted build and made no model/provider calls.
+
+Diagnostic traces, sampling helpers and the focused workflow stay on separate
+historical diagnostic branches. This clean production patch retains the
+original group/flood/exit-ownership regressions and ordinary CI unchanged.
+Clean production source: `terminal.rs` blob
+`d16a734cb63069f68c4260608134c162c3e35e80`; original `server.rs` regression blob
+`2219f841b8fcc116e8eb59a32ecd1cb272d7048c` and ordinary CI are unchanged.
+Independent Spec and Standards reviews verified equivalence to the successful
+candidate's production behavior after removing test-only diagnostics.
+
+Fresh Linux clean-patch checks passed: 28 terminal tests; 55 server tests with
+one opt-in Pi test ignored, both serialized and with normal parallelism;
+100 exact flood repetitions; test build and non-test core check; formatting
+and diff whitespace. The native run above tested the same production behavior
+with test-only instrumentation. No full-workspace green result is claimed.
+
 ## Remaining limits
 
 This covers the shell's original group. It does not promise termination of
 jobs that moved into a separate process group or detached session. It does not
 replace Alacritty's unbounded `Child::wait()` and cannot make a kernel-stuck
-process reap within a deadline. Hosted macOS testing and a captured stalled
-stack are still needed before resolving #44. The separate shutdown-reply race
-fixed in PR94 and the attach-boundary failure #91 are not part of this change.
+process reap within a deadline. An already failed reader may no longer drain;
+this fix removes the intentional stop before the child's final wait while
+the reader is functioning. The captured stack and successful candidate verify this ordering
+case, not every possible #44 failure. The separate shutdown-reply race fixed
+in PR94 and the attach-boundary failure #91 remain separate changes.
