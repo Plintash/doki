@@ -112,6 +112,13 @@ fn unsaved_edits(
 }
 
 impl Waku {
+    /// Native Linux close events must not queue another decision while the
+    /// confirmation is open: a queued repeat could otherwise outlive Cancel.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn is_window_close_confirmation_open(&self) -> bool {
+        self.unsaved_edits_guard.is_open()
+    }
+
     /// Whether a file editor holds edits that were never saved.
     pub(super) fn has_unsaved_edits(&self) -> bool {
         unsaved_edits(
