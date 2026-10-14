@@ -81,6 +81,7 @@ pub(super) struct TaskStats {
     pub(super) busy: HashSet<Uuid>,
     pub(super) conversations: HashMap<Uuid, usize>,
     pub(super) attention_total: usize,
+    project_scope: Option<HashSet<Uuid>>,
     running: HashMap<Uuid, usize>,
     attention_sessions: HashMap<Uuid, Vec<TaskAttention>>,
     progress: HashMap<Uuid, (u64, String)>,
@@ -251,7 +252,12 @@ impl Waku {
             .filter(|task| !task.state.is_done())
             .map(|task| task.id)
             .collect::<HashSet<_>>();
-        let mut stats = TaskStats::default();
+        let mut stats = TaskStats {
+            project_scope: self
+                .board_project_filter
+                .map(|selected| projects::project_path_ids(&self.state.projects, selected)),
+            ..TaskStats::default()
+        };
         for session in &self.state.sessions {
             let Some(task_id) = session.task_id else {
                 continue;
@@ -293,8 +299,10 @@ impl Waku {
     pub(super) fn task_matches_board_scope(&self, task: &Task) -> bool {
         let project_id = task_details::task_project_id(task);
         if self
-            .board_project_filter
-            .is_some_and(|id| Some(id) != project_id)
+            .task_stats()
+            .project_scope
+            .as_ref()
+            .is_some_and(|ids| project_id.is_none_or(|id| !ids.contains(&id)))
         {
             return false;
         }

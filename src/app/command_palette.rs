@@ -1431,19 +1431,13 @@ impl Waku {
             return;
         }
 
-        let project_id = if let Some(project) = self
-            .state
-            .projects
-            .iter()
-            .find(|project| project.path == summary.cwd)
-        {
-            project.id
+        let host = if self.daemon.is_remote() {
+            projects::ProjectPathHost::Remote
         } else {
-            let project = Project::from_path(summary.cwd.clone());
-            let project_id = project.id;
-            self.state.projects.push(project);
-            project_id
+            projects::ProjectPathHost::Local
         };
+        let project_id =
+            self.register_project(summary.cwd.clone(), self.state.selected_project, host);
         let provider = summary.provider();
         let runtime_mode = self
             .selected_session()

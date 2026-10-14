@@ -617,19 +617,12 @@ impl Waku {
                     if this.task_for_editor(task_id).is_none() {
                         return;
                     }
-                    let project_id = if let Some(project) = this
-                        .state
-                        .projects
-                        .iter()
-                        .find(|project| project.path == path)
-                    {
-                        project.id
-                    } else {
-                        let project = Project::from_path(path);
-                        let id = project.id;
-                        this.state.projects.push(project);
-                        id
-                    };
+                    let preferred = this.task_for_editor(task_id).and_then(task_project_id);
+                    let project_id =
+                        this.register_project(path, preferred, projects::ProjectPathHost::Local);
+                    if preferred == Some(project_id) {
+                        return;
+                    }
                     this.set_task_workspace(task_id, TaskWorkspace::NewWorktree { project_id }, cx);
                 });
             }
@@ -709,11 +702,8 @@ impl Waku {
                     return Vec::new();
                 };
                 let this = entity.read(cx);
-                let projects = this
-                    .state
-                    .projects
-                    .iter()
-                    .filter(|project| !project.is_projectless())
+                let projects = projects::picker_projects(&this.state.projects, project_id)
+                    .into_iter()
                     .map(|project| (project.id, project.display_name()))
                     .collect::<Vec<_>>();
                 let has_sessions = this

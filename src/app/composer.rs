@@ -4360,44 +4360,35 @@ impl Waku {
             .selected(can_choose_project && project_handle.is_open())
             .max_w(px(190.0));
         let project_selector = if can_choose_project {
-            let project_options = self
-                .state
-                .projects
-                .iter()
-                .filter(|project| !project.is_projectless())
-                .filter(|project| Some(project.id) == selected_project_id)
-                .chain(
-                    self.state
-                        .projects
-                        .iter()
-                        .filter(|project| !project.is_projectless())
-                        .filter(|project| Some(project.id) != selected_project_id),
-                )
-                .map(|project| (project.id, project.display_name()))
-                .collect::<Vec<_>>();
             let weak = cx.entity().downgrade();
             dropdown_menu(
                 project_trigger,
                 "workspace-project-menu",
                 &project_handle,
                 MenuAlign::AboveLeft,
-                move |_| {
-                    let mut items = project_options
-                        .clone()
-                        .into_iter()
-                        .map(|(project_id, project_name)| {
-                            let weak = weak.clone();
-                            MenuItem::new(project_name, move |_, cx| {
-                                if Some(project_id) != selected_project_id {
-                                    let _ = weak.update(cx, |this, cx| {
-                                        this.select_project_from_composer(project_id, cx);
-                                    });
-                                }
+                move |cx| {
+                    let Some(entity) = weak.upgrade() else {
+                        return Vec::new();
+                    };
+                    let this = entity.read(cx);
+                    let mut items =
+                        projects::picker_projects(&this.state.projects, selected_project_id)
+                            .into_iter()
+                            .map(|project| {
+                                let project_id = project.id;
+                                let project_name = project.display_name();
+                                let weak = weak.clone();
+                                MenuItem::new(project_name, move |_, cx| {
+                                    if Some(project_id) != selected_project_id {
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.select_project_from_composer(project_id, cx);
+                                        });
+                                    }
+                                })
+                                .semantic_id(format!("composer-project-{project_id}"))
+                                .selected(Some(project_id) == selected_project_id)
                             })
-                            .semantic_id(format!("composer-project-{project_id}"))
-                            .selected(Some(project_id) == selected_project_id)
-                        })
-                        .collect::<Vec<_>>();
+                            .collect::<Vec<_>>();
                     if !items.is_empty() {
                         items.push(MenuItem::Separator);
                     }

@@ -1134,7 +1134,11 @@ impl Waku {
             self.remove_right_panel_session_state(*session_id);
             self.task_switcher.remove(*session_id);
         }
-        self.state.projects = snapshot.projects;
+        projects::merge_catalog(
+            &mut self.state.projects,
+            snapshot.projects,
+            &mut self.pending_project_registrations,
+        );
         merge_remote_tasks(&mut self.state.tasks, snapshot.tasks);
 
         let attach = self

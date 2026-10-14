@@ -58,12 +58,9 @@ impl Waku {
                 let Some(entity) = weak.upgrade() else {
                     return Vec::new();
                 };
-                let projects = entity
-                    .read(cx)
-                    .state
-                    .projects
-                    .iter()
-                    .filter(|project| !project.is_projectless())
+                let this = entity.read(cx);
+                let projects = projects::picker_projects(&this.state.projects, selected)
+                    .into_iter()
                     .map(|project| (project.id, project.display_name()))
                     .collect::<Vec<_>>();
                 let all = weak.clone();
