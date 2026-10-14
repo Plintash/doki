@@ -2241,6 +2241,8 @@ annotation.selected_text:
   en: "Selected text:"
 annotation.add_to_chat:
   en: Add to chat
+annotation.newline_hint:
+  en: Shift+Enter for newline
 annotation.comment_placeholder:
   en: Add an optional comment…
 annotation.create:

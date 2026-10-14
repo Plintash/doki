@@ -1138,6 +1138,7 @@ annotation.edit: コメントを編集
 annotation.remove_all: 注釈をすべて削除
 annotation.selected_text: "引用したテキスト："
 annotation.add_to_chat: チャットに追加
+annotation.newline_hint: Shift+Enter で改行
 annotation.comment_placeholder: 任意のコメントを入力…
 annotation.create: 選択範囲を注釈
 annotation.user_comment: "ユーザーのコメント："

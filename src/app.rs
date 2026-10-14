@@ -13,9 +13,9 @@ use gpui::{
     Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, IntoElement, KeyDownEvent,
     ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, ObjectFit, PathPromptOptions, Pixels, Point, Render,
-    ScrollHandle, SharedString, Stateful, StyleRefinement, TextRun, WeakEntity, Window,
+    ScrollHandle, SharedString, Size, Stateful, StyleRefinement, TextRun, WeakEntity, Window,
     WindowBounds, canvas, div, ease_out_quint, fill, font, img, linear_color_stop, linear_gradient,
-    list, point, prelude::*, pulsating_between, px, rgb,
+    list, point, prelude::*, pulsating_between, px, rgb, size,
 };
 use uuid::Uuid;
 
@@ -909,6 +909,8 @@ struct SelectionToolbar {
 struct AnnotationEditor {
     id: Uuid,
     anchor: Point<Pixels>,
+    /// Painted size, used to keep a growing comment above the composer.
+    size: Rc<Cell<Size<Pixels>>>,
 }
 
 /// The transient highlight a card activation leaves on its span. The paint
