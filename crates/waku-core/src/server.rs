@@ -1256,6 +1256,7 @@ fn command_targets_runtime(command: &Command) -> bool {
         Command::AttachSession
             | Command::Start { .. }
             | Command::Prompt { .. }
+            | Command::Review { .. }
             | Command::Steer { .. }
             | Command::Cancel
             | Command::CancelComputerUse
@@ -1424,6 +1425,7 @@ fn handle_request(
     let session_id = request.session_id;
     let runtime_id = request.runtime_id;
     let task_catalog_action = task_catalog_action(&request.command);
+    let is_review = matches!(&request.command, Command::Review { .. });
     let starts_runtime = matches!(
         &request.command,
         Command::Start { .. } | Command::OpenTerminal { .. }
@@ -1452,6 +1454,24 @@ fn handle_request(
             Ok(payload) => ResponseOutcome::Ok { payload },
             Err(error) => {
                 let error = RpcError::from(error);
+                if is_review {
+                    // Reviews open an optimistic turn and are ordinarily sent
+                    // as notifications, which have no error response. Publish
+                    // rejection and settlement to every attached client too.
+                    let events = hub.event_sink(session_id, runtime_id);
+                    let _ = events.send(WireDriverEvent::new(
+                        "error",
+                        serde_json::Value::String(error.message.clone()),
+                    ));
+                    let _ = events.send(WireDriverEvent::new(
+                        "turnFinished",
+                        serde_json::json!({
+                            "success": false,
+                            "summary": null,
+                            "interrupted": false,
+                        }),
+                    ));
+                }
                 // A failed request is the daemon's own record of the failure:
                 // it names what the daemon could not do for this session, next to
                 // the app's and the provider's records in the same stream.
@@ -4976,6 +4996,80 @@ mod tests {
         ));
     }
 
+    struct RejectReviewBackend;
+
+    impl Backend for RejectReviewBackend {
+        fn handle(&self, request: Request, _: EventSink) -> anyhow::Result<ResponsePayload> {
+            assert!(matches!(request.command, Command::Review { .. }));
+            bail!("native review is not supported by this provider")
+        }
+    }
+
+    #[test]
+    fn review_rejection_settles_notifications_and_does_not_replay_cached_errors() {
+        for request_id in [Uuid::nil(), Uuid::new_v4()] {
+            let session_id = Uuid::new_v4();
+            let runtime_id = Uuid::new_v4();
+            let hub = Arc::new(Hub::default());
+            hub.begin_runtime(session_id, runtime_id);
+            let (outgoing, responses) = unbounded();
+            let (events, received) = unbounded();
+            hub.subscribe(&[], None, Subscriber::new(events).0);
+            let request = Request {
+                request_id,
+                session_id,
+                runtime_id,
+                command: Command::Review {
+                    prompt: "Review changes".into(),
+                    turn_id: Some(Uuid::new_v4()),
+                    message_id: Some(Uuid::new_v4()),
+                },
+            };
+            assert!(command_targets_runtime(&request.command));
+            let handled = handle_request(
+                request.clone(),
+                outgoing.clone(),
+                0,
+                Arc::new(RejectReviewBackend),
+                hub.clone(),
+            );
+            assert!(handled.executed);
+            assert!(matches!(handled.outcome, ResponseOutcome::Error { .. }));
+            let review_events = received
+                .try_iter()
+                .filter_map(|message| match message {
+                    ServerMessage::Event(event) => Some(event),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(review_events.len(), 2);
+            assert_eq!(review_events[0].event.kind, "error");
+            assert_eq!(review_events[1].event.kind, "turnFinished");
+            assert_eq!(review_events[1].event.payload["success"], false);
+            assert!(
+                review_events
+                    .iter()
+                    .all(|event| event.session_id == session_id && event.runtime_id == runtime_id)
+            );
+            assert_eq!(
+                responses.try_iter().count(),
+                usize::from(!request_id.is_nil())
+            );
+            if !request_id.is_nil() {
+                let cached =
+                    handle_request(request, outgoing, 0, Arc::new(RejectReviewBackend), hub);
+                assert!(!cached.executed);
+                assert_eq!(
+                    received
+                        .try_iter()
+                        .filter(|message| matches!(message, ServerMessage::Event(_)))
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
+
     struct RuntimeOrderingBackend {
         blocked_session_id: Uuid,
         handled: Sender<(Uuid, &'static str)>,
@@ -4995,6 +5089,7 @@ mod tests {
                     });
                 }
                 Command::Prompt { .. } => "prompt",
+                Command::Review { .. } => "review",
                 Command::CloseSession => "close",
                 _ => "other",
             };
@@ -5005,6 +5100,12 @@ mod tests {
 
     #[test]
     fn runtime_commands_are_ordered_per_session_without_blocking_other_sessions() {
+        for review in [false, true] {
+            assert_runtime_commands_are_ordered_per_session(review);
+        }
+    }
+
+    fn assert_runtime_commands_are_ordered_per_session(review: bool) {
         let blocked_session_id = Uuid::new_v4();
         let blocked_runtime_id = Uuid::new_v4();
         let other_session_id = Uuid::new_v4();
@@ -5047,10 +5148,18 @@ mod tests {
                 request_id: prompt_id,
                 session_id: blocked_session_id,
                 runtime_id: blocked_runtime_id,
-                command: Command::Prompt {
-                    prompt: "after start".into(),
-                    turn_id: None,
-                    message_id: None,
+                command: if review {
+                    Command::Review {
+                        prompt: "after start".into(),
+                        turn_id: None,
+                        message_id: None,
+                    }
+                } else {
+                    Command::Prompt {
+                        prompt: "after start".into(),
+                        turn_id: None,
+                        message_id: None,
+                    }
                 },
             },
             second_client_outgoing,
@@ -5091,7 +5200,7 @@ mod tests {
         ));
         assert_eq!(
             handled_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            (blocked_session_id, "prompt")
+            (blocked_session_id, if review { "review" } else { "prompt" })
         );
         assert!(matches!(
             second_client_responses

@@ -450,6 +450,18 @@ pub fn driver_milestone(event: &DriverEvent) -> Option<DriverMilestone> {
         DriverEvent::TurnStarted => {
             milestone(DiagnosticLevel::Info, "driver", "turn started", Value::Null)
         }
+        DriverEvent::ReviewStarted => milestone(
+            DiagnosticLevel::Info,
+            "driver",
+            "review started",
+            Value::Null,
+        ),
+        DriverEvent::ReviewCompleted { .. } => milestone(
+            DiagnosticLevel::Info,
+            "driver",
+            "review completed",
+            Value::Null,
+        ),
         DriverEvent::TurnParked => {
             milestone(DiagnosticLevel::Info, "driver", "turn parked", Value::Null)
         }
@@ -560,6 +572,18 @@ pub fn driver_milestone(event: &DriverEvent) -> Option<DriverMilestone> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn review_lifecycle_has_explicit_content_free_diagnostic_milestones() {
+        let started = driver_milestone(&DriverEvent::ReviewStarted).unwrap();
+        assert_eq!(started.message, "review started");
+        let completed = driver_milestone(&DriverEvent::ReviewCompleted {
+            review: "Review content stays in the transcript".into(),
+        })
+        .unwrap();
+        assert_eq!(completed.message, "review completed");
+        assert_eq!(completed.fields, Value::Null);
+    }
 
     #[test]
     fn runtime_verbosity_is_process_and_source_scoped_and_restorable() {

@@ -232,7 +232,76 @@ mod tests {
     }
 
     #[test]
-    fn task_creation_copy_uses_task_terminology() {
+    fn board_copy_uses_issue_terminology_in_every_locale() {
+        let issue_labels = [
+            ("en", "New issue", "Create issue", "Issue", "task"),
+            ("zh-CN", "新建 issue", "创建 issue", "issue", "任务"),
+            ("ja", "新しい課題", "課題を作成", "課題", "タスク"),
+        ];
+        let board_keys = [
+            "sidebar.board",
+            "sidebar.grouping_task",
+            "board.title",
+            "board.new_task",
+            "board.new_task_placeholder",
+            "board.new_issue",
+            "board.search_issues",
+            "board.no_matching_issues",
+            "board.completed_toast",
+            "board.complete_confirm_body",
+            "board.untitled_task",
+            "task.bind",
+            "task.new_from_session",
+            "task.unbind",
+            "archive.empty",
+            "board.reopened_toast",
+            "command_palette.show_board",
+            "command_palette.hide_board",
+            "board.completion_waiting_for_setup",
+            "board.open_task",
+            "board.archived_hint",
+            "board.title_required",
+            "board.session_context_hint",
+            "board.create_task",
+            "board.empty_backlog",
+            "board.empty_done",
+            "board.back_to_task",
+            "board.detach_draft_hint",
+            "board.completion_cannot_stop",
+            "board.completion_stop_failed",
+        ];
+
+        for (locale, new_issue, create_issue, grouping, old_term) in issue_labels {
+            assert_eq!(
+                &*rust_i18n::t!("board.new_issue", locale = locale),
+                new_issue
+            );
+            assert_eq!(
+                &*rust_i18n::t!("board.new_task", locale = locale),
+                new_issue
+            );
+            assert_eq!(
+                &*rust_i18n::t!("board.create_task", locale = locale),
+                create_issue
+            );
+            assert_eq!(
+                &*rust_i18n::t!("sidebar.grouping_task", locale = locale),
+                grouping
+            );
+
+            for key in board_keys {
+                let translated = rust_i18n::t!(key, locale = locale);
+                assert_ne!(translated.as_ref(), key, "missing {locale} copy for {key}");
+                assert!(
+                    !translated.to_lowercase().contains(old_term),
+                    "{locale} {key} still uses task terminology: {translated}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_session_creation_copy_keeps_shared_task_terminology() {
         assert_eq!(&*rust_i18n::t!("menu.new_task", locale = "en"), "New Task");
         assert_eq!(
             &*rust_i18n::t!("command_palette.new_task", locale = "en"),

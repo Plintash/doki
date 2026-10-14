@@ -1184,7 +1184,8 @@ impl StateStore {
         let mut sessions = connection
             .prepare(
                 "SELECT id, project_id, title, auto_title, provider, model, status,
-                        task_id, created_at, updated_at, last_reply_at, is_draft, workspace
+                        task_id, created_at, updated_at, last_reply_at, is_draft, workspace, review,
+                        review_correction_source_id
                  FROM sessions ORDER BY updated_at",
             )
             .map_err(to_io_error)?;
@@ -1205,6 +1206,8 @@ impl StateStore {
                     row.get::<_, Option<i64>>(10)?,
                     row.get::<_, bool>(11)?,
                     row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
                 ))
             })
             .map_err(to_io_error)?
@@ -1625,6 +1628,8 @@ type SessionColumns = (
     Option<i64>,
     bool,
     String,
+    Option<String>,
+    Option<String>,
 );
 
 /// Builds a list-only session from its columns. `messages`,
@@ -1647,6 +1652,8 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         last_reply_at,
         is_draft,
         workspace,
+        review,
+        review_correction_source_id,
     ) = row;
     Some(AgentSession {
         id: Uuid::parse_str(&id).ok()?,
@@ -1654,6 +1661,9 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         auto_title,
         project_id: Uuid::parse_str(&project_id).ok()?,
         task_id: task_id.and_then(|id| Uuid::parse_str(&id).ok()),
+        review: review.and_then(|review| serde_json::from_str(&review).ok()),
+        review_correction_source_id: review_correction_source_id
+            .and_then(|id| Uuid::parse_str(&id).ok()),
         workspace: serde_json::from_str(&workspace).unwrap_or_default(),
         provider: serde_json::from_value(serde_json::Value::String(provider)).ok()?,
         model,
@@ -2004,8 +2014,9 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
 /// listing sessions never has to deserialize a transcript.
 const UPSERT_SESSION: &str = "INSERT INTO sessions(
          id, project_id, title, auto_title, provider, model, status, task_id,
-         created_at, updated_at, last_reply_at, is_draft, workspace
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         created_at, updated_at, last_reply_at, is_draft, workspace, review,
+         review_correction_source_id
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
      ON CONFLICT(id) DO UPDATE SET
          project_id    = excluded.project_id,
          title         = excluded.title,
@@ -2018,7 +2029,9 @@ const UPSERT_SESSION: &str = "INSERT INTO sessions(
          updated_at    = excluded.updated_at,
          last_reply_at = excluded.last_reply_at,
          is_draft      = excluded.is_draft,
-         workspace     = excluded.workspace";
+         workspace     = excluded.workspace,
+         review        = excluded.review,
+         review_correction_source_id = excluded.review_correction_source_id";
 
 const INSERT_PROJECT: &str = "INSERT INTO projects(id, name, path, position, created_at)
      VALUES(?1, ?2, ?3, ?4, ?5)
@@ -2063,6 +2076,12 @@ fn tag_of(value: impl Serialize) -> String {
 fn session_params(session: &AgentSession) -> io::Result<Vec<rusqlite::types::Value>> {
     use rusqlite::types::Value;
     let workspace = serde_json::to_string(&session.workspace).map_err(to_io_error)?;
+    let review = session
+        .review
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(to_io_error)?;
     Ok(vec![
         Value::Text(session.id.to_string()),
         Value::Text(session.project_id.to_string()),
@@ -2081,6 +2100,10 @@ fn session_params(session: &AgentSession) -> io::Result<Vec<rusqlite::types::Val
             .map_or(Value::Null, |at| Value::Integer(at as i64)),
         Value::Integer(i64::from(!session.has_started())),
         Value::Text(workspace),
+        review.map_or(Value::Null, Value::Text),
+        session
+            .review_correction_source_id
+            .map_or(Value::Null, |id| Value::Text(id.to_string())),
     ])
 }
 
@@ -2095,8 +2118,8 @@ fn normalize_computer_app_grants(grants: &mut Vec<ComputerAppGrant>) {
 mod tests {
     use super::*;
     use crate::model::{
-        ActivityItem, ActivityKind, AnnotationSpan, FavoriteModel, MessageRole, ReasoningBlock,
-        TranscriptBlock,
+        ActivityItem, ActivityKind, AnnotationSpan, FavoriteModel, IssueReviewStatus,
+        IssueReviewTarget, MessageRole, ReasoningBlock, SessionReview, TranscriptBlock,
     };
     use base64::Engine as _;
 
@@ -2636,6 +2659,281 @@ mod tests {
                 .any(|message| message.content == "an answer")
         );
 
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn issue_review_catalog_round_trips_without_reading_transcript_detail() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let session = &mut state.sessions[0];
+        session.begin_turn("Review issue changes");
+        let result_message_id =
+            session.push_message(MessageRole::Assistant, "Full review findings");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+        session.review = Some(SessionReview {
+            target: IssueReviewTarget::BaseBranch {
+                branch: "main".into(),
+            },
+            source_session_id: Some(Uuid::new_v4()),
+            status: IssueReviewStatus::Completed,
+            summary: Some("One issue found".into()),
+            result_message_id: Some(result_message_id),
+            fix_session_id: Some(Uuid::new_v4()),
+        });
+        let expected = session.review.clone();
+        store.save(&mut state).unwrap();
+
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load().unwrap();
+        assert_eq!(restored.sessions[0].review, expected);
+        assert!(!restored.sessions[0].detail_loaded);
+        assert!(restored.sessions[0].messages.is_empty());
+        reopened.hydrate(&mut restored.sessions[0]).unwrap();
+        assert_eq!(restored.sessions[0].review, expected);
+        assert_eq!(restored.sessions[0].messages[1].id, result_message_id);
+        assert_eq!(
+            restored.sessions[0].messages[1].content,
+            "Full review findings"
+        );
+
+        // A catalog read must still succeed if transcript JSON cannot even be
+        // parsed. All review metadata, including result/fix links, is promoted.
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        connection
+            .execute("UPDATE session_details SET data = 'invalid JSON'", [])
+            .unwrap();
+        let catalog = store_in(&directory).load().unwrap();
+        assert_eq!(catalog.sessions[0].review, expected);
+        assert!(catalog.sessions[0].messages.is_empty());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn issue_review_skeleton_updates_survive_hydration_without_rewriting_transcript() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let session = &mut state.sessions[0];
+        let id = session.id;
+        session.begin_turn("Review issue changes");
+        session.push_message(MessageRole::Assistant, "Keep the full review");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+        session.review = Some(SessionReview {
+            target: IssueReviewTarget::Commit {
+                sha: "abc123".into(),
+            },
+            source_session_id: None,
+            status: IssueReviewStatus::Running,
+            summary: None,
+            result_message_id: None,
+            fix_session_id: None,
+        });
+        store.save(&mut state).unwrap();
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        let detail_before: String = connection
+            .query_row(
+                "SELECT data FROM session_details WHERE session_id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load().unwrap();
+        let session = restored.session_mut(id).unwrap();
+        let review = session.review.as_mut().unwrap();
+        review.status = IssueReviewStatus::Completed;
+        review.summary = Some("Needs a fix".into());
+        review.result_message_id = Some(state.sessions[0].messages[1].id);
+        review.fix_session_id = Some(Uuid::new_v4());
+        let expected = session.review.clone();
+        reopened.save(&mut restored).unwrap();
+        let detail_after: String = connection
+            .query_row(
+                "SELECT data FROM session_details WHERE session_id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail_after, detail_before);
+
+        let checked = load_hydrated(&store_in(&directory));
+        assert_eq!(checked.sessions[0].review, expected);
+        assert_eq!(
+            checked.sessions[0].messages[1].content,
+            "Keep the full review"
+        );
+
+        // Clearing metadata is also authoritative over the older detail blob.
+        restored.session_mut(id).unwrap().review = None;
+        reopened.save(&mut restored).unwrap();
+        let checked = load_hydrated(&store_in(&directory));
+        assert!(checked.sessions[0].review.is_none());
+        assert_eq!(
+            checked.sessions[0].messages[1].content,
+            "Keep the full review"
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn issue_review_draft_preserves_its_catalog_metadata() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let task = Task::new("Review issue", TaskState::Backlog, 0);
+        let session = &mut state.sessions[0];
+        session.task_id = Some(task.id);
+        session.review = Some(SessionReview {
+            target: IssueReviewTarget::UncommittedChanges,
+            source_session_id: Some(Uuid::new_v4()),
+            status: IssueReviewStatus::Draft,
+            summary: None,
+            result_message_id: None,
+            fix_session_id: None,
+        });
+        let expected = session.review.clone();
+        state.tasks.push(task);
+        store.save(&mut state).unwrap();
+
+        let restored = load_hydrated(&store_in(&directory));
+        assert_eq!(restored.sessions.len(), 1);
+        assert_eq!(restored.sessions[0].review, expected);
+        assert!(!restored.sessions[0].has_started());
+        assert!(restored.sessions[0].messages.is_empty());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn correction_provenance_survives_source_removal_and_hydration() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let source_id = state.sessions[0].id;
+        let task = Task::new("Review corrections", TaskState::Backlog, 0);
+        state.sessions[0].task_id = Some(task.id);
+        let mut correction = AgentSession::new(state.projects[0].id, ProviderKind::Pi);
+        correction.task_id = Some(task.id);
+        let correction_id = correction.id;
+        state.push_session(correction);
+        state.tasks.push(task);
+        store.save(&mut state).unwrap();
+
+        // The compact catalog is authoritative even when the stored detail
+        // predates the provenance field or contains an older value.
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load().unwrap();
+        restored
+            .session_mut(correction_id)
+            .unwrap()
+            .review_correction_source_id = Some(source_id);
+        reopened.save(&mut restored).unwrap();
+        restored.sessions.retain(|session| session.id != source_id);
+        reopened.save(&mut restored).unwrap();
+        let checked = load_hydrated(&store_in(&directory));
+        let correction = checked
+            .sessions
+            .iter()
+            .find(|session| session.id == correction_id)
+            .unwrap();
+        assert_eq!(correction.review_correction_source_id, Some(source_id));
+        assert!(correction.review.is_none());
+        assert!(!correction.has_started());
+
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        connection
+            .execute("UPDATE session_details SET data = 'invalid JSON'", [])
+            .unwrap();
+        let catalog = store_in(&directory).load().unwrap();
+        let correction = catalog
+            .sessions
+            .iter()
+            .find(|session| session.id == correction_id)
+            .unwrap();
+        assert_eq!(correction.review_correction_source_id, Some(source_id));
+        assert!(!correction.detail_loaded);
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn correction_provenance_migration_backfills_existing_review_fix_links() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let source_id = state.sessions[0].id;
+        let task = Task::new("Review corrections", TaskState::Backlog, 0);
+        let mut correction = AgentSession::new(state.projects[0].id, ProviderKind::Pi);
+        let correction_id = correction.id;
+        correction.task_id = Some(task.id);
+        state.sessions[0].task_id = Some(task.id);
+        state.sessions[0].review = Some(SessionReview {
+            target: IssueReviewTarget::UncommittedChanges,
+            source_session_id: None,
+            status: IssueReviewStatus::Completed,
+            summary: Some("Needs a fix".into()),
+            result_message_id: None,
+            fix_session_id: Some(correction_id),
+        });
+        state.push_session(correction);
+        state.tasks.push(task);
+        store.save(&mut state).unwrap();
+        drop(store);
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        connection
+            .execute_batch("ALTER TABLE sessions DROP COLUMN review_correction_source_id")
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM migrations WHERE tag = '0009_review_correction_provenance'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let checked = load_hydrated(&store_in(&directory));
+        let correction = checked
+            .sessions
+            .iter()
+            .find(|session| session.id == correction_id)
+            .unwrap();
+        assert_eq!(correction.review_correction_source_id, Some(source_id));
+        let source = checked
+            .sessions
+            .iter()
+            .find(|session| session.id == source_id)
+            .unwrap();
+        assert!(source.review_correction_source_id.is_none());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn issue_review_migration_preserves_legacy_sessions_without_review_metadata() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        state.sessions[0].begin_turn("Keep legacy history");
+        state.sessions[0].finish_active_turn(crate::model::TurnStatus::Completed);
+        let id = state.sessions[0].id;
+        store.save(&mut state).unwrap();
+        drop(store);
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        connection
+            .execute_batch("ALTER TABLE sessions DROP COLUMN review")
+            .unwrap();
+        connection
+            .execute("DELETE FROM migrations WHERE tag = '0008_issue_review'", [])
+            .unwrap();
+        drop(connection);
+
+        let restored = load_hydrated(&store_in(&directory));
+        assert_eq!(restored.sessions[0].id, id);
+        assert!(restored.sessions[0].review.is_none());
+        assert_eq!(
+            restored.sessions[0].messages[0].content,
+            "Keep legacy history"
+        );
         fs::remove_dir_all(directory).ok();
     }
 

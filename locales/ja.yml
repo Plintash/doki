@@ -1148,13 +1148,13 @@ annotation.select_one_reply: 注釈は 1 つの返信にしか付けられませ
 annotation.wait_for_reply: 返信が終わってから注釈を付けられます
 
 sidebar.board: ボード
-sidebar.grouping_task: タスク
+sidebar.grouping_task: 課題
 board.title: ボード
 board.backlog: 未着手
 board.doing: 進行中
 board.done: 完了
-board.new_task: 新規タスク
-board.new_task_placeholder: このタスクは何をしますか？
+board.new_task: 新しい課題
+board.new_task_placeholder: この課題はどのような内容ですか？
 board.needs_you: "%{count} 件が対応待ち"
 board.needs_you_short: 対応待ち
 board.running: 実行中
@@ -1165,21 +1165,21 @@ board.move_backlog: 未着手に移動
 board.move_doing: 進行中に移動
 board.complete: 完了にする
 board.reopen: 再開
-board.completed_toast: タスクを完了しました。会話はサイドバーから片付きました
+board.completed_toast: 課題を完了しました。会話はサイドバーから片付きました
 board.complete_confirm_title: 「%{title}」を完了しますか？
-board.complete_confirm_body: "完了すると、接続中または実行中の %{count} 件の会話を停止して閉じ、このタスクの会話をサイドバーからアーカイブします。"
+board.complete_confirm_body: "完了すると、接続中または実行中の %{count} 件の会話を停止して閉じ、この課題の会話をサイドバーからアーカイブします。"
 board.archive_not_delete: アーカイブは削除ではありません。
 board.complete_and_stop: 完了して停止
-board.untitled_task: 無題のタスク
-task.bind: タスクに割り当て
-task.new_from_session: この会話で新しいタスクを作成
-task.unbind: タスクから外す
+board.untitled_task: 無題の課題
+task.bind: 課題に割り当て
+task.new_from_session: この会話で新しい課題を作成
+task.unbind: 課題から外す
 settings.archive: アーカイブ
-settings.archive_keywords: 設定 環境設定 アーカイブ 完了 タスク 会話 復元
-archive.empty: 完了したタスクはまだありません
+settings.archive_keywords: 設定 環境設定 アーカイブ 完了 課題 会話 復元
+archive.empty: 完了した課題はまだありません
 archive.restore: 復元
 archive.completed_at: "%{time} に完了"
-board.reopened_toast: タスクを再開しました。会話がサイドバーに戻ります
+board.reopened_toast: 課題を再開しました。会話がサイドバーに戻ります
 
 activity.background_shell: バックグラウンドシェル
 activity.provider_retrying: リクエストを再試行しています
@@ -1210,7 +1210,7 @@ subagent.title: サブエージェント
 menu.new_session: "新しい会話"
 session.new_session: "新しい会話"
 sidebar.unfiled_sessions: "未分類の会話"
-board.open_task: "タスクを開く"
+board.open_task: "課題を開く"
 board.back_to_board: "← ボード"
 board.description: "説明"
 board.description_placeholder: "目標、要件、参考情報を記入…"
@@ -1226,26 +1226,26 @@ board.new_session: "新しい会話"
 board.reopen_new_session: "再開して会話を開始"
 board.continue_session: "会話を開く"
 board.open_draft: "下書きを続ける"
-board.detach_session: "関連付けを解除"
+board.detach_session: "課題との関連付けを解除"
 board.draft_session: "未送信の下書き"
 board.session_failed: "失敗"
 board.archived: "アーカイブ済み"
 board.session_idle: "待機中"
 board.loading_workspace: "ワークスペースを読み込み中…"
-board.archived_hint: "完了しました。会話はここに保存され、サイドバーから非表示になります。作業を続けるにはタスクを再開してください。"
+board.archived_hint: "完了しました。会話はここに保存され、サイドバーから非表示になります。作業を続けるには課題を再開してください。"
 board.title_required: "タイトルを入力してください"
 board.no_sessions: "まだ会話がありません"
 board.session_context_hint: "説明とワークスペースを引き継いで会話を開始するか、既存の会話を関連付けてください。"
 board.session_project_mismatch: "その会話は別のプロジェクトに属しています"
-board.create_task: "タスクを作成"
-board.empty_backlog: "次のタスクを計画"
+board.create_task: "課題を作成"
+board.empty_backlog: "次の課題を計画"
 board.empty_doing: "進行中の作業はここに表示されます"
-board.empty_done: "完了したタスクはここに残ります"
+board.empty_done: "完了した課題はここに残ります"
 
-board.back_to_task: "← タスク"
-board.detach_draft_hint: "この未送信の下書きはタスクに属しています。送信後に関連付けを解除するか、不要なら下書きを削除してください。"
+board.back_to_task: "← 課題"
+board.detach_draft_hint: "この未送信の下書きは課題に属しています。送信後に関連付けを解除するか、不要なら下書きを削除してください。"
 board.completion_stopping: "作業を停止中…"
-board.completion_cannot_stop: "バックグラウンド作業をすべて停止できません。タスクは有効のままです。会話から停止して再試行してください。"
+board.completion_cannot_stop: "バックグラウンド作業をすべて停止できません。課題は有効のままです。会話から停止して再試行してください。"
 board.completion_stop_failed: "一部の作業が停止しませんでした。課題は有効のままです。会話を確認して再試行してください。"
 
 board.cancel_completion: 完了操作をキャンセル
@@ -1276,3 +1276,31 @@ board.attach_project_scope: "%{project} の未分類の会話"
 board.attach_all_scope: "すべてのプロジェクトの未分類の会話"
 board.attach_no_matches: "一致する会話はありません"
 board.attach_keyboard_hint: "↑↓ 選択 · Enter 関連付け · Esc 閉じる"
+
+# Issue-centered review
+review.section: "Codex レビュー"
+review.start: "Codex でレビュー"
+review.develop_pi: "Pi で開発"
+review.reopen_develop_pi: "再開して Pi で開発"
+review.uncommitted: "未コミットの変更"
+review.base_branch: "ベースブランチとの差分"
+review.commit: "コミット指定"
+review.commit_range: "コミット範囲"
+review.reference_placeholder: "ブランチ、SHA、base..head"
+review.against_branch: "%{reference} との差分"
+review.at_commit: "コミット %{reference}"
+review.draft: "Codex レビュー · 下書き"
+review.running: "Codex レビュー · 実行中"
+review.completed: "Codex レビュー · 完了"
+review.interrupted: "Codex レビュー · 停止"
+review.failed: "Codex レビュー · 未完了"
+review.workspace_required: "開発を開始するか、既存のワークスペースを選んでください"
+review.session_title: "レビュー: %{title}"
+review.fix_title: "レビュー対応: %{title}"
+review.open: "レビューを開く"
+review.fix_pi: "Pi で修正"
+review.loading_result: "レビュー結果を読み込み中…"
+review.invalid_session: "レビューには Codex と元のワークスペースが必要です"
+review.composer_scope: "Codex レビュー · %{scope}"
+review.loading_context: "開発のコンテキストを読み込み中…"
+review.context_hint: "この issue のワークスペースと最新の開発コンテキストを使用"

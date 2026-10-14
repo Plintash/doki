@@ -1,6 +1,9 @@
 use chrono::{DateTime, Datelike, Days, Local, NaiveDate, Utc};
 use gpui::{KeyBinding, actions};
 
+use super::window_chrome::{
+    HISTORY_GAP, HISTORY_MARGIN, MACOS_TRAFFIC_LIGHT_CLEARANCE, TITLEBAR_BUTTON_SIZE,
+};
 use super::*;
 use crate::ui::SemanticControlExt;
 
@@ -554,14 +557,34 @@ impl Waku {
             )
     }
 
+    fn titlebar_button_focus(&self, id: &'static str, cx: &mut Context<Self>) -> FocusHandle {
+        self.sidebar_action_focuses
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
     fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = Theme::current(cx);
+        let focus = self.titlebar_button_focus("toggle-sidebar", cx);
         div()
             .id("toggle-sidebar")
             .role(gpui::Role::Button)
             .aria_label("Toggle sidebar")
-            .w(px(26.0))
-            .h(px(26.0))
+            .track_focus(&focus)
+            .tab_index(0)
+            .tab_stop(true)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .tooltip(Tooltip::text(tr!("menu.toggle_sidebar")))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    this.set_sidebar_visible(!this.sidebar_visible, cx);
+                }
+            }))
+            .w(px(TITLEBAR_BUTTON_SIZE))
+            .h(px(TITLEBAR_BUTTON_SIZE))
             .flex_none()
             .rounded(px(6.0))
             .flex()
@@ -589,10 +612,21 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = Theme::current(cx);
+        let focus = self.titlebar_button_focus(id, cx);
         div()
             .id(id)
-            .w(px(26.0))
-            .h(px(26.0))
+            .track_focus(&focus)
+            .semantic_control(gpui::Role::Button, !enabled)
+            .aria_label(if navigate_back {
+                "Go back"
+            } else {
+                "Go forward"
+            })
+            .tab_index(0)
+            .tab_stop(enabled)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .w(px(TITLEBAR_BUTTON_SIZE))
+            .h(px(TITLEBAR_BUTTON_SIZE))
             .flex_none()
             .rounded(px(6.0))
             .flex()
@@ -602,6 +636,16 @@ impl Waku {
             .when(!enabled, |element| element.opacity(0.35))
             .when(enabled, |element| {
                 element
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            cx.stop_propagation();
+                            if navigate_back {
+                                this.navigate_back_action(&NavigateBack, window, cx);
+                            } else {
+                                this.navigate_forward_action(&NavigateForward, window, cx);
+                            }
+                        }
+                    }))
                     .hover(|element| element.bg(theme.overlay))
                     .active(|element| element.bg(theme.overlay_strong))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -619,11 +663,32 @@ impl Waku {
             .child(icon(icon_path, 14.0, theme.text_tertiary))
     }
 
-    fn render_sidebar_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
-        div()
-            .id("sidebar-titlebar")
-            .h(px(48.0))
+    fn render_sidebar_titlebar(&self, _window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
+        // Navigation lives at the window root, outside the sidebar's animated
+        // clip. This strip is only the background and remaining drag surface.
+        self.window_drag_region(div().id("sidebar-titlebar").h(px(48.0)).flex_none(), cx)
+    }
+
+    pub(super) fn render_titlebar_navigation(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        // AppKit can restore its buttons before our exit-fullscreen tween
+        // finishes. Clip navigation (paint AND hit regions) out of that native
+        // area while it glides right; never lay a clickable control over it.
+        let guard = if cfg!(target_os = "macos") && !window.is_fullscreen() {
+            MACOS_TRAFFIC_LIGHT_CLEARANCE
+        } else {
+            0.0
+        };
+        let width = self.titlebar_navigation_width(window, cx);
+        let controls = div()
+            .relative()
+            .left(px(-guard))
+            .w(px(width))
             .flex_none()
+            .h(px(48.0))
             .flex()
             .items_center()
             .children(self.render_client_window_controls(
@@ -634,8 +699,8 @@ impl Waku {
             .child(
                 self.window_drag_region(
                     div()
-                        .id("sidebar-traffic-light-drag-region")
-                        .w(px(TRAFFIC_LIGHT_CLEARANCE))
+                        .id("titlebar-native-controls-drag-region")
+                        .w(px(self.titlebar_clearance.width()))
                         .h_full()
                         .flex_none(),
                     cx,
@@ -644,10 +709,10 @@ impl Waku {
             .child(self.render_sidebar_toggle(cx))
             .child(
                 div()
-                    .ml(px(6.0))
+                    .ml(px(HISTORY_MARGIN))
                     .flex()
                     .items_center()
-                    .gap(px(2.0))
+                    .gap(px(HISTORY_GAP))
                     .child(self.render_history_button(
                         "navigate-back",
                         "icons/arrow-left.svg",
@@ -662,11 +727,38 @@ impl Waku {
                         false,
                         cx,
                     )),
+            );
+        div()
+            .id("titlebar-navigation")
+            .absolute()
+            .top_0()
+            .left_0()
+            .w(px(width.max(guard)))
+            .h(px(48.0))
+            .when(guard > 0.0, |element| {
+                element.child(
+                    self.window_drag_region(
+                        div()
+                            .id("titlebar-traffic-light-drag-region")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(guard))
+                            .h_full(),
+                        cx,
+                    ),
+                )
+            })
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(guard))
+                    .w(px((width - guard).max(0.0)))
+                    .h_full()
+                    .overflow_hidden()
+                    .child(controls),
             )
-            .child(self.window_drag_region(
-                div().id("sidebar-titlebar-drag-region").h_full().flex_1(),
-                cx,
-            ))
     }
 
     fn render_sidebar_header_actions(&self, cx: &mut Context<Self>) -> Div {
@@ -844,7 +936,7 @@ impl Waku {
         self.render_sidebar_action_row(
             "sidebar-new-task-action",
             "icons/plus.svg",
-            tr!("menu.new_task"),
+            tr!("board.new_issue"),
             cx,
         )
         .on_click(cx.listener(|this, _, window, cx| {
@@ -2472,15 +2564,6 @@ impl Waku {
         let agent_preset_label = session
             .filter(|session| session.provider == ProviderKind::DeepSeek && session.has_started())
             .and_then(|session| self.agent_preset_label_for_session(session));
-        let left_window_controls = (!self.sidebar_visible)
-            .then(|| {
-                self.render_client_window_controls(
-                    super::window_chrome::WindowControlSide::Left,
-                    window,
-                    cx,
-                )
-            })
-            .flatten();
         let right_panel_visible = self.right_panel_visible && !self.board_open;
         let right_window_controls = (!right_panel_visible)
             .then(|| {
@@ -2498,58 +2581,8 @@ impl Waku {
             .flex()
             .items_center()
             .gap(px(8.0))
-            .children(left_window_controls)
-            // The header starts where the sidebar ends, so until the sidebar
-            // is wide enough to host the traffic lights itself the header has
-            // to clear them. Steady state with the sidebar open adds nothing;
-            // a sidebar sliding in shrinks the inset as it takes the lights
-            // over, which is what keeps the title from passing under them.
-            .pl(if self.sidebar_visible {
-                px(14.0 + (TRAFFIC_LIGHT_CLEARANCE - self.sidebar_rendered_width).max(0.0))
-            } else {
-                px(0.0)
-            })
+            .pl(px(self.titlebar_content_inset(window, cx)))
             .pr(px(14.0))
-            .when(!self.sidebar_visible, |element| {
-                element
-                    .child(
-                        self.window_drag_region(
-                            div()
-                                .id("header-traffic-light-drag-region")
-                                .w(px(TRAFFIC_LIGHT_CLEARANCE - 8.0))
-                                .h_full()
-                                .flex_none(),
-                            cx,
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(self.render_sidebar_toggle(cx))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(2.0))
-                                    .child(self.render_history_button(
-                                        "navigate-back",
-                                        "icons/arrow-left.svg",
-                                        !self.session_navigation.back.is_empty(),
-                                        true,
-                                        cx,
-                                    ))
-                                    .child(self.render_history_button(
-                                        "navigate-forward",
-                                        "icons/arrow-right.svg",
-                                        !self.session_navigation.forward.is_empty(),
-                                        false,
-                                        cx,
-                                    )),
-                            ),
-                    )
-            })
             .child(
                 self.window_drag_region(
                     div()
@@ -2762,21 +2795,6 @@ impl Waku {
                 }
             })
             .unwrap_or_else(|| tr!("project.your_project"));
-        let project_options = self
-            .state
-            .projects
-            .iter()
-            .filter(|project| !project.is_projectless())
-            .filter(|project| Some(project.id) == selected_project_id)
-            .chain(
-                self.state
-                    .projects
-                    .iter()
-                    .filter(|project| !project.is_projectless())
-                    .filter(|project| Some(project.id) != selected_project_id),
-            )
-            .map(|project| (project.id, project.display_name()))
-            .collect::<Vec<_>>();
         let weak = cx.entity().downgrade();
         let handle = self.menu_handle("empty-state-project", cx);
         let project_selector = dropdown_menu(
@@ -2785,22 +2803,29 @@ impl Waku {
             "empty-state-project-menu",
             &handle,
             MenuAlign::BelowLeft,
-            move |_| {
-                let mut items = project_options
-                    .clone()
-                    .into_iter()
-                    .map(|(project_id, project_name)| {
-                        let weak = weak.clone();
-                        MenuItem::new(project_name, move |_, cx| {
-                            if Some(project_id) == selected_project_id {
-                                return;
-                            }
-                            let _ = weak.update(cx, |this, cx| this.select_project(project_id, cx));
+            move |cx| {
+                let Some(entity) = weak.upgrade() else {
+                    return Vec::new();
+                };
+                let this = entity.read(cx);
+                let mut items =
+                    projects::picker_projects(&this.state.projects, selected_project_id)
+                        .into_iter()
+                        .map(|project| {
+                            let project_id = project.id;
+                            let project_name = project.display_name();
+                            let weak = weak.clone();
+                            MenuItem::new(project_name, move |_, cx| {
+                                if Some(project_id) == selected_project_id {
+                                    return;
+                                }
+                                let _ =
+                                    weak.update(cx, |this, cx| this.select_project(project_id, cx));
+                            })
+                            .semantic_id(format!("empty-state-project-{project_id}"))
+                            .selected(Some(project_id) == selected_project_id)
                         })
-                        .semantic_id(format!("empty-state-project-{project_id}"))
-                        .selected(Some(project_id) == selected_project_id)
-                    })
-                    .collect::<Vec<_>>();
+                        .collect::<Vec<_>>();
                 if !items.is_empty() {
                     items.push(MenuItem::Separator);
                 }

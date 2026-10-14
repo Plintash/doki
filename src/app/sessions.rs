@@ -318,7 +318,11 @@ impl Waku {
         let Some(session) = self.selected_session_mut() else {
             return;
         };
-        if session.has_started() || session.is_busy() || session.workspace == workspace {
+        if session.has_started()
+            || session.is_busy()
+            || session.review.is_some()
+            || session.workspace == workspace
+        {
             return;
         }
         session.workspace = workspace;
@@ -1774,14 +1778,12 @@ impl Waku {
                 && let Some(path) = paths.into_iter().next()
             {
                 let _ = this.update(cx, |this, cx| {
-                    if let Some(existing) = this.state.projects.iter().find(|p| p.path == path) {
-                        this.select_project(existing.id, cx);
-                        return;
-                    }
-                    let project = Project::from_path(path);
-                    let project_id = project.id;
-                    this.state.projects.push(project);
-                    this.create_session_for(project_id, this.state.last_provider, cx);
+                    let project_id = this.register_project(
+                        path,
+                        this.state.selected_project,
+                        projects::ProjectPathHost::Local,
+                    );
+                    this.select_project(project_id, cx);
                 });
             }
         })

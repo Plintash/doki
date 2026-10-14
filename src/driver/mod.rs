@@ -224,10 +224,18 @@ struct RemoteDriverControl {
 impl RemoteDriverControl {
     fn notify(&self, command: waku_client::Command) {
         let client = self.client.lock().clone();
+        let is_review = matches!(&command, waku_client::Command::Review { .. });
         if let Err(error) = client.notify(self.session_id, self.runtime_id, command) {
             let _ = self.events.send(DriverEvent::Error(format!(
                 "Waku daemon command failed: {error}"
             )));
+            if is_review {
+                let _ = self.events.send(DriverEvent::TurnFinished {
+                    success: false,
+                    summary: None,
+                    interrupted: false,
+                });
+            }
         }
     }
 }
@@ -235,6 +243,14 @@ impl RemoteDriverControl {
 impl DriverControl for RemoteDriverControl {
     fn prompt(&self, prompt: String, turn_id: Option<uuid::Uuid>, message_id: Option<uuid::Uuid>) {
         self.notify(waku_client::Command::Prompt {
+            prompt,
+            turn_id,
+            message_id,
+        });
+    }
+
+    fn review(&self, prompt: String, turn_id: Option<uuid::Uuid>, message_id: Option<uuid::Uuid>) {
+        self.notify(waku_client::Command::Review {
             prompt,
             turn_id,
             message_id,

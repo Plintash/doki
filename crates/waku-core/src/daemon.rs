@@ -1237,6 +1237,11 @@ impl Backend for WakuBackend {
                     prompt,
                     turn_id,
                     message_id,
+                }
+                | Command::Review {
+                    prompt,
+                    turn_id,
+                    message_id,
                 } = &command
                 {
                     // Publish the submission into the runtime's event stream
@@ -1274,6 +1279,7 @@ fn command_starts_issue_work(command: &Command) -> bool {
     matches!(
         command,
         Command::Prompt { .. }
+            | Command::Review { .. }
             | Command::Steer { .. }
             | Command::Goal {
                 operation: GoalOperation::Set {
@@ -2205,6 +2211,7 @@ fn handle_driver_command(
 ) -> anyhow::Result<ResponsePayload> {
     match command {
         Command::Prompt { prompt, .. } => driver.prompt(prompt),
+        Command::Review { prompt, .. } => driver.review(prompt)?,
         Command::Steer { prompt } => driver.steer(prompt),
         Command::Cancel => driver.cancel(),
         Command::CancelComputerUse => driver.cancel_computer_use(),
@@ -2752,6 +2759,33 @@ mod tests {
         assert!(
             validate_task_completions(&state, &[done], &[stale], &HashMap::new(), &HashSet::new())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn native_review_starts_issue_work() {
+        assert!(command_starts_issue_work(&Command::Review {
+            prompt: "Review the implementation".into(),
+            turn_id: None,
+            message_id: None,
+        }));
+    }
+
+    #[test]
+    fn unsupported_review_returns_a_validation_error_instead_of_a_prompt() {
+        let (dropped, _dropped_rx) = crossbeam_channel::bounded(1);
+        let driver = DriverHandle::from_control(Arc::new(ShutdownTestDriver(dropped)));
+        let result = handle_driver_command(
+            &driver,
+            Command::Review {
+                prompt: "Review the implementation".into(),
+                turn_id: None,
+                message_id: None,
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a transport without native review must reject it"
         );
     }
 

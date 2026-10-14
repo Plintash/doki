@@ -33,12 +33,13 @@ use crate::model::{
     ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget,
     BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind,
     BackgroundWorkStatus, Checkpoint, CheckpointStatus, ContextUsage, DriverEvent,
-    ExtensionStatusEntry, ExtensionWidget, ExtensionWidgetPlacement, FavoriteModel, Message,
-    MessageAnnotation, MessageAttachment, MessageRole, NotificationSeverity, PendingPermission,
-    Project, ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode,
-    SessionStatus, SessionWorkspace, Task, TaskState, TaskWorkspace, TextSpan, TranscriptBlock,
-    TurnStatus, UserInputAnswer, UserInputQuestion, compact_path, unix_time, unix_time_millis,
+    ExtensionStatusEntry, ExtensionWidget, ExtensionWidgetPlacement, FavoriteModel,
+    IssueReviewStatus, IssueReviewTarget, Message, MessageAnnotation, MessageAttachment,
+    MessageRole, NotificationSeverity, PendingPermission, Project, ProviderKind, ProviderModel,
+    ProviderProbe, ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary,
+    QueuedMessage, ReasoningBlock, RuntimeMode, SessionReview, SessionStatus, SessionWorkspace,
+    Task, TaskState, TaskWorkspace, TextSpan, TranscriptBlock, TurnStatus, UserInputAnswer,
+    UserInputQuestion, compact_path, unix_time, unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -79,10 +80,6 @@ use crate::{
     ToggleFullScreen, ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 
-#[cfg(target_os = "macos")]
-const TRAFFIC_LIGHT_CLEARANCE: f32 = 86.0;
-#[cfg(not(target_os = "macos"))]
-const TRAFFIC_LIGHT_CLEARANCE: f32 = 8.0;
 const CONTENT_MAX_WIDTH: f32 = 720.0;
 /// Menu-registry id of the composer's model picker, shared by its render site
 /// and the primary-modifier `/` toggle action.
@@ -719,7 +716,7 @@ impl WakuPane {
             // (terminal output, pulse leases) dirty their ancestor pane
             // without this observer, and the slide's retirement notify
             // below re-runs the fan-out, so nothing outlasts the 200ms.
-            if !waku.read(cx).panels_sliding() {
+            if !waku.read(cx).panels_sliding() && !waku.read(cx).titlebar_clearance.is_sliding() {
                 cx.notify();
             }
         })
@@ -1176,6 +1173,8 @@ pub struct Waku {
     /// Session details currently being fetched from the daemon. Sidebar rows
     /// stay usable while the selected transcript hydrates asynchronously.
     session_hydrations: HashSet<Uuid>,
+    /// Registrations made here that no daemon catalog has acknowledged yet.
+    pending_project_registrations: HashSet<Uuid>,
     /// Selection is committed only after this target's transcript arrives, so
     /// the currently visible task stays intact during daemon latency.
     pending_session_activation: Option<PendingSessionActivation>,
@@ -1519,7 +1518,7 @@ pub struct Waku {
     /// The board details stay separate from conversation selection.
     selected_task: Option<Uuid>,
     task_detail: Option<task_details::TaskDetail>,
-    task_detail_save_generation: u64,
+    task_detail_save: task_details::TaskDetailSave,
     task_save_in_flight: bool,
     task_save_pending: bool,
     task_save_error: Option<String>,
@@ -1568,6 +1567,7 @@ pub struct Waku {
     /// hand from `render` (see [`motion::WidthTween`]) because the width these
     /// produce is what the transcript column between them is laid out against.
     sidebar_slide: Option<motion::WidthTween>,
+    titlebar_clearance: window_chrome::TitlebarClearance,
     right_panel_slide: Option<motion::WidthTween>,
     /// Width each panel actually occupied in the last frame — where a toggle
     /// starts its slide from, and what the transcript measures itself against
@@ -1870,6 +1870,8 @@ mod drafts;
 mod file_search;
 mod goal_dialog;
 mod image_preview;
+mod issue_review;
+mod projects;
 mod render;
 mod right_panel;
 pub(crate) mod rpa;
@@ -3018,6 +3020,7 @@ impl Waku {
                 daemon,
                 daemon_hostname,
                 session_hydrations: HashSet::new(),
+                pending_project_registrations: HashSet::new(),
                 pending_session_activation: None,
                 state,
                 store,
@@ -3190,7 +3193,7 @@ impl Waku {
                 board_activity_filter: board::BoardActivityFilter::All,
                 selected_task: None,
                 task_detail: None,
-                task_detail_save_generation: 0,
+                task_detail_save: task_details::TaskDetailSave::default(),
                 task_save_in_flight: false,
                 task_save_pending: false,
                 task_save_error: None,
@@ -3222,6 +3225,7 @@ impl Waku {
                 right_panel_visible,
                 right_panel_width,
                 sidebar_slide: None,
+                titlebar_clearance: window_chrome::TitlebarClearance::default(),
                 right_panel_slide: None,
                 sidebar_rendered_width: if sidebar_visible { sidebar_width } else { 0.0 },
                 right_panel_rendered_width: if right_panel_visible {

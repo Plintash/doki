@@ -81,9 +81,11 @@ pub(super) struct TaskStats {
     pub(super) busy: HashSet<Uuid>,
     pub(super) conversations: HashMap<Uuid, usize>,
     pub(super) attention_total: usize,
+    project_scope: Option<HashSet<Uuid>>,
     running: HashMap<Uuid, usize>,
     attention_sessions: HashMap<Uuid, Vec<TaskAttention>>,
     progress: HashMap<Uuid, (u64, String)>,
+    reviews: HashMap<Uuid, ((u64, u64, Uuid), SessionReview)>,
 }
 
 struct TaskAttention {
@@ -142,6 +144,16 @@ impl TaskStats {
             return;
         };
         *self.conversations.entry(task_id).or_default() += 1;
+        if let Some(review) = session.review.as_ref() {
+            let at = issue_review::review_order(session);
+            if self
+                .reviews
+                .get(&task_id)
+                .is_none_or(|(previous, _)| at >= *previous)
+            {
+                self.reviews.insert(task_id, (at, review.clone()));
+            }
+        }
         // A parked foreground turn can still have a live background process.
         // Preserve both signals instead of letting attention hide running work.
         if session.status.is_busy() || background {
@@ -251,7 +263,12 @@ impl Waku {
             .filter(|task| !task.state.is_done())
             .map(|task| task.id)
             .collect::<HashSet<_>>();
-        let mut stats = TaskStats::default();
+        let mut stats = TaskStats {
+            project_scope: self
+                .board_project_filter
+                .map(|selected| projects::project_path_ids(&self.state.projects, selected)),
+            ..TaskStats::default()
+        };
         for session in &self.state.sessions {
             let Some(task_id) = session.task_id else {
                 continue;
@@ -274,6 +291,12 @@ impl Waku {
                 )
             } else if session.status == SessionStatus::Waiting {
                 Some(tr!("board.awaiting_input"))
+            } else if session
+                .review
+                .as_ref()
+                .is_some_and(|review| review.status == IssueReviewStatus::Failed)
+            {
+                Some(tr!("review.failed"))
             } else {
                 None
             };
@@ -293,8 +316,10 @@ impl Waku {
     pub(super) fn task_matches_board_scope(&self, task: &Task) -> bool {
         let project_id = task_details::task_project_id(task);
         if self
-            .board_project_filter
-            .is_some_and(|id| Some(id) != project_id)
+            .task_stats()
+            .project_scope
+            .as_ref()
+            .is_some_and(|ids| project_id.is_none_or(|id| !ids.contains(&id)))
         {
             return false;
         }
@@ -791,16 +816,45 @@ impl Waku {
             })
             .children(attention_rows)
             .when_some(more_attention, |element, menu| element.child(menu))
-            .when_some(stats.progress.get(&task_id), |element, (_, preview)| {
+            .when_some(stats.reviews.get(&task_id), |element, (_, review)| {
                 element.child(
                     div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
                         .text_size(sp(11.0))
-                        .text_color(theme.text_secondary)
-                        .whitespace_normal()
-                        .line_clamp(2)
-                        .child(tr!("board.latest_progress", progress = preview)),
+                        .child(
+                            div()
+                                .text_color(theme.text_secondary)
+                                .child(issue_review::review_status_label(review)),
+                        )
+                        .when_some(review.summary.clone(), |row, summary| {
+                            row.child(
+                                div()
+                                    .text_color(theme.text_tertiary)
+                                    .whitespace_normal()
+                                    .line_clamp(2)
+                                    .child(summary),
+                            )
+                        }),
                 )
             })
+            .when_some(
+                stats
+                    .progress
+                    .get(&task_id)
+                    .filter(|_| !stats.reviews.contains_key(&task_id)),
+                |element, (_, preview)| {
+                    element.child(
+                        div()
+                            .text_size(sp(11.0))
+                            .text_color(theme.text_secondary)
+                            .whitespace_normal()
+                            .line_clamp(2)
+                            .child(tr!("board.latest_progress", progress = preview)),
+                    )
+                },
+            )
             .when(!renaming, |element| {
                 element
                     .track_focus(&row_focus)

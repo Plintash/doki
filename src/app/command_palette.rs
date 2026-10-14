@@ -697,11 +697,11 @@ impl Waku {
         let mut commands = vec![
             CommandPaletteItem::command(
                 display_section(PaletteSection::Suggested),
-                tr!("command_palette.new_task"),
+                tr!("board.new_issue"),
                 "icons/pencil.svg",
                 Some(crate::platform::primary_shortcut("⌘N", "Ctrl+N")),
                 PaletteAction::NewTask,
-                "new task session chat conversation start",
+                "new issue task start",
                 next(),
             ),
             CommandPaletteItem::command(
@@ -1431,19 +1431,13 @@ impl Waku {
             return;
         }
 
-        let project_id = if let Some(project) = self
-            .state
-            .projects
-            .iter()
-            .find(|project| project.path == summary.cwd)
-        {
-            project.id
+        let host = if self.daemon.is_remote() {
+            projects::ProjectPathHost::Remote
         } else {
-            let project = Project::from_path(summary.cwd.clone());
-            let project_id = project.id;
-            self.state.projects.push(project);
-            project_id
+            projects::ProjectPathHost::Local
         };
+        let project_id =
+            self.register_project(summary.cwd.clone(), self.state.selected_project, host);
         let provider = summary.provider();
         let runtime_mode = self
             .selected_session()

@@ -1096,14 +1096,14 @@ annotation.select_reply: 请在一条回复内选择要标注的文字
 annotation.select_one_reply: 一条标注只能落在同一条回复里，请重新选择
 annotation.wait_for_reply: 回复结束后才能标注
 
-sidebar.board: 任务板
-sidebar.grouping_task: 任务
-board.title: 任务板
+sidebar.board: 看板
+sidebar.grouping_task: issue
+board.title: 看板
 board.backlog: 待办
 board.doing: 进行中
 board.done: 完成
-board.new_task: 新任务
-board.new_task_placeholder: 这件任务要做什么？
+board.new_task: 新建 issue
+board.new_task_placeholder: 这个 issue 要做什么？
 board.needs_you: "%{count} 条需要你"
 board.needs_you_short: 需要你
 board.running: 运行中
@@ -1114,21 +1114,21 @@ board.move_backlog: 移到待办
 board.move_doing: 移到进行中
 board.complete: 完成
 board.reopen: 重新打开
-board.completed_toast: 任务已完成，对话已从左侧收起
+board.completed_toast: issue 已完成，对话已从左侧收起
 board.complete_confirm_title: 完成「%{title}」？
-board.complete_confirm_body: "完成会停止并关闭 %{count} 个已连接或运行中的会话，然后将该任务的会话从侧栏归档。"
+board.complete_confirm_body: "完成会停止并关闭 %{count} 个已连接或运行中的会话，然后将该 issue 的会话从侧栏归档。"
 board.archive_not_delete: 归档不是删除，内容都在。
 board.complete_and_stop: 完成并停止
-board.untitled_task: 未命名任务
-task.bind: 归入任务
-task.new_from_session: 用这条对话新建任务
-task.unbind: 移出任务
+board.untitled_task: 未命名 issue
+task.bind: 归入 issue
+task.new_from_session: 用这条对话新建 issue
+task.unbind: 移出 issue
 settings.archive: 归档
-settings.archive_keywords: 设置 偏好 归档 完成 任务 对话 恢复
-archive.empty: 还没有完成的任务
+settings.archive_keywords: 设置 偏好 归档 完成 issue 对话 恢复
+archive.empty: 还没有完成的 issue
 archive.restore: 恢复
 archive.completed_at: 完成于 %{time}
-board.reopened_toast: 任务已重新打开，对话回到左侧
+board.reopened_toast: issue 已重新打开，对话回到左侧
 
 activity.background_shell: 后台 Shell
 activity.provider_retrying: 正在重试请求
@@ -1137,9 +1137,9 @@ computer_use.desktop_access: 桌面访问
 computer_use.linux_access_description: 控制当前 Linux 桌面会话中的应用。截图与输入支持取决于你的合成器与无障碍服务。
 computer_use.windows_access_description: 控制当前 Windows 桌面会话中的应用。Windows 可能限制对提权应用和安全桌面的访问。
 errors.provider_catalogue_unavailable: "%{provider} 无法读取它的 %{catalogue} 目录：%{error}"
-command_palette.show_board: 打开任务板
-command_palette.hide_board: 收起任务板
-board.completion_waiting_for_setup: 还有对话正在准备中，稳定后再完成任务
+command_palette.show_board: 打开看板
+command_palette.hide_board: 收起看板
+board.completion_waiting_for_setup: 还有对话正在准备中，稳定后再完成 issue
 
 subagent.running_count: "%{count} 个子代理运行中"
 subagent.running_count_one: 1 个子代理运行中
@@ -1159,7 +1159,7 @@ subagent.title: 子代理
 menu.new_session: "新建会话"
 session.new_session: "新建会话"
 sidebar.unfiled_sessions: "未归类会话"
-board.open_task: "打开任务"
+board.open_task: "打开 issue"
 board.back_to_board: "← 看板"
 board.description: "描述"
 board.description_placeholder: "描述目标、要求和相关背景…"
@@ -1175,27 +1175,27 @@ board.new_session: "新建会话"
 board.reopen_new_session: "重新打开并开始会话"
 board.continue_session: "打开会话"
 board.open_draft: "继续草稿"
-board.detach_session: "移除关联"
+board.detach_session: "移除此议题关联"
 board.draft_session: "未发送的草稿"
 board.session_failed: "失败"
 board.archived: "已归档"
 board.session_idle: "空闲"
 board.loading_workspace: "正在加载工作区…"
-board.archived_hint: "已完成。会话保留在此处，并从活跃侧边栏中归档。重新打开任务即可继续工作。"
-board.title_required: "任务标题不能为空"
+board.archived_hint: "已完成。会话保留在此处，并从活跃侧边栏中归档。重新打开 issue 即可继续工作。"
+board.title_required: "issue 标题不能为空"
 board.no_sessions: "还没有会话"
-board.session_context_hint: "新会话会继承此任务的描述和工作区，也可以关联现有会话。"
+board.session_context_hint: "新会话会继承此 issue 的描述和工作区，也可以关联现有会话。"
 board.session_project_mismatch: "该会话属于其他项目"
-board.create_task: "创建任务"
-board.empty_backlog: "规划下一个任务"
+board.create_task: "创建 issue"
+board.empty_backlog: "规划下一个 issue"
 board.empty_doing: "进行中的工作会显示在这里"
-board.empty_done: "已完成的任务保留在这里"
+board.empty_done: "已完成的 issue 保留在这里"
 
-board.back_to_task: "← 任务"
-board.detach_draft_hint: "未发送的草稿属于此任务。发送后可移除关联，不再需要时可删除草稿。"
+board.back_to_task: "← issue"
+board.detach_draft_hint: "未发送的草稿属于此 issue。发送后可移除关联，不再需要时可删除草稿。"
 board.completion_stopping: "正在停止工作…"
-board.completion_cannot_stop: "无法停止全部后台工作。任务仍保持进行中，请在会话中停止后重试。"
-board.completion_stop_failed: "部分工作未能停止。Issue 仍保持进行中，请打开会话检查后重试。"
+board.completion_cannot_stop: "无法停止全部后台工作。issue 仍保持进行中，请在会话中停止后重试。"
+board.completion_stop_failed: "部分工作未能停止。issue 仍保持进行中，请打开会话检查后重试。"
 
 board.cancel_completion: 取消完成操作
 
@@ -1225,3 +1225,31 @@ board.attach_project_scope: "%{project} 中未归类的会话"
 board.attach_all_scope: "所有项目中未归类的会话"
 board.attach_no_matches: "没有匹配的会话"
 board.attach_keyboard_hint: "↑↓ 选择 · Enter 关联 · Esc 关闭"
+
+# Issue-centered review
+review.section: "Codex 审查"
+review.start: "用 Codex 审查"
+review.develop_pi: "用 Pi 开发"
+review.reopen_develop_pi: "重新打开并用 Pi 开发"
+review.uncommitted: "未提交的改动"
+review.base_branch: "对比基准分支"
+review.commit: "单个提交"
+review.commit_range: "提交范围"
+review.reference_placeholder: "分支、SHA 或 base..head"
+review.against_branch: "对比 %{reference}"
+review.at_commit: "提交 %{reference}"
+review.draft: "Codex 审查 · 草稿"
+review.running: "Codex 审查 · 进行中"
+review.completed: "Codex 审查 · 已完成"
+review.interrupted: "Codex 审查 · 已停止"
+review.failed: "Codex 审查 · 未完成"
+review.workspace_required: "先开始开发，或选择现有工作区进行审查"
+review.session_title: "审查：%{title}"
+review.fix_title: "修正审查问题：%{title}"
+review.open: "打开审查"
+review.fix_pi: "交给 Pi 修正"
+review.loading_result: "正在读取审查结果…"
+review.invalid_session: "审查需要使用 Codex 和原有工作区"
+review.composer_scope: "Codex 审查 · %{scope}"
+review.loading_context: "正在读取开发上下文…"
+review.context_hint: "沿用此 issue 的工作区和最新开发上下文"

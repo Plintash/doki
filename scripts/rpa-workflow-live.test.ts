@@ -303,6 +303,8 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     expect(briefNodes.some(node => node.element_id === "new-task-layer")).toBe(false);
     expect(briefNodes.some(node => node.element_id === `task-project-${projectId}`)).toBe(false);
     expect(briefNodes.some(node => node.element_id === "task-detail-new-session")).toBe(false);
+    expect(briefNodes.some(node => node.element_id === "issue-start-review")).toBe(false);
+    expect(briefNodes.some(node => node.element_id === "issue-review-scope")).toBe(false);
     expect(briefNodes.find(node => node.element_id === "new-task-create")?.disabled).toBe(true);
     await client.automationCall(sessionId, { type: "type", text: "   ", target: { id: `issue-title-${draftIssueId}` } });
     const whitespace = await client.automationCall(sessionId, { type: "snapshot", sections: ["tree", "tasks", "sessions"] });
@@ -325,7 +327,7 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     const newIssueId = field(fresh.observed, "state", "task", "id") as string;
     const title = "Empty issue before any conversation";
     const description = "Keep the title, description, and chosen workspace together.";
-    await client.automationCall(sessionId, { type: "type", text: title, target: { id: `issue-title-${newIssueId}` } });
+    await client.automationCall(sessionId, { type: "type", text: `${title} (draft)`, target: { id: `issue-title-${newIssueId}` } });
     await client.automationCall(sessionId, { type: "type", text: description, target: { id: `issue-description-${newIssueId}` } });
     await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "task-detail-workspace" } });
     await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "task-workspace-local" } });
@@ -333,6 +335,11 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     await invoke("openTask", { id: issueId });
     await invoke("newTask");
     await wait({ on: "state", pointer: "/task/id", equals: newIssueId });
+    // An immediate edit + Create may share a timestamp. The same editor must
+    // still remeasure when its review/conversation controls become visible.
+    await client.automationCall(sessionId, { type: "act", action: "focus", target: { id: `issue-title-${newIssueId}` } });
+    await client.automationCall(sessionId, { type: "key", chord: process.platform === "darwin" ? "cmd-a" : "ctrl-a" });
+    await client.automationCall(sessionId, { type: "type", text: title, target: { id: `issue-title-${newIssueId}` } });
     await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "new-task-create" } });
     await wait({ on: "state", pointer: "/board/newTaskDraft", equals: null });
     await wait({ on: "state", pointer: "/board/savePending", equals: false });
@@ -349,6 +356,9 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     const detailNodes = field(details.observed, "tree", "nodes") as { element_id?: string }[];
     expect(detailNodes.some(node => node.element_id === `issue-title-${newIssueId}`)).toBe(true);
     expect(detailNodes.some(node => node.element_id === `issue-description-${newIssueId}`)).toBe(true);
+    expect(detailNodes.some(node => node.element_id === "task-detail-new-session")).toBe(true);
+    expect(detailNodes.some(node => node.element_id === "issue-start-review")).toBe(true);
+    expect(detailNodes.some(node => node.element_id === "issue-review-scope")).toBe(true);
     // Menu triggers and entries must advertise real semantic Click actions.
     await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "task-detail-workspace" } });
     await wait({ on: "node", id: "task-workspace-local", present: true });
@@ -440,7 +450,7 @@ liveTest("native attachment picker filters eligible conversations and keeps keyb
     await call({ type: "key", chord: "home" });
     await wait({ on: "node", id: `task-attach-${sessions[999]!.id}`, present: true });
     // No explicit target: opening must have placed real focus in the search field.
-    await call({ type: "type", text: "needle attachment" });
+    await call({ type: "type", text: "needle attachment", target: null });
     await wait({ on: "node", id: `task-attach-${sessions[101]!.id}`, present: true });
     const filtered = await nodes();
     expect(filtered.some(node => node.element_id === `task-attach-${sessions[100]!.id}`)).toBe(true);
@@ -464,6 +474,153 @@ liveTest("native attachment picker filters eligible conversations and keeps keyb
     await wait({ on: "node", id: "task-attach-search", present: true });
     await call({ type: "key", chord: "escape" });
   } finally {
+    events?.close();
+    if (sessionId) await client.automation({ type: "detach", sessionId }).catch(() => {});
+    if (scratchId) await client.automation({ type: "scratchRemove", instanceId: scratchId }).catch(() => {});
+    await client.disconnect();
+  }
+}, 90_000);
+
+liveTest("native issue Back only flushes edits and save feedback keeps Board controls still", async () => {
+  const client = connect();
+  let scratchId: string | undefined;
+  let sessionId: string | undefined;
+  let events: ReturnType<typeof notifications> | undefined;
+  let database: Database | undefined;
+  try {
+    await client.connect();
+    const issueId = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+    const created = await client.automation({ type: "scratchCreate", headless: false, name: "Board exit acceptance", seed: {
+      projects: [], sessions: [], tasks: [{ id: issueId, title: "Board exit fixture", description: "", state: "backlog", position: 0, created_at: now, updated_at: now }],
+    } }, { timeoutMs: 40_000 });
+    if (created.type !== "scratchCreated") throw new Error("unexpected scratch response");
+    scratchId = created.instance.instanceId;
+    sessionId = (await client.attachAutomation(scratchId)).sessionId;
+    events = notifications(client, sessionId);
+    database = new Database(created.instance.database);
+    const call = (request: Parameters<WakuClient["automationCall"]>[1]) => client.automationCall(sessionId!, request);
+    const click = (id: string) => call({ type: "act", action: "click", target: { id } });
+    const open = () => call({ type: "invoke", verb: "openTask", args: { id: issueId } });
+    const wait = async (condition: AutomationCondition) => {
+      const response = await client.automation({ type: "wait", sessionId: sessionId!, condition, timeoutMs: 10_000 });
+      if (response.type !== "wait") throw new Error("unexpected wait response");
+      const pushed = response.wait.status === "pending"
+        ? await events!.find(message => message.type === "waitResolved" && message.wait.waitId === response.wait.waitId)
+        : undefined;
+      expect(pushed?.type === "waitResolved" ? pushed.wait.status : response.wait.status).toBe("succeeded");
+    };
+    const boardBounds = async () => {
+      const snapshot = await call({ type: "snapshot", sections: ["tree", "board"] });
+      const nodes = field(snapshot.observed, "tree", "nodes") as { element_id?: string; bounds?: unknown }[];
+      return ["board-running-filter", "board-attention-filter", "board-new-issue"].map(id => {
+        const node = nodes.find(node => node.element_id === id);
+        expect(node?.bounds).toBeDefined();
+        return node!.bounds;
+      });
+    };
+    const replaceTitle = async (title: string) => {
+      await call({ type: "act", action: "focus", target: { id: `issue-title-${issueId}` } });
+      await call({ type: "key", chord: "secondary-a" });
+      return call({ type: "type", text: title, target: null });
+    };
+    const savedTitle = () => (database!.query("SELECT title FROM tasks WHERE id=?").get(issueId) as { title: string }).title;
+    await wait({ on: "node", id: "board-new-issue", present: true });
+    await wait({ on: "state", pointer: "/board/savePending", equals: false });
+    const idleBounds = await boardBounds();
+
+    // Navigation alone must not enter the saving state, for either mouse or
+    // keyboard activation, including cancelling an uncreated issue brief.
+    database.exec("BEGIN IMMEDIATE");
+    for (let repetition = 0; repetition < 3; repetition++) {
+      await open();
+      const back = await click("board-detail-back");
+      expect(field(back.observed, "state", "board", "savePending")).toBe(false);
+      expect(field(back.observed, "state", "route", "view")).toBe("board");
+      expect(await boardBounds()).toEqual(idleBounds);
+    }
+    database.exec("ROLLBACK");
+    await open();
+    await call({ type: "act", action: "focus", target: { id: "board-detail-back" } });
+    const keyboardBack = await call({ type: "key", chord: "enter" });
+    expect(field(keyboardBack.observed, "state", "board", "savePending")).toBe(false);
+    await call({ type: "invoke", verb: "newTask", args: {} });
+    const canceled = await click("new-task-cancel");
+    expect(field(canceled.observed, "state", "board", "savePending")).toBe(false);
+
+    // Hold this disposable database's write lock so real save state remains
+    // observable. Back must immediately flush a real edit before its debounce.
+    await open();
+    database.exec("BEGIN IMMEDIATE");
+    const edited = await replaceTitle("Immediate Back edit");
+    // Native RPC framing includes observation/paint overhead. Assert the
+    // actual pending-edit state, then issue Back with no intervening wait.
+    expect(field(edited.observed, "state", "board", "savePending")).toBe(false);
+    const editedBack = await click("board-detail-back");
+    expect(field(editedBack.observed, "state", "board", "savePending")).toBe(true);
+    expect(await boardBounds()).toEqual(idleBounds);
+    database.exec("COMMIT");
+    await wait({ on: "state", pointer: "/board/savePending", equals: false });
+    expect(savedTitle()).toBe("Immediate Back edit");
+    expect(await boardBounds()).toEqual(idleBounds);
+    // A fresh pending-state wait spans the retired 300 ms debounce timer.
+    // It must time out: an acknowledgment may not be followed by a second
+    // navigation-triggered save, even when the catalog itself is unchanged.
+    const duplicate = await client.automation({ type: "wait", sessionId, condition: {
+      on: "state", pointer: "/board/savePending", equals: true,
+    }, timeoutMs: 500 });
+    if (duplicate.type !== "wait") throw new Error("unexpected duplicate-save wait response");
+    const duplicateResult = duplicate.wait.status === "pending"
+      ? await events.find(message => message.type === "waitResolved" && message.wait.waitId === duplicate.wait.waitId)
+      : undefined;
+    const retiredTimer = duplicateResult?.type === "waitResolved" ? duplicateResult.wait : duplicate.wait;
+    expect(retiredTimer.status).toBe("failed");
+    expect(retiredTimer.error?.code).toBe("wait_timeout");
+
+    // A second edit made while the first acknowledgment is held must survive
+    // coalescing, and retiring the first timer must not discard the new edit.
+    await open();
+    database.exec("BEGIN IMMEDIATE");
+    await replaceTitle("First in-flight edit");
+    await wait({ on: "state", pointer: "/board/savePending", equals: true });
+    await replaceTitle("Newest in-flight edit");
+    await click("board-detail-back");
+    expect(await boardBounds()).toEqual(idleBounds);
+    database.exec("COMMIT");
+    await wait({ on: "state", pointer: "/board/savePending", equals: false });
+    expect(savedTitle()).toBe("Newest in-flight edit");
+    await open();
+    const afterSaveBack = await click("board-detail-back");
+    expect(field(afterSaveBack.observed, "state", "board", "savePending")).toBe(false);
+
+    // Failure remains actionable in the same slot without pushing filters.
+    database.exec("CREATE TRIGGER rpa_reject_exit_edit BEFORE INSERT ON tasks WHEN NEW.title = 'Rejected Board edit' BEGIN SELECT RAISE(ABORT, 'rpa deliberate Board exit save failure'); END");
+    await open();
+    await replaceTitle("Rejected Board edit");
+    await click("board-detail-back");
+    await wait({ on: "stateContains", pointer: "/board/saveError", contains: "rpa deliberate Board exit save failure" });
+    await wait({ on: "node", id: "task-save-retry", present: true });
+    expect(await boardBounds()).toEqual(idleBounds);
+    database.exec("DROP TRIGGER rpa_reject_exit_edit");
+    await click("task-save-retry");
+    await wait({ on: "state", pointer: "/board/savePending", equals: false });
+    await wait({ on: "state", pointer: "/board/saveError", equals: null });
+    expect(savedTitle()).toBe("Rejected Board edit");
+    expect(await boardBounds()).toEqual(idleBounds);
+
+    // The Back target remains reachable when the sidebar cannot own focus.
+    await call({ type: "invoke", verb: "togglePanel", args: { panel: "sidebar" } });
+    await open();
+    await click("board-detail-back");
+    await wait({ on: "node", id: "board-new-issue", present: true });
+    const focusedCreate = await call({ type: "key", chord: "enter" });
+    expect(field(focusedCreate.observed, "state", "board", "newTaskDraft")).toBeString();
+    await click("new-task-cancel");
+    expect(savedTitle()).toBe("Rejected Board edit");
+  } finally {
+    if (database?.inTransaction) database.exec("ROLLBACK");
+    database?.exec("DROP TRIGGER IF EXISTS rpa_reject_exit_edit");
+    database?.close();
     events?.close();
     if (sessionId) await client.automation({ type: "detach", sessionId }).catch(() => {});
     if (scratchId) await client.automation({ type: "scratchRemove", instanceId: scratchId }).catch(() => {});

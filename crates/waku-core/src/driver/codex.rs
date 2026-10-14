@@ -44,6 +44,7 @@ const DISABLE_CODEX_NODE_REPL: &str = "mcp_servers.node_repl.enabled=false";
 
 enum CommandMessage {
     Prompt(String),
+    Review(String),
     Steer(String),
     Cancel,
     Respond {
@@ -71,6 +72,37 @@ enum CommandMessage {
     },
     GeneratedTitle(String),
     Shutdown,
+}
+
+/// A native review stays pending through its terminal turn event. Its output
+/// must never be advertised as complete merely because an exit item arrived.
+#[derive(Default)]
+struct ReviewRpcState {
+    pending: Option<PendingReview>,
+}
+
+struct PendingReview {
+    request_id: Option<u64>,
+    turn_id: Option<String>,
+    entered: bool,
+    output: Option<String>,
+    cancelled: bool,
+    interrupt_sent: bool,
+    error: Option<String>,
+}
+
+impl PendingReview {
+    fn new(request_id: u64) -> Self {
+        Self {
+            request_id: Some(request_id),
+            turn_id: None,
+            entered: false,
+            output: None,
+            cancelled: false,
+            interrupt_sent: false,
+            error: None,
+        }
+    }
 }
 
 struct CodexTitleRequest {
@@ -130,12 +162,54 @@ impl BackgroundRpcState {
     }
 }
 
+/// Chat turns carry option overrides; native review turns do not. Remember
+/// when a thread needs restart/resume for a truthful option change.
+struct CodexOptionState {
+    current: SessionOptions,
+    reviewed: bool,
+    resume_history_pending: bool,
+}
+
+impl CodexOptionState {
+    fn observe_opened_thread(&mut self, response: &Value) {
+        let Some(thread) = response.pointer("/result/thread") else {
+            return;
+        };
+        self.reviewed |= thread
+            .get("turns")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|turn| {
+                turn.get("items")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .any(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("enteredReviewMode" | "exitedReviewMode")
+                )
+            });
+        self.resume_history_pending = false;
+    }
+
+    fn needs_restart(&self, options: &SessionOptions) -> bool {
+        (self.reviewed || self.resume_history_pending)
+            && (options.model != self.current.model
+                || options.reasoning_effort != self.current.reasoning_effort
+                || options.service_tier != self.current.service_tier)
+    }
+}
+
 pub struct CodexDriver {
     _automation_repl: Option<Arc<super::automation_repl::AutomationReplConfig>>,
     commands: Sender<CommandMessage>,
     binary: PathBuf,
     cwd: PathBuf,
     mode: RuntimeMode,
+    option_state: Arc<Mutex<CodexOptionState>>,
     computer_use_process_directory: Option<PathBuf>,
     computer_use_server_path: Option<PathBuf>,
     computer_use_preview_monitor: Option<computer_use_runtime::ComputerUsePreviewMonitor>,
@@ -257,6 +331,17 @@ impl CodexDriver {
             }
             None => None,
         };
+        let option_state = Arc::new(Mutex::new(CodexOptionState {
+            current: SessionOptions {
+                mode,
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+                service_tier: service_tier.clone(),
+                context_window: None,
+            },
+            reviewed: false,
+            resume_history_pending: provider_session_id.is_some(),
+        }));
         let computer_use = computer_use_enabled
             .then(CodexComputerUseConfig::load)
             .transpose()?;
@@ -320,6 +405,7 @@ impl CodexDriver {
         let pending_steers = Arc::new(Mutex::new(HashMap::<u64, String>::new()));
         let background_rpcs = Arc::new(Mutex::new(BackgroundRpcState::default()));
         let goal_rpcs = Arc::new(Mutex::new(GoalRpcState::default()));
+        let review_rpcs = Arc::new(Mutex::new(ReviewRpcState::default()));
         let title_generation = Arc::new(Mutex::new(CodexTitleGeneration {
             enabled: provider_session_id.is_none(),
             launched: false,
@@ -333,6 +419,7 @@ impl CodexDriver {
         let writer_pending_steers = pending_steers.clone();
         let writer_background_rpcs = background_rpcs.clone();
         let writer_goal_rpcs = goal_rpcs.clone();
+        let writer_review_rpcs = review_rpcs.clone();
         let writer_title_generation = title_generation.clone();
         let writer_events = events.clone();
         let cwd_string = cwd.display().to_string();
@@ -409,6 +496,11 @@ impl CodexDriver {
                         "sandbox": sandbox,
                         "approvalsReviewer": approvals_reviewer
                     });
+                    apply_codex_thread_review_options(
+                        &mut params,
+                        model.as_deref(),
+                        reasoning_effort.as_deref(),
+                    );
                     if let Some(model) = model.as_deref() {
                         params["model"] = json!(model);
                     }
@@ -428,6 +520,11 @@ impl CodexDriver {
                         "approvalsReviewer": approvals_reviewer,
                         "serviceName": "waku"
                     });
+                    apply_codex_thread_review_options(
+                        &mut params,
+                        model.as_deref(),
+                        reasoning_effort.as_deref(),
+                    );
                     if let Some(model) = model.as_deref() {
                         params["model"] = json!(model);
                     }
@@ -483,6 +580,41 @@ impl CodexDriver {
                                 "params": params
                             })
                         }
+                        CommandMessage::Review(instructions) => {
+                            let Some(thread_id) = wait_for_thread_id(&writer_thread_id) else {
+                                fail_codex_review(
+                                    &writer_events,
+                                    "Codex did not finish opening its review thread.",
+                                );
+                                continue;
+                            };
+                            if writer_turn_id.lock().is_some()
+                                || writer_review_rpcs.lock().pending.is_some()
+                            {
+                                fail_codex_review(
+                                    &writer_events,
+                                    "Codex already has an active turn.",
+                                );
+                                continue;
+                            }
+                            next_request_id += 1;
+                            let request_id = next_request_id;
+                            writer_review_rpcs.lock().pending =
+                                Some(PendingReview::new(request_id));
+                            let message = json!({
+                                "method": "review/start",
+                                "id": request_id,
+                                "params": review_start_params(&thread_id, instructions)
+                            });
+                            if let Err(error) = write_json_line(&mut stdin, &message) {
+                                writer_review_rpcs.lock().pending = None;
+                                fail_codex_review(
+                                    &writer_events,
+                                    &format!("Codex review transport write failed: {error}"),
+                                );
+                            }
+                            continue;
+                        }
                         CommandMessage::Steer(text) => {
                             let (thread_id, active_turn_id) = (
                                 writer_thread_id.lock().clone(),
@@ -529,12 +661,23 @@ impl CodexDriver {
                             continue;
                         }
                         CommandMessage::Cancel => {
+                            if let Some(review) = writer_review_rpcs.lock().pending.as_mut() {
+                                // Keep early Stop requests until the response/start event gives
+                                // us a provider turn id, then send the ordinary interrupt.
+                                if review.interrupt_sent {
+                                    continue;
+                                }
+                                review.cancelled = true;
+                            }
                             let (Some(thread_id), Some(turn_id)) = (
                                 writer_thread_id.lock().clone(),
                                 writer_turn_id.lock().clone(),
                             ) else {
                                 continue;
                             };
+                            if let Some(review) = writer_review_rpcs.lock().pending.as_mut() {
+                                review.interrupt_sent = true;
+                            }
                             next_request_id += 1;
                             json!({
                                 "method": "turn/interrupt",
@@ -767,6 +910,8 @@ impl CodexDriver {
         let reader_pending_steers = pending_steers.clone();
         let reader_background_rpcs = background_rpcs.clone();
         let reader_goal_rpcs = goal_rpcs.clone();
+        let reader_review_rpcs = review_rpcs.clone();
+        let reader_option_state = option_state.clone();
         let reader_title_generation = title_generation;
         let reader_commands = commands.clone();
         let reader_events = events.clone();
@@ -779,6 +924,11 @@ impl CodexDriver {
                         Ok(line) if !line.trim().is_empty() => {
                             match serde_json::from_str::<Value>(&line) {
                                 Ok(value) => {
+                                    if value.get("method").is_none()
+                                        && value.get("id").and_then(Value::as_u64) == Some(1)
+                                    {
+                                        reader_option_state.lock().observe_opened_thread(&value);
+                                    }
                                     let main_turn_started = is_codex_turn_started(
                                         &value,
                                         reader_thread_id.lock().as_deref(),
@@ -792,6 +942,7 @@ impl CodexDriver {
                                         &reader_pending_steers,
                                         &reader_background_rpcs,
                                         &reader_goal_rpcs,
+                                        &reader_review_rpcs,
                                         &reader_commands,
                                         &reader_events,
                                         &mut stream_state,
@@ -896,6 +1047,7 @@ impl CodexDriver {
             binary,
             cwd,
             mode,
+            option_state,
             computer_use_process_directory,
             computer_use_server_path,
             computer_use_preview_monitor,
@@ -1020,6 +1172,16 @@ fn handle_goal_response(
 }
 
 impl DriverControl for CodexDriver {
+    fn review(&self, prompt: String) -> anyhow::Result<()> {
+        if prompt.trim().is_empty() {
+            anyhow::bail!("review instructions cannot be empty");
+        }
+        self.option_state.lock().reviewed = true;
+        self.commands
+            .send(CommandMessage::Review(prompt))
+            .map_err(|_| anyhow!("Codex review transport is closed"))
+    }
+
     fn prompt(&self, prompt: String) {
         let _ = self.commands.send(CommandMessage::Prompt(prompt));
     }
@@ -1079,10 +1241,22 @@ impl DriverControl for CodexDriver {
         // same way even though they are also per-turn fields: loosening or
         // tightening what an already-running agent may touch deserves a fresh
         // thread, so a mode change asks to be restarted instead.
-        if options.mode != self.mode {
+        let mut state = self.option_state.lock();
+        if options.mode != self.mode || state.needs_restart(&options) {
             return false;
         }
-        self.commands.send(CommandMessage::Options(options)).is_ok()
+        // review/start has no model, effort or tier fields. Once native review
+        // has been used, a changed selection must reopen this Codex thread with
+        // thread/resume overrides rather than only update turn/start defaults.
+        if self
+            .commands
+            .send(CommandMessage::Options(options.clone()))
+            .is_err()
+        {
+            return false;
+        }
+        state.current = options;
+        true
     }
 
     fn rollback(&self, turns: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
@@ -1355,6 +1529,46 @@ fn normalize_codex_title(raw: &str) -> Option<String> {
     let title = title.chars().take(80).collect::<String>();
     let title = title.trim_end().to_owned();
     (!title.is_empty()).then_some(title)
+}
+
+fn apply_codex_thread_review_options(
+    params: &mut Value,
+    model: Option<&str>,
+    effort: Option<&str>,
+) {
+    // ReviewTask prefers config.review_model over the thread's model. An
+    // explicit Doki selection must therefore override both, for this thread
+    // only. No selection leaves the user's configured review model untouched.
+    if let Some(model) = model {
+        params["config"]["review_model"] = json!(model);
+    }
+    if let Some(effort) = effort {
+        params["config"]["model_reasoning_effort"] = json!(effort);
+    }
+}
+
+fn review_start_params(thread_id: &str, instructions: String) -> Value {
+    json!({
+        "threadId": thread_id,
+        "delivery": "inline",
+        "target": {"type": "custom", "instructions": instructions}
+    })
+}
+
+fn is_displayable_review(text: &str) -> bool {
+    let text = text.trim();
+    // Codex's public item builder uses this sentinel when the reviewer did
+    // not produce output; it is not a successful empty-findings review.
+    !text.is_empty() && text != "Reviewer failed to output a response."
+}
+
+fn fail_codex_review(events: &impl DriverEventSink, message: &str) {
+    let _ = events.send(DriverEvent::Error(message.to_owned()));
+    let _ = events.send(DriverEvent::TurnFinished {
+        success: false,
+        interrupted: false,
+        summary: Some(message.to_owned()),
+    });
 }
 
 fn wait_for_thread_id(thread_id: &Mutex<Option<String>>) -> Option<String> {
@@ -1662,6 +1876,7 @@ fn handle_codex_message(
     pending_steers: &Mutex<HashMap<u64, String>>,
     background_rpcs: &Mutex<BackgroundRpcState>,
     goal_rpcs: &Mutex<GoalRpcState>,
+    review_rpcs: &Mutex<ReviewRpcState>,
     commands: &Sender<CommandMessage>,
     events: &impl DriverEventSink,
     stream_state: &mut CodexStreamState,
@@ -1670,6 +1885,47 @@ fn handle_codex_message(
     // the same numeric ID as one of Waku's earlier requests. Only messages
     // without a method are responses to Waku-originated requests.
     let is_response = value.get("method").is_none();
+    if is_response
+        && let Some(id) = value.get("id").and_then(Value::as_u64)
+        && review_rpcs
+            .lock()
+            .pending
+            .as_ref()
+            .is_some_and(|review| review.request_id == Some(id))
+    {
+        if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
+            review_rpcs.lock().pending = None;
+            fail_codex_review(events, error);
+        } else if let Some(id) = value.pointer("/result/turn/id").and_then(Value::as_str) {
+            if value
+                .pointer("/result/reviewThreadId")
+                .and_then(Value::as_str)
+                != thread_id.lock().as_deref()
+            {
+                review_rpcs.lock().pending = None;
+                fail_codex_review(
+                    events,
+                    "Codex returned a different thread for an inline review.",
+                );
+                return;
+            }
+            *turn_id.lock() = Some(id.to_owned());
+            let cancelled = {
+                let mut state = review_rpcs.lock();
+                let review = state.pending.as_mut().expect("review response is pending");
+                review.request_id = None;
+                review.turn_id = Some(id.to_owned());
+                review.cancelled && !review.interrupt_sent
+            };
+            if cancelled {
+                let _ = commands.send(CommandMessage::Cancel);
+            }
+        } else {
+            review_rpcs.lock().pending = None;
+            fail_codex_review(events, "Codex returned no turn for the review request.");
+        }
+        return;
+    }
     let pending_goal = is_response
         .then(|| value.get("id").and_then(Value::as_u64))
         .flatten()
@@ -1813,11 +2069,42 @@ fn handle_codex_message(
     };
     let params = value.get("params").cloned().unwrap_or(Value::Null);
 
+    if method.starts_with("turn/") || method.starts_with("item/") {
+        let state = review_rpcs.lock();
+        if let Some(review) = state.pending.as_ref() {
+            if let Some(event_thread) = params.get("threadId").and_then(Value::as_str)
+                && thread_id.lock().as_deref() != Some(event_thread)
+            {
+                return;
+            }
+            if let Some(event_turn) = params
+                .get("turnId")
+                .or_else(|| params.pointer("/turn/id"))
+                .and_then(Value::as_str)
+                && review.turn_id.as_deref().is_some_and(|id| id != event_turn)
+            {
+                return;
+            }
+        }
+    }
+
     match method {
         "turn/started" => {
             stream_state.begin_turn();
             if let Some(id) = params.pointer("/turn/id").and_then(Value::as_str) {
                 *turn_id.lock() = Some(id.to_owned());
+                let cancel_review = {
+                    let mut state = review_rpcs.lock();
+                    if let Some(review) = state.pending.as_mut() {
+                        review.turn_id = Some(id.to_owned());
+                        review.cancelled && !review.interrupt_sent
+                    } else {
+                        false
+                    }
+                };
+                if cancel_review {
+                    let _ = commands.send(CommandMessage::Cancel);
+                }
                 let mut turn_ids = turn_ids.lock();
                 if turn_ids.last().is_none_or(|last| last != id) {
                     turn_ids.push(id.to_owned());
@@ -1883,6 +2170,31 @@ fn handle_codex_message(
             if let Some(item) = params.get("item") {
                 stream_state.capture_citations(item);
                 let complete = method == "item/completed";
+                if let Some(review) = review_rpcs.lock().pending.as_mut() {
+                    let matching_turn =
+                        params
+                            .get("turnId")
+                            .and_then(Value::as_str)
+                            .is_none_or(|id| {
+                                review.turn_id.as_deref().is_none_or(|active| id == active)
+                            });
+                    if matching_turn {
+                        match item.get("type").and_then(Value::as_str) {
+                            Some("enteredReviewMode") if !complete && !review.entered => {
+                                review.entered = true;
+                                let _ = events.send(DriverEvent::ReviewStarted);
+                            }
+                            Some("exitedReviewMode") if complete => {
+                                review.output = item
+                                    .get("review")
+                                    .and_then(Value::as_str)
+                                    .filter(|text| is_displayable_review(text))
+                                    .map(str::to_owned);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if let Some(work) = codex_command_work(item, complete) {
                     let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
                         work,
@@ -1918,19 +2230,55 @@ fn handle_codex_message(
             }
         }
         "turn/completed" => {
+            if let Some(id) = params.pointer("/turn/id").and_then(Value::as_str)
+                && review_rpcs.lock().pending.as_ref().is_some_and(|review| {
+                    review.turn_id.as_deref().is_some_and(|active| active != id)
+                })
+            {
+                return;
+            }
             stream_state.citation_buffer.clear();
             *turn_id.lock() = None;
             let status = params
                 .pointer("/turn/status")
                 .and_then(Value::as_str)
                 .unwrap_or("completed");
-            let error = params
+            let mut error = params
                 .pointer("/turn/error/message")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            let review = {
+                let mut state = review_rpcs.lock();
+                let matching = state.pending.as_ref().is_some_and(|review| {
+                    params
+                        .pointer("/turn/id")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| {
+                            review.turn_id.as_deref().is_none_or(|active| id == active)
+                        })
+                });
+                matching.then(|| state.pending.take()).flatten()
+            };
+            let mut success = status == "completed";
+            let mut interrupted = status == "interrupted";
+            if let Some(review) = review {
+                interrupted |= review.cancelled;
+                success &= !interrupted && review.error.is_none();
+                if error.is_none() {
+                    error = review.error;
+                }
+                if success {
+                    if let Some(review) = review.output {
+                        let _ = events.send(DriverEvent::ReviewCompleted { review });
+                    } else {
+                        success = false;
+                        error = Some("Codex review finished without a review result.".to_owned());
+                    }
+                }
+            }
             let _ = events.send(DriverEvent::TurnFinished {
-                interrupted: false,
-                success: status == "completed",
+                interrupted,
+                success,
                 summary: error,
             });
         }
@@ -1981,7 +2329,29 @@ fn handle_codex_message(
             }
         }
         "error" => {
-            if let Some(message) = params.get("message").and_then(Value::as_str) {
+            if let Some(event_thread) = params.get("threadId").and_then(Value::as_str)
+                && thread_id.lock().as_deref() != Some(event_thread)
+            {
+                return;
+            }
+            if let Some(message) = params
+                .pointer("/error/message")
+                .or_else(|| params.get("message"))
+                .and_then(Value::as_str)
+            {
+                if params.get("willRetry").and_then(Value::as_bool) != Some(true)
+                    && let Some(review) = review_rpcs.lock().pending.as_mut()
+                {
+                    if params
+                        .get("turnId")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| {
+                            review.turn_id.as_deref().is_none_or(|active| active == id)
+                        })
+                    {
+                        review.error = Some(message.to_owned());
+                    }
+                }
                 let _ = events.send(DriverEvent::Error(message.to_owned()));
             }
         }
@@ -2698,6 +3068,7 @@ mod tests {
         steers: Mutex<HashMap<u64, String>>,
         background: Mutex<BackgroundRpcState>,
         goals: Mutex<GoalRpcState>,
+        reviews: Mutex<ReviewRpcState>,
         commands: Sender<CommandMessage>,
         command_rx: crossbeam_channel::Receiver<CommandMessage>,
         events: crate::driver::DriverEventSender,
@@ -2716,6 +3087,7 @@ mod tests {
                 steers: Mutex::new(HashMap::new()),
                 background: Mutex::new(BackgroundRpcState::default()),
                 goals: Mutex::new(GoalRpcState::default()),
+                reviews: Mutex::new(ReviewRpcState::default()),
                 commands,
                 command_rx,
                 events,
@@ -2734,11 +3106,439 @@ mod tests {
                 &self.steers,
                 &self.background,
                 &self.goals,
+                &self.reviews,
                 &self.commands,
                 &self.events,
                 &mut stream_state,
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_native_review_fixture_preserves_scope_settings_and_settlement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (instructions, resume) in [
+            ("Review uncommitted changes. Issue: repair auth.", false),
+            ("REFUSE_REVIEW", false),
+            ("WAIT_FOR_CANCEL", false),
+            ("Review uncommitted changes. Issue: repair auth.", true),
+        ] {
+            let directory =
+                std::env::temp_dir().join(format!("waku-codex-review-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            let binary = directory.join("codex");
+            fs::write(&binary, include_str!("fixtures/codex_review.sh")).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+            let (events, received) = crate::driver::test_event_channel();
+            let driver = CodexDriver::start(
+                DriverStartOptions {
+                    binary,
+                    cwd: directory.clone(),
+                    mode: RuntimeMode::Ask,
+                    model: Some("fixture-model".into()),
+                    reasoning_effort: Some("high".into()),
+                    service_tier: None,
+                    context_window: None,
+                    agent_preset: None,
+                    computer_use_enabled: false,
+                    provider_cursor: resume.then(|| ProviderResumeCursor::Codex {
+                        thread_id: "review-thread".into(),
+                    }),
+                },
+                events,
+            )
+            .unwrap();
+            assert!(
+                matches!(received.recv_timeout(Duration::from_secs(5)).unwrap(), DriverEvent::Connected { provider_cursor: Some(ProviderResumeCursor::Codex { thread_id }) } if thread_id == "review-thread")
+            );
+            if resume {
+                assert!(
+                    !driver.apply_options(session_options(RuntimeMode::Ask, "changed-model")),
+                    "resumed reviews must reopen for model changes"
+                );
+            }
+            driver.review(instructions.to_owned()).unwrap();
+            assert!(
+                !driver.apply_options(session_options(RuntimeMode::Ask, "changed-model")),
+                "native reviews cannot accept turn/start-only option changes"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut results = Vec::new();
+            let mut review_started = false;
+            let mut refused = false;
+            loop {
+                match received
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                {
+                    DriverEvent::ReviewStarted => {
+                        review_started = true;
+                        if instructions == "WAIT_FOR_CANCEL" {
+                            driver.cancel();
+                        }
+                    }
+                    DriverEvent::ReviewCompleted { review } => results.push(review),
+                    DriverEvent::TextDelta(_) => {
+                        panic!("review result must not be duplicated as text")
+                    }
+                    DriverEvent::TurnFinished {
+                        success,
+                        interrupted,
+                        ..
+                    } => {
+                        assert_eq!(
+                            success,
+                            !instructions.starts_with("REFUSE")
+                                && instructions != "WAIT_FOR_CANCEL"
+                        );
+                        assert_eq!(interrupted, instructions == "WAIT_FOR_CANCEL");
+                        break;
+                    }
+                    DriverEvent::Error(message) => {
+                        assert_eq!(
+                            instructions, "REFUSE_REVIEW",
+                            "unexpected provider error: {message}"
+                        );
+                        refused = true;
+                    }
+                    DriverEvent::ProcessExited => panic!("fixture exited before settling review"),
+                    _ => {}
+                }
+            }
+            assert_eq!(review_started, instructions != "REFUSE_REVIEW");
+            assert_eq!(refused, instructions == "REFUSE_REVIEW");
+            if instructions.starts_with("Review ") {
+                assert_eq!(results, vec!["No blocking findings."]);
+            } else {
+                assert!(results.is_empty());
+            }
+            drop(driver);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !matches!(
+                received
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap(),
+                DriverEvent::ProcessExited
+            ) {}
+            let requests = fs::read_to_string(directory.join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let opens = requests
+                .iter()
+                .filter(|request| {
+                    request["method"] == "thread/start" || request["method"] == "thread/resume"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                opens.len(),
+                1,
+                "review must not run a title-generation turn"
+            );
+            assert_eq!(
+                opens[0]["method"],
+                if resume {
+                    "thread/resume"
+                } else {
+                    "thread/start"
+                }
+            );
+            assert_eq!(opens[0]["params"]["model"], "fixture-model");
+            assert_eq!(
+                opens[0]["params"]["config"]["review_model"],
+                "fixture-model"
+            );
+            assert_eq!(
+                opens[0]["params"]["config"]["model_reasoning_effort"],
+                "high"
+            );
+            assert!(
+                !requests
+                    .iter()
+                    .any(|request| request["method"] == "turn/start")
+            );
+            if instructions == "WAIT_FOR_CANCEL" {
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request["method"] == "turn/interrupt")
+                        .count(),
+                    1
+                );
+            }
+            let review = requests
+                .iter()
+                .find(|request| request["method"] == "review/start")
+                .unwrap();
+            assert_eq!(
+                review["params"],
+                review_start_params("review-thread", instructions.to_owned())
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn review_request_uses_native_custom_target_and_thread_effort() {
+        let params = review_start_params(
+            "review-thread",
+            "Review staged changes.\nIssue: repair auth.".into(),
+        );
+        assert_eq!(
+            params,
+            json!({
+                "threadId": "review-thread", "delivery": "inline",
+                "target": {"type": "custom", "instructions": "Review staged changes.\nIssue: repair auth."}
+            })
+        );
+        assert!(params.get("input").is_none());
+        let mut thread = json!({"cwd": "/tmp/repo"});
+        apply_codex_thread_review_options(&mut thread, Some("selected-review-model"), Some("high"));
+        assert_eq!(thread["config"]["model_reasoning_effort"], "high");
+        assert_eq!(thread["config"]["review_model"], "selected-review-model");
+        let mut configured_thread = json!({"config":{"review_model":"configured-review-model"}});
+        apply_codex_thread_review_options(&mut configured_thread, None, Some("low"));
+        assert_eq!(
+            configured_thread["config"]["review_model"],
+            "configured-review-model"
+        );
+        let mut default_thread = json!({"cwd": "/tmp/repo"});
+        apply_codex_thread_review_options(&mut default_thread, None, None);
+        assert!(default_thread.get("config").is_none());
+    }
+
+    fn review_harness() -> GoalHarness {
+        let harness = GoalHarness::new();
+        harness.reviews.lock().pending = Some(PendingReview::new(42));
+        harness.handle(json!({"id":42,"result":{
+            "reviewThreadId":"thread-1", "turn":{"id":"review-turn","status":"inProgress"}
+        }}));
+        harness.handle(json!({"method":"turn/started","params":{
+            "threadId":"thread-1", "turn":{"id":"review-turn"}
+        }}));
+        assert!(matches!(
+            harness.received.try_recv(),
+            Ok(DriverEvent::TurnStarted)
+        ));
+        harness
+    }
+
+    fn review_item(harness: &GoalHarness, method: &str, kind: &str, review: &str) {
+        harness.handle(json!({"method": method,"params":{
+            "threadId":"thread-1", "turnId":"review-turn",
+            "item":{"id":"review-item", "type":kind,"review":review}
+        }}));
+    }
+
+    fn finish_review(harness: &GoalHarness, status: &str) {
+        harness.handle(json!({"method":"turn/completed","params":{
+            "threadId":"thread-1", "turn":{"id":"review-turn","status":status}
+        }}));
+    }
+
+    #[test]
+    fn review_emits_result_once_only_after_successful_turn_settlement() {
+        let harness = review_harness();
+        review_item(
+            &harness,
+            "item/started",
+            "enteredReviewMode",
+            "Issue review",
+        );
+        review_item(
+            &harness,
+            "item/completed",
+            "enteredReviewMode",
+            "Issue review",
+        );
+        assert!(matches!(
+            harness.received.try_recv(),
+            Ok(DriverEvent::ReviewStarted)
+        ));
+        review_item(
+            &harness,
+            "item/started",
+            "exitedReviewMode",
+            "No blocking findings.",
+        );
+        review_item(
+            &harness,
+            "item/completed",
+            "exitedReviewMode",
+            "No blocking findings.",
+        );
+        review_item(
+            &harness,
+            "item/completed",
+            "exitedReviewMode",
+            "No blocking findings.",
+        );
+        assert!(
+            harness.received.try_recv().is_err(),
+            "an exit item is not settlement"
+        );
+        finish_review(&harness, "completed");
+        assert!(
+            matches!(harness.received.try_recv(), Ok(DriverEvent::ReviewCompleted { review }) if review == "No blocking findings.")
+        );
+        assert!(matches!(
+            harness.received.try_recv(),
+            Ok(DriverEvent::TurnFinished {
+                success: true,
+                interrupted: false,
+                ..
+            })
+        ));
+        assert!(
+            harness.received.try_recv().is_err(),
+            "no duplicate text delta"
+        );
+        assert!(harness.reviews.lock().pending.is_none());
+    }
+
+    #[test]
+    fn failed_and_interrupted_reviews_never_emit_completed_results() {
+        for status in ["failed", "interrupted"] {
+            let harness = review_harness();
+            review_item(
+                &harness,
+                "item/completed",
+                "exitedReviewMode",
+                "Partial findings",
+            );
+            finish_review(&harness, status);
+            assert!(
+                matches!(harness.received.try_recv(), Ok(DriverEvent::TurnFinished { success:false, interrupted, .. }) if interrupted == (status == "interrupted"))
+            );
+            assert!(harness.received.try_recv().is_err());
+        }
+        let harness = review_harness();
+        harness.reviews.lock().pending.as_mut().unwrap().cancelled = true;
+        review_item(
+            &harness,
+            "item/completed",
+            "exitedReviewMode",
+            "Late findings",
+        );
+        finish_review(&harness, "completed");
+        assert!(matches!(
+            harness.received.try_recv(),
+            Ok(DriverEvent::TurnFinished {
+                success: false,
+                interrupted: true,
+                ..
+            })
+        ));
+        assert!(harness.received.try_recv().is_err());
+    }
+
+    #[test]
+    fn missing_or_provider_fallback_review_results_are_failures() {
+        for text in ["", "   ", "Reviewer failed to output a response."] {
+            let harness = review_harness();
+            review_item(&harness, "item/completed", "exitedReviewMode", text);
+            finish_review(&harness, "completed");
+            assert!(matches!(
+                harness.received.try_recv(),
+                Ok(DriverEvent::TurnFinished {
+                    success: false,
+                    summary: Some(_),
+                    ..
+                })
+            ));
+            assert!(harness.received.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn review_rpc_refusal_settles_the_submitted_turn() {
+        let harness = GoalHarness::new();
+        harness.reviews.lock().pending = Some(PendingReview::new(42));
+        harness.handle(json!({"id":42,"error":{"message":"review unavailable"}}));
+        assert!(
+            matches!(harness.received.try_recv(), Ok(DriverEvent::Error(message)) if message == "review unavailable")
+        );
+        assert!(matches!(
+            harness.received.try_recv(),
+            Ok(DriverEvent::TurnFinished {
+                success: false,
+                interrupted: false,
+                ..
+            })
+        ));
+        assert!(harness.reviews.lock().pending.is_none());
+    }
+
+    #[test]
+    fn review_results_ignore_other_threads_and_stale_turns() {
+        let harness = review_harness();
+        harness.handle(json!({"method":"item/completed","params":{
+            "threadId":"other-thread", "turnId":"review-turn", "item":{
+                "type":"exitedReviewMode","review":"Not ours"
+            }
+        }}));
+        harness.handle(json!({"method":"turn/completed","params":{
+            "threadId":"thread-1", "turn":{"id":"older-turn","status":"completed"}
+        }}));
+        assert!(harness.received.try_recv().is_err());
+        assert!(
+            harness
+                .reviews
+                .lock()
+                .pending
+                .as_ref()
+                .unwrap()
+                .output
+                .is_none()
+        );
+        review_item(&harness, "item/completed", "exitedReviewMode", "Ours");
+        finish_review(&harness, "completed");
+        assert!(
+            matches!(harness.received.try_recv(), Ok(DriverEvent::ReviewCompleted { review }) if review == "Ours")
+        );
+    }
+
+    #[test]
+    fn early_review_stop_is_replayed_once_a_turn_id_is_known() {
+        let harness = GoalHarness::new();
+        let mut review = PendingReview::new(42);
+        review.cancelled = true;
+        harness.reviews.lock().pending = Some(review);
+        harness.handle(json!({"id":42,"result":{
+            "reviewThreadId":"thread-1", "turn":{"id":"review-turn","status":"inProgress"}
+        }}));
+        assert!(matches!(
+            harness.command_rx.try_recv(),
+            Ok(CommandMessage::Cancel)
+        ));
+        assert_eq!(harness.turn_id.lock().as_deref(), Some("review-turn"));
+    }
+
+    #[test]
+    fn terminal_review_error_cannot_be_followed_by_success() {
+        let harness = review_harness();
+        harness.handle(json!({"method":"error","params":{
+            "threadId":"thread-1", "turnId":"review-turn", "willRetry":false,
+            "error":{"message":"review provider failed"}
+        }}));
+        assert!(matches!(
+            harness.received.try_recv(),
+            Ok(DriverEvent::Error(_))
+        ));
+        review_item(
+            &harness,
+            "item/completed",
+            "exitedReviewMode",
+            "Partial findings",
+        );
+        finish_review(&harness, "completed");
+        assert!(
+            matches!(harness.received.try_recv(), Ok(DriverEvent::TurnFinished { success:false, summary:Some(message), .. }) if message == "review provider failed")
+        );
+        assert!(harness.received.try_recv().is_err());
     }
 
     fn goal_json() -> Value {
@@ -2999,6 +3799,62 @@ mod tests {
     }
 
     #[test]
+    fn native_review_options_require_restart_only_when_the_selection_changes() {
+        let options = session_options(RuntimeMode::Ask, "model-a");
+        let state = CodexOptionState {
+            current: options.clone(),
+            reviewed: true,
+            resume_history_pending: false,
+        };
+        assert!(!state.needs_restart(&options));
+        assert!(state.needs_restart(&session_options(RuntimeMode::Ask, "model-b")));
+        let mut changed = options.clone();
+        changed.reasoning_effort = Some("high".into());
+        assert!(state.needs_restart(&changed));
+        changed = options.clone();
+        changed.service_tier = Some("fast".into());
+        assert!(state.needs_restart(&changed));
+    }
+
+    #[test]
+    fn resumed_native_review_history_preserves_option_restart_requirement() {
+        let options = session_options(RuntimeMode::Ask, "model-a");
+        let changed = session_options(RuntimeMode::Ask, "model-b");
+        let mut state = CodexOptionState {
+            current: options,
+            reviewed: false,
+            resume_history_pending: true,
+        };
+        assert!(
+            state.needs_restart(&changed),
+            "opening history cannot accept stale defaults"
+        );
+        state.observe_opened_thread(&json!({"result":{"thread":{"turns":[
+            {"id":"review-turn","items":[{"type":"exitedReviewMode","review":"Finding"}]}
+        ]}}}));
+        assert!(!state.resume_history_pending);
+        assert!(state.needs_restart(&changed));
+    }
+
+    #[test]
+    fn ordinary_resumed_chat_can_still_apply_turn_options_in_place() {
+        let mut state = CodexOptionState {
+            current: session_options(RuntimeMode::Ask, "model-a"),
+            reviewed: false,
+            resume_history_pending: true,
+        };
+        state.observe_opened_thread(&json!({"result":{"thread":{"turns":[
+            {"id":"chat-turn","items":[{"type":"agentMessage","text":"Done"}]}
+        ]}}}));
+        assert!(!state.needs_restart(&session_options(RuntimeMode::Ask, "model-b")));
+        // A review submitted while opening the thread cannot be forgotten by
+        // the later empty thread/start response.
+        state.reviewed = true;
+        state.observe_opened_thread(&json!({"result":{"thread":{"turns":[]}}}));
+        assert!(state.needs_restart(&session_options(RuntimeMode::Ask, "model-b")));
+    }
+
+    #[test]
     fn model_changes_reach_the_running_thread_but_mode_changes_ask_for_a_restart() {
         let (commands, command_rx) = unbounded();
         let driver = CodexDriver {
@@ -3006,6 +3862,11 @@ mod tests {
             binary: PathBuf::from("codex"),
             cwd: std::env::temp_dir(),
             mode: RuntimeMode::FullAccess,
+            option_state: Arc::new(Mutex::new(CodexOptionState {
+                current: session_options(RuntimeMode::FullAccess, "gpt-5-codex"),
+                reviewed: false,
+                resume_history_pending: false,
+            })),
             computer_use_process_directory: None,
             computer_use_server_path: None,
             computer_use_preview_monitor: None,
@@ -3192,6 +4053,7 @@ mod tests {
                 &pending_steers,
                 &background_rpcs,
                 &goal_rpcs,
+                &Mutex::new(ReviewRpcState::default()),
                 &goal_commands,
                 &event_tx,
                 &mut stream_state,
@@ -3261,6 +4123,7 @@ mod tests {
             &pending_steers,
             &background_rpcs,
             &goal_rpcs,
+            &Mutex::new(ReviewRpcState::default()),
             &goal_commands,
             &event_tx,
             &mut stream_state,
@@ -3296,6 +4159,7 @@ mod tests {
             &pending_steers,
             &background_rpcs,
             &goal_rpcs,
+            &Mutex::new(ReviewRpcState::default()),
             &goal_commands,
             &event_tx,
             &mut stream_state,
@@ -3348,6 +4212,7 @@ mod tests {
                 &pending_steers,
                 &background_rpcs,
                 &goal_rpcs,
+                &Mutex::new(ReviewRpcState::default()),
                 &goal_commands,
                 &event_tx,
                 &mut stream_state,
@@ -3393,6 +4258,7 @@ mod tests {
             &pending_steers,
             &background_rpcs,
             &goal_rpcs,
+            &Mutex::new(ReviewRpcState::default()),
             &goal_commands,
             &event_tx,
             &mut stream_state,
@@ -3431,6 +4297,7 @@ mod tests {
             &pending_steers,
             &background_rpcs,
             &goal_rpcs,
+            &Mutex::new(ReviewRpcState::default()),
             &goal_commands,
             &event_tx,
             &mut stream_state,
@@ -3505,6 +4372,7 @@ mod tests {
             &pending_steers,
             &background_rpcs,
             &goal_rpcs,
+            &Mutex::new(ReviewRpcState::default()),
             &goal_commands,
             &event_tx,
             &mut stream_state,
@@ -3613,6 +4481,7 @@ mod tests {
                 &pending_steers,
                 &background_rpcs,
                 &goal_rpcs,
+                &Mutex::new(ReviewRpcState::default()),
                 &goal_commands,
                 &event_tx,
                 &mut stream_state,

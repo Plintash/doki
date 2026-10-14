@@ -30,7 +30,7 @@ export type Command = { "type": "automation", command: AutomationCommand, } | { 
  * other client attached to the runtime mirrors the same rows instead
  * of minting its own; older clients omit them and the daemon mints.
  */
-turnId?: string | null, messageId?: string | null, } | { "type": "steer", prompt: string, } | { "type": "cancel" } | { "type": "cancelComputerUse" } | { "type": "refreshBackgroundWork" } | { "type": "stopBackgroundWork", key: JsonValue, controlId: string, } | { "type": "respond", requestId: string, optionId: string,
+turnId?: string | null, messageId?: string | null, } | { "type": "review", prompt: string, turnId?: string | null, messageId?: string | null, } | { "type": "steer", prompt: string, } | { "type": "cancel" } | { "type": "cancelComputerUse" } | { "type": "refreshBackgroundWork" } | { "type": "stopBackgroundWork", key: JsonValue, controlId: string, } | { "type": "respond", requestId: string, optionId: string,
 /**
  * An optional explanation to send with the answer. OpenCode forwards
  * a rejection's note to the agent as feedback and keeps the turn

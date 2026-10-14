@@ -10,6 +10,7 @@ import type { QueuedMessage } from "./QueuedMessage";
 import type { ReportedCommand } from "./ReportedCommand";
 import type { RuntimeEventCursor } from "./RuntimeEventCursor";
 import type { RuntimeMode } from "./RuntimeMode";
+import type { SessionReview } from "./SessionReview";
 import type { SessionStatus } from "./SessionStatus";
 import type { SessionWorkspace } from "./SessionWorkspace";
 import type { ThreadGoal } from "./ThreadGoal";
@@ -30,6 +31,16 @@ auto_title?: string | null, project_id: string,
  * The task this conversation is filed under, when the user has filed it.
  */
 task_id?: string | null,
+/**
+ * Present only for an issue-centered native review conversation.
+ */
+review?: SessionReview | null,
+/**
+ * The Codex review this correction conversation originated from. Kept on
+ * the correction itself so rerunning or removing its source review never
+ * turns it into an ordinary development draft.
+ */
+review_correction_source_id?: string | null,
 /**
  * Local project checkout or an isolated Git worktree for this task.
  */

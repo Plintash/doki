@@ -35,6 +35,10 @@ export const sessions = sqliteTable(
     isDraft: integer("is_draft", { mode: "boolean" }).notNull().default(false),
     /** Compact SessionWorkspace JSON for accurate unloaded conversation rows. */
     workspace: text("workspace").notNull().default('{"kind":"local"}'),
+    /** Compact SessionReview JSON; the complete result stays in messages. */
+    review: text("review"),
+    /** Durable source review ID for a correction, independent of review reruns. */
+    reviewCorrectionSourceId: text("review_correction_source_id"),
     /** Explicit user title; "New task" means the automatic fallback is active. */
     title: text("title").notNull(),
     /** Provider-generated title, with the first prompt as a local fallback. */

@@ -128,6 +128,193 @@ describe('promptSubmitted', () => {
   })
 })
 
+describe('native issue review', () => {
+  test('explicit lifecycle stores the full result and a bounded summary under the current turn', () => {
+    let session = reviewSession()
+    session.review!.status = 'draft'
+    session = apply(session, 'reviewStarted', null)
+    expect(session.review?.status).toBe('running')
+    session = apply(session, 'turnStarted', null)
+    session = apply(session, 'textDelta', 'Checking the implementation…')
+    session = apply(session, 'activity', { id: 'read', title: 'Read files', complete: false })
+    const text = `### Findings\n\n${'Detailed 🐈 findings '.repeat(100)}`
+    const result = reduceRuntimeEvent(session, event('reviewCompleted', { review: text }), clock)
+    expect(result.settled).toBe(false)
+    expect(result.session.turns.at(-1)?.status).toBe('running')
+    expect(result.session.review?.status).toBe('completed')
+    const message = result.session.messages.at(-1)!
+    expect(message).toMatchObject({ turn_id: 'turn', role: 'assistant', content: text, streaming: false })
+    expect(result.session.review?.result_message_id).toBe(message.id)
+    expect(result.session.review?.summary).toBe(
+      [...text].slice(0, 400).join('').trim().split(/\s+/u).join(' '),
+    )
+    expect([...result.session.review!.summary!].length).toBeLessThanOrEqual(400)
+    expect(result.session.messages.every((message) => !message.streaming)).toBe(true)
+    const activities = result.session.transcript_blocks[0]!.content
+    if (activities.kind !== 'activities') throw new Error('Expected activities')
+    expect(activities.data.every((activity) => activity.complete)).toBe(true)
+    const settled = apply(result.session, 'turnFinished', { success: true })
+    expect(settled.review?.status).toBe('completed')
+    expect(settled.status).toBe('idle')
+    expect(settled.messages).toEqual(result.session.messages)
+  })
+
+  test('summary retains the words inside the first four hundred characters', () => {
+    const session = apply(reviewSession(), 'reviewCompleted', { review: 'x '.repeat(100) })
+    expect(session.review?.summary).toBe(Array(100).fill('x').join(' '))
+    expect(session.messages.at(-1)?.content).toBe('x '.repeat(100))
+  })
+
+  test('large single tokens produce a bounded summary without splitting Unicode characters', () => {
+    const text = '🐈'.repeat(100_000)
+    const session = apply(reviewSession(), 'reviewCompleted', { review: text })
+    expect(session.review?.summary).toBe('🐈'.repeat(400))
+    expect(session.messages.at(-1)?.content).toBe(text)
+  })
+
+  test('duplicate lifecycle and submission echoes preserve the same result exactly once', () => {
+    let session = apply(reviewSession(), 'reviewCompleted', { review: 'No findings.' })
+    const recorded = JSON.parse(JSON.stringify(session)) as AgentSession
+    session = apply(session, 'reviewStarted', null)
+    session = apply(session, 'promptSubmitted', { message: 'Go', turnId: 'turn', messageId: 'message' })
+    session = apply(session, 'reviewCompleted', { review: 'No findings.' })
+    expect(session.review).toEqual(recorded.review)
+    expect(session.messages).toEqual(recorded.messages)
+    session = apply(session, 'turnFinished', { success: true })
+    const settled = session
+    session = apply(session, 'reviewCompleted', { review: 'No findings.' })
+    expect(session.review).toEqual(settled.review)
+    expect(session.messages).toEqual(settled.messages)
+  })
+
+  test('a new submitted review clears only the previous result and fix link', () => {
+    const previous: AgentSession = {
+      ...idleSession(),
+      review: {
+        target: { kind: 'baseBranch', branch: 'main' },
+        source_session_id: 'development',
+        status: 'completed',
+        summary: 'Old findings',
+        result_message_id: 'reply',
+        fix_session_id: 'fix-conversation',
+      },
+    }
+    const session = apply(previous, 'promptSubmitted', SUBMISSION)
+    expect(session.review).toEqual({
+      target: { kind: 'baseBranch', branch: 'main' },
+      source_session_id: 'development',
+      status: 'running',
+      summary: null,
+      result_message_id: null,
+      fix_session_id: null,
+    })
+    expect(session.turns.at(-1)?.id).toBe(SUBMISSION.turnId)
+    expect(previous.review?.status).toBe('completed')
+  })
+
+  test('ordinary assistant text does not imply a review result', () => {
+    const session = apply(reviewSession(), 'textDelta', 'Review complete, no issues found.')
+    const result = apply(session, 'turnFinished', { success: true })
+    expect(result.review?.status).toBe('failed')
+    expect(result.review?.result_message_id).toBeFalsy()
+    expect(result.review?.summary).toBeFalsy()
+    expect(result.messages.at(-1)?.content).toBe('Review complete, no issues found.')
+  })
+
+  test('blank and malformed review results never complete a review', () => {
+    for (const payload of [null, {}, { review: 5 }, { review: ' \n ' }]) {
+      const session = apply(reviewSession(), 'reviewCompleted', payload)
+      expect(session.messages).toEqual(reviewSession().messages)
+      expect(session.review?.result_message_id).toBeFalsy()
+      expect(apply(session, 'turnFinished', { success: true }).review?.status).toBe('failed')
+    }
+  })
+
+  test('interruption wins over a success flag and leaves the session idle', () => {
+    for (const success of [true, false]) {
+      const result = reduceRuntimeEvent(
+        reviewSession(), event('turnFinished', { success, interrupted: true }), clock,
+      )
+      expect(result.settled).toBe(true)
+      expect(result.session.review?.status).toBe('interrupted')
+      expect(result.session.turns.at(-1)?.status).toBe('interrupted')
+      expect(result.session.status).toBe('idle')
+    }
+  })
+
+  test('failed settlement cannot promote a supplied review result to success', () => {
+    const session = apply(reviewSession(), 'reviewCompleted', { review: 'A finding' })
+    const failed = apply(session, 'turnFinished', { success: false })
+    expect(failed.review?.status).toBe('failed')
+    expect(failed.review?.result_message_id).toBe(session.review?.result_message_id)
+    expect(failed.messages.at(-1)?.content).toBe('A finding')
+  })
+
+  test('startup refusal and process exit fail unsettled review metadata', () => {
+    const error = reduceRuntimeEvent(reviewSession(), event('error', 'Native review unavailable'), clock)
+    const refused = reduceRuntimeEvent(error.session, event('turnFinished', { success: false, summary: 'Native review unavailable' }), clock)
+    expect(error.error).toBe('Native review unavailable')
+    expect(refused.session.review?.status).toBe('failed')
+    expect(refused.session.status).toBe('failed')
+    const failure = apply(refused.session, 'turnFinished', { success: false })
+    expect(failure.review?.status).toBe('failed')
+    const working = apply(reviewSession(), 'turnStarted', null)
+    const exited = reduceRuntimeEvent(working, event('processExited', null), clock)
+    expect(exited.removeRuntime).toBe(true)
+    expect(exited.settled).toBe(true)
+    expect(exited.session.review?.status).toBe('failed')
+    expect(apply(working, 'error', 'Transport retry pending').review?.status).toBe('running')
+  })
+
+  test('exit after receiving a result but before settlement fails that review', () => {
+    const session = apply(reviewSession(), 'reviewCompleted', { review: 'A finding' })
+    expect(apply(session, 'processExited', null).review?.status).toBe('failed')
+  })
+
+  test('late ordinary events preserve an already settled review', () => {
+    const completed = apply(
+      apply(reviewSession(), 'reviewCompleted', { review: 'No findings' }),
+      'turnFinished', { success: true },
+    )
+    for (const [kind, payload] of [
+      ['error', 'Later transport issue'],
+      ['processExited', null],
+      ['turnFinished', { success: false }],
+      ['reviewStarted', null],
+      ['textDelta', 'Late text'],
+    ] as const) {
+      const session = apply(completed, kind, payload)
+      expect(session.review).toEqual(completed.review)
+      expect(session.messages).toEqual(completed.messages)
+    }
+  })
+
+  test('lifecycle events do not turn ordinary conversations into reviews', () => {
+    let session = apply(runningSession(), 'reviewStarted', null)
+    session = apply(session, 'reviewCompleted', { review: 'Unexpected review' })
+    expect(session.review).toBeUndefined()
+    expect(session.messages).toEqual(runningSession().messages)
+  })
+})
+
+test('retryable errors preserve successful native review output', () => {
+  let session = apply(reviewSession(), 'turnStarted', null)
+  session = apply(session, 'reviewStarted', null)
+  const retried = reduceRuntimeEvent(session, event('error', 'Retrying transient provider error'), clock)
+  expect(retried.error).toBe('Retrying transient provider error')
+  expect(retried.session.review?.status).toBe('running')
+  session = apply(retried.session, 'reviewCompleted', { review: '[P1] Preserve carts' })
+  session = apply(session, 'turnFinished', { success: true })
+  expect(session.review?.status).toBe('completed')
+  expect(session.messages.at(-1)?.content).toBe('[P1] Preserve carts')
+})
+
+test('review mutations advance a future catalog revision monotonically', () => {
+  const before = { ...reviewSession(), updated_at: 500 }
+  const result = apply(before, 'reviewCompleted', { review: 'No findings' })
+  expect(result.updated_at).toBe(501)
+})
+
 describe('provider-initiated Pi turns', () => {
   for (const provider of ['pi', 'ohMyPi'] as const) {
     for (const status of ['idle', 'background'] as const) {
@@ -313,5 +500,16 @@ function runningSession(): AgentSession {
         checkpoint: null,
       },
     ],
+  }
+}
+
+function reviewSession(): AgentSession {
+  return {
+    ...runningSession(),
+    review: {
+      target: { kind: 'uncommittedChanges' },
+      source_session_id: 'development',
+      status: 'running',
+    },
   }
 }
