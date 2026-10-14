@@ -1176,6 +1176,8 @@ pub struct Waku {
     /// Session details currently being fetched from the daemon. Sidebar rows
     /// stay usable while the selected transcript hydrates asynchronously.
     session_hydrations: HashSet<Uuid>,
+    /// Registrations made here that no daemon catalog has acknowledged yet.
+    pending_project_registrations: HashSet<Uuid>,
     /// Selection is committed only after this target's transcript arrives, so
     /// the currently visible task stays intact during daemon latency.
     pending_session_activation: Option<PendingSessionActivation>,
@@ -1870,6 +1872,7 @@ mod drafts;
 mod file_search;
 mod goal_dialog;
 mod image_preview;
+mod projects;
 mod render;
 mod right_panel;
 pub(crate) mod rpa;
@@ -3018,6 +3021,7 @@ impl Waku {
                 daemon,
                 daemon_hostname,
                 session_hydrations: HashSet::new(),
+                pending_project_registrations: HashSet::new(),
                 pending_session_activation: None,
                 state,
                 store,
