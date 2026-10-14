@@ -31,7 +31,7 @@ producer/PTY throughput or establish a production performance improvement.
 Temporary in-process snapshots and extended diagnostic logging are removed
 from the repair.
 
-## Verification status
+## Verification
 
 Four standalone tests of the exact extracted helper passed: split marker
 assembly, completion after the three-second default under an explicit allowance,
@@ -41,7 +41,15 @@ minimal event wrappers; they do not replace the full integration test.
 Formatting and whitespace checks passed, and independent Spec and Standards
 reviews cleared the source change.
 
-Hosted verification of the repair is pending. The temporary focused workflow
-is retained only while collecting that evidence and must be removed before a
-final mergeable patch is recommended. No issue closure or production throughput
-fix is claimed on the basis of the diagnostic run alone.
+Focused macOS repair verification:
+https://github.com/Plintash/doki/actions/runs/38606353237/job/115998135556
+
+- Tested remote head: `166f465954bb55d1be601891264c5b5a7223b272`
+- Normal optimized test build completed in 9 min 56 s
+- Exact attach-boundary test: 1 passed, 0 failed, 773 filtered out, 6.22 s
+- Command: `cargo test --locked -p waku-core --lib server::tests::websocket_terminal_attach_boundary_has_no_duplicates_or_gaps -- --exact --nocapture`
+
+The final cleanup removes only the temporary focused workflow and updates this
+record; `server.rs` is unchanged from that hosted passing run. The regular
+Tests workflow is unchanged. The focused pass does not claim a green full
+workspace suite or a production throughput improvement.
