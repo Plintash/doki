@@ -69,3 +69,23 @@ The user subsequently requested that the description box itself must not protrud
 Native verification passed at 1178×814 (outer border edges 330/1100px, text inset 341px) and 980×680 (outer edges 288/945px). The geometry check derives the wrapper edges from the measured editor bounds and the unchanged 10px padding plus 1px border. Focus/edit round-trips preserved the original description and unchanged field bounds. Light/dark screenshots, unfocused hover, and narrow focused editing were inspected. Source suite again passed 47 tests/338 assertions, native issue interaction regression passed 26 assertions, and independent focused source review cleared the one-line change. No provider/model calls were made. Prior full backend/runtime-suite checkpoints above are unchanged; this bounded layout delta did not rerun them.
 
 Evidence: `description-edge-light.jpg`, `description-edge-dark.jpg`, `description-edge-hover.jpg`, and `description-edge-narrow.jpg`. The app, watcher, and daemon were stopped after verification.
+
+## Compact conversation list follow-up
+
+Product `9a7c9b28c4ea48ee53d6803d8751225ab7a35817` implements the subsequently approved shared-list direction: thin separators, a quiet activity timestamp below each real title, shape/color status indicators, and an outlined broken-link detach action. Timestamps use reply/turn-start/creation data, never render or metadata-save time. Existing issue ordering remains unchanged, so timestamps are not a promise of chronological sorting. Meaningful review findings and the accepted outer alignment remain unchanged.
+
+Only live Working/Connecting states request the existing reduced-motion-aware shared spinner. Waiting, failure, stopped, complete, background, and draft states have static distinct glyphs; precise labels remain on hover and row keyboard hints/accessible names. Idle persisted review state does not acquire an animation lease. Independent source review cleared the list, embedding, status precedence, and reduced-motion reuse.
+
+Verification on the final product source:
+- 47 source tests / 338 assertions passed
+- 679 app tests passed, 2 ignored, including state-icon/animation-priority coverage
+- 26 native interaction assertions passed on retry (unlink, keyboard focus recovery, reattach, title/spec preservation)
+- Native normal-width geometry, row metadata, and keyboard focus checks passed
+- Light/dark native screenshots and the keyboard-focused unlink hint inspected
+- With the description caret blurred, native idle frame counts stayed 483 → 483 → 483 over 2.4 seconds
+
+The ordinary optimized app-test compiler was killed with SIGKILL under resource pressure; the simultaneous native scratch startup timed out before reaching changed behavior. A serialized retry using `--config 'profile.dev.package.waku.opt-level=0'` passed all app tests in 45 seconds without changing source or dependency cache. The normal optimized native build was then restarted and its interaction test passed in 5 seconds. This test-only optimization override does not change the native prototype/release profile.
+
+An existing input-caret caveat was isolated: a fresh issue initially continued low-frequency caret redraws even after focus moved away; explicitly focusing then blurring Description stopped them without any code change. The new idle status icons themselves are quiescent. That separate input lifecycle was not modified in this visual follow-up. Reduced-motion behavior was checked through the reused implementation and source review, not a separate OS-settings runtime pass. No model/provider calls were made. The app, watcher, daemon, and extra bridge were stopped after verification.
+
+Evidence: `compact-list-light.jpg`, `compact-list-dark.jpg`, `compact-list-keyboard-unlink.jpg`, and the compact-list acceptance/test logs. The approved preview uses the same product source as the final verified tree.

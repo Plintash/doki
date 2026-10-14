@@ -134,6 +134,27 @@ fn task_session_navigation_index(index: usize, count: usize, key: &str) -> Optio
     }
 }
 
+/// Only live foreground work animates. Persisted review state alone must not
+/// keep an idle issue page requesting frames.
+fn task_session_status_icon(
+    status: SessionStatus,
+    review: Option<IssueReviewStatus>,
+) -> (&'static str, bool) {
+    match status {
+        SessionStatus::Working | SessionStatus::Connecting => ("icons/loader-circle.svg", true),
+        SessionStatus::Background => ("icons/hourglass.svg", false),
+        SessionStatus::Waiting => ("icons/alert.svg", false),
+        SessionStatus::Failed => ("icons/circle-alert.svg", false),
+        SessionStatus::Idle => match review {
+            Some(IssueReviewStatus::Completed) => ("icons/check.svg", false),
+            Some(IssueReviewStatus::Failed) => ("icons/circle-alert.svg", false),
+            Some(IssueReviewStatus::Interrupted) => ("icons/stop.svg", false),
+            Some(IssueReviewStatus::Running) => ("icons/hourglass.svg", false),
+            Some(IssueReviewStatus::Draft) | None => ("icons/compose.svg", false),
+        },
+    }
+}
+
 impl Waku {
     pub(super) fn task_detail_values(&self, id: Uuid, cx: &App) -> Option<(String, String)> {
         let detail = self.task_detail.as_ref().filter(|detail| detail.id == id)?;
@@ -1057,7 +1078,7 @@ impl Waku {
             detail
                 .list
                 .splice_focusable(prefix + 1..old_count + 1, focuses);
-            detail.list.clone().with_uniform_item_height(px(44.0));
+            detail.list.clone().with_uniform_item_height(px(62.0));
             detail.session_ids = ids;
         }
         detail.session_indices = sessions.into_iter().map(|(_, index, _)| index).collect();
@@ -1371,19 +1392,54 @@ impl Waku {
             tr!("board.draft_session")
         };
         let provider = session.provider;
-        let review_status = session.review.as_ref().map(|review| {
-            if session.status == SessionStatus::Waiting {
-                tr!("board.needs_you_short")
-            } else {
-                issue_review::review_status_label(review)
-            }
-        });
+        let is_draft_session = !session.has_started();
+        let review_state = session.review.as_ref().map(|review| review.status);
         let status =
             if session.status == SessionStatus::Idle && self.session_has_live_background_work(id) {
                 SessionStatus::Background
             } else {
                 session.status
             };
+        let status_label = match status {
+            SessionStatus::Working | SessionStatus::Connecting | SessionStatus::Background => {
+                tr!("board.running")
+            }
+            SessionStatus::Waiting => tr!("board.needs_you_short"),
+            SessionStatus::Failed => tr!("board.session_failed"),
+            SessionStatus::Idle => session
+                .review
+                .as_ref()
+                .map(issue_review::review_status_label)
+                .unwrap_or_else(|| {
+                    if session.has_started() {
+                        tr!("board.session_idle")
+                    } else {
+                        tr!("board.draft_session")
+                    }
+                }),
+        };
+        // Activity metadata, not updated_at: renaming/saving must not invent activity.
+        let activity_at = session
+            .last_reply_at
+            .into_iter()
+            .chain(session.turns.last().map(|turn| turn.started_at))
+            .chain(Some(session.created_at))
+            .max()
+            .unwrap_or(0);
+        let activity_label = i64::try_from(activity_at)
+            .ok()
+            .filter(|value| *value > 0)
+            .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
+            .map(|value| {
+                value
+                    .with_timezone(&Local)
+                    .format("%b %-d · %H:%M")
+                    .to_string()
+            });
+        let row_hint = activity_label.as_ref().map_or_else(
+            || status_label.clone(),
+            |time| format!("{status_label} · {time}"),
+        );
         let show_workspace = self
             .task_for_editor(detail.id)
             .is_none_or(|task| !task_session_uses_default_workspace(task, session));
@@ -1395,6 +1451,23 @@ impl Waku {
             }
         };
         let theme = Theme::current(cx);
+        let (status_path, animate_status) = task_session_status_icon(status, review_state);
+        let status_tint = if status == SessionStatus::Idle {
+            match review_state {
+                Some(IssueReviewStatus::Completed) => theme.success,
+                Some(IssueReviewStatus::Failed) => theme.danger,
+                Some(IssueReviewStatus::Interrupted) => theme.text_tertiary,
+                _ => theme.text_tertiary,
+            }
+        } else {
+            status_color(&theme, status)
+        };
+        let status_glyph = icon(status_path, 14.0, status_tint);
+        let status_glyph = if animate_status {
+            motion::spin_slow(status_glyph)
+        } else {
+            status_glyph.into_any_element()
+        };
         let menu = self.menu_handle(&format!("task-session-menu-{id}"), cx);
         let keyboard_menu = menu.clone();
         let weak = cx.entity().downgrade();
@@ -1412,7 +1485,7 @@ impl Waku {
         let detach = self.task_icon_action(
             format!("issue-session-detach-{id}"),
             tr!("board.detach_session"),
-            "icons/x.svg",
+            "icons/unlink.svg",
             true,
             move |this, window, cx| this.detach_task_detail_session(id, index, window, cx),
             cx,
@@ -1422,14 +1495,16 @@ impl Waku {
         let row = div()
             .id(SharedString::from(format!("task-session-{id}")))
             .semantic_control(gpui::Role::Button, false)
-            .aria_label(title.clone())
+            .aria_label(format!("{title} · {row_hint}"))
+            .relative()
+            .child(crate::ui::tooltip::FocusHint::new(focus.clone(), row_hint))
             .track_focus(&focus)
             .tab_index(0)
             .tab_stop(true)
             .w_full()
             // 10px padding + 1px focus border shares the editor's content baseline.
             .px(px(10.0))
-            .py(px(5.0))
+            .py(px(8.0))
             .rounded(px(6.0))
             .border_1()
             .border_color(gpui::transparent_black())
@@ -1486,28 +1561,40 @@ impl Waku {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .text_size(sp(13.0))
-                            .line_height(sp(18.0))
-                            .text_color(theme.text)
-                            .child(single_line_label(&title)),
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(sp(13.0))
+                                    .line_height(sp(18.0))
+                                    .text_color(theme.text)
+                                    .child(single_line_label(&title)),
+                            )
+                            .when_some(activity_label, |element, time| {
+                                element.child(
+                                    div()
+                                        .text_size(sp(11.0))
+                                        .line_height(sp(16.0))
+                                        .text_color(theme.text_tertiary)
+                                        .child(time),
+                                )
+                            }),
                     )
                     .when(
-                        status != SessionStatus::Idle || review_status.is_some(),
+                        status != SessionStatus::Idle || review_state.is_some() || is_draft_session,
                         |element| {
                             element.child(
                                 div()
+                                    .id(SharedString::from(format!("issue-session-status-{id}")))
+                                    .size(px(28.0))
                                     .flex_none()
-                                    .text_size(sp(11.0))
-                                    .text_color(status_color(&theme, status))
-                                    .child(review_status.unwrap_or_else(|| match status {
-                                        SessionStatus::Working
-                                        | SessionStatus::Connecting
-                                        | SessionStatus::Background => tr!("board.running"),
-                                        SessionStatus::Waiting => tr!("board.needs_you_short"),
-                                        SessionStatus::Failed => tr!("board.session_failed"),
-                                        SessionStatus::Idle => tr!("board.session_idle"),
-                                    })),
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .tooltip(Tooltip::text(status_label))
+                                    .child(status_glyph),
                             )
                         },
                     )
@@ -1530,7 +1617,13 @@ impl Waku {
             &menu,
             menu_items,
         );
-        div().w_full().pb(px(2.0)).child(row).into_any_element()
+        div()
+            .w_full()
+            .child(row)
+            .when(index + 1 < count, |element| {
+                element.child(div().mx(px(11.0)).h(px(1.0)).bg(theme.border))
+            })
+            .into_any_element()
     }
 }
 
@@ -1538,6 +1631,42 @@ impl Waku {
 mod tests {
     use super::*;
     use crate::ui::SemanticControlExt;
+
+    #[test]
+    fn conversation_state_icons_only_animate_live_work() {
+        use IssueReviewStatus as Review;
+        use SessionStatus as Session;
+        for (review, path) in [
+            (Review::Draft, "icons/compose.svg"),
+            (Review::Running, "icons/hourglass.svg"),
+            (Review::Completed, "icons/check.svg"),
+            (Review::Interrupted, "icons/stop.svg"),
+            (Review::Failed, "icons/circle-alert.svg"),
+        ] {
+            assert_eq!(
+                task_session_status_icon(Session::Idle, Some(review)),
+                (path, false)
+            );
+        }
+        for state in [Session::Working, Session::Connecting] {
+            assert_eq!(
+                task_session_status_icon(state, Some(Review::Completed)),
+                ("icons/loader-circle.svg", true)
+            );
+        }
+        assert_eq!(
+            task_session_status_icon(Session::Waiting, Some(Review::Completed)),
+            ("icons/alert.svg", false)
+        );
+        assert_eq!(
+            task_session_status_icon(Session::Background, None),
+            ("icons/hourglass.svg", false)
+        );
+        assert_eq!(
+            task_session_status_icon(Session::Failed, None),
+            ("icons/circle-alert.svg", false)
+        );
+    }
 
     #[test]
     fn leaving_an_unchanged_issue_does_not_create_a_save() {
