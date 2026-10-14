@@ -704,6 +704,31 @@ impl Backend for WakuBackend {
                 drop(disposed);
                 Ok(ResponsePayload::Ack)
             }
+            Command::ReadTranscript {
+                conversation_id,
+                query,
+            } => {
+                if !cfg!(debug_assertions) {
+                    bail!("transcript inspection is only available in debug builds");
+                }
+                Ok(ResponsePayload::Transcript {
+                    result: crate::transcript::read_transcript(
+                        self.task_store.path(),
+                        conversation_id,
+                        &query,
+                    )
+                    .map_err(|error| {
+                        error
+                            .downcast::<waku_protocol::TranscriptError>()
+                            .unwrap_or_else(|error| {
+                                waku_protocol::TranscriptError::new(
+                                    "transcript_read_failed",
+                                    &error.to_string(),
+                                )
+                            })
+                    }),
+                })
+            }
             Command::HydrateSession { session_id } => {
                 // Live runtimes stay resident; everything else is trimmed to
                 // the recency window once the response is built.
@@ -2223,6 +2248,7 @@ fn handle_driver_command(
         | Command::SaveTaskState { .. }
         | Command::RemoveSession
         | Command::HydrateSession { .. }
+        | Command::ReadTranscript { .. }
         | Command::SearchSessionMessages { .. }
         | Command::ListProviderSessions { .. }
         | Command::LoadProviderSession { .. }

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::ui::SemanticControlExt;
 
 const TAB_SCROLL_FADE_WIDTH: f32 = 24.0;
 const REVIEW_DIFF_FILE_HEADER_HEIGHT: f32 = 36.0;
@@ -3384,8 +3385,17 @@ impl Waku {
         div()
             .id(SharedString::from(format!(
                 "right-panel-card-{}",
-                label.to_lowercase()
+                match &surface {
+                    RightPanelSurface::Browser(_) => "browser".to_owned(),
+                    RightPanelSurface::Terminal(_) => "terminal".to_owned(),
+                    RightPanelSurface::Files => "files".to_owned(),
+                    RightPanelSurface::Diff => "review".to_owned(),
+                    RightPanelSurface::File(path) => format!("file-{path}"),
+                    RightPanelSurface::BackgroundWork { key, .. } => format!("work-{key:?}"),
+                }
             )))
+            .semantic_control(gpui::Role::Button, false)
+            .aria_label(label.clone())
             .h(px(112.0))
             .flex_1()
             .min_w_0()
@@ -4342,6 +4352,8 @@ impl Waku {
         };
         let refresh = div()
             .id("right-panel-diff-refresh")
+            .semantic_control(gpui::Role::Button, false)
+            .aria_label(tr!("diff.refresh"))
             .track_focus(&refresh_focus)
             .tab_index(0)
             .size(px(28.0))
@@ -5297,6 +5309,7 @@ impl Waku {
                 }
 
                 waku.right_panel_diff_loading = false;
+                super::rpa::daemon::model_changed();
                 match result {
                     Ok(snapshot) => {
                         waku.right_panel_diff_selection.clear();
@@ -5325,9 +5338,8 @@ impl Waku {
                         let message = error.to_string();
                         if waku.right_panel_diff_snapshot.is_some() {
                             waku.show_toast(tr!("diff.refresh_failed", error = message));
-                        } else {
-                            waku.right_panel_diff_error = Some(message);
                         }
+                        waku.right_panel_diff_error = Some(message);
                     }
                 }
                 cx.notify();

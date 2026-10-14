@@ -220,7 +220,7 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     expect(field(snapshot.observed, "state", "tasks")).toEqual([issue]);
     const catalog = field(snapshot.observed, "state", "sessions") as AgentSession[];
     expect(catalog.filter(session => session.task_id === issueId).map(session => session.id).sort()).toEqual(sessions.map(session => session.id).sort());
-    expect(catalog.every(session => session.messages.length === 0)).toBe(true);
+    expect(catalog.every(session => !("messages" in session))).toBe(true);
 
     const opened = await invoke("openTask", { id: issueId });
     expect(field(opened.observed, "state", "route", "view")).toBe("issue");
@@ -319,8 +319,8 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     const drafted = await invoke("newSession", { taskId: newIssueId });
     const draftId = field(drafted.value, "opened") as string;
     await wait({ on: "state", pointer: "/session/id", equals: draftId });
-    expect(field(drafted.observed, "state", "session", "task_id")).toBe(newIssueId);
-    expect(field(drafted.observed, "state", "session", "workspace", "kind")).toBe("newWorktree");
+    expect(field(drafted.observed, "state", "selection", "task_id")).toBe(newIssueId);
+    expect(field(drafted.observed, "state", "selection", "workspace", "kind")).toBe("newWorktree");
     expect(field(drafted.observed, "state", "composer", "text")).toBe(title);
     await wait({ on: "node", id: "composer-create-worktree", present: true });
     const checkbox = await client.automationCall(sessionId, { type: "snapshot", sections: ["tree"] });
@@ -329,13 +329,13 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     expect(worktreeNode?.toggled).toBe("True");
     const unchecked = await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "composer-create-worktree" } });
     // Local is the omitted default in the persisted AgentSession contract.
-    expect(field(unchecked.observed, "state", "session", "workspace", "kind") ?? "local").toBe("local");
+    expect(field(unchecked.observed, "state", "selection", "workspace", "kind") ?? "local").toBe("local");
     await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "composer-create-worktree" } });
     await wait({ on: "state", pointer: "/session/workspace/kind", equals: "newWorktree" });
     expect(field((await invoke("newSession", { taskId: newIssueId })).value, "opened")).toBe(draftId);
     const standalone = await invoke("newSession");
     expect(field(standalone.value, "opened")).not.toBe(draftId);
-    expect(field(standalone.observed, "state", "session", "task_id") ?? null).toBeNull();
+    expect(field(standalone.observed, "state", "selection", "task_id") ?? null).toBeNull();
     expect(field(standalone.observed, "state", "composer", "text")).not.toBe(title);
     await invoke("openSession", { id: draftId });
     await wait({ on: "state", pointer: "/composer/text", equals: title });

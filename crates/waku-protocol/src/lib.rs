@@ -46,6 +46,7 @@ pub mod settings;
 pub mod skills;
 pub mod subagent;
 pub mod theme;
+pub mod transcript;
 pub mod usage;
 pub mod usage_history;
 pub mod workspace;
@@ -62,4 +63,5 @@ pub use protocol::{
     WireComputerToolRequest, WireDriverEvent, WireDriverStartOptions, WireSessionOptions,
 };
 pub use settings::DaemonSettings;
+pub use transcript::*;
 pub use workspace::{WorkspaceOperation, WorkspaceResult};

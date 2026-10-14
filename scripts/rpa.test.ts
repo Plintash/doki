@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LEGACY_PROTOCOL_VERSION, parseArguments } from "./rpa";
+import { LEGACY_PROTOCOL_VERSION, parseArguments, snapshotSections } from "./rpa";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -466,4 +466,56 @@ test("fresh-build deadline bounds every RPC and cleanup cannot replace verified 
     if (hung === "detach") expect(JSON.parse(result.stdout)).toEqual(fresh);
     else expect(JSON.parse(result.stderr).error.code).toBe("timeout");
   }
+});
+
+
+test("ordinary tree and pointer-state reads select only the requested section", () => {
+  expect(snapshotSections("tree")).toEqual(["tree"]);
+  expect(snapshotSections("state", "/composer/text")).toEqual(["composer"]);
+  expect(snapshotSections("state", "/runtime/permission")).toEqual(["runtime"]);
+  expect(snapshotSections("state", "/a~1b/~0")).toEqual(["a/b"]);
+  expect(snapshotSections("state")).toEqual(snapshotSections("inspect"));
+  expect(snapshotSections("snap")).toEqual([]);
+  expect(snapshotSections("state", "/composer", "composer,route")).toEqual(["composer", "route"]);
+  expect(snapshotSections("inspect")).not.toContain("session");
+  expect(snapshotSections("inspect")).not.toContain("model");
+  expect(() => snapshotSections("state", "composer")).toThrow("JSON pointer");
+  expect(() => snapshotSections("state", "/composer~2")).toThrow("JSON pointer");
+});
+
+test("daemon tree and state requests avoid full transcript serialization", async () => {
+  for (const [command, pointer, sections] of [["tree", "", ["tree"]], ["state", "/composer/text", ["composer"]], ["inspect", "", snapshotSections("inspect")]] as const) {
+    const result = await runDaemonCli([command, ...(pointer ? [pointer] : []), "--json"], command => {
+      if (command.type === "automation" && command.command.type === "call") {
+        expect(command.command.call).toEqual({type:"snapshot", sections});
+        return {type:"automation", result:{type:"called", result:{...effect, value:{state:{composer:{text:"safe"}},tree:{nodes:[]}}}}};
+      }
+    });
+    expect(result.code).toBe(0);
+  }
+});
+
+
+test("transcript queries preserve separate attachment and conversation identities", async () => {
+  const conversationId = "55555555-5555-4555-8555-555555555555";
+  const query = {type:"index",collection:"messages",offset:0,limit:2};
+  const result = await runDaemonCli(["--session", sessionId, "transcript", "--conversation", conversationId, JSON.stringify(query), "--json"], command => {
+    if (command.type === "automation" && command.command.type === "call") {
+      expect(command.command.sessionId).toBe(sessionId);
+      expect(command.command.call).toEqual({type:"transcript",conversationId,query});
+      return {type:"automation",result:{type:"called",result:{...effect,value:{conversationId,source:"persisted",detailLoaded:false,page:{type:"index",items:[],total:0,nextOffset:null}}}}};
+    }
+  });
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({conversationId,source:"persisted",detailLoaded:false});
+});
+
+
+test("ordinary describe exposes the discoverable argument contracts", async () => {
+  const manifest = {instance,capabilities:{readOnly:["describe","snapshot","transcript"],verbs:[{name:"openSession",args:{id:"conversation UUID"}}]}};
+  const result = await runDaemonCli(["describe"], command => {
+    if (command.type === "automation" && command.command.type === "call") return {type:"automation",result:{type:"called",result:{...effect,value:manifest}}};
+  });
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout)).toEqual(manifest);
 });

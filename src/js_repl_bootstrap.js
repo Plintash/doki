@@ -397,6 +397,7 @@
     };
     const automation = (command, timeoutMs) => request("automation", command, timeoutMs);
     const call = (sessionId, call) => automation({ type: "call", sessionId, call });
+    const contextSections = ["route", "selection", "task", "composer", "providers", "runtime", "workspace", "board", "panels", "ui"];
     globalThis.waku = Object.freeze({ rpa: Object.freeze({
       instances: () => automation({ type: "instances" }),
       waitForBuild: async (checkout, previousBuild, { timeoutMs = 30000, pollMs = 100 } = {}) => {
@@ -465,6 +466,15 @@
       detach: (sessionId) => automation({ type: "detach", sessionId }),
       describe: (sessionId) => call(sessionId, { type: "describe" }),
       snapshot: (sessionId, sections = []) => call(sessionId, { type: "snapshot", sections }),
+      transcript: (sessionId, conversationId, query) => call(sessionId, { type: "transcript", conversationId, query }),
+      inspect: (sessionId) => call(sessionId, { type: "snapshot", sections: contextSections }),
+      tree: (sessionId) => call(sessionId, { type: "snapshot", sections: ["tree"] }),
+      state: async (sessionId, pointer = "") => {
+        if (typeof pointer !== "string" || (pointer && (!pointer.startsWith("/") || /~(?![01])/.test(pointer)))) throw new TypeError("state pointer must be a valid JSON pointer starting with /");
+        const parts = pointer ? pointer.slice(1).split("/").map(part => part.replace(/~1/g, "/").replace(/~0/g, "~")) : [];
+        const envelope = await call(sessionId, { type: "snapshot", sections: parts.length ? [parts[0]] : contextSections });
+        return parts.reduce((value, part) => value?.[part], envelope.result.value.state);
+      },
       act: (sessionId, action, target) => call(sessionId, { type: "act", action, target }),
       click: (sessionId, id) => call(sessionId, { type: "act", action: "click", target: { id } }),
       type: (sessionId, text, target = null) => call(sessionId, { type: "type", text, target }),

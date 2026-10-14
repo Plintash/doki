@@ -83,6 +83,7 @@ impl Waku {
                         if !waku.branch_snapshots.fulfill(token, result.clone()) {
                             return;
                         }
+                        super::rpa::daemon::model_changed();
                         match &result {
                             Ok(Some(snapshot)) => waku
                                 .cache_sidebar_branch_label(&fetch_path, snapshot.display_branch()),

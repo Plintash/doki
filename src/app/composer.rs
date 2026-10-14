@@ -749,6 +749,8 @@ impl Waku {
                         "computer-permission-{}-{decision}",
                         permission.request.call_id
                     )))
+                    .semantic_control(gpui::Role::Button, false)
+                    .aria_label(label.clone())
                     .h(px(29.0))
                     .px(px(13.0))
                     .rounded(px(7.0))
@@ -2730,6 +2732,9 @@ impl Waku {
                     // Enter or space on the focused chip pins the panel open for
                     // the keyboard, and closes it again.
                     .on_activation(cx, |this, _, cx| {
+                        if this.annotation_editor.borrow().is_some() {
+                            return;
+                        }
                         let pinned = !this.annotation_panel_pinned.get();
                         this.annotation_panel_pinned.set(pinned);
                         if pinned {
@@ -2867,6 +2872,9 @@ impl Waku {
     /// period after the count reaches zero covers a fast pointer crossing the
     /// seam before it is over the panel.
     fn set_annotation_preview_hover(&mut self, hovering: bool, cx: &mut Context<Self>) {
+        if self.annotation_editor.borrow().is_some() {
+            return;
+        }
         let count = self.annotation_preview_hover.get();
         let next = if hovering {
             count.saturating_add(1)

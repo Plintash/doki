@@ -23,7 +23,14 @@ const PAINT_SECTIONS: &[&str] = &[
     "tree", "route", "board", "composer", "panels", "toast", "ui",
 ];
 const LIVE_SECTIONS: &[&str] = &[
-    "task", "session", "route", "board", "composer", "panels", "toast",
+    "task",
+    "selection",
+    "route",
+    "board",
+    "composer",
+    "panels",
+    "toast",
+    "ui",
 ];
 static ATTACHED: AtomicBool = AtomicBool::new(false);
 static INTEREST: AtomicU8 = AtomicU8::new(0);
@@ -277,7 +284,7 @@ pub(crate) fn init(cx: &mut App) {
                         .get(&request.session_id)
                         .map(|(value, _)| value.clone())
                         .unwrap_or(Value::Null);
-                    let outcome = bounded_outcome(execute(cx, &request, &previous));
+                    let outcome = bounded_outcome(execute(cx, &request, &previous).await);
                     let observed = match &outcome {
                         AutomationExecutorOutcome::Ok { execution } => {
                             Some(&execution.observation.observed)
@@ -645,17 +652,80 @@ fn unavailable(cx: &mut AsyncApp) -> Value {
     )
 }
 
-fn execute(
+/// Persisted fallback runs off the UI executor and never calls hydration or
+/// selection handlers. Live reads observe the app's current, possibly unsaved
+/// state; separate calls do not promise an immutable streaming snapshot.
+async fn transcript(
+    cx: &mut AsyncApp,
+    conversation_id: Uuid,
+    query: &waku_client::TranscriptQuery,
+) -> Result<Value, Error> {
+    query
+        .validate()
+        .map_err(|error| Error::new(error.code, error.message))?;
+    enum Read {
+        Live(Result<waku_client::TranscriptResult, waku_client::TranscriptError>),
+        Persisted(waku_client::DaemonSupervisor),
+    }
+    let read = cx.update(|app| {
+        super::with_workspace(app, false, |waku, _window, _cx| {
+            let session = waku
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == conversation_id)
+                .ok_or_else(|| {
+                    Error::new("not_found", format!("no conversation `{conversation_id}`"))
+                        .with_target(conversation_id.to_string())
+                })?;
+            Ok(if session.detail_loaded {
+                Read::Live(waku_client::transcript::read_transcript(session, query))
+            } else {
+                Read::Persisted(waku.daemon.clone())
+            })
+        })
+        .unwrap_or_else(|| Err(super::app_not_ready()))
+    })?;
+    match read {
+        Read::Live(result) => result
+            .map(|result| super::json_of(&result))
+            .map_err(|error| Error::new(error.code, error.message)),
+        Read::Persisted(daemon) => {
+            let query = query.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    waku_client::persistence::read_transcript(&daemon, conversation_id, query)
+                })
+                .await
+                .map(|result| super::json_of(&result))
+                .map_err(|error| {
+                    if let Some(domain) = error
+                        .get_ref()
+                        .and_then(|error| error.downcast_ref::<waku_client::TranscriptError>())
+                    {
+                        Error::new(domain.code.clone(), domain.message.clone())
+                    } else {
+                        Error::new("transcript_read_failed", error.to_string())
+                    }
+                })
+        }
+    }
+}
+
+async fn execute(
     cx: &mut AsyncApp,
     request: &AutomationExecutorRequest,
     previous: &Value,
 ) -> AutomationExecutorOutcome {
     let is_input = !matches!(
         request.call,
-        AutomationCall::Describe | AutomationCall::Snapshot { .. }
+        AutomationCall::Describe
+            | AutomationCall::Snapshot { .. }
+            | AutomationCall::Transcript { .. }
     );
     let sections = match &request.call {
         AutomationCall::Snapshot { sections } => sections.clone(),
+        AutomationCall::Describe | AutomationCall::Transcript { .. } => live_sections(false),
         _ => live_sections(true),
     };
     let before = if is_input {
@@ -671,9 +741,13 @@ fn execute(
     } else {
         match &request.call {
             AutomationCall::Describe => Ok(
-                json!({ "instance": instance(), "verbs": super::VERBS, "snapshotSections": super::STATE_SECTIONS }),
+                json!({ "instance": instance(), "verbs": super::VERBS, "snapshotSections": super::STATE_SECTIONS, "capabilities": super::info::capabilities() }),
             ),
             AutomationCall::Snapshot { .. } => snapshot(cx, &sections),
+            AutomationCall::Transcript {
+                conversation_id,
+                query,
+            } => transcript(cx, *conversation_id, query).await,
             AutomationCall::Invoke { verb, args } => {
                 let request = Request::Invoke {
                     verb: verb.clone(),
@@ -1034,6 +1108,29 @@ mod tests {
             "observation_too_large"
         );
         assert_eq!(selected.observed["observationSection"], "session");
+    }
+
+    #[test]
+    fn implicit_observation_uses_metadata_even_for_an_oversized_selected_history() {
+        use crate::model::{AgentSession, Message, MessageRole, ProviderKind};
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        session.messages.push(Message::new(
+            MessageRole::Assistant,
+            "x".repeat(5 * 1024 * 1024),
+        ));
+        for tree in [false, true] {
+            let state =
+                super::super::serialize_state_sections(
+                    &live_sections(tree),
+                    |section| match section {
+                        "session" | "model" => panic!("implicit observation serialized history"),
+                        "selection" => super::super::info::session_summary(&session),
+                        _ => Value::Null,
+                    },
+                );
+            assert_eq!(state["selection"]["historyCounts"]["messages"], 1);
+            assert!(serde_json::to_vec(&state).unwrap().len() < 4096);
+        }
     }
 
     #[test]

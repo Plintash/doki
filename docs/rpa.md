@@ -7,7 +7,9 @@ This document records the implemented surface, how to use and verify it, and
 which acceptance gates are still open. The P0 checkpoint is historical verified
 evidence; P1 infrastructure now has native provider-free verification and
 independent review. Full phase acceptance still has the live-model gate below.
-See [the verification record](rpa-p1-qa.md) for exact results and limitations.
+See [the verification record](rpa-p1-qa.md) for the historical P1 checkpoint,
+and [agent-information QA](agent-observability-qa.md) for the later compact
+context, bounded history reads and native annotation evidence.
 
 ## Where this branch stands
 
@@ -26,6 +28,11 @@ See [the verification record](rpa-p1-qa.md) for exact results and limitations.
   same external daemon, with native REPL snapshots before and after; see the
   [combined QA evidence](board-rpa-integration.md#combined-tree-results).
   The real-model phase acceptance gate also remains open.
+- Agent-information completion is verified: discoverable compact context,
+  cached provider/runtime/workspace state, bounded live and persisted transcript
+  reads, and observable annotation controls. Final native diagnosis passed
+  with a 5.31 MB selected history and unchanged unselected conversation/draft;
+  see [the exact checkpoint and boundaries](agent-observability-qa.md).
 - The default transport is the existing authenticated daemon connection. The
   app-local TCP endpoint is an explicit legacy fallback only.
 - **Task 2.7 and phase acceptance 3.11 remain UNVERIFIED.** A real-model fan-out
@@ -37,7 +44,7 @@ See [the verification record](rpa-p1-qa.md) for exact results and limitations.
 
 - **Protocol** (`crates/waku-protocol/src/automation.rs`, `diagnostics.rs`)
   owns the shared automation and diagnostic shapes. The daemon wire version
-  is `PROTOCOL_VERSION = 16`.
+  is `PROTOCOL_VERSION = 17`.
 - **App** (`src/app/rpa.rs`, `src/app/rpa/daemon.rs`) registers its instance
   and build identity over its existing daemon connection. It owns UI truth,
   on-demand full-refresh observations, semantic input and action effects;
@@ -176,8 +183,8 @@ information. With `--json`, actions expose their cursor, observed frame,
 `treeDiff` and `stateDiff`, so a second snapshot is not needed to see the effect.
 
 Selectable snapshot sections are `tree`, `state`, `model`, `task`, `tasks`,
-`session`, `sessions`, `projects`, `route`, `board`, `composer`, `toast`, `panels`
-and `ui`. An empty selection
+`session`, `sessions`, `projects`, `route`, `board`, `composer`, `toast`, `panels`,
+`ui`, `selection`, `providers`, `runtime`, and `workspace`. An empty selection
 returns all sections; `state` includes every state section. Health, instance
 and window identity remain present, and unselected `tree` is null. Unknown
 section names fail explicitly. `/session` is the selected serialized session,
@@ -185,7 +192,7 @@ including runtime subagent runs; `/model` includes the persisted model with
 observable sessions. `/tasks` contains actual Board issues, including issues
 with no conversations. `/task` is the issue open in Board detail, or null.
 `/sessions` contains lightweight conversation list projections with their own
-IDs and optional `task_id` bindings; one issue can have many conversations.
+IDs, `detailLoaded`, history counts and optional `task_id` bindings; one issue can have many conversations. History arrays are omitted from this list rather than falsely reported empty.
 Use `/session` or `/model/sessions` when transcript detail is needed.
 `/route/view` distinguishes `board`, `issue`, `session` and `settings`;
 `/route/selectedTask` is separate from `/route/selectedSession`. The retained
@@ -194,7 +201,7 @@ project/search/activity filters, dialogs, and `savePending`/`saveError`. Issue
 creation is optimistic; wait for `savePending: false` and check `saveError`
 before claiming its asynchronous database save succeeded. Board, route,
 composer, panels, toast and UI layout fields are explicit UI-only state. JSON pointers for `state` and waits are relative to
-this state object, for example `/composer/text` or `/session/status`.
+this state object, for example `/composer/text` or `/selection/status`.
 
 Waits accept one condition: `--id` (optionally `--gone`), `--text ID=SUBSTR`,
 `--state PTR=JSON`, `--state-contains PTR=SUBSTR`, `--frame N`, or
@@ -206,7 +213,7 @@ Control, text, frame and diagnostic waits retain lightweight tree/UI evidence
 and the selected session's current health summary; they do not serialize stored
 transcripts. State waits capture the section named by their JSON pointer. An
 explicit `/session/status` wait therefore selects the complete `session`
-section, and an oversized requested section fails with `observation_too_large`
+section (use `/selection/status` for compact status-only observation), and an oversized requested section fails with `observation_too_large`
 at the 4 MiB observation bound rather than silently truncating its model fields.
 Concurrent selected sections are captured independently, including when another
 client subscribes to full model state. A section's size failure only fails waits
@@ -301,6 +308,101 @@ executor, and is never a conversation or Board issue ID.
 6. Abort unfinished runs when stopping, then release persistent sessions and
    remove remaining scratch instances. Record the actual results and any
    unverified acceptance gates; do not infer a real-model pass from smoke.
+
+### Agent information without disturbing the app
+
+Protocol 17 adds bounded history reads and replaces the implicit full-session
+observation in action/Describe replies with `selection`, a lightweight selected
+conversation projection. It contains IDs/status/workspace, the provider-native
+ID and cached context usage, `detailLoaded`, and history counts. Counts are null for unloaded history, never a false empty list.
+Full `session` and `model` snapshots remain explicit, unbounded selections and
+retain the existing 4 MiB observation limit.
+
+Start with discovery and compact context:
+
+```sh
+bun scripts/rpa.ts --instance INSTANCE_ID describe
+bun scripts/rpa.ts --instance INSTANCE_ID inspect
+bun scripts/rpa.ts --instance INSTANCE_ID state /runtime/permission
+bun scripts/rpa.ts --instance INSTANCE_ID state /providers
+bun scripts/rpa.ts --instance INSTANCE_ID state /workspace
+bun scripts/rpa.ts --instance INSTANCE_ID state /ui/annotations
+```
+
+`describe` returns the capability manifest in ordinary and JSON output: verb
+argument contracts/effects, sections, identity domains, examples and limits.
+`inspect` and bare `state` use compact sections; `tree` requests only the tree,
+and `state /composer/text` requests only `composer`. `snap` without sections is
+the explicit full snapshot. `--sections` remains an explicit override.
+
+The new sections are:
+
+- `selection`: selected conversation metadata without transcript bodies
+- `providers`: cached installation, enablement, version/catalog and discovery
+  state, model choices, and whether this conversation can select them.
+  `authentication: notChecked` is intentional; no probe/login/model call occurs
+- `runtime`: selected process state, errors/backlog, permission details and
+  actual option IDs, user questions/choices, computer-approval target and
+  conditional decisions, queue count and reported subagent state
+- `workspace`: selected conversation's concrete path and workspace intent,
+  cached branch and review results, with `notRequested`, `loading`, `ready`,
+  `notRepository` or `error` as applicable. These are app caches, not a fresh
+  filesystem scan; retained review data can coexist with loading/error
+- `ui.annotations`: current selection, toolbar/comment/editor and preview
+  visibility. `composer` also names staged attachment/annotation counts.
+  Annotation editor inputs and buttons now have semantic IDs
+
+Provider and workspace observations use only in-memory app state. Background
+branch/review completions notify the same existing model observer; observation
+never starts Git, reads a filesystem, changes a provider, or grants approval.
+Computer approval options name their semantic `controlId`; `answerPermission`
+continues to mean provider permissions only. A listed decision is information,
+not permission for an agent to take it.
+
+Read a conversation's history without opening it:
+
+```sh
+bun scripts/rpa.ts --instance INSTANCE_ID transcript --conversation CONVERSATION_UUID \
+  '{"type":"index","collection":"messages","offset":0,"limit":20}'
+bun scripts/rpa.ts --instance INSTANCE_ID transcript --conversation CONVERSATION_UUID \
+  '{"type":"index","collection":"activities","offset":0,"limit":20}'
+# Copy a returned field.query, then follow nextOffsetBytes exactly
+bun scripts/rpa.ts --instance INSTANCE_ID transcript --conversation CONVERSATION_UUID \
+  '{"type":"text","collection":"messages","itemId":"MESSAGE_UUID","field":"content","offsetBytes":0,"maxBytes":32768}'
+```
+
+Collections are `messages`, `activities`, and `turns`. Index pages preserve order
+and contain metadata, limited previews, full scalar text lengths, continuation,
+and usable text-query locators. Structured fields expose counts and fixed leaf
+path templates, such as `reasoning/content` or `file_changes/0/diff`; they never
+inline an image or serialize a complete large object merely to make a preview.
+Text reads copy at most 64 KiB of one field and return UTF-8-safe byte
+continuations. Unknown items, fields, malformed paths, or invalid offsets fail
+explicitly. Read the returned locator rather than guessing a persisted field.
+
+Loaded conversations are read from current app memory (`source: live`). Unloaded
+conversations use an independent read-only daemon database query
+(`source: persisted`, `detailLoaded: false`); they do not hydrate, navigate, save,
+or start a provider. Stored activity/turn JSON is scanned inside the daemon,
+not transferred whole to the app. Persisted data may lag unsaved live changes.
+Each call observes current state, not an immutable recording: re-index if
+another actor changes or removes items while you read. Native stored IDs are
+preserved. Old reasoning blocks have no native activity ID; their explicitly
+marked derived IDs last only until normal hydration/migration, so re-index when
+that provenance changes.
+
+The REPL has the same `inspect`, `tree`, and `transcript` calls. They return the
+shared result envelope; `state` is a convenience returning the pointer value:
+
+```js
+const { result } = await waku.rpa.inspect(attachmentId);
+const pending = await waku.rpa.state(attachmentId, "/runtime/permission");
+const history = await waku.rpa.transcript(attachmentId, conversationId,
+  { type: "index", collection: "activities", offset: 0, limit: 20 });
+```
+
+Transcript reads require the daemon transport. The optional legacy snapshot
+request now honors `sections`, but that fallback has no transcript RPC.
 
 ### Scratch setup and scenario lifecycle
 

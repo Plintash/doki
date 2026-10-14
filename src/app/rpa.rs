@@ -7,6 +7,7 @@
 //! snapshots read the frame's tree plus live view state.
 
 pub(crate) mod daemon;
+mod info;
 
 use std::time::{Duration, Instant};
 
@@ -170,12 +171,22 @@ async fn diagnostic_query(cx: &mut AsyncApp, request: Request) -> Result<Value, 
 /// Observe without retaining a workspace lease. A failed tree capture still
 /// yields the available state and health, including startup/disconnect errors.
 fn observe(cx: &mut AsyncApp, draw: bool) -> Value {
+    let sections = [
+        "tree",
+        "selection",
+        "route",
+        "board",
+        "composer",
+        "panels",
+        "toast",
+    ]
+    .map(str::to_owned);
     cx.update(|app| {
         with_workspace(app, draw, |waku, window, cx| {
-            match waku.rpa_snapshot(window, cx) {
+            match waku.rpa_snapshot_sections(window, cx, &sections) {
                 Ok(snapshot) => snapshot,
                 Err(error) => json!({
-                    "state": waku.rpa_state(cx),
+                    "state": waku.rpa_state_sections(cx, &sections),
                     "health": waku.rpa_health(cx),
                     "tree": null,
                     "observationError": { "code": error.code, "message": error.message },
@@ -296,7 +307,7 @@ fn selected_correlation(cx: &mut AsyncApp) -> waku_client::DiagnosticCorrelation
 /// of a snapshot. Taking the workspace lease is safe here because none of
 /// these dispatches input.
 fn query(cx: &mut AsyncApp, request: Request) -> Result<Value, Error> {
-    let draws = matches!(request, Request::Snapshot);
+    let draws = matches!(request, Request::Snapshot { .. });
     cx.update(|app| {
         match with_workspace(app, draws, |waku, window, cx| {
             waku.rpa_execute(request, window, cx)
@@ -341,10 +352,21 @@ async fn wait_for(
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let needs_frame = matches!(condition, Condition::Node { .. } | Condition::Text { .. });
+    let sections = match condition {
+        Condition::Node { .. } | Condition::Text { .. } => vec!["tree".to_owned()],
+        Condition::State { pointer, .. } | Condition::StateContains { pointer, .. } => vec![
+            pointer
+                .strip_prefix('/')
+                .and_then(|pointer| pointer.split('/').next())
+                .filter(|section| !section.is_empty())
+                .map(|section| section.replace("~1", "/").replace("~0", "~"))
+                .unwrap_or_else(|| "state".into()),
+        ],
+    };
     loop {
         let observed = cx.update(|app| {
             with_workspace(app, needs_frame, |waku, window, cx| {
-                let snapshot = waku.rpa_snapshot(window, cx)?;
+                let snapshot = waku.rpa_snapshot_sections(window, cx, &sections)?;
                 Ok(condition_holds(condition, &snapshot))
             })
         });
@@ -605,10 +627,11 @@ impl Waku {
                 "snapshotSections": STATE_SECTIONS,
                 "automation": window.is_a11y_automation_enabled(),
                 "treeReady": window.a11y_automation_snapshot().is_some(),
-                "state": self.rpa_state(cx),
+                "capabilities": info::capabilities(),
+                "state": self.rpa_state_sections(cx, &info::CONTEXT_SECTIONS.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()),
                 "health": self.rpa_health(cx),
             })),
-            Request::Snapshot => self.rpa_snapshot(window, cx),
+            Request::Snapshot { sections } => self.rpa_snapshot_sections(window, cx, &sections),
             Request::Invoke { verb, args } => self.rpa_invoke(&verb, &args, window, cx),
             Request::Act { .. }
             | Request::Type { .. }
@@ -878,11 +901,6 @@ impl Waku {
         }
     }
 
-    /// The current frame's tree plus the app's observable state.
-    pub(crate) fn rpa_snapshot(&self, window: &Window, cx: &App) -> Result<Value, Error> {
-        self.rpa_snapshot_sections(window, cx, &[])
-    }
-
     fn rpa_snapshot_sections(
         &self,
         window: &Window,
@@ -1025,10 +1043,6 @@ impl Waku {
     /// Serialized model data stays complete as the model evolves. Only the
     /// genuinely UI-owned state is enumerated here. A section is serialized
     /// only when selected, so a frame subscription never walks every transcript.
-    pub(crate) fn rpa_state(&self, cx: &App) -> Value {
-        self.rpa_state_sections(cx, &[])
-    }
-
     fn rpa_state_sections(&self, cx: &App, sections: &[String]) -> Value {
         serialize_state_sections(sections, |section| {
             match section {
@@ -1039,6 +1053,10 @@ impl Waku {
                 model
             }
             "session" => self.selected_session().map(observable_session).unwrap_or(Value::Null),
+            "selection" => self.selected_session().map(info::session_summary).unwrap_or(Value::Null),
+            "providers" => self.rpa_providers(),
+            "runtime" => self.rpa_runtime(),
+            "workspace" => self.rpa_workspace(),
             "task" => self.selected_task.and_then(|id| self.state.tasks.iter().find(|task| task.id == id)).map(json_of).unwrap_or(Value::Null),
             "tasks" => json_of(&self.state.tasks),
             "sessions" => observable_session_list(&self.state.sessions),
@@ -1070,10 +1088,20 @@ impl Waku {
                 "text": self.composer.read(cx).content(cx),
                 "preparing": self.state.selected_session.is_some_and(|id| self.submission_preparations.contains(&id) || self.response_fork_preparations.contains_key(&id)),
                 "providerAvailable": !self.model_picker_has_no_providers(),
+                "attachmentCount": self.composer_attachments.len(),
+                "annotationCount": self.composer_annotations.len(),
             }),
             "toast" => self.toast.as_ref().map(|toast| json!({ "message": toast.message, "tone": format!("{:?}", toast.tone) })).unwrap_or(Value::Null),
             "panels" => json!({ "sidebar": self.sidebar_visible, "rightPanel": self.right_panel_visible }),
             "ui" => json!({
+                "annotations": {
+                    "selectionActive": !self.transcript_selection.selection.borrow().is_empty(),
+                    "toolbarVisible": self.selection_toolbar.borrow().is_some(),
+                    "commentOpen": self.selection_toolbar.borrow().as_ref().is_some_and(|toolbar| toolbar.comment_open),
+                    "commentText": self.selection_toolbar.borrow().as_ref().filter(|toolbar| toolbar.comment_open).and_then(|_| self.annotation_prompt_input.borrow().as_ref().map(|input| input.read(cx).content().to_owned())),
+                    "editor": self.annotation_editor.borrow().as_ref().map(|editor| json!({"annotationId":editor.id, "text":self.annotation_editor_input.borrow().as_ref().map(|input| input.read(cx).content().to_owned())})),
+                    "previewVisible": self.annotation_preview_visible.get(),
+                },
                 "sidebarRowCount": self.sidebar_list_state.item_count(),
                 "sidebarRows": self.sidebar_row_cache.borrow().len(),
                 "sidebarViewport": f32::from(self.sidebar_list_state.viewport_bounds().size.height),
@@ -1085,8 +1113,22 @@ impl Waku {
 }
 
 const STATE_SECTIONS: &[&str] = &[
-    "model", "task", "tasks", "session", "sessions", "projects", "route", "board", "composer",
-    "toast", "panels", "ui",
+    "model",
+    "task",
+    "tasks",
+    "session",
+    "sessions",
+    "projects",
+    "route",
+    "board",
+    "composer",
+    "toast",
+    "panels",
+    "ui",
+    "selection",
+    "providers",
+    "runtime",
+    "workspace",
 ];
 
 /// Board issue identity must never be inferred from a conversation UUID.
@@ -1120,7 +1162,7 @@ fn observable_session_list(sessions: &[crate::model::AgentSession]) -> Value {
     json_of(
         &sessions
             .iter()
-            .map(|session| session.list_projection())
+            .map(info::session_summary)
             .collect::<Vec<_>>(),
     )
 }
@@ -1171,8 +1213,24 @@ fn audit_tree(tree: &Value) {
 
 fn validate_sections(sections: &[String]) -> Result<(), Error> {
     const KNOWN: &[&str] = &[
-        "tree", "state", "model", "task", "tasks", "session", "sessions", "projects", "route",
-        "board", "composer", "toast", "panels", "ui",
+        "tree",
+        "state",
+        "model",
+        "task",
+        "tasks",
+        "session",
+        "sessions",
+        "projects",
+        "route",
+        "board",
+        "composer",
+        "toast",
+        "panels",
+        "ui",
+        "selection",
+        "providers",
+        "runtime",
+        "workspace",
     ];
     if let Some(section) = sections
         .iter()
@@ -1552,7 +1610,8 @@ mod tests {
         assert_eq!(state["sessions"][1]["id"], second.id.to_string());
         for session in state["sessions"].as_array().unwrap() {
             assert_eq!(session["task_id"], task.id.to_string());
-            assert_eq!(session["messages"], json!([]));
+            assert!(session.get("messages").is_none());
+            assert!(session.get("detailLoaded").is_some());
         }
         // Empty issues remain observable even when there are no conversations.
         assert_eq!(json_of(&tasks).as_array().unwrap().len(), 1);
@@ -1665,7 +1724,7 @@ mod tests {
         let mut app = cx.to_async();
         for request in [
             Request::Describe,
-            Request::Snapshot,
+            Request::Snapshot { sections: vec![] },
             Request::Act {
                 action: Action::Click,
                 target: Target::Id("missing".into()),

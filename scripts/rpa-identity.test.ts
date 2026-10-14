@@ -99,3 +99,27 @@ test("Board controls expose semantic identity and disabled state", () => {
   const rollback = completion.slice(completion.indexOf("if rollback.apply(*attempt, task)"), completion.indexOf("if rollback.apply(*attempt, task)") + 210);
   expect(rollback).toContain("super::rpa::daemon::model_changed()");
 });
+
+
+test("annotation overlays expose inspectable identities instead of requiring coordinates", () => {
+  const source = read("src/app/transcript_view.rs");
+  for (const id of ["selection-add-to-chat", "annotation-editor-cancel", "annotation-editor-save"]) {
+    const offset = source.indexOf(`.id("${id}")`);
+    expect(offset).toBeGreaterThanOrEqual(0);
+    expect(source.slice(offset, offset + 230)).toContain("semantic_control(gpui::Role::Button, false)");
+  }
+  expect(source).toContain('.semantic_id("annotation-editor-input")');
+  expect(source).toContain('.semantic_id("annotation-comment-input")');
+  expect(read("src/app/rpa.rs")).toContain('"toolbarVisible": self.selection_toolbar.borrow().is_some()');
+});
+
+
+test("agent context presets agree across app discovery, CLI and REPL", () => {
+  const info = read("src/app/rpa/info.rs");
+  const rust = info.slice(info.indexOf("const CONTEXT_SECTIONS"),info.indexOf("pub(super) fn capabilities"));
+  const sections = [...rust.matchAll(/"([a-zA-Z]+)"/g)].map(match => match[1]);
+  const cli = read("scripts/rpa.ts").match(/const CONTEXT_SECTIONS = (\[[^;]+\]);/)![1]!;
+  const repl = read("src/js_repl_bootstrap.js").match(/const contextSections = (\[[^;]+\]);/)![1]!;
+  expect(JSON.parse(cli)).toEqual(sections);
+  expect(JSON.parse(repl)).toEqual(sections);
+});

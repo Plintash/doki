@@ -286,7 +286,7 @@ pub(crate) fn action(
         // Reading the app is observation, not an action; recording every
         // snapshot would fill the stream with the caller's polling.
         Request::Describe
-        | Request::Snapshot
+        | Request::Snapshot { .. }
         | Request::Logs { .. }
         | Request::Timeline { .. }
         | Request::Counters
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn read_only_requests_are_not_action_records() {
         let mut looked_up = false;
-        let record = action(&Request::Snapshot, || {
+        let record = action(&Request::Snapshot { sections: vec![] }, || {
             looked_up = true;
             DiagnosticCorrelation::default()
         });

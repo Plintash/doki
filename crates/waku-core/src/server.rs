@@ -2760,7 +2760,7 @@ mod tests {
             )
             .unwrap();
         });
-        for protocol_version in [13, 15] {
+        for protocol_version in [13, 15, 16] {
             let (mut socket, _) = tungstenite::connect(format!("ws://{address}/v1")).unwrap();
             socket
                 .send(Message::Text(
@@ -2778,7 +2778,7 @@ mod tests {
             let rejected: ServerMessage =
                 serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
             assert!(
-                matches!(rejected, ServerMessage::Rejected { message } if message.contains("expected 16"))
+                matches!(rejected, ServerMessage::Rejected { message } if message.contains(&format!("expected {}", waku_protocol::PROTOCOL_VERSION)))
             );
         }
         let current = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
@@ -5141,5 +5141,54 @@ mod tests {
             computer_use_enabled: false,
             provider_cursor: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_transcript_tests {
+    use super::*;
+    use crate::{daemon::WakuBackend, persistence::StateStore, settings::DaemonSettingsStore};
+
+    #[test]
+    fn transcript_rpc_is_debug_only_and_preserves_domain_errors() {
+        let root = std::env::temp_dir().join(format!("waku-transcript-rpc-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap();
+        let hub = Arc::new(Hub::default());
+        let outcome = backend.handle(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id: Uuid::nil(),
+                runtime_id: Uuid::nil(),
+                command: Command::ReadTranscript {
+                    conversation_id: Uuid::new_v4(),
+                    query: waku_protocol::TranscriptQuery::Index {
+                        collection: waku_protocol::TranscriptCollection::Messages,
+                        offset: 0,
+                        limit: 50,
+                    },
+                },
+            },
+            hub.event_sink(Uuid::nil(), Uuid::nil()),
+        );
+        if cfg!(debug_assertions) {
+            let ResponsePayload::Transcript { result: Err(error) } = outcome.unwrap() else {
+                panic!("expected typed missing-conversation error")
+            };
+            assert_eq!(error.code, "conversation_not_found");
+        } else {
+            assert!(
+                outcome
+                    .unwrap_err()
+                    .to_string()
+                    .contains("only available in debug builds")
+            );
+        }
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

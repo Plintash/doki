@@ -26,7 +26,10 @@ pub enum Request {
     /// Instance identity: which checkout, database, build and process answered.
     Describe,
     /// The current frame's semantic tree plus the app's observable state.
-    Snapshot,
+    Snapshot {
+        #[serde(default)]
+        sections: Vec<String>,
+    },
     /// Read the instance's merged diagnostic stream from its daemon.
     Logs {
         query: waku_client::DiagnosticQuery,

@@ -7,7 +7,7 @@ import { parseArgs } from "node:util";
 import { WakuClient, WakuConnectionError } from "../packages/waku-client/src/client";
 import type {
   AutomationCall, AutomationCommand, AutomationCondition, AutomationCursor,
-  AutomationInstance, AutomationResult, AutomationScenario, AutomationSession,
+  AutomationInstance, AutomationResult, AutomationScenario, AutomationSession, TranscriptQuery,
 } from "../packages/waku-client/src/generated";
 
 type Discovery = {
@@ -29,10 +29,13 @@ const HELP = `Usage: bun scripts/rpa.ts [--json] [--instance ID | --checkout PAT
 
 Commands:
   instances                      list registered instance identities and executor health
-  describe                       instance and build identity
+  describe                       instance, capabilities and argument contracts
   tree [pattern]                 controls on screen (id, role, label)
-  state [pointer]                app state (optionally one JSON pointer)
+  state [pointer]                compact context, or one JSON pointer
+  inspect                        compact agent context (no transcript history)
   snap [--sections a,b]           the full snapshot, or selected sections
+  transcript --conversation ID QUERY_JSON
+                                 bounded history index/text without changing selection
   logs [--filter JSON]            merged daemon/app/provider events
   timeline --conversation ID [--turn ID]
                                  conversation lifecycle (diagnostic sessionId)
@@ -347,6 +350,17 @@ async function waitForCondition(daemon: Daemon, options: Arguments["options"]) {
   return wait;
 }
 
+export const CONTEXT_SECTIONS = ["route", "selection", "task", "composer", "providers", "runtime", "workspace", "board", "panels", "ui"];
+
+export function snapshotSections(command: string, pointer = "", explicit?: string): string[] {
+  if (explicit !== undefined) return explicit.split(",");
+  if (command === "tree") return ["tree"];
+  if (command === "inspect" || (command === "state" && !pointer)) return [...CONTEXT_SECTIONS];
+  if (command !== "state" || !pointer) return [];
+  if (!pointer.startsWith("/") || /~(?![01])/.test(pointer)) throw new Error("state pointer must be a valid JSON pointer starting with /");
+  return [pointer.slice(1).split("/")[0]!.replace(/~1/g, "/").replace(/~0/g, "~")];
+}
+
 function pointerValue(value: any, pointer: string): any {
   if (!pointer) return value;
   if (!pointer.startsWith("/")) throw new Error("state pointer must start with /");
@@ -444,18 +458,22 @@ async function main() {
         output(run);
         break;
       }
-      case "describe": {
-        const { value } = await perform({ type: "describe" });
-        if (options.json) output(value);
-        else {
-          const instance = value.instance ?? value;
-          output(`${instance.app ?? "Doki"} ${instance.build} · pid ${instance.pid} · ${instance.checkout} · ${instance.protocolVersion ? `protocol v${instance.protocolVersion}` : instance.instanceId ?? ""}`.trim());
-        }
+      case "transcript": {
+        native();
+        const conversationId = required(options.conversation, "--conversation ID");
+        const query: TranscriptQuery = JSON.parse(required(args[0], "a transcript query JSON object"));
+        const { value } = await perform({ type: "transcript", conversationId, query });
+        output(value);
         break;
       }
-      case "tree": case "state": case "snap": {
-        const { value } = await perform({ type: "snapshot", sections: options.sections?.split(",") ?? [] });
-        if (command === "snap") { output(value); break; }
+      case "describe": {
+        const { value } = await perform({ type: "describe" });
+        output(value);
+        break;
+      }
+      case "tree": case "state": case "snap": case "inspect": {
+        const { value } = await perform({ type: "snapshot", sections: snapshotSections(command, args[0], options.sections) });
+        if (command === "snap" || command === "inspect") { output(value); break; }
         if (command === "state") { output(pointerValue(value.state, args[0] ?? "")); break; }
         const nodes: any[] = (value?.tree?.nodes ?? []).filter((node: any) => node.element_id);
         const filtered = args[0] ? nodes.filter(node => [node.element_id, node.role, node.label, node.value].some(field => String(field ?? "").toLowerCase().includes(args[0]!.toLowerCase()))) : nodes;

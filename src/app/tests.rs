@@ -369,6 +369,34 @@ fn the_annotation_hover_panel_offers_edit_delete_and_jump() {
 }
 
 #[test]
+fn opening_annotation_editor_dismisses_the_preview_before_showing_the_editor() {
+    let source = include_str!("transcript_view.rs");
+    let start = source.find("fn open_annotation_editor(").unwrap();
+    let body = &source[start..];
+    let end = body.find("\n    fn annotation_mark_anchor(").unwrap();
+    let body = &body[..end];
+    let dismiss = body.find("self.reset_annotation_preview_hover();").unwrap();
+    let open = body.find("Some(AnnotationEditor { id, anchor })").unwrap();
+    assert!(
+        dismiss < open,
+        "the preview's outside-click handler must not close the editor before Save"
+    );
+
+    let source = include_str!("composer.rs");
+    for start in [
+        source.find(".id(\"composer-annotations-label\")").unwrap(),
+        source.find("fn set_annotation_preview_hover(").unwrap(),
+    ] {
+        let body = &source[start..];
+        let show = body.find("annotation_preview_visible.set(true)").unwrap();
+        assert!(
+            body[..show].contains("annotation_editor.borrow().is_some()"),
+            "hovering or activating the chip must not reopen the preview while editing"
+        );
+    }
+}
+
+#[test]
 fn structured_user_input_preserves_question_order_and_custom_answer_precedence() {
     let questions = vec![
         UserInputQuestion {

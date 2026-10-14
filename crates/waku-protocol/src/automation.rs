@@ -133,6 +133,10 @@ pub enum AutomationCommand {
 )]
 pub enum AutomationCall {
     Describe,
+    Transcript {
+        conversation_id: Uuid,
+        query: crate::TranscriptQuery,
+    },
     Snapshot {
         #[serde(default)]
         sections: Vec<String>,

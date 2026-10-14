@@ -1311,6 +1311,32 @@ impl StateStore {
     }
 }
 
+/// Bounded read of persisted history without hydrating or selecting a session.
+pub fn read_transcript(
+    daemon: &DaemonSupervisor,
+    conversation_id: Uuid,
+    query: waku_protocol::TranscriptQuery,
+) -> io::Result<waku_protocol::TranscriptResult> {
+    query.validate().map_err(io::Error::other)?;
+    match daemon
+        .client()
+        .request(
+            Uuid::nil(),
+            Uuid::nil(),
+            Command::ReadTranscript {
+                conversation_id,
+                query,
+            },
+        )
+        .map_err(to_io_error)?
+    {
+        ResponsePayload::Transcript { result } => result.map_err(io::Error::other),
+        _ => Err(io::Error::other(
+            "Waku daemon returned an invalid transcript response",
+        )),
+    }
+}
+
 /// Fetches one daemon-owned session. Remote image materialization is kept
 /// separate so presentation code can show the transcript before large blobs
 /// finish crossing the daemon boundary.

@@ -21,9 +21,8 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-// Version 16 combines durable issue bindings with the automation/diagnostic
-// contract. Earlier clients cannot safely preserve both projections.
-pub const PROTOCOL_VERSION: u32 = 16;
+// Version 17 adds bounded explicit-conversation transcript reads.
+pub const PROTOCOL_VERSION: u32 = 17;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -232,6 +231,11 @@ pub enum Command {
     RemoveSession,
     HydrateSession {
         session_id: Uuid,
+    },
+    /// Debug-only bounded read; does not hydrate or select the conversation.
+    ReadTranscript {
+        conversation_id: Uuid,
+        query: crate::TranscriptQuery,
     },
     SearchSessionMessages {
         query: String,
@@ -477,6 +481,9 @@ pub enum ResponseOutcome {
     rename_all_fields = "camelCase"
 )]
 pub enum ResponsePayload {
+    Transcript {
+        result: Result<crate::TranscriptResult, crate::TranscriptError>,
+    },
     Automation {
         result: AutomationResult,
     },
@@ -730,7 +737,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 16);
+        assert_eq!(PROTOCOL_VERSION, 17);
     }
 
     #[test]
@@ -739,7 +746,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 16);
+        assert_eq!(PROTOCOL_VERSION, 17);
     }
 
     #[test]

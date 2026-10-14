@@ -59,6 +59,7 @@ pub mod skills;
 mod slash_command_catalog;
 pub mod terminal;
 pub mod theme;
+mod transcript;
 pub mod usage;
 pub mod usage_history;
 pub mod workspace;

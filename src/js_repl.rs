@@ -31,7 +31,7 @@ const KERNEL_BOOTSTRAP: &str = include_str!("js_repl_bootstrap.js");
 const JS_TOOL_DESCRIPTION: &str = "Run JavaScript in a persistent QuickJS kernel with top-level await. This is the JavaScript execution tool for the `waku_js_repl` MCP server; use it whenever instructions say to use `waku_js_repl`, the Waku JavaScript REPL MCP, or run Waku JavaScript REPL code. If `timeout_ms` is omitted, execution times out after 30000 ms (30 seconds); pass a larger `timeout_ms` for slow Computer Use automation or other long-running operations. Use `jsRepl.cwd`, `jsRepl.homeDir`, and `jsRepl.tmpDir` to inspect host paths. Use `jsRepl.requestMeta` to inspect the current MCP request `_meta` object during a tool call. Use `jsRepl.setResponseMeta(meta)` to attach top-level MCP result `_meta`; repeated calls shallow-merge object keys for the current tool call. Use `jsRepl.write(value)` to add output without a newline. Strings are unchanged; other values use console-style formatting, including BigInt and circular objects. Prefer it over `console.log(...)` for final output; `console.log(...)` remains useful for debugging or multiple values. Use `await jsRepl.emitImage(imageLike)` to return images; each call adds one image to the outer tool result, so call it multiple times to emit multiple images. Supported image inputs are a base64 data URL, a file URL, an object with a `url` property, or a Cua image content block with `data` and `mimeType`. Saved references to `jsRepl.write(...)` and `jsRepl.emitImage(...)` stay reusable across calls. Scheduled callbacks only run while a JavaScript execution call is active; overdue timers resume at the start of the next call. Top-level bindings persist across calls until `js_reset`. If a call throws, prior bindings remain available and bindings that finished initializing before the throw often remain reusable. For reusable names that may be assigned again later, prefer top-level `var name = ...`; `var` can be redeclared across calls. If you hit `SyntaxError: Identifier 'x' has already been declared`, reuse the existing binding if possible, reassign it only if it was declared with `let` or `var`, or pick a new name instead of resetting immediately; a previous `const x` cannot be changed into `var x`. Use a short `{ ... }` block only for temporary scratch names, and do not wrap an entire call in block scope if you want those names reusable later. Initialize Cua Driver with `await setupComputerUseRuntime({ globals: globalThis })`, which exposes every native tool as `cua.<tool_name>(arguments)`, such as `cua.list_apps()` or `cua.click(arguments)`. The bundled Computer Use skill documents the method signatures; call the methods directly. Module imports are not supported. Prefer `jsRepl.write(...)` for text or formatted values and `jsRepl.emitImage(...)` for images.";
 
 #[cfg(debug_assertions)]
-const RPA_DESCRIPTION: &str = " Debug app automation is available as waku.rpa, independently of Computer Use. Start with await waku.rpa.instances(), then await waku.rpa.attach(instanceId); pass the returned session.sessionId to snapshot, describe, click/act/type/key/invoke, subscribe/events, diff, wait/waitResult, and scenarioStart/scenarioResult/scenarioAbort. Diagnostics use logs, timeline, counters and verbosity. Pass a conversation UUID as logs/timeline query.sessionId; it is distinct from the automation attachment sessionId and a Board issue taskId. scratchCreate/scratchRemove manage disposable instances. waitForBuild(checkout, previousBuild, {timeoutMs, pollMs}) waits for a new connected build of the explicit checkout. Methods return the shared daemon protocol result envelopes; failures preserve their code and failure bundle. Wait and scenario start calls return promptly; inspect their status or subscribe for results.";
+const RPA_DESCRIPTION: &str = " Debug app automation is available as waku.rpa, independently of Computer Use. Start with await waku.rpa.instances(), then await waku.rpa.attach(instanceId); pass the returned session.sessionId to inspect (compact context), tree, state (JSON pointer), snapshot (explicit sections), describe (argument contracts), click/act/type/key/invoke, subscribe/events, diff, wait/waitResult, and scenarioStart/scenarioResult/scenarioAbort. transcript(attachmentId, conversationId, query) reads bounded history by explicit conversation without opening it. Diagnostics use logs, timeline, counters and verbosity. Pass a conversation UUID as logs/timeline query.sessionId; it is distinct from the automation attachment sessionId and a Board issue taskId. scratchCreate/scratchRemove manage disposable instances. waitForBuild(checkout, previousBuild, {timeoutMs, pollMs}) waits for a new connected build of the explicit checkout. Methods return the shared daemon protocol result envelopes, except state returns the selected state value; failures preserve their code and failure bundle. Wait and scenario start calls return promptly; inspect their status or subscribe for results.";
 #[cfg(not(debug_assertions))]
 const RPA_DESCRIPTION: &str = "";
 
@@ -1472,6 +1472,43 @@ mod tests {
             assert!(query.get("taskId").is_none());
         }
         assert_eq!(calls.lock()[9].1["call"]["target"], json!({"id":"send"}));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn automation_repl_compact_reads_and_transcript_use_shared_protocol() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<JsonValue>::new()));
+        context.with(|ctx| {
+            let captured = calls.clone();
+            ctx.globals().set("__wakuRpaCall", Function::new(ctx.clone(), move |_: String, args: String| {
+                let command: JsonValue = serde_json::from_str(&args).unwrap();
+                let _: waku_protocol::AutomationCommand = serde_json::from_value(command.clone()).unwrap();
+                captured.lock().push(command);
+                json!({"ok":true,"value":{"type":"called","result":{"value":{"state":{"composer":{"text":"kept draft"}}}}}}).to_string()
+            }).unwrap()).unwrap();
+            ctx.eval::<(), _>(KERNEL_BOOTSTRAP).unwrap();
+            let promise: Promise<'_> = ctx.eval(r#"(async () => {
+                const id = '00000000-0000-0000-0000-000000000001';
+                await waku.rpa.inspect(id); await waku.rpa.tree(id);
+                const draft = await waku.rpa.state(id, '/composer/text');
+                await waku.rpa.transcript(id, id, {type:'index',collection:'messages'});
+                try { await waku.rpa.state(id, '/bad~2pointer'); } catch (error) { return draft + ':' + error.name; }
+            })()"#).unwrap();
+            assert_eq!(promise.finish::<String>().unwrap(), "kept draft:TypeError");
+        });
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 4);
+        assert!(
+            !calls[0]["call"]["sections"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("session"))
+        );
+        assert_eq!(calls[1]["call"]["sections"], json!(["tree"]));
+        assert_eq!(calls[2]["call"]["sections"], json!(["composer"]));
+        assert_eq!(calls[3]["call"]["type"], "transcript");
     }
 
     #[test]
