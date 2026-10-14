@@ -102,6 +102,9 @@ pub struct MainWindow {
     /// notification click can beat a slow daemon, and the tag has to survive
     /// until there is a workspace to select the task in.
     requested_task: Option<Uuid>,
+    /// Coalesce native close events until the Linux callback has returned.
+    #[cfg(target_os = "linux")]
+    native_close_pending: bool,
 }
 
 /// What the main window shows.
@@ -133,6 +136,8 @@ impl MainWindow {
             content: WindowContent::Connecting,
             preferences,
             requested_task: None,
+            #[cfg(target_os = "linux")]
+            native_close_pending: false,
         }
     }
 
@@ -208,6 +213,43 @@ impl MainWindow {
             WindowContent::Connecting | WindowContent::Failed(_) => {
                 self.requested_task = Some(task_id);
             }
+        }
+    }
+
+    /// Leave Linux's native callback before consulting the workspace or
+    /// removing the window. The pinned GPUI X11 client holds its client and
+    /// callback RefCells while asking whether to close; frame capture queries
+    /// the display and would re-enter that borrowed client. A foreground task
+    /// crosses this boundary; `defer` still runs inside the callback.
+    fn native_window_should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if self.native_close_pending
+                || self
+                    .workspace()
+                    .is_some_and(|workspace| workspace.read(cx).is_window_close_confirmation_open())
+            {
+                return false;
+            }
+            self.native_close_pending = true;
+            cx.spawn_in(window, async move |this, cx| {
+                // The weak entity and original window handle make a request
+                // harmless if another close route has already removed it.
+                let _ = cx.update(|window, cx| {
+                    this.update(cx, |root, cx| {
+                        root.native_close_pending = false;
+                        if root.window_should_close(window, cx) {
+                            crate::platform::close_window(window);
+                        }
+                    })
+                });
+            })
+            .detach();
+            false
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.window_should_close(window, cx)
         }
     }
 
@@ -362,7 +404,7 @@ fn open_main_window_with(
             root.update(cx, |root, cx| root.connect(window, connector, cx));
             let closing = root.clone();
             window.on_window_should_close(cx, move |window, cx| {
-                closing.update(cx, |root, cx| root.window_should_close(window, cx))
+                closing.update(cx, |root, cx| root.native_window_should_close(window, cx))
             });
             root
         },
@@ -886,6 +928,7 @@ mod tests {
     /// AppKit's close with `true`, and the window comes down when the platform
     /// closes it. A confirmation that swallowed the answer would leave a
     /// window that could not be closed.
+    #[cfg(not(target_os = "linux"))]
     #[gpui::test]
     fn a_window_with_nothing_unsaved_answers_the_close(cx: &mut TestAppContext) {
         let window =
@@ -905,5 +948,72 @@ mod tests {
                 .unwrap()
         });
         assert!(cx.windows().is_empty(), "the window still closes");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn linux_native_close_waits_for_the_callback_to_return(cx: &mut TestAppContext) {
+        let window =
+            cx.update(|cx| open_main_window_with(cx, unreachable_daemon(), AppSettings::default()));
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(!visual.simulate_close());
+        assert!(
+            !visual.simulate_close(),
+            "repeated native requests are coalesced"
+        );
+        assert_eq!(
+            cx.windows().len(),
+            1,
+            "the callback cannot remove its window"
+        );
+        assert!(
+            window
+                .read_with(cx, |root, _| root.native_close_pending)
+                .unwrap()
+        );
+
+        cx.run_until_parked();
+        assert!(
+            cx.windows().is_empty(),
+            "the queued close removes a connecting window"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn linux_native_close_removes_a_failed_window(cx: &mut TestAppContext) {
+        let window =
+            cx.update(|cx| open_main_window_with(cx, unreachable_daemon(), AppSettings::default()));
+        cx.run_until_parked();
+        assert!(
+            window
+                .read_with(cx, |root, _| matches!(
+                    root.content,
+                    WindowContent::Failed(_)
+                ))
+                .unwrap()
+        );
+        assert!(!VisualTestContext::from_window(*window, cx).simulate_close());
+        assert_eq!(cx.windows().len(), 1);
+        cx.run_until_parked();
+        assert!(cx.windows().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn a_pending_linux_close_cannot_remove_a_replacement_window(cx: &mut TestAppContext) {
+        let original =
+            cx.update(|cx| open_main_window_with(cx, unreachable_daemon(), AppSettings::default()));
+        assert!(!VisualTestContext::from_window(*original, cx).simulate_close());
+        cx.update(|cx| {
+            original
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap()
+        });
+        let replacement =
+            cx.update(|cx| open_main_window_with(cx, unreachable_daemon(), AppSettings::default()));
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 1);
+        assert_eq!(cx.windows()[0].window_id(), replacement.window_id());
     }
 }
