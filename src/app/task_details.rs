@@ -28,6 +28,31 @@ pub(super) struct TaskDetail {
     workspace_menu: ContextMenuHandle,
 }
 
+/// An edited issue may have a debounced write waiting after its editor closes.
+/// Navigation consumes that write; it must never invent one or let its old
+/// timer save the same edit again.
+#[derive(Default)]
+pub(super) struct TaskDetailSave {
+    generation: u64,
+    pending: bool,
+}
+
+impl TaskDetailSave {
+    fn schedule(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = true;
+        self.generation
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.pending && self.generation == generation
+    }
+
+    fn take_pending(&mut self) -> bool {
+        std::mem::take(&mut self.pending)
+    }
+}
+
 pub(super) fn task_project_id(task: &Task) -> Option<Uuid> {
     task.workspace.as_ref().map(|workspace| match workspace {
         TaskWorkspace::Local { project_id }
@@ -303,6 +328,9 @@ impl Waku {
     /// Coalescing preserves ordering without blocking a frame or streaming saves.
     pub(super) fn save_task_changes(&mut self, cx: &mut Context<Self>) {
         super::rpa::daemon::model_changed();
+        // This save includes the current issue catalog, including any edit
+        // whose debounce timer has not fired yet.
+        self.task_detail_save.take_pending();
         if self.task_save_in_flight {
             self.task_save_pending = true;
             return;
@@ -347,24 +375,37 @@ impl Waku {
 
     pub(super) fn render_task_save_status(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
+        // A save acknowledgment must not move filters or issue actions. Keep
+        // the same small slot in both header modes, including while idle.
+        let slot = div()
+            .id("board-save-status")
+            .w(px(80.0))
+            .h(px(30.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_end();
         if !self.task_save_in_flight && !self.task_save_pending && self.task_save_error.is_none() {
-            return div().into_any_element();
+            return slot.into_any_element();
         }
         if self.task_save_error.is_some() {
-            return self
-                .task_action_button(
-                    "task-save-retry",
-                    tr!("board.retry_save"),
-                    false,
-                    true,
-                    |this, _, cx| this.save_task_changes(cx),
-                    cx,
+            return slot
+                .child(
+                    self.task_action_button(
+                        "task-save-retry",
+                        tr!("common.retry"),
+                        false,
+                        true,
+                        |this, _, cx| this.save_task_changes(cx),
+                        cx,
+                    )
+                    .aria_label(tr!("board.retry_save"))
+                    .tooltip(Tooltip::text(tr!("board.retry_save")))
+                    .text_color(theme.warning),
                 )
-                .text_color(theme.warning)
                 .into_any_element();
         }
-        div()
-            .text_size(sp(11.0))
+        slot.text_size(sp(11.0))
             .text_color(theme.text_ghost)
             .child(tr!("board.saving"))
             .into_any_element()
@@ -373,14 +414,13 @@ impl Waku {
     fn schedule_task_detail_save(&mut self, cx: &mut Context<Self>) {
         super::rpa::daemon::model_changed();
         self.sidebar_rows_fingerprint.set(None);
-        self.task_detail_save_generation = self.task_detail_save_generation.wrapping_add(1);
-        let generation = self.task_detail_save_generation;
+        let generation = self.task_detail_save.schedule();
         cx.spawn(async move |waku, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(300))
                 .await;
             let _ = waku.update(cx, |this, cx| {
-                if this.task_detail_save_generation == generation {
+                if this.task_detail_save.is_current(generation) {
                     this.save_task_changes(cx);
                     cx.notify();
                 }
@@ -393,7 +433,9 @@ impl Waku {
         self.selected_task = None;
         self.task_detail = None;
         self.board_open = true;
-        self.save_task_changes(cx);
+        if self.task_detail_save.take_pending() {
+            self.save_task_changes(cx);
+        }
         window.focus(&self.board_dialog_focus(cx), cx);
         cx.notify();
     }
@@ -1390,6 +1432,47 @@ impl Waku {
 mod tests {
     use super::*;
     use crate::ui::SemanticControlExt;
+
+    #[test]
+    fn leaving_an_unchanged_issue_does_not_create_a_save() {
+        let mut save = TaskDetailSave::default();
+        assert!(!save.take_pending());
+        assert!(
+            !save.take_pending(),
+            "repeated Back is still navigation only"
+        );
+    }
+
+    #[test]
+    fn leaving_after_an_edit_flushes_once_and_retires_its_timer() {
+        let mut save = TaskDetailSave::default();
+        let generation = save.schedule();
+        assert!(save.is_current(generation));
+        assert!(save.take_pending(), "the real edit must be flushed");
+        assert!(
+            !save.is_current(generation),
+            "the old timer cannot save twice"
+        );
+        assert!(!save.take_pending(), "reopening and leaving adds no write");
+    }
+
+    #[test]
+    fn consuming_a_pending_save_does_not_invalidate_a_newer_edit() {
+        let mut save = TaskDetailSave::default();
+        let first = save.schedule();
+        let second = save.schedule();
+        assert!(!save.is_current(first));
+        assert!(save.is_current(second));
+
+        // An explicit save, including one queued behind an in-flight save,
+        // consumes the pending catalog edit before leaving the inspector.
+        assert!(save.take_pending());
+        let third = save.schedule();
+        assert!(!save.is_current(first));
+        assert!(!save.is_current(second));
+        assert!(save.is_current(third));
+        assert!(save.take_pending());
+    }
 
     #[test]
     fn planned_isolation_and_explicit_local_remain_distinct() {

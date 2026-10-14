@@ -1519,7 +1519,7 @@ pub struct Waku {
     /// The board details stay separate from conversation selection.
     selected_task: Option<Uuid>,
     task_detail: Option<task_details::TaskDetail>,
-    task_detail_save_generation: u64,
+    task_detail_save: task_details::TaskDetailSave,
     task_save_in_flight: bool,
     task_save_pending: bool,
     task_save_error: Option<String>,
@@ -3190,7 +3190,7 @@ impl Waku {
                 board_activity_filter: board::BoardActivityFilter::All,
                 selected_task: None,
                 task_detail: None,
-                task_detail_save_generation: 0,
+                task_detail_save: task_details::TaskDetailSave::default(),
                 task_save_in_flight: false,
                 task_save_pending: false,
                 task_save_error: None,

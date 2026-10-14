@@ -236,8 +236,6 @@ impl Waku {
             window,
             cx,
         );
-        let show_save_status =
-            self.task_save_in_flight || self.task_save_pending || self.task_save_error.is_some();
         let mut controls = div()
             .min_w_0()
             .flex_1()
@@ -267,9 +265,7 @@ impl Waku {
                         cx,
                     ),
                 )
-                .when(show_save_status, |element| {
-                    element.child(self.render_task_save_status(cx))
-                })
+                .child(self.render_task_save_status(cx))
                 .child(if self.is_task_draft(task.id) {
                     div()
                         .flex()
@@ -382,11 +378,9 @@ impl Waku {
                         .items_center()
                         .justify_end()
                         .gap(px(8.0))
+                        .child(self.render_task_save_status(cx))
                         .child(running_filter)
                         .child(attention_filter)
-                        .when(show_save_status, |element| {
-                            element.child(self.render_task_save_status(cx))
-                        })
                         .child(new_issue),
                 );
         }

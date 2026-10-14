@@ -697,11 +697,11 @@ impl Waku {
         let mut commands = vec![
             CommandPaletteItem::command(
                 display_section(PaletteSection::Suggested),
-                tr!("command_palette.new_task"),
+                tr!("board.new_issue"),
                 "icons/pencil.svg",
                 Some(crate::platform::primary_shortcut("⌘N", "Ctrl+N")),
                 PaletteAction::NewTask,
-                "new task session chat conversation start",
+                "new issue task start",
                 next(),
             ),
             CommandPaletteItem::command(
