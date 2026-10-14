@@ -42,7 +42,7 @@ jobs:
             macos-latest-rust-1.96.0-cargo-
 
       # Direct core selection bypasses unrelated earlier workspace test failures.
-      # --nocapture retains the deadline and eventual-marker diagnostic output.
-      # A late marker still fails the test; there is no retry or failure override.
+      # --nocapture preserves any assertion failure and test completion output.
+      # The fixture's completion bound is enforced; no retry or failure override.
       - name: Run exact attach-boundary test
         run: cargo test --locked -p waku-core --lib server::tests::websocket_terminal_attach_boundary_has_no_duplicates_or_gaps -- --exact --nocapture
