@@ -4617,6 +4617,226 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn terminal_exit_event_preserves_child_ownership_until_drop() {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let hub = Arc::new(Hub::default());
+        let session = Uuid::new_v4();
+        let runtime = Uuid::new_v4();
+        hub.begin_runtime(session, runtime);
+        let (messages, events) = unbounded();
+        let (subscriber, _kicked) = Subscriber::new(messages);
+        hub.subscribe(&[], None, subscriber);
+        let terminal = crate::terminal::DaemonTerminal::open_with_shell(
+            &root,
+            80,
+            24,
+            hub.event_sink(session, runtime),
+            terminal_test_shell("echo $$ > shell.pid; printf 'done\n'"),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let message = events
+                .recv_timeout(remaining)
+                .expect("terminal did not report exit");
+            if matches!(message, ServerMessage::Event(event) if event.event.kind == "terminalExited")
+            {
+                break;
+            }
+        }
+        let pid: libc::pid_t = std::fs::read_to_string(root.join("shell.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // A PTY can report EOF just before its child becomes waitable. Poll
+        // without consuming status, but stop immediately if ownership is lost.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let (result, observed_pid) = loop {
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut status,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            let observed_pid = unsafe { status.si_pid() };
+            if result != 0 || observed_pid != 0 {
+                break (result, observed_pid);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exited shell never became waitable"
+            );
+            std::thread::sleep(Duration::from_millis(4));
+        };
+        drop(terminal);
+        let reaped = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut status,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        let error = std::io::Error::last_os_error();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            result, 0,
+            "reader reaped the child while the terminal still owns its group"
+        );
+        assert_eq!(observed_pid, pid);
+        assert_eq!(reaped, -1);
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ECHILD),
+            "drop must reap its direct child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_terminal_terminates_hangup_ignoring_group_children() {
+        terminal_drop_terminates_group_children(TerminalGroupFixture::Waiting);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_terminal_terminates_group_children_after_shell_exit() {
+        terminal_drop_terminates_group_children(TerminalGroupFixture::Exited);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_flooding_terminal_terminates_pipeline_group() {
+        terminal_drop_terminates_group_children(TerminalGroupFixture::Flooding);
+    }
+
+    #[cfg(unix)]
+    enum TerminalGroupFixture {
+        Waiting,
+        Exited,
+        Flooding,
+    }
+
+    #[cfg(unix)]
+    fn terminal_drop_terminates_group_children(fixture: TerminalGroupFixture) {
+        let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let hub = Arc::new(Hub::default());
+        let terminal = crate::terminal::DaemonTerminal::open_with_shell(
+            &root,
+            80,
+            24,
+            hub.event_sink(Uuid::new_v4(), Uuid::new_v4()),
+            terminal_test_shell(match fixture {
+                TerminalGroupFixture::Waiting => {
+                    "trap '' HUP; echo $$ > shell.pid; (sleep 5; kill -KILL 0) & sleep 120 & echo $! > child.pid; wait"
+                }
+                TerminalGroupFixture::Exited => {
+                    "trap '' HUP; echo $$ > shell.pid; (sleep 5; kill -KILL 0) & sleep 120 & echo $! > child.pid; exit 0"
+                }
+                TerminalGroupFixture::Flooding => {
+                    "trap '' HUP; echo $$ > shell.pid; (sleep 5; kill -KILL 0) & yes x | cat & echo $! > child.pid; wait"
+                }
+            }),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let read_pid = |name: &str| -> libc::pid_t {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(root.join(name))
+                    && let Ok(pid) = text.trim().parse()
+                {
+                    break pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "shell did not publish {name}"
+                );
+                std::thread::sleep(Duration::from_millis(4));
+            }
+        };
+        let shell_pid = read_pid("shell.pid");
+        let child_pid = read_pid("child.pid");
+        // Each fixture has an in-group watchdog. If teardown regresses, it
+        // signals its own current group after five seconds. No parent-side
+        // cleanup retains a raw group ID after the terminal reaps its leader.
+        if matches!(fixture, TerminalGroupFixture::Flooding) {
+            while terminal.retained_snapshot().1 < 64 * 1024 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture pipeline did not flood"
+                );
+                std::thread::sleep(Duration::from_millis(4));
+            }
+        }
+        if matches!(fixture, TerminalGroupFixture::Exited) {
+            loop {
+                let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        shell_pid as libc::id_t,
+                        &mut status,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                assert_eq!(
+                    result, 0,
+                    "terminal shell was reaped before terminal ownership ended"
+                );
+                if unsafe { status.si_pid() } != 0 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture shell did not exit"
+                );
+                std::thread::sleep(Duration::from_millis(4));
+            }
+        }
+        let (dropped, finished) = bounded(1);
+        std::thread::spawn(move || {
+            drop(terminal);
+            let _ = dropped.send(());
+        });
+        let completed = finished.recv_timeout(Duration::from_secs(3)).is_ok();
+        // An orphan can briefly remain as a zombie until init reaps it. ps is
+        // portable across the supported Unix platforms; kill(pid, 0) alone
+        // would incorrectly count that already-terminated child as running.
+        let running = || {
+            let output = std::process::Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &child_pid.to_string()])
+                .output()
+                .expect("inspect fixture child state");
+            assert!(
+                output.status.success()
+                    || (output.status.code() == Some(1) && output.stderr.is_empty()),
+                "could not inspect fixture child: {output:?}"
+            );
+            let state = String::from_utf8(output.stdout).unwrap();
+            !state.trim().is_empty() && !state.trim_start().starts_with('Z')
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        let child_running = running();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(completed, "terminal drop did not finish");
+        assert!(
+            !child_running,
+            "terminal drop left its HUP-ignoring child running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dropping_an_idle_terminal_does_not_wait_for_output() {
         let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
