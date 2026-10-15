@@ -3,6 +3,191 @@ use super::*;
 use crate::ui::{ActivationExt, SemanticControlExt};
 use base64::Engine as _;
 
+/// Scrollbar and wheel input share the same one-way reserve consumption. The
+/// list has already moved by the time this adapter shortens the padding.
+#[derive(Clone)]
+struct BufferedTranscriptScroll {
+    rows: ListState,
+    buffer: Rc<RefCell<transcript_buffer::TranscriptBuffer>>,
+    padding: Rc<Cell<Pixels>>,
+    following: Rc<Cell<bool>>,
+    is_scrolled: Rc<Cell<bool>>,
+    recheck: Rc<Cell<bool>>,
+}
+
+impl BufferedTranscriptScroll {
+    fn scrolled(&self) -> f32 {
+        f32::from(-self.rows.scroll_px_offset_for_scrollbar().y)
+    }
+
+    fn consume_movement(&self, before: f32) {
+        let mut after = self.scrolled();
+        let mut buffer = self.buffer.borrow_mut();
+        // Several wheel events can use one painted list's old padding. A
+        // reverse event must respect reserve already spent earlier in that
+        // frame, rather than overshoot and get clamped back on the next paint.
+        if let Some(max) =
+            buffer.max_scroll(before, f32::from(self.rows.viewport_bounds().size.height))
+            && after > max
+        {
+            self.rows.scroll_by(px(max - after));
+            after = self.scrolled();
+        }
+        buffer.consume_scroll(before, after);
+        self.padding.set(px(buffer.padding()));
+        if before > after + 0.01 {
+            // Spending padding can leave the list exactly at its new end.
+            // An upward gesture must still release following, rather than
+            // having the tail check immediately take the viewport back.
+            self.following.set(false);
+            self.is_scrolled.set(true);
+            self.recheck.set(false);
+        }
+    }
+}
+
+impl scrollbar::Scrollable for BufferedTranscriptScroll {
+    fn viewport_height(&self) -> Pixels {
+        self.rows.viewport_bounds().size.height
+    }
+    fn max_offset(&self) -> Pixels {
+        let viewport = self.rows.viewport_bounds();
+        // Painting the scrollbar happens after list layout. Prefer that fresh
+        // tail geometry over a controller sample from before layout/adoption.
+        if let Some(last) = self
+            .rows
+            .item_count()
+            .checked_sub(1)
+            .and_then(|last| self.rows.bounds_for_item(last))
+        {
+            return (px(self.scrolled()) + last.bottom() - viewport.top() + self.padding.get()
+                - viewport.size.height)
+                .max(Pixels::ZERO);
+        }
+        self.buffer
+            .borrow()
+            .max_scroll(self.scrolled(), f32::from(viewport.size.height))
+            .map(px)
+            .unwrap_or_else(|| self.rows.max_offset_for_scrollbar().y)
+    }
+    fn scrolled(&self) -> Pixels {
+        px(self.scrolled())
+    }
+    fn scroll_to(&self, offset: Pixels) {
+        let before = self.scrolled();
+        self.rows
+            .set_offset_from_scrollbar(point(Pixels::ZERO, -offset));
+        self.following.set(false);
+        self.is_scrolled.set(true);
+        self.recheck.set(true);
+        self.consume_movement(before);
+    }
+}
+
+fn transcript_scroll_observer(scroll: BufferedTranscriptScroll) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            let scroll = scroll.clone();
+            let mut before = None;
+            // Registered before the list paints: capture sees its old offset,
+            // bubble sees its new offset. Nested panes that consume a wheel
+            // stop propagation before this bubble handler, so they cannot
+            // consume transcript reserve. Raw wheel deltas are deliberately
+            // not used: GPUI coalesces them and clamps at the content edge.
+            window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, _, _| {
+                if phase == gpui::DispatchPhase::Capture {
+                    before = scroll
+                        .rows
+                        .viewport_bounds()
+                        .contains(&event.position)
+                        .then(|| scroll.scrolled());
+                } else if let Some(before) = before.take() {
+                    scroll.consume_movement(before);
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+/// Padding is resolved against this frame's actual list bounds, not the
+/// previous paint's viewport. Otherwise shrinking a settled window can make
+/// GPUI skip every row for a frame (padding >= the new height).
+struct BufferedTranscriptList {
+    inner: gpui::List,
+    scroll: BufferedTranscriptScroll,
+}
+
+impl IntoElement for BufferedTranscriptList {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for BufferedTranscriptList {
+    type RequestLayoutState = <gpui::List as gpui::Element>::RequestLayoutState;
+    type PrepaintState = <gpui::List as gpui::Element>::PrepaintState;
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        id: Option<&gpui::GlobalElementId>,
+        inspector: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        self.inner.request_layout(id, inspector, window, cx)
+    }
+    fn prepaint(
+        &mut self,
+        id: Option<&gpui::GlobalElementId>,
+        inspector: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let previous = self.scroll.rows.viewport_bounds().size;
+        self.scroll
+            .buffer
+            .borrow_mut()
+            .cap_padding(f32::from(bounds.size.height) - 1.0);
+        let padding = px(self.scroll.buffer.borrow().padding());
+        self.scroll.padding.set(padding);
+        self.inner.style().padding.bottom = Some(padding.into());
+        let result = self
+            .inner
+            .prepaint(id, inspector, bounds, state, window, cx);
+        if previous != bounds.size {
+            // One functional reconciliation after first layout or a resize,
+            // including reduce-motion and an otherwise idle settled turn.
+            let view = window.current_view();
+            window.on_next_frame(move |_, cx| cx.notify(view));
+        }
+        result
+    }
+    fn paint(
+        &mut self,
+        id: Option<&gpui::GlobalElementId>,
+        inspector: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request: &mut Self::RequestLayoutState,
+        state: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.inner
+            .paint(id, inspector, bounds, request, state, window, cx);
+    }
+}
+
 const CHANGED_FILES_PREVIEW_LIMIT: usize = 3;
 /// Keep one virtualized transcript row bounded even when a generator touches
 /// hundreds of files. The full immutable list remains one click away in the
@@ -202,7 +387,7 @@ impl Waku {
         self.sync_sent_annotation_resolution(cx);
         self.sync_selection_toolbar();
         self.sync_transcript_rows();
-        self.sync_transcript_layout_width(window);
+        let layout_invalidated = self.sync_transcript_layout_width(window);
         self.apply_pending_transcript_search_reveal(window, cx);
         self.apply_pending_annotation_reveal(window, cx);
         let search_bar = self.render_transcript_search_bar(chat_viewport_width, cx);
@@ -228,21 +413,17 @@ impl Waku {
                 self.transcript_tail_recheck.set(true);
             }
         }
-        let anchor_end_space = self.update_transcript_anchor_end_space(window);
-        if self.transcript_anchor_following.get()
-            && anchor_end_space <= Pixels::ZERO
-            && self
-                .selected_transcript_anchor_row()
-                .is_some_and(|anchor_row| anchor_row + 1 < transcript_rows.item_count())
-        {
-            transcript_rows.scroll_to(ListOffset {
-                item_ix: transcript_rows.item_count(),
-                offset_in_item: Pixels::ZERO,
-            });
-            self.transcript_is_scrolled.set(false);
-        }
+        let anchor_end_space =
+            self.update_transcript_anchor_end_space(window, layout_invalidated, cx);
         let entity = cx.entity().downgrade();
-        let scrollbar_handle = transcript_rows.clone();
+        let scrollbar_handle = BufferedTranscriptScroll {
+            rows: transcript_rows.clone(),
+            buffer: self.transcript_buffer.clone(),
+            padding: self.transcript_anchor_end_space.clone(),
+            following: self.transcript_anchor_following.clone(),
+            is_scrolled: self.transcript_is_scrolled.clone(),
+            recheck: self.transcript_tail_recheck.clone(),
+        };
         let viewport_bounds = transcript_rows.viewport_bounds();
         let streaming_window = self.streaming_body_window(&transcript_rows, viewport_bounds);
         let transcript_scrollable = viewport_bounds.size.height > Pixels::ZERO
@@ -267,7 +448,7 @@ impl Waku {
             && let Some(rests_at_tail) = tail_rest
         {
             self.transcript_tail_recheck.set(false);
-            if rests_at_tail {
+            if rests_at_tail && self.transcript_buffer.borrow().may_resume_following() {
                 self.pin_transcript_to_tail();
             }
         }
@@ -380,8 +561,10 @@ impl Waku {
             // Painted before any row, so the frame's selection registry holds
             // exactly the text elements this frame put on screen, in order.
             .child(md::render::frame_reset(self.transcript_selection.clone()))
-            .child(
-                list(transcript_rows, move |index, window, cx| {
+            .child(transcript_scroll_observer(scrollbar_handle.clone()))
+            .child(BufferedTranscriptList {
+                scroll: scrollbar_handle.clone(),
+                inner: list(transcript_rows, move |index, window, cx| {
                     entity
                         .upgrade()
                         .map(|entity| {
@@ -394,9 +577,8 @@ impl Waku {
                         })
                         .unwrap_or_else(|| div().into_any_element())
                 })
-                .size_full()
-                .pb(anchor_end_space),
-            )
+                .size_full(),
+            })
             // Soft fades so rows dissolve into the header above and the composer
             // below rather than ending at a hard edge. Painted before the
             // scrollbar and the other overlays so those stay crisp on top of
@@ -447,18 +629,16 @@ impl Waku {
         cx.notify();
     }
 
-    /// Re-engage tail following from wherever the transcript sits now.
-    ///
-    /// What actually survives a growing reply is GPUI's past-the-end anchor,
-    /// not the follow flag: `scroll_to_end` parks the list on `item_count`, and
-    /// the layout walks backwards from there, so the last row's bottom stays
-    /// against the viewport as that row grows. The flag alone only re-pins in
-    /// the phase where the anchor's end space has already collapsed to zero.
+    /// The explicit user action can move directly to the tail. Subsequent
+    /// generation follows the continuous reserve instead of a GPUI end pin.
     fn pin_transcript_to_tail(&self) {
+        self.transcript_buffer.borrow_mut().resume_following();
         self.transcript_anchor_following
             .set(self.transcript_anchor.get().is_some());
         self.active_transcript_rows().scroll_to_end();
+        self.transcript_buffer.borrow_mut().adopt_position();
         self.transcript_is_scrolled.set(false);
+        self.transcript_tail_recheck.set(false);
     }
 
     /// Copy the transcript's text selection.
@@ -2057,6 +2237,8 @@ impl Waku {
         };
 
         self.transcript_anchor_following.set(false);
+        self.transcript_tail_recheck.set(false);
+        self.transcript_buffer.borrow_mut().adopt_position();
         self.active_transcript_rows().scroll_to(ListOffset {
             item_ix: row_index,
             offset_in_item: Pixels::ZERO,
@@ -2192,6 +2374,8 @@ impl Waku {
             self.expanded_turns.insert(turn_id);
         }
         self.transcript_anchor_following.set(false);
+        self.transcript_tail_recheck.set(false);
+        self.transcript_buffer.borrow_mut().adopt_position();
         self.splice_transcript_rows_after_visibility_change(&previous_kinds);
 
         let next_kinds = self.transcript_row_kinds.borrow();
@@ -2666,7 +2850,9 @@ impl Waku {
                             // never measured — a user message, whose body
                             // `clip_body` hands back untouched.
                             view.advance_clip(
-                                animate_streaming && rests_at_tail,
+                                animate_streaming
+                                    && rests_at_tail
+                                    && self.transcript_anchor.get().is_none(),
                                 std::time::Instant::now(),
                             );
                             &*view
@@ -4630,5 +4816,253 @@ mod annotation_frame_path_tests {
                 "annotation_marks must read only the resolution cache; found `{forbidden}`",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod transcript_buffer_input_tests {
+    use super::*;
+    use crate::ui::scrollbar::Scrollable;
+    use gpui::{ScrollDelta, ScrollWheelEvent, TestAppContext};
+
+    struct BufferedScrollHarness {
+        scroll: BufferedTranscriptScroll,
+        painted_rows: Rc<Cell<usize>>,
+    }
+
+    impl Render for BufferedScrollHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let painted_rows = self.painted_rows.clone();
+            div()
+                .size_full()
+                .relative()
+                .child(transcript_scroll_observer(self.scroll.clone()))
+                .child(BufferedTranscriptList {
+                    scroll: self.scroll.clone(),
+                    inner: list(self.scroll.rows.clone(), move |_, _, _| {
+                        let painted_rows = painted_rows.clone();
+                        div()
+                            .h(px(50.0))
+                            .w_full()
+                            .child(
+                                canvas(
+                                    |_, _, _| (),
+                                    move |_, _, _, _| painted_rows.set(painted_rows.get() + 1),
+                                )
+                                .size_full(),
+                            )
+                            .into_any_element()
+                    })
+                    .size_full(),
+                })
+        }
+    }
+
+    fn scroll_fixture() -> BufferedTranscriptScroll {
+        let rows =
+            ListState::new(10, ListAlignment::Top, px(1000.0)).with_uniform_item_height(px(50.0));
+        rows.scroll_by(px(350.0));
+        let mut buffer = transcript_buffer::TranscriptBuffer::default();
+        buffer.update(
+            transcript_buffer::BufferFrame {
+                content_bottom: Some(500.0),
+                anchor_top: Some(350.0),
+                viewport_height: 200.0,
+                width: 100.0,
+                running: false,
+                following: true,
+                reduce_motion: false,
+            },
+            Instant::now(),
+        );
+        let scroll = BufferedTranscriptScroll {
+            rows,
+            buffer: Rc::new(RefCell::new(buffer)),
+            padding: Rc::new(Cell::new(px(50.0))),
+            following: Rc::new(Cell::new(true)),
+            is_scrolled: Rc::new(Cell::new(false)),
+            recheck: Rc::new(Cell::new(false)),
+        };
+        let following = scroll.following.clone();
+        let recheck = scroll.recheck.clone();
+        scroll.rows.set_scroll_handler(move |_, _, _| {
+            following.set(false);
+            recheck.set(true);
+        });
+        scroll
+    }
+
+    #[gpui::test]
+    fn wheel_spends_reserve_once_and_reverse_cannot_resurrect_it(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let scroll = scroll_fixture();
+        let view = cx.update(|_, cx| {
+            cx.new(|_| BufferedScrollHarness {
+                scroll: scroll.clone(),
+                painted_rows: Rc::new(Cell::new(0)),
+            })
+        });
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(px(100.0), px(200.0)),
+            |_, _| view.clone().into_any_element(),
+        );
+        assert_eq!(scroll.scrolled(), 350.0);
+        assert_eq!(
+            scroll.max_offset(),
+            px(350.0),
+            "scrollbar includes the reserve"
+        );
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.0), px(100.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(20.0))),
+            ..Default::default()
+        });
+        assert_eq!(scroll.scrolled(), 330.0);
+        assert_eq!(scroll.padding.get(), px(30.0));
+        assert!(!scroll.following.get());
+        assert!(!scroll.recheck.get());
+        assert!(!scroll.buffer.borrow().may_resume_following());
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.0), px(100.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-20.0))),
+            ..Default::default()
+        });
+        assert_eq!(scroll.padding.get(), px(30.0));
+        assert!(
+            scroll.scrolled() <= 330.0,
+            "reverse input cannot use old painted padding"
+        );
+        let before_paint = scroll.scrolled();
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(px(100.0), px(200.0)),
+            |_, _| view.clone().into_any_element(),
+        );
+        assert_eq!(
+            scroll.scrolled(),
+            before_paint,
+            "paint must not clamp a stale-padding overshoot"
+        );
+    }
+
+    #[gpui::test]
+    fn scrollbar_upward_release_keeps_manual_ownership(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let scroll = scroll_fixture();
+        let view = cx.update(|_, cx| {
+            cx.new(|_| BufferedScrollHarness {
+                scroll: scroll.clone(),
+                painted_rows: Rc::new(Cell::new(0)),
+            })
+        });
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(px(100.0), px(200.0)),
+            |_, _| view.clone().into_any_element(),
+        );
+        scroll.scroll_to(px(325.0));
+        assert_eq!(scroll.scrolled(), 325.0);
+        assert_eq!(scroll.padding.get(), px(25.0));
+        assert_eq!(scroll.max_offset(), px(325.0));
+        // Releasing the thumb asks for a tail recheck. This must not overrule
+        // the actual upward direction, even though spending reserve means the
+        // reader now rests exactly on the smaller tail.
+        scroll.recheck.set(true);
+        assert!(!scroll.buffer.borrow().may_resume_following());
+        scroll.scroll_to(px(300.0));
+        assert_eq!(scroll.padding.get(), px(0.0));
+        scroll.scroll_to(px(350.0));
+        assert_eq!(scroll.scrolled(), 300.0);
+        assert_eq!(scroll.padding.get(), px(0.0));
+    }
+
+    #[gpui::test]
+    fn first_shorter_paint_caps_padding_before_list_prepaint(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let scroll = scroll_fixture();
+        let painted_rows = Rc::new(Cell::new(0));
+        let view = cx.update(|_, cx| {
+            cx.new(|_| BufferedScrollHarness {
+                scroll: scroll.clone(),
+                painted_rows: painted_rows.clone(),
+            })
+        });
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(px(100.0), px(200.0)),
+            |_, _| view.clone().into_any_element(),
+        );
+        assert_eq!(scroll.padding.get(), px(50.0));
+        painted_rows.set(0);
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(px(100.0), px(20.0)),
+            |_, _| view.clone().into_any_element(),
+        );
+        assert_eq!(scroll.rows.viewport_bounds().size.height, px(20.0));
+        assert_eq!(scroll.padding.get(), px(19.0));
+        assert!(
+            painted_rows.get() > 0,
+            "the first resized paint must still paint transcript rows"
+        );
+    }
+
+    #[gpui::test]
+    fn explicit_tail_jump_reaches_unmeasured_rows_and_adopts_without_motion(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let scroll = scroll_fixture();
+        let view = cx.update(|_, cx| {
+            cx.new(|_| BufferedScrollHarness {
+                scroll: scroll.clone(),
+                painted_rows: Rc::new(Cell::new(0)),
+            })
+        });
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(px(100.0), px(200.0)),
+            |_, _| view.clone().into_any_element(),
+        );
+        scroll.rows.splice(10..10, 90);
+        assert!(scroll.rows.bounds_for_item(99).is_none());
+        scroll.rows.scroll_to_end();
+        scroll.buffer.borrow_mut().resume_following();
+        scroll.buffer.borrow_mut().adopt_position();
+        assert!(
+            scroll
+                .buffer
+                .borrow()
+                .max_scroll(scroll.scrolled(), 200.0)
+                .is_none(),
+            "old relative geometry is invalid until adoption"
+        );
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(px(100.0), px(200.0)),
+            |_, _| view.clone().into_any_element(),
+        );
+        let last = scroll
+            .rows
+            .bounds_for_item(99)
+            .expect("the actual final row was reached");
+        assert!(scroll.rows.logical_scroll_top().item_ix > 90);
+        let viewport = scroll.rows.viewport_bounds();
+        let layout = scroll.buffer.borrow_mut().update(
+            transcript_buffer::BufferFrame {
+                content_bottom: Some(f32::from(last.bottom() - viewport.top())),
+                anchor_top: None,
+                viewport_height: 200.0,
+                width: 100.0,
+                running: false,
+                following: true,
+                reduce_motion: false,
+            },
+            Instant::now(),
+        );
+        assert_eq!(layout.scroll_by, None);
+        assert_eq!(layout.padding, 50.0);
+        assert!((last.bottom() + px(layout.padding) - viewport.bottom()).abs() < px(0.01));
     }
 }

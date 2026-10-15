@@ -341,6 +341,7 @@ impl Waku {
     }
 
     pub(super) fn detach_transcript_search_from_tail(&self) {
+        self.transcript_buffer.borrow_mut().adopt_position();
         self.transcript_anchor_following.set(false);
         self.transcript_tail_recheck.set(false);
         self.transcript_is_scrolled.set(true);

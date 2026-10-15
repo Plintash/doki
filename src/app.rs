@@ -1776,6 +1776,7 @@ pub struct Waku {
     last_idle_session_sweep: Instant,
     transcript_anchor: Cell<Option<TranscriptAnchor>>,
     transcript_anchor_end_space: Rc<Cell<Pixels>>,
+    transcript_buffer: Rc<RefCell<transcript_buffer::TranscriptBuffer>>,
     transcript_anchor_following: Rc<Cell<bool>>,
     /// A wheel scroll has landed and where it came to rest is not classified
     /// yet. The first frame that can measure the tail consumes this and
@@ -1886,6 +1887,7 @@ mod task_completion;
 mod task_details;
 mod task_switcher;
 mod transcript;
+mod transcript_buffer;
 mod transcript_search;
 mod transcript_view;
 mod usage_meter;
@@ -3345,6 +3347,9 @@ impl Waku {
                 last_idle_session_sweep: Instant::now(),
                 transcript_anchor: Cell::new(None),
                 transcript_anchor_end_space: Rc::new(Cell::new(Pixels::ZERO)),
+                transcript_buffer: Rc::new(RefCell::new(
+                    transcript_buffer::TranscriptBuffer::default(),
+                )),
                 transcript_anchor_following,
                 transcript_tail_recheck,
                 transcript_is_scrolled,
