@@ -198,18 +198,25 @@ and the boundary with
   live reasoning tail, which streams
   through `markdown_tail`, and a body holding an image or a formula, which no
   window is built for, skip the per-block measuring wrapper
-  entirely. Planning itself still
-  walks the whole ledger — two vectors and two scans a frame — so it stays
-  proportional to the document, and the build is proportional to the viewport
-  **per top-level block**: the planner selects whole blocks, so a body that is
-  a single block
-  — one list, one table, one fenced code block, one wall-of-text paragraph —
-  is one group covering the whole body, and no spacer can stand in for any of
-  it: that frame rebuilds the whole body, at the plain walk's cost. Windowing
-  pays off only once a body spans many top-level blocks, because the part the
-  spacers can drop is exactly the part the viewport cannot reach — the bench
-  below times both shapes, and the same payload spread over 400 top-level
-  blocks drops the windowed frame well under a millisecond.
+  entirely. Planning top-level blocks still walks the whole ledger — two
+  vectors and two scans a frame — so that part remains proportional to the
+  document. Within a top-level **list or table**, a second measured ledger
+  windows complete list items or table rows (including the table header).
+  Its cached prefix offsets use binary searches; cached table column fractions
+  avoid rescanning every cell on unchanged frames. The normal row builders,
+  text primitives, wrapping, ordered/task markers, table borders and cell
+  styles are shared with the full path. Skipped rows keep their exact measured
+  space and canonical text ordinals/block-break state, so later visible cells
+  do not acquire new selection/search identities.
+  Every source commit, mended/settled transition, rewrite, wrap-width, palette
+  or metric change discards the nested ledger. The next pass measures the
+  whole affected container before it can window again. In particular, a new
+  table row can change every column's width and the previous last row's
+  divider; reusing its old measurements would be unsound. This first slice
+  bounds **unchanged pulse frames**, not commit frames. A single oversized
+  list item or table row still costs its full content, and giant paragraphs
+  and fenced blocks still take their full shaping/paint path. Issue #67
+  remains open for those costs; there is no custom text painter or GPUI fork.
   Bodies containing an image or formula are never windowed, because those
   blocks can change height after their first frame and a spacer would freeze
   the old value. The gate is scanned from the parsed block tree, which marks a
@@ -314,6 +321,53 @@ run. In order of usefulness:
 Debug-build numbers overweight taffy/style/scene generics by several fold;
 treat them as structure, not as what users feel, and confirm user-facing
 claims on a release build.
+
+## Measured list/table row window (issue #67)
+
+The row-window prototype keeps source/layout primitives intact and optimizes
+unchanged streaming pulse frames. Its regression suite checks exact height and
+text-registry geometry at top/middle/bottom/offscreen windows, nested ordered
+and task lists, fractional metric gaps, preceding blocks, changing table
+columns/dividers, incomplete table tails, reflows and rewrites, real
+search/annotation targets, mouse selection across omitted rows, and veil
+expiry/re-entry/settle/resume. Test-only counters count built and measured rows;
+no per-frame diagnostic I/O ships.
+
+A 2026-10-15 Linux x86_64 cloud run used Rust 1.96.0, the checked-in optimized
+test profile, pinned GPUI's test platform, a 700px body and an 800px viewport
+with the existing 600px overscan on each side. These are individual local
+measurements, not native FPS or release-build/product latency guarantees.
+
+| Fixture | Full renderer reference, same binary | Warm windowed frame | Built/measured rows per warm frame | Cold full measurement | First post-commit measurement |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 400 list items | 20.78ms | 2.52ms | 58 / 58 | 25.48ms (400 rows) | 25.20ms (401 rows) |
+| 400 table body rows + header | 30.39ms | 2.13ms | 37 / 37 | 33.09ms (401 rows) | 32.16ms (402 rows) |
+| 400 paragraph blocks | 5.07ms | 0.61ms | no nested-row ledger | 6.51ms | 6.90ms |
+| One giant paragraph | 0.42ms | 0.42ms | no nested-row ledger | 0.48ms | 2.98ms |
+| One giant fence | 1.08ms | 1.06ms | no nested-row ledger | 2.59ms | 1.29ms |
+
+Reproduce with `cargo test --locked -p waku --lib bench_row_window_frames --
+--ignored --nocapture`. The full reference uses the original unwindowed row
+builders in the same binary; each warm result averages 30 draws after the
+ledger is filled. Cold/post-commit columns time one draw. Parsing happens before
+that draw, so the commit numbers are renderer cost, not total event-pump cost.
+The paragraph/fence controls intentionally show that this change does not bound
+work within a single text element.
+
+The pre-existing `bench_markdown_frame` fixture also provides an exact-main
+before/after comparison: its 400-item list windowed frame was 17.93ms on
+`fdc23d7a894ab5d69dd186161704deff60f0a9e5`, and 1.34ms with row windowing
+(10 draws; full walk 30.31ms before, 31.83ms after). Its list text is longer
+than the new fixture above, so the absolute figures are not interchangeable.
+
+Acceptance so far: 7 focused row-window tests, 146 Markdown tests and 671 full
+library tests passed (3 manual measurements ignored in the ordinary suite).
+Two independent source reviews found no blocker. Native screenshot/scroll
+smoothness QA, real-provider streaming and release-build measurements remain
+pending: this cloud executor cannot open the display server's required local
+sockets. A test-platform pass does not replace those visual checks. Issue #67
+remains open for full commit cost, top-level planning, giant paragraphs/fences
+and oversized individual rows.
 
 ## Known floor and next levers
 
