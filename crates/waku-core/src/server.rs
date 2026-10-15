@@ -1179,8 +1179,11 @@ fn handle_connection(
                 }
                 Ok(ClientMessage::Shutdown) => {
                     if options.allow_shutdown {
-                        write_json(&mut socket, &ServerMessage::ShuttingDown)?;
+                        // The requester can close immediately after sending.
+                        // Accept shutdown before replying so a broken socket
+                        // cannot leave the daemon running without its owner.
                         shutdown.store(true, Ordering::Release);
+                        write_json(&mut socket, &ServerMessage::ShuttingDown)?;
                         break;
                     }
                     write_json(
@@ -1775,6 +1778,88 @@ mod tests {
                 _ => Ok(ResponsePayload::Ack),
             }
         }
+    }
+
+    #[test]
+    fn authorized_shutdown_survives_a_failed_acknowledgment() {
+        shutdown_with_failed_acknowledgment(true);
+    }
+
+    #[test]
+    fn denied_shutdown_stays_denied_when_rejection_write_fails() {
+        shutdown_with_failed_acknowledgment(false);
+    }
+
+    fn shutdown_with_failed_acknowledgment(allow_shutdown: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let (streams, server_stream) = bounded(1);
+        let (finished, completion) = bounded(1);
+        let connection = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            streams.send(stream.try_clone().unwrap()).unwrap();
+            let hub = Arc::new(Hub::default());
+            let dispatcher = Arc::new(RequestDispatcher::new(
+                Arc::new(TestBackend::default()),
+                hub.clone(),
+            ));
+            let result = handle_connection(
+                stream,
+                "secret",
+                dispatcher,
+                hub,
+                server_shutdown,
+                &ServerOptions {
+                    allow_shutdown,
+                    ..Default::default()
+                },
+            );
+            finished.send(result).unwrap();
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (mut socket, _) = tungstenite::client(format!("ws://{address}/v1"), stream).unwrap();
+        write_json(
+            &mut socket,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_id: Uuid::new_v4(),
+                token: "secret".into(),
+                resume_from: vec![],
+                diagnostic_from: None,
+            },
+        )
+        .unwrap();
+        let hello: ServerMessage =
+            serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+        assert!(matches!(hello, ServerMessage::Hello { .. }));
+        // Subscription setup queues diagnostic controls after Hello. A Pong
+        // proves those writes were drained before we break only the reply.
+        socket.send(Message::Ping(Vec::new().into())).unwrap();
+        while !matches!(socket.read().unwrap(), Message::Pong(_)) {}
+
+        // Keep client -> server reads working, but deterministically fail the
+        // reply. Closing the client itself could discard its shutdown request.
+        let server_stream = server_stream.recv_timeout(Duration::from_secs(3)).unwrap();
+        server_stream.shutdown(std::net::Shutdown::Write).unwrap();
+        write_json(&mut socket, &ClientMessage::Shutdown).unwrap();
+        let result = completion
+            .recv_timeout(Duration::from_secs(3))
+            .expect("shutdown handler did not finish");
+        connection.join().unwrap();
+        assert!(
+            result.is_err(),
+            "fixture must fail the acknowledgment write"
+        );
+        assert_eq!(
+            shutdown.load(Ordering::Acquire),
+            allow_shutdown,
+            "an accepted shutdown must not depend on delivering its reply"
+        );
     }
 
     #[test]
