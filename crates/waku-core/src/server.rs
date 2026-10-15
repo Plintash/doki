@@ -3942,7 +3942,10 @@ mod tests {
         // Let the burst finish before stopping the server so its shell exits
         // on its own; killing a shell mid-write leaves the PTY child stuck
         // exiting and blocks the daemon teardown.
-        terminal_output_until(&events, b"burst-done");
+        // This drains the finite producer for teardown, not a throughput
+        // assertion. Use the same completion bound as the output-shape and
+        // retained-window fixtures; the exact attach boundary was checked above.
+        terminal_output_until_with_timeout(&events, b"burst-done", Duration::from_secs(30));
 
         shutdown.store(true, Ordering::Release);
         client.shutdown();
@@ -4983,7 +4986,16 @@ mod tests {
 
     #[cfg(unix)]
     fn terminal_output_until(events: &Receiver<SequencedEvent>, marker: &[u8]) -> Vec<u8> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        terminal_output_until_with_timeout(events, marker, Duration::from_secs(3))
+    }
+
+    #[cfg(unix)]
+    fn terminal_output_until_with_timeout(
+        events: &Receiver<SequencedEvent>,
+        marker: &[u8],
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + timeout;
         let mut output = Vec::new();
         let mut seen_events = Vec::new();
         while std::time::Instant::now() < deadline
