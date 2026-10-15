@@ -21,8 +21,8 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-// Version 19 adds native review commands and explicit review lifecycle events.
-pub const PROTOCOL_VERSION: u32 = 19;
+// Version 20 adds durable project boards and explicit compare-and-swap edits.
+pub const PROTOCOL_VERSION: u32 = 20;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -215,6 +215,11 @@ pub enum Command {
         dirs: Vec<PathBuf>,
     },
     LoadTaskState,
+    SaveProjectBoard {
+        project_id: Uuid,
+        expected_revision: u64,
+        board: crate::model::ProjectBoard,
+    },
     SaveTaskState {
         projects: Vec<Project>,
         /// Tasks in `tasks` are merged by id, newest `updated_at` winning;
@@ -548,6 +553,9 @@ pub enum ResponsePayload {
         default_cwd: PathBuf,
         projectless_root: Option<PathBuf>,
     },
+    ProjectBoardSaved {
+        project: Project,
+    },
     TaskStateSaved {
         sessions: Vec<AgentSession>,
     },
@@ -776,7 +784,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 19);
+        assert_eq!(PROTOCOL_VERSION, 20);
     }
 
     #[test]
@@ -785,7 +793,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 19);
+        assert_eq!(PROTOCOL_VERSION, 20);
     }
 
     #[test]

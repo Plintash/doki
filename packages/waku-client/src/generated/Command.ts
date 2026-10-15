@@ -10,6 +10,7 @@ import type { DiagnosticTimelineQuery } from "./DiagnosticTimelineQuery";
 import type { DiagnosticVerbosity } from "./DiagnosticVerbosity";
 import type { GoalOperation } from "./GoalOperation";
 import type { Project } from "./Project";
+import type { ProjectBoard } from "./ProjectBoard";
 import type { ProviderKind } from "./ProviderKind";
 import type { ProviderResumeCursor } from "./ProviderResumeCursor";
 import type { ProviderSessionForkRequest } from "./ProviderSessionForkRequest";
@@ -36,7 +37,7 @@ turnId?: string | null, messageId?: string | null, } | { "type": "review", promp
  * a rejection's note to the agent as feedback and keeps the turn
  * alive; transports without that notion drop it.
  */
-message?: string | null, } | { "type": "respondUserInput", requestId: string, answers: Array<UserInputAnswer>, } | { "type": "goal", operation: GoalOperation, } | { "type": "runComputerTool", request: WireComputerToolRequest, } | { "type": "rejectComputerTool", request: WireComputerToolRequest, reason: string, } | { "type": "applyOptions", options: WireSessionOptions, } | { "type": "rollback", turns: number, } | { "type": "fork", turnsToRemove: number, } | { "type": "getSettings" } | { "type": "updateSettings", settings: DaemonSettings, } | { "type": "probeProvider", provider: ProviderKind, binaryOverride: string | null, discoverModels: boolean, probeVersion: boolean, } | { "type": "fetchPlanUsage", provider: ProviderKind, binaryOverride: string | null, cliVersion: string | null, } | { "type": "probeComputerPermissions", prompt: boolean, } | { "type": "loadUsageHistory", window: UsageWindow, projectRoots: Array<string>, } | { "type": "loadSkills", projects: Array<[string, string]>, } | { "type": "setSkillsEnabled", dirs: Array<string>, enabled: boolean, } | { "type": "trashSkills", dirs: Array<string>, } | { "type": "loadTaskState" } | { "type": "saveTaskState", projects: Array<Project>,
+message?: string | null, } | { "type": "respondUserInput", requestId: string, answers: Array<UserInputAnswer>, } | { "type": "goal", operation: GoalOperation, } | { "type": "runComputerTool", request: WireComputerToolRequest, } | { "type": "rejectComputerTool", request: WireComputerToolRequest, reason: string, } | { "type": "applyOptions", options: WireSessionOptions, } | { "type": "rollback", turns: number, } | { "type": "fork", turnsToRemove: number, } | { "type": "getSettings" } | { "type": "updateSettings", settings: DaemonSettings, } | { "type": "probeProvider", provider: ProviderKind, binaryOverride: string | null, discoverModels: boolean, probeVersion: boolean, } | { "type": "fetchPlanUsage", provider: ProviderKind, binaryOverride: string | null, cliVersion: string | null, } | { "type": "probeComputerPermissions", prompt: boolean, } | { "type": "loadUsageHistory", window: UsageWindow, projectRoots: Array<string>, } | { "type": "loadSkills", projects: Array<[string, string]>, } | { "type": "setSkillsEnabled", dirs: Array<string>, enabled: boolean, } | { "type": "trashSkills", dirs: Array<string>, } | { "type": "loadTaskState" } | { "type": "saveProjectBoard", projectId: string, expectedRevision: number, board: ProjectBoard, } | { "type": "saveTaskState", projects: Array<Project>,
 /**
  * Tasks in `tasks` are merged by id, newest `updated_at` winning;
  * a save never deletes another client's task.

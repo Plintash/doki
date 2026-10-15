@@ -24,6 +24,8 @@ use crate::rpa::service::Inbound;
 const VERBS: &[&str] = &[
     "openTask",
     "newTask",
+    "prepareStage",
+    "stageResults",
     "openSession",
     "newSession",
     "selectProject",
@@ -701,6 +703,31 @@ impl Waku {
                     Ok(json!({ "opened": "newTask" }))
                 }
             }
+            "prepareStage" => {
+                let task_id = uuid("taskId")?;
+                let stage_id = uuid("stageId")?;
+                let source = args
+                    .get("source")
+                    .filter(|value| !value.is_null())
+                    .map(|value| {
+                        serde_json::from_value(value.clone()).map_err(|error| {
+                            Error::new(
+                                "invalid_args",
+                                format!("invalid stage result source: {error}"),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                self.prepare_stage_invocation(task_id, stage_id, source, window, cx)
+                    .map(|id| json!({ "opened": id }))
+                    .map_err(|error| Error::new("disabled", error))
+            }
+            "stageResults" => {
+                let task_id = uuid("taskId")?;
+                self.load_stage_results(task_id, cx)
+                    .map(|results| json_of(&results))
+                    .map_err(|error| Error::new("disabled", error))
+            }
             "newSession" => {
                 if args.get("taskId").is_some() {
                     let id = uuid("taskId")?;
@@ -1068,6 +1095,8 @@ impl Waku {
                 "open": self.board_open,
                 "selectedTask": self.selected_task,
                 "projectFilter": self.board_project_filter,
+                "stages": self.stage_board_snapshot(),
+                "stagePrototype": self.stage_board_snapshot(),
                 "search": self.board_search_query,
                 "activityFilter": match self.board_activity_filter {
                     super::board::BoardActivityFilter::All => "all",

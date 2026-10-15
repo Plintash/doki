@@ -47,6 +47,8 @@ pub(super) fn capabilities() -> Value {
         "verbs": [
             {"name":"openTask", "args":{"id":"Board issue UUID"}, "effect":"navigation"},
             {"name":"newTask", "args":{"title?":"nonempty string; omit to open dialog"}, "effect":"creates issue when title is supplied"},
+            {"name":"prepareStage", "args":{"taskId":"Board issue UUID", "stageId":"current project-owned stage UUID", "source?":{"session_id":"prior conversation UUID", "message_id":"successful final result UUID"}}, "effect":"creates or reopens reviewable stage draft; never submits a provider prompt"},
+            {"name":"stageResults", "args":{"taskId":"Board issue UUID"}, "effect":"loads eligible result context; returns explicit source choices or loading/error"},
             {"name":"openSession", "args":{"id":"conversation UUID"}, "effect":"navigation; may hydrate history"},
             {"name":"newSession", "args":{"taskId?":"Board issue UUID"}, "effect":"creates or reuses draft; may reopen issue"},
             {"name":"selectProject", "args":{"id":"project UUID"}, "effect":"selects project and creates/reuses its standalone draft"},

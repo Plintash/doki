@@ -1541,6 +1541,8 @@ pub struct Waku {
     task_stats_cache: RefCell<Option<Rc<board::TaskStats>>>,
     /// The board's per-column card lists, so long columns stay virtualized.
     board_column_lists: RefCell<[board::BoardColumnList; 3]>,
+    board_stages: board_stages::StageBoard,
+    stage_result_choices: Option<Result<Vec<(crate::model::StageResultSource, String)>, String>>,
     /// The Settings archive's virtualized row list.
     archive_rows: RefCell<settings::ArchiveRows>,
     /// Stable focus for the archive surface itself, so restoring a row (which
@@ -1861,6 +1863,7 @@ mod autocomplete;
 mod background_work;
 mod board;
 mod board_header;
+mod board_stages;
 mod branches;
 mod command_palette;
 mod commit_dialog;
@@ -1880,6 +1883,7 @@ mod sessions;
 mod settings;
 mod sidebar;
 mod skills_page;
+mod stage_execution;
 mod streaming;
 mod task_completion;
 mod task_details;
@@ -3207,6 +3211,8 @@ impl Waku {
                 task_completion_save_rollbacks: HashMap::new(),
                 unconfirmed_task_closes: HashMap::new(),
                 task_stats_cache: RefCell::new(None),
+                board_stages: board_stages::StageBoard::new(),
+                stage_result_choices: None,
                 board_column_lists: RefCell::new([
                     board::BoardColumnList::new(),
                     board::BoardColumnList::new(),

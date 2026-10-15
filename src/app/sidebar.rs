@@ -3253,12 +3253,14 @@ mod tests {
     fn projectless_sidebar_projects_are_paths_under_the_workspace_root() {
         let root = Path::new("/tmp/.waku/projects");
         let projectless = Project {
+            board: Default::default(),
             id: Uuid::from_u128(1),
             name: "Task".to_owned(),
             path: root.join("2026-08-23/task"),
             created_at: 0,
         };
         let ordinary = Project {
+            board: Default::default(),
             id: Uuid::from_u128(2),
             name: "Ordinary".to_owned(),
             path: PathBuf::from("/tmp/dev/ordinary"),

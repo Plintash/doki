@@ -203,6 +203,7 @@ struct HubState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProjectCatalogEntry {
+    board: crate::model::ProjectBoard,
     name: String,
     path: std::path::PathBuf,
     created_at: u64,
@@ -211,6 +212,7 @@ struct ProjectCatalogEntry {
 impl From<&Project> for ProjectCatalogEntry {
     fn from(project: &Project) -> Self {
         Self {
+            board: project.board.clone(),
             name: project.name.clone(),
             path: project.path.clone(),
             created_at: project.created_at,
@@ -1559,7 +1561,8 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
             projects: projects.clone(),
             tasks: tasks.clone(),
         },
-        Command::RemoveSession
+        Command::SaveProjectBoard { .. }
+        | Command::RemoveSession
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. } => TaskCatalogAction::Changed,
         _ => TaskCatalogAction::None,
@@ -2628,6 +2631,7 @@ mod tests {
         else {
             panic!("expected daemon task state");
         };
+        task.stage_id = Some(crate::model::canonical_stage_id(project.id, task.state));
         assert_eq!(tasks, vec![task.clone()]);
         assert_eq!(sessions[0].task_id, Some(task_id));
 

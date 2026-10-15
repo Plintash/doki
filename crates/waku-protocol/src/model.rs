@@ -605,6 +605,8 @@ pub fn parse_cli_version(output: &str) -> Option<String> {
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct Project {
+    #[serde(default)]
+    pub board: ProjectBoard,
     pub id: Uuid,
     pub name: String,
     pub path: PathBuf,
@@ -675,8 +677,10 @@ impl Project {
             .filter(|value| !value.is_empty())
             .unwrap_or("Project")
             .to_owned();
+        let id = Uuid::new_v4();
         Self {
-            id: Uuid::new_v4(),
+            board: ProjectBoard::canonical(id),
+            id,
             name,
             path,
             created_at: unix_time(),
@@ -690,9 +694,8 @@ impl Project {
 
 /// Where a task sits on the board.
 ///
-/// The three columns are fixed for now; user-defined columns come later. The
-/// state is the user's own declaration — runtime activity never moves a task
-/// on its own.
+/// Internal lifecycle compatibility, independent of project-owned stage IDs.
+/// The state is the user's declaration; runtime activity never moves a task.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum TaskState {
@@ -726,6 +729,137 @@ impl TaskState {
     }
 }
 
+/// Persisted execution intent. Moving a card never invokes a provider.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum StageHandoff {
+    #[default]
+    BriefOnly,
+    PriorResult,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct BoardStage {
+    pub id: Uuid,
+    pub name: String,
+    pub state: TaskState,
+    pub provider: Option<ProviderKind>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub instructions: String,
+    #[serde(default)]
+    pub handoff: StageHandoff,
+}
+
+/// Explicitly selected prior result; never implies copying provider-private history.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct StageResultSource {
+    pub session_id: Uuid,
+    pub message_id: Uuid,
+}
+
+/// Immutable intent snapshot for an attempt. Several sessions may share an
+/// invocation; renaming a stage does not rewrite conversation provenance.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct SessionStageInvocation {
+    pub id: Uuid,
+    pub stage: BoardStage,
+    pub board_revision: u64,
+    pub source: Option<StageResultSource>,
+}
+
+/// Ordered, project-ID-owned catalog. A revision describes the entire catalog,
+/// so a stale reorder cannot revive a deleted stage. Path aliases do not share
+/// execution defaults implicitly.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct ProjectBoard {
+    pub revision: u64,
+    pub stages: Vec<BoardStage>,
+}
+
+/// Reserved deterministic IDs, without changing any existing issue IDs.
+pub fn canonical_stage_id(project_id: Uuid, state: TaskState) -> Uuid {
+    let mut bytes = *project_id.as_bytes();
+    bytes[0] ^= 0xb0;
+    bytes[15] ^= state.ordinal() as u8;
+    Uuid::from_bytes(bytes)
+}
+
+impl ProjectBoard {
+    pub fn canonical(project_id: Uuid) -> Self {
+        Self {
+            revision: 0,
+            stages: [
+                (TaskState::Backlog, "Backlog"),
+                (TaskState::Doing, "Doing"),
+                (TaskState::Done, "Done"),
+            ]
+            .into_iter()
+            .map(|(state, name)| BoardStage {
+                id: canonical_stage_id(project_id, state),
+                name: name.into(),
+                state,
+                provider: None,
+                model: None,
+                instructions: String::new(),
+                handoff: StageHandoff::BriefOnly,
+            })
+            .collect(),
+        }
+    }
+
+    pub fn stage_for_task(&self, task: &Task) -> Option<&BoardStage> {
+        self.stages
+            .iter()
+            .find(|stage| Some(stage.id) == task.stage_id && stage.state == task.state)
+    }
+
+    pub fn validate(&self, project_id: Uuid) -> Result<(), String> {
+        let mut ids = std::collections::HashSet::new();
+        for stage in &self.stages {
+            if stage.name.trim().is_empty() || !ids.insert(stage.id) {
+                return Err("stage names must be nonempty and stage IDs unique".into());
+            }
+            if stage.provider.is_none() && stage.model.is_some() {
+                return Err("choose a harness before setting a model override".into());
+            }
+            if stage
+                .model
+                .as_ref()
+                .is_some_and(|model| model.trim().is_empty())
+            {
+                return Err("use provider default instead of an empty model override".into());
+            }
+        }
+        for state in [TaskState::Backlog, TaskState::Doing, TaskState::Done] {
+            if !self.stages.iter().any(|stage| {
+                stage.id == canonical_stage_id(project_id, state) && stage.state == state
+            }) {
+                return Err(
+                    "canonical lifecycle destinations cannot be removed or recategorized".into(),
+                );
+            }
+        }
+        if self
+            .stages
+            .iter()
+            .filter(|stage| stage.state.is_done())
+            .count()
+            != 1
+        {
+            return Err("the board must have exactly one terminal stage".into());
+        }
+        if !self
+            .stages
+            .last()
+            .is_some_and(|stage| stage.state.is_done())
+        {
+            return Err("the terminal stage must remain last".into());
+        }
+        Ok(())
+    }
+}
+
 /// A user-declared unit of work that groups conversations.
 ///
 /// A task exists on its own: it may have no conversations yet, and several
@@ -733,6 +867,8 @@ impl TaskState {
 /// It is the unit the board arranges and the unit that survives archiving.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct Task {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_id: Option<Uuid>,
     pub id: Uuid,
     pub title: String,
     /// The issue brief, separate from any conversation or execution prompt.
@@ -780,6 +916,7 @@ impl Task {
         Self {
             id: Uuid::new_v4(),
             title: title.into(),
+            stage_id: None,
             description: String::new(),
             state,
             position,
@@ -796,8 +933,33 @@ impl Task {
             return;
         }
         self.state = state;
+        self.stage_id = self.project_id().map(|id| canonical_stage_id(id, state));
         self.touch();
         self.completed_at = state.is_done().then(unix_time);
+    }
+
+    /// Caller must pass the existing completion acknowledgment boundary before
+    /// selecting a terminal destination. One revision covers the whole move.
+    pub fn set_stage(&mut self, stage: &BoardStage, position: i64) {
+        if self.stage_id == Some(stage.id) && self.state == stage.state && self.position == position
+        {
+            return;
+        }
+        if self.state != stage.state {
+            self.completed_at = stage.state.is_done().then(unix_time);
+        }
+        self.state = stage.state;
+        self.stage_id = Some(stage.id);
+        self.position = position;
+        self.touch();
+    }
+
+    pub fn project_id(&self) -> Option<Uuid> {
+        match self.workspace.as_ref()? {
+            TaskWorkspace::Local { project_id }
+            | TaskWorkspace::NewWorktree { project_id }
+            | TaskWorkspace::Worktree { project_id, .. } => Some(*project_id),
+        }
     }
 
     /// Marks any other user-driven mutation (a rename, an inferred workspace)
@@ -1146,6 +1308,8 @@ pub struct AgentSession {
     /// turns it into an ordinary development draft.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_correction_source_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_invocation: Option<SessionStageInvocation>,
     /// Local project checkout or an isolated Git worktree for this task.
     #[serde(default, skip_serializing_if = "SessionWorkspace::is_local")]
     pub workspace: SessionWorkspace,
@@ -1259,6 +1423,7 @@ impl AgentSession {
             task_id: None,
             review: None,
             review_correction_source_id: None,
+            stage_invocation: None,
             workspace: SessionWorkspace::Local,
             provider,
             model: None,
@@ -1309,6 +1474,7 @@ impl AgentSession {
             task_id: self.task_id,
             review: self.review.clone(),
             review_correction_source_id: self.review_correction_source_id,
+            stage_invocation: self.stage_invocation.clone(),
             is_draft: !self.has_started(),
             workspace: self.workspace.clone(),
             provider: self.provider,
@@ -4260,6 +4426,51 @@ pub fn compact_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn board_same_lifecycle_move_and_wire_roundtrip_preserve_identity() {
+        let project = Project::from_path("/tmp/board".into());
+        let mut stage = project.board.stages[1].clone();
+        stage.id = Uuid::new_v4();
+        stage.name = "Review".into();
+        let mut task = Task::new("Issue", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local {
+            project_id: project.id,
+        });
+        let id = task.id;
+        let revision = task.updated_at;
+        task.set_stage(&stage, 8);
+        assert_eq!(task.id, id);
+        assert_eq!(task.state, TaskState::Doing);
+        assert_eq!(task.stage_id, Some(stage.id));
+        assert!(task.updated_at > revision);
+        let decoded: Task = serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
+        assert_eq!(decoded, task);
+        task.set_state(TaskState::Done);
+        assert_eq!(
+            task.stage_id,
+            Some(canonical_stage_id(project.id, TaskState::Done))
+        );
+        task.set_state(TaskState::Doing);
+        assert!(task.completed_at.is_none());
+    }
+
+    #[test]
+    fn stage_invocation_wire_and_list_projection_retain_snapshot() {
+        let project = Project::from_path("/tmp/board".into());
+        let mut session = AgentSession::new(project.id, ProviderKind::Pi);
+        let invocation = SessionStageInvocation {
+            id: Uuid::new_v4(),
+            stage: project.board.stages[1].clone(),
+            board_revision: 0,
+            source: None,
+        };
+        session.stage_invocation = Some(invocation.clone());
+        let decoded: AgentSession =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!(decoded.stage_invocation, Some(invocation.clone()));
+        assert_eq!(session.list_projection().stage_invocation, Some(invocation));
+    }
 
     #[test]
     fn issue_description_defaults_for_older_saved_tasks() {

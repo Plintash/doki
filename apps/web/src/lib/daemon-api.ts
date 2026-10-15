@@ -586,6 +586,8 @@ export function createProject(path: string): Project {
     id: crypto.randomUUID(),
     name,
     path: normalized,
+    // The daemon assigns canonical stage IDs when the project is persisted.
+    board: { revision: 0, stages: [] },
     created_at: unixTime(),
   }
 }

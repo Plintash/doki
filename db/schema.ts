@@ -15,6 +15,7 @@
 import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const projects = sqliteTable("projects", {
+  board: text("board").notNull().default('{"revision":0,"stages":[]}'),
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   path: text("path").notNull(),
@@ -39,6 +40,7 @@ export const sessions = sqliteTable(
     review: text("review"),
     /** Durable source review ID for a correction, independent of review reruns. */
     reviewCorrectionSourceId: text("review_correction_source_id"),
+    stageInvocation: text("stage_invocation"),
     /** Explicit user title; "New task" means the automatic fallback is active. */
     title: text("title").notNull(),
     /** Provider-generated title, with the first prompt as a local fallback. */
@@ -71,6 +73,7 @@ export const sessions = sqliteTable(
 export const tasks = sqliteTable(
   "tasks",
   {
+    stageId: text("stage_id"),
     id: text("id").primaryKey(),
     title: text("title").notNull(),
     description: text("description").notNull().default(""),

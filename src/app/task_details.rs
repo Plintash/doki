@@ -22,7 +22,15 @@ pub(super) struct TaskDetail {
     session_ids: Vec<Uuid>,
     session_indices: Vec<usize>,
     session_focuses: HashMap<Uuid, FocusHandle>,
-    editor_layout: Option<(u64, bool, bool, bool, bool, Option<(Uuid, u64)>)>,
+    editor_layout: Option<(
+        u64,
+        bool,
+        bool,
+        bool,
+        bool,
+        Option<(Uuid, u64)>,
+        Option<(u64, bool)>,
+    )>,
     attach_picker: Entity<attach_picker::TaskAttachPicker>,
     project_menu: ContextMenuHandle,
     workspace_menu: ContextMenuHandle,
@@ -83,6 +91,41 @@ pub(super) fn task_session_workspace(task: &Task) -> SessionWorkspace {
     }
 }
 
+fn task_stage_layout_key(
+    task: &Task,
+    projects: &[Project],
+    enabled: impl Fn(ProviderKind) -> bool,
+) -> Option<(u64, bool)> {
+    let owner = projects
+        .iter()
+        .find(|project| Some(project.id) == task.project_id())?;
+    Some((
+        owner.board.revision,
+        owner
+            .board
+            .stage_for_task(task)
+            .and_then(|stage| stage.provider)
+            .is_some_and(enabled),
+    ))
+}
+
+fn update_task_workspace(task: &mut Task, workspace: TaskWorkspace) -> bool {
+    if task.workspace.as_ref() == Some(&workspace) {
+        return false;
+    }
+    let project_id = match &workspace {
+        TaskWorkspace::Local { project_id }
+        | TaskWorkspace::NewWorktree { project_id }
+        | TaskWorkspace::Worktree { project_id, .. } => *project_id,
+    };
+    if task.project_id() != Some(project_id) {
+        task.stage_id = Some(crate::model::canonical_stage_id(project_id, task.state));
+    }
+    task.workspace = Some(workspace);
+    task.touch();
+    true
+}
+
 fn task_session_uses_default_workspace(task: &Task, session: &AgentSession) -> bool {
     task_project_id(task) == Some(session.project_id)
         && task_session_workspace(task) == session.workspace
@@ -116,9 +159,20 @@ fn task_draft_follows_workspace(task_id: Uuid, session: &AgentSession) -> bool {
         && !session.has_started()
         && !session.is_busy()
         && session.review.is_none()
+        && session.stage_invocation.is_none()
         // The correction owns its reviewed workspace even after the source
         // review reruns, is rolled back, or leaves the issue/catalog.
         && session.review_correction_source_id.is_none()
+}
+
+fn task_session_row_title(session: &AgentSession) -> String {
+    if session.has_started() || session.review.is_some() {
+        session.display_title().to_owned()
+    } else if let Some(invocation) = &session.stage_invocation {
+        format!("{} · {}", invocation.stage.name, tr!("board.draft_session"))
+    } else {
+        tr!("board.draft_session")
+    }
 }
 
 fn task_session_navigation_index(index: usize, count: usize, key: &str) -> Option<usize> {
@@ -708,19 +762,16 @@ impl Waku {
             .as_mut()
             .filter(|task| task.id == task_id)
         {
-            draft.workspace = Some(workspace);
-            draft.touch();
+            update_task_workspace(draft, workspace);
             cx.notify();
             return;
         }
         let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) else {
             return;
         };
-        if task.workspace.as_ref() == Some(&workspace) {
+        if !update_task_workspace(task, workspace) {
             return;
         }
-        task.workspace = Some(workspace);
-        task.touch();
         let session_workspace = task_session_workspace(task);
         let drafts = self
             .state
@@ -1043,6 +1094,9 @@ impl Waku {
             .latest
             .map(|(id, index)| (id, self.state.sessions[index].updated_at));
         let is_draft = self.is_task_draft(task_id);
+        let stage_layout = task_stage_layout_key(&task, &self.state.projects, |provider| {
+            self.provider_enabled(provider)
+        });
         let detail = self
             .task_detail
             .as_mut()
@@ -1091,6 +1145,7 @@ impl Waku {
             detail.title.read(cx).content().trim().is_empty(),
             detail.session_ids.is_empty(),
             review_revision,
+            stage_layout,
         );
         if detail.editor_layout != Some(editor_layout) {
             detail.list.remeasure_items(0..1);
@@ -1142,6 +1197,9 @@ impl Waku {
         let theme = Theme::current(cx);
         let project = task_project_id(&task)
             .and_then(|id| self.state.projects.iter().find(|project| project.id == id));
+        let configured_stage = project
+            .and_then(|project| project.board.stage_for_task(task))
+            .is_some_and(|stage| stage.provider.is_some());
         let can_start = project.is_some();
         let completing = self.task_completion_stops.contains_key(&task_id);
         let project_picker = self.render_task_project_picker(&task, cx);
@@ -1174,7 +1232,8 @@ impl Waku {
                 }
             }));
 
-        let review = (!is_draft).then(|| self.render_issue_review(task, cx));
+        let stage = (!is_draft).then(|| self.render_stage_invocation_controls(task, cx));
+        let review = (!is_draft && !configured_stage).then(|| self.render_issue_review(task, cx));
         let editor = div()
             .track_focus(&editor_focus)
             .w_full()
@@ -1294,6 +1353,7 @@ impl Waku {
                             .child(description),
                     ),
             )
+            .when_some(stage, |element, stage| element.child(stage))
             .when_some(review, |element, review| element.child(review))
             .when(!is_draft, |element| {
                 element
@@ -1314,7 +1374,7 @@ impl Waku {
                             )
                             .child(div().flex_1())
                             .child(attach)
-                            .child(start),
+                            .when(!configured_stage, |element| element.child(start)),
                     )
                     .when(session_count == 0, |element| {
                         element.child(
@@ -1386,11 +1446,7 @@ impl Waku {
         };
         let focus = detail.session_focuses[&id].clone().tab_stop(true);
         let count = detail.session_ids.len();
-        let title = if session.has_started() || session.review.is_some() {
-            session.display_title().to_owned()
-        } else {
-            tr!("board.draft_session")
-        };
+        let title = task_session_row_title(session);
         let provider = session.provider;
         let is_draft_session = !session.has_started();
         let review_state = session.review.as_ref().map(|review| review.status);
@@ -1764,6 +1820,104 @@ mod tests {
         assert_eq!(task_development_draft(&task, &sessions), Some(next_id));
         sessions.last_mut().unwrap().project_id = Uuid::new_v4();
         assert_eq!(task_development_draft(&task, &sessions), None);
+    }
+
+    #[test]
+    fn stage_configuration_and_provider_availability_invalidate_editor_measurement() {
+        let mut project = Project::from_path(std::path::PathBuf::from("/fixture"));
+        let mut task = Task::new("Issue", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local {
+            project_id: project.id,
+        });
+        task.stage_id = Some(project.board.stages[1].id);
+        let initial_revision = task.updated_at;
+        let initial = super::task_stage_layout_key(&task, &[project.clone()], |_| false);
+        project.board.revision += 1;
+        project.board.stages[1].provider = Some(ProviderKind::Amp);
+        let configured = super::task_stage_layout_key(&task, &[project.clone()], |_| false);
+        let available = super::task_stage_layout_key(&task, &[project], |_| true);
+        assert_ne!(initial, configured);
+        assert_ne!(configured, available);
+        assert_eq!(task.updated_at, initial_revision);
+    }
+
+    #[test]
+    fn workspace_project_change_resets_current_stage_but_same_owner_keeps_it() {
+        let project = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        let custom_stage = Uuid::new_v4();
+        let mut task = Task::new("Issue", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local {
+            project_id: project,
+        });
+        task.stage_id = Some(custom_stage);
+        let before = task.updated_at;
+        assert!(super::update_task_workspace(
+            &mut task,
+            TaskWorkspace::NewWorktree {
+                project_id: project
+            }
+        ));
+        assert_eq!(task.stage_id, Some(custom_stage));
+        assert!(task.updated_at > before);
+        assert!(super::update_task_workspace(
+            &mut task,
+            TaskWorkspace::Local {
+                project_id: destination
+            }
+        ));
+        assert_eq!(
+            task.stage_id,
+            Some(crate::model::canonical_stage_id(
+                destination,
+                TaskState::Doing
+            ))
+        );
+        assert_eq!(task.state, TaskState::Doing);
+    }
+
+    #[test]
+    fn stage_draft_titles_use_the_persisted_stage_snapshot() {
+        let project = Uuid::new_v4();
+        let mut session = AgentSession::new(project, ProviderKind::Amp);
+        assert_eq!(
+            super::task_session_row_title(&session),
+            tr!("board.draft_session")
+        );
+        let mut stage = crate::model::ProjectBoard::canonical(project).stages[1].clone();
+        stage.name = "Review".into();
+        session.stage_invocation = Some(crate::model::SessionStageInvocation {
+            id: Uuid::new_v4(),
+            stage: stage.clone(),
+            board_revision: 2,
+            source: None,
+        });
+        stage.name = "Quality gate".into();
+        assert_eq!(
+            super::task_session_row_title(&session),
+            format!("Review · {}", tr!("board.draft_session"))
+        );
+        assert_eq!(
+            session.stage_invocation.as_ref().unwrap().stage.name,
+            "Review"
+        );
+    }
+
+    #[test]
+    fn stage_drafts_keep_their_invocation_workspace_and_are_not_legacy_development_drafts() {
+        let project_id = Uuid::new_v4();
+        let mut task = Task::new("Issue", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local { project_id });
+        let mut session = AgentSession::new(project_id, ProviderKind::Pi);
+        session.task_id = Some(task.id);
+        session.stage_invocation = Some(crate::model::SessionStageInvocation {
+            id: Uuid::new_v4(),
+            stage: crate::model::ProjectBoard::canonical(project_id).stages[1].clone(),
+            board_revision: 0,
+            source: None,
+        });
+        assert!(!task_draft_follows_workspace(task.id, &session));
+        assert_eq!(task_development_draft(&task, &[session]), None);
     }
 
     #[test]

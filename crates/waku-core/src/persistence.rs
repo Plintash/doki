@@ -1123,7 +1123,7 @@ impl StateStore {
         }
 
         let mut projects = connection
-            .prepare("SELECT id, name, path, created_at FROM projects ORDER BY position")
+            .prepare("SELECT id, name, path, created_at, board FROM projects ORDER BY position")
             .map_err(to_io_error)?;
         state.projects = projects
             .query_map([], |row| {
@@ -1132,25 +1132,33 @@ impl StateStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })
             .map_err(to_io_error)?
             .filter_map(Result::ok)
-            .filter_map(|(id, name, path, created_at)| {
-                Some(Project {
-                    id: Uuid::parse_str(&id).ok()?,
+            .map(|(id, name, path, created_at, board)| {
+                let id = Uuid::parse_str(&id).map_err(to_io_error)?;
+                let mut board: crate::model::ProjectBoard =
+                    serde_json::from_str(&board).map_err(to_io_error)?;
+                if board.stages.is_empty() {
+                    board = crate::model::ProjectBoard::canonical(id);
+                }
+                Ok(Project {
+                    board,
+                    id,
                     name,
                     path: PathBuf::from(path),
                     created_at: created_at as u64,
                 })
             })
-            .collect();
+            .collect::<io::Result<Vec<_>>>()?;
         drop(projects);
 
         let mut tasks = connection
             .prepare(
                 "SELECT id, title, state, position, project_id, path, branch, worktree,
-                        created_at, updated_at, completed_at, description, new_worktree
+                        created_at, updated_at, completed_at, description, new_worktree, stage_id
                  FROM tasks ORDER BY state, position, created_at",
             )
             .map_err(to_io_error)?;
@@ -1170,6 +1178,7 @@ impl StateStore {
                     row.get::<_, Option<i64>>(10)?,
                     row.get::<_, String>(11)?,
                     row.get::<_, bool>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             })
             .map_err(to_io_error)?
@@ -1185,7 +1194,7 @@ impl StateStore {
             .prepare(
                 "SELECT id, project_id, title, auto_title, provider, model, status,
                         task_id, created_at, updated_at, last_reply_at, is_draft, workspace, review,
-                        review_correction_source_id
+                        review_correction_source_id, stage_invocation
                  FROM sessions ORDER BY updated_at",
             )
             .map_err(to_io_error)?;
@@ -1208,6 +1217,7 @@ impl StateStore {
                     row.get::<_, String>(12)?,
                     row.get::<_, Option<String>>(13)?,
                     row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
                 ))
             })
             .map_err(to_io_error)?
@@ -1354,6 +1364,18 @@ impl StateStore {
     }
 
     fn save_state(&self, state: &mut PersistedState, include_empty: bool) -> io::Result<()> {
+        for project in &mut state.projects {
+            if project.board.stages.is_empty() {
+                project.board = crate::model::ProjectBoard::canonical(project.id);
+            }
+        }
+        for task in &mut state.tasks {
+            if task.stage_id.is_none() {
+                task.stage_id = task
+                    .project_id()
+                    .map(|id| crate::model::canonical_stage_id(id, task.state));
+            }
+        }
         // Only changed sessions can hold a new inline payload, so the blob walk
         // follows the same set rather than every transcript on every save.
         let dirty = state.dirty_sessions.clone();
@@ -1417,7 +1439,8 @@ impl StateStore {
                             project.name,
                             project.path.to_string_lossy(),
                             position as i64,
-                            project.created_at as i64
+                            project.created_at as i64,
+                            serde_json::to_string(&project.board).map_err(to_io_error)?
                         ],
                     )
                     .map_err(to_io_error)?;
@@ -1466,7 +1489,8 @@ impl StateStore {
                             task.updated_at as i64,
                             task.completed_at.map(|at| at as i64),
                             task.description,
-                            matches!(task.workspace, Some(TaskWorkspace::NewWorktree { .. }))
+                            matches!(task.workspace, Some(TaskWorkspace::NewWorktree { .. })),
+                            task.stage_id.map(|id| id.to_string())
                         ],
                     )
                     .map_err(to_io_error)?;
@@ -1630,6 +1654,7 @@ type SessionColumns = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 /// Builds a list-only session from its columns. `messages`,
@@ -1654,8 +1679,10 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         workspace,
         review,
         review_correction_source_id,
+        stage_invocation,
     ) = row;
     Some(AgentSession {
+        stage_invocation: stage_invocation.and_then(|value| serde_json::from_str(&value).ok()),
         id: Uuid::parse_str(&id).ok()?,
         title,
         auto_title,
@@ -1710,6 +1737,7 @@ type TaskColumns = (
     Option<i64>,
     String,
     bool,
+    Option<String>,
 );
 
 /// Builds a task from its row. A workspace is recovered only when the row
@@ -1730,6 +1758,7 @@ fn task_from_row(row: TaskColumns) -> Option<Task> {
         completed_at,
         description,
         new_worktree,
+        stage_id,
     ) = row;
     let project_id = project_id.and_then(|id| Uuid::parse_str(&id).ok());
     let workspace = match (project_id, path, branch, worktree != 0, new_worktree) {
@@ -1744,11 +1773,15 @@ fn task_from_row(row: TaskColumns) -> Option<Task> {
         (Some(project_id), _, _, false, false) => Some(TaskWorkspace::Local { project_id }),
         _ => None,
     };
+    let state: TaskState = serde_json::from_value(serde_json::Value::String(state)).ok()?;
     Some(Task {
+        stage_id: stage_id
+            .and_then(|id| Uuid::parse_str(&id).ok())
+            .or_else(|| project_id.map(|id| crate::model::canonical_stage_id(id, state))),
         id: Uuid::parse_str(&id).ok()?,
         title,
         description,
-        state: serde_json::from_value(serde_json::Value::String(state)).ok()?,
+        state,
         position,
         workspace,
         created_at: created_at as u64,
@@ -2015,8 +2048,8 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
 const UPSERT_SESSION: &str = "INSERT INTO sessions(
          id, project_id, title, auto_title, provider, model, status, task_id,
          created_at, updated_at, last_reply_at, is_draft, workspace, review,
-         review_correction_source_id
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         review_correction_source_id, stage_invocation
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
      ON CONFLICT(id) DO UPDATE SET
          project_id    = excluded.project_id,
          title         = excluded.title,
@@ -2031,20 +2064,22 @@ const UPSERT_SESSION: &str = "INSERT INTO sessions(
          is_draft      = excluded.is_draft,
          workspace     = excluded.workspace,
          review        = excluded.review,
-         review_correction_source_id = excluded.review_correction_source_id";
+         review_correction_source_id = excluded.review_correction_source_id,
+         stage_invocation = excluded.stage_invocation";
 
-const INSERT_PROJECT: &str = "INSERT INTO projects(id, name, path, position, created_at)
-     VALUES(?1, ?2, ?3, ?4, ?5)
+const INSERT_PROJECT: &str = "INSERT INTO projects(id, name, path, position, created_at, board)
+     VALUES(?1, ?2, ?3, ?4, ?5, ?6)
      ON CONFLICT(id) DO UPDATE SET
          name       = excluded.name,
          path       = excluded.path,
          position   = excluded.position,
-         created_at = excluded.created_at";
+         created_at = excluded.created_at,
+         board = excluded.board";
 
 const INSERT_TASK: &str = "INSERT INTO tasks(
          id, title, state, position, project_id, path, branch, worktree,
-         created_at, updated_at, completed_at, description, new_worktree
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         created_at, updated_at, completed_at, description, new_worktree, stage_id
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
      ON CONFLICT(id) DO UPDATE SET
          title        = excluded.title,
          state        = excluded.state,
@@ -2057,7 +2092,8 @@ const INSERT_TASK: &str = "INSERT INTO tasks(
          updated_at   = excluded.updated_at,
          completed_at = excluded.completed_at,
          description  = excluded.description,
-         new_worktree = excluded.new_worktree";
+         new_worktree = excluded.new_worktree,
+         stage_id = excluded.stage_id";
 
 /// The transcript, written alongside the list row it belongs to.
 const UPSERT_SESSION_DETAIL: &str = "INSERT INTO session_details(session_id, data)
@@ -2104,6 +2140,13 @@ fn session_params(session: &AgentSession) -> io::Result<Vec<rusqlite::types::Val
         session
             .review_correction_source_id
             .map_or(Value::Null, |id| Value::Text(id.to_string())),
+        session
+            .stage_invocation
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(to_io_error)?
+            .map_or(Value::Null, Value::Text),
     ])
 }
 
@@ -4310,6 +4353,72 @@ mod tests {
             Some("net.imput.helium")
         );
         assert!(saved.get("teamId").is_none());
+    }
+
+    #[test]
+    fn board_catalog_placement_and_defaults_survive_restart() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let project = &mut state.projects[0];
+        let mut review = project.board.stages[1].clone();
+        review.id = Uuid::new_v4();
+        review.name = "Review".into();
+        review.provider = Some(ProviderKind::Pi);
+        review.model = Some("test-model".into());
+        review.instructions = "Inspect changes; do not change files".into();
+        project.board.stages.insert(2, review.clone());
+        project.board.revision = 1;
+        let mut task = Task::new("Review", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local {
+            project_id: project.id,
+        });
+        task.set_stage(&review, 7);
+        state.tasks.push(task.clone());
+        let board = project.board.clone();
+        let invocation = crate::model::SessionStageInvocation {
+            id: Uuid::new_v4(),
+            stage: review,
+            board_revision: board.revision,
+            source: Some(crate::model::StageResultSource {
+                session_id: Uuid::new_v4(),
+                message_id: Uuid::new_v4(),
+            }),
+        };
+        state.sessions[0].task_id = Some(task.id);
+        state.sessions[0].stage_invocation = Some(invocation.clone());
+        state.mark_session_dirty(state.sessions[0].id);
+        store.save(&mut state).unwrap();
+        drop(store);
+        let restored = store_in(&directory).load().unwrap();
+        assert_eq!(restored.tasks, vec![task]);
+        assert_eq!(restored.projects[0].board, board);
+        assert_eq!(restored.sessions[0].stage_invocation, Some(invocation));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn legacy_board_rows_migrate_without_changing_issue_revision_or_workspace() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let project_id = state.projects[0].id;
+        let mut task = Task::new("Legacy issue", TaskState::Done, 3);
+        task.workspace = Some(TaskWorkspace::Local { project_id });
+        state.tasks.push(task.clone());
+        store.save(&mut state).unwrap();
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        connection.execute_batch("ALTER TABLE projects DROP COLUMN board; ALTER TABLE tasks DROP COLUMN stage_id; DELETE FROM migrations WHERE tag = '0010_flowery_la_nuit';").unwrap();
+        drop(connection);
+        drop(store);
+        task.stage_id = Some(crate::model::canonical_stage_id(project_id, task.state));
+        let restored = store_in(&directory).load().unwrap();
+        assert_eq!(restored.tasks, vec![task]);
+        assert_eq!(
+            restored.projects[0].board,
+            crate::model::ProjectBoard::canonical(project_id)
+        );
+        fs::remove_dir_all(directory).ok();
     }
 
     #[test]
