@@ -2491,7 +2491,7 @@ impl Waku {
                 )
             })
             .flatten();
-        div()
+        let header = div()
             .id("window-header")
             .h(px(48.0))
             .flex_none()
@@ -2642,8 +2642,10 @@ impl Waku {
                     .when(!self.board_open, |element| {
                         element.child(self.render_right_panel_toggle(cx))
                     })
-            })
-            .children(right_window_controls)
+            });
+        #[cfg(debug_assertions)]
+        let header = header.child(self.render_stream_playground_button(cx));
+        header.children(right_window_controls)
     }
 
     // ── Empty states ───────────────────────────────────────────────────────
