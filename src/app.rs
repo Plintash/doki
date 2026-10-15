@@ -1652,6 +1652,8 @@ pub struct Waku {
     /// swapping in frozen page pixels while an overlay is open.
     scene_overlay_enabled: bool,
     settings_page: Option<SettingsPage>,
+    /// Debug-only streaming playground, opened from the header.
+    stream_playground: Option<StreamPlayground>,
     /// The Skills page's library snapshot, scanned off-thread. Frames read
     /// only this; `None` means the first scan has not landed yet.
     skills_catalog: Option<Rc<crate::skills::SkillsCatalog>>,
@@ -1878,6 +1880,7 @@ mod sessions;
 mod settings;
 mod sidebar;
 mod skills_page;
+mod stream_test;
 mod streaming;
 mod task_completion;
 mod task_details;
@@ -1905,6 +1908,7 @@ pub use settings::init as init_settings_keys;
 pub use sidebar::init as init_sidebar_keys;
 use sidebar::{SidebarGroup, SidebarRow};
 pub use skills_page::init as init_skills_keys;
+use stream_test::*;
 use streaming::*;
 use transcript::*;
 use transcript_view::ConversationNavigationRail;
@@ -3279,6 +3283,7 @@ impl Waku {
                 right_panel_pending_browser_focus: None,
                 scene_overlay_enabled,
                 settings_page: None,
+                stream_playground: None,
                 skills_catalog: None,
                 skills_scan_generation: 0,
                 skills_scan_pending: false,

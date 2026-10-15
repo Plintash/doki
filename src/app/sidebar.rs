@@ -482,6 +482,16 @@ fn reveal_sidebar_list_row(list: &ListState, rows: &[SidebarRow], index: usize) 
     }
 }
 
+#[cfg(debug_assertions)]
+fn debug_stream_playground_button(waku: &Waku, cx: &mut Context<Waku>) -> Option<AnyElement> {
+    Some(waku.render_stream_playground_button(cx))
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_stream_playground_button(_: &Waku, _: &mut Context<Waku>) -> Option<AnyElement> {
+    None
+}
+
 impl Waku {
     pub(super) fn window_drag_region(
         &self,
@@ -2644,6 +2654,7 @@ impl Waku {
                     })
             })
             .children(right_window_controls)
+            .children(debug_stream_playground_button(self, cx))
     }
 
     // ── Empty states ───────────────────────────────────────────────────────

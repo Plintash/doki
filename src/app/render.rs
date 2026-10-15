@@ -254,6 +254,10 @@ impl Render for Waku {
         }
         let image_preview = self.render_image_preview(cx);
         let task_switcher = self.render_task_switcher(window, cx);
+        if self.stream_playground.is_some() {
+            let content = self.render_stream_playground(window, cx);
+            return super::window_chrome::render_window_frame(content, window, cx);
+        }
         if self.settings_page.is_some() {
             let command_palette = self.render_command_palette(window, cx);
             let commit_dialog = self.render_commit_dialog(cx);
