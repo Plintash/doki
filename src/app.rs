@@ -33,12 +33,13 @@ use crate::model::{
     ActivityItem, ActivityKind, AgentSession, AnnotationSpan, AnnotationTarget,
     BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind,
     BackgroundWorkStatus, Checkpoint, CheckpointStatus, ContextUsage, DriverEvent,
-    ExtensionStatusEntry, ExtensionWidget, ExtensionWidgetPlacement, FavoriteModel, Message,
-    MessageAnnotation, MessageAttachment, MessageRole, NotificationSeverity, PendingPermission,
-    Project, ProviderKind, ProviderModel, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, QueuedMessage, ReasoningBlock, RuntimeMode,
-    SessionStatus, SessionWorkspace, Task, TaskState, TaskWorkspace, TextSpan, TranscriptBlock,
-    TurnStatus, UserInputAnswer, UserInputQuestion, compact_path, unix_time, unix_time_millis,
+    ExtensionStatusEntry, ExtensionWidget, ExtensionWidgetPlacement, FavoriteModel,
+    IssueReviewStatus, IssueReviewTarget, Message, MessageAnnotation, MessageAttachment,
+    MessageRole, NotificationSeverity, PendingPermission, Project, ProviderKind, ProviderModel,
+    ProviderProbe, ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary,
+    QueuedMessage, ReasoningBlock, RuntimeMode, SessionReview, SessionStatus, SessionWorkspace,
+    Task, TaskState, TaskWorkspace, TextSpan, TranscriptBlock, TurnStatus, UserInputAnswer,
+    UserInputQuestion, compact_path, unix_time, unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -79,10 +80,6 @@ use crate::{
     ToggleFullScreen, ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 
-#[cfg(target_os = "macos")]
-const TRAFFIC_LIGHT_CLEARANCE: f32 = 86.0;
-#[cfg(not(target_os = "macos"))]
-const TRAFFIC_LIGHT_CLEARANCE: f32 = 8.0;
 const CONTENT_MAX_WIDTH: f32 = 720.0;
 /// Menu-registry id of the composer's model picker, shared by its render site
 /// and the primary-modifier `/` toggle action.
@@ -719,7 +716,7 @@ impl WakuPane {
             // (terminal output, pulse leases) dirty their ancestor pane
             // without this observer, and the slide's retirement notify
             // below re-runs the fan-out, so nothing outlasts the 200ms.
-            if !waku.read(cx).panels_sliding() {
+            if !waku.read(cx).panels_sliding() && !waku.read(cx).titlebar_clearance.is_sliding() {
                 cx.notify();
             }
         })
@@ -1544,6 +1541,8 @@ pub struct Waku {
     task_stats_cache: RefCell<Option<Rc<board::TaskStats>>>,
     /// The board's per-column card lists, so long columns stay virtualized.
     board_column_lists: RefCell<[board::BoardColumnList; 3]>,
+    board_stages: board_stages::StageBoard,
+    stage_result_choices: Option<Result<Vec<(crate::model::StageResultSource, String)>, String>>,
     /// The Settings archive's virtualized row list.
     archive_rows: RefCell<settings::ArchiveRows>,
     /// Stable focus for the archive surface itself, so restoring a row (which
@@ -1570,6 +1569,7 @@ pub struct Waku {
     /// hand from `render` (see [`motion::WidthTween`]) because the width these
     /// produce is what the transcript column between them is laid out against.
     sidebar_slide: Option<motion::WidthTween>,
+    titlebar_clearance: window_chrome::TitlebarClearance,
     right_panel_slide: Option<motion::WidthTween>,
     /// Width each panel actually occupied in the last frame — where a toggle
     /// starts its slide from, and what the transcript measures itself against
@@ -1863,6 +1863,7 @@ mod autocomplete;
 mod background_work;
 mod board;
 mod board_header;
+mod board_stages;
 mod branches;
 mod command_palette;
 mod commit_dialog;
@@ -1872,6 +1873,7 @@ mod drafts;
 mod file_search;
 mod goal_dialog;
 mod image_preview;
+mod issue_review;
 mod projects;
 mod render;
 mod right_panel;
@@ -1881,6 +1883,7 @@ mod sessions;
 mod settings;
 mod sidebar;
 mod skills_page;
+mod stage_execution;
 mod streaming;
 mod task_completion;
 mod task_details;
@@ -3208,6 +3211,8 @@ impl Waku {
                 task_completion_save_rollbacks: HashMap::new(),
                 unconfirmed_task_closes: HashMap::new(),
                 task_stats_cache: RefCell::new(None),
+                board_stages: board_stages::StageBoard::new(),
+                stage_result_choices: None,
                 board_column_lists: RefCell::new([
                     board::BoardColumnList::new(),
                     board::BoardColumnList::new(),
@@ -3226,6 +3231,7 @@ impl Waku {
                 right_panel_visible,
                 right_panel_width,
                 sidebar_slide: None,
+                titlebar_clearance: window_chrome::TitlebarClearance::default(),
                 right_panel_slide: None,
                 sidebar_rendered_width: if sidebar_visible { sidebar_width } else { 0.0 },
                 right_panel_rendered_width: if right_panel_visible {

@@ -110,7 +110,7 @@ fn composer_toggled_worktree(
     task: Option<&Task>,
     preparing: bool,
 ) -> Option<SessionWorkspace> {
-    if session.has_started() || session.is_busy() || preparing {
+    if session.has_started() || session.is_busy() || preparing || session.review.is_some() {
         return None;
     }
     Some(match &session.workspace {
@@ -1147,7 +1147,7 @@ impl Waku {
         let selected_model = session.and_then(|session| self.catalog_model_id_for_session(session));
         let selected_model_name = self.model_display_name(provider, selected_model);
         let locked_provider = session
-            .filter(|session| !session.messages.is_empty())
+            .filter(|session| !session.messages.is_empty() || session.review.is_some())
             .map(|session| session.provider);
         let picker_enabled = session.is_some_and(|session| session.can_choose_model(provider));
 
@@ -1207,9 +1207,9 @@ impl Waku {
                         // A draft can sit on a provider that was since switched
                         // off; open onto the first usable provider instead of a
                         // tab whose rows the filter would leave empty.
-                        let locked = this
-                            .selected_session()
-                            .is_some_and(|session| !session.messages.is_empty());
+                        let locked = this.selected_session().is_some_and(|session| {
+                            !session.messages.is_empty() || session.review.is_some()
+                        });
                         let provider =
                             if !locked && this.state.disabled_providers.contains(&provider) {
                                 ProviderKind::ALL
@@ -1699,7 +1699,7 @@ impl Waku {
         }
         let locked_provider = self
             .selected_session()
-            .filter(|session| !session.messages.is_empty())
+            .filter(|session| !session.messages.is_empty() || session.review.is_some())
             .map(|session| session.provider);
         let tabs = visible_picker_tabs(
             &self.probes,
@@ -1726,7 +1726,7 @@ impl Waku {
         let provider = session.map(|session| session.provider).unwrap_or_default();
         let selected_model = session.and_then(|session| self.catalog_model_id_for_session(session));
         let locked_provider = session
-            .filter(|session| !session.messages.is_empty())
+            .filter(|session| !session.messages.is_empty() || session.review.is_some())
             .map(|session| session.provider);
         let index = visible_picker_models(
             &self.probes,
@@ -3734,6 +3734,22 @@ impl Waku {
                         }))
                 })
                 .children(autocomplete)
+                .when_some(
+                    session.and_then(|session| session.review.as_ref()),
+                    |card, review| {
+                        card.child(
+                            div()
+                                .px(px(12.0))
+                                .pb(px(8.0))
+                                .text_size(sp(11.5))
+                                .text_color(theme.text_secondary)
+                                .child(tr!(
+                                    "review.composer_scope",
+                                    scope = issue_review::review_target_label(&review.target)
+                                )),
+                        )
+                    },
+                )
                 .when(!self.composer_annotations.is_empty(), |card| {
                     card.child(self.render_composer_annotations(cx))
                 })
@@ -3906,7 +3922,8 @@ impl Waku {
         let workspace_path = self.workspace_path_for_session(session)?.to_path_buf();
         self.selected_project()
             .filter(|project| !project.is_projectless())?;
-        let branch_enabled = !session.is_busy() && !self.branch_operation_pending;
+        let branch_enabled =
+            !session.is_busy() && session.review.is_none() && !self.branch_operation_pending;
         let planned_worktree = matches!(workspace, SessionWorkspace::NewWorktree { .. });
         let snapshot = self.branch_snapshot_for_workspace(&workspace_path, cx)?;
         let selected_branch = match &workspace {
@@ -4333,7 +4350,7 @@ impl Waku {
             .unwrap_or_else(|| tr!("project.choose_project"));
         let is_draft = self
             .selected_session()
-            .is_some_and(|session| !session.has_started());
+            .is_some_and(|session| !session.has_started() && session.review.is_none());
         let preparing_workspace = self.selected_session().is_some_and(|session| {
             self.submission_preparations.contains(&session.id)
                 || self.goal_runtime_starts.contains(&session.id)

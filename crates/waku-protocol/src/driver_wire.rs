@@ -39,6 +39,8 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             ("availableCommands", serde_json::to_value(commands)?)
         }
         DriverEvent::TurnStarted => ("turnStarted", Value::Null),
+        DriverEvent::ReviewStarted => ("reviewStarted", Value::Null),
+        DriverEvent::ReviewCompleted { review } => ("reviewCompleted", json!({ "review": review })),
         DriverEvent::TurnParked => ("turnParked", Value::Null),
         DriverEvent::TextDelta(text) => ("textDelta", Value::String(text)),
         DriverEvent::ReasoningDelta(text) => ("reasoningDelta", Value::String(text)),
@@ -192,6 +194,13 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         "autoTitleUpdated" => DriverEvent::AutoTitleUpdated(serde_json::from_value(payload)?),
         "availableCommands" => DriverEvent::AvailableCommands(serde_json::from_value(payload)?),
         "turnStarted" => DriverEvent::TurnStarted,
+        "reviewStarted" => DriverEvent::ReviewStarted,
+        "reviewCompleted" => {
+            let completed: ReviewCompletedWire = serde_json::from_value(payload)?;
+            DriverEvent::ReviewCompleted {
+                review: completed.review,
+            }
+        }
         "turnParked" => DriverEvent::TurnParked,
         "textDelta" => DriverEvent::TextDelta(serde_json::from_value(payload)?),
         "reasoningDelta" => DriverEvent::ReasoningDelta(serde_json::from_value(payload)?),
@@ -468,6 +477,11 @@ struct UsageWire {
 }
 
 #[derive(Deserialize)]
+struct ReviewCompletedWire {
+    review: String,
+}
+
+#[derive(Deserialize)]
 struct TurnFinishedWire {
     success: bool,
     summary: Option<String>,
@@ -481,6 +495,46 @@ struct TurnFinishedWire {
 mod tests {
     use super::*;
     use crate::model::{ThreadGoal, ThreadGoalStatus, UserInputOption, UserInputQuestion};
+
+    #[test]
+    fn review_lifecycle_round_trips_without_inferring_from_text() {
+        let started = event_to_wire(DriverEvent::ReviewStarted).unwrap();
+        assert_eq!(started.kind, "reviewStarted");
+        assert!(matches!(
+            event_from_wire(started).unwrap(),
+            DriverEvent::ReviewStarted
+        ));
+        let review = "### Findings\n[P1] Retain the review's explicit result";
+        let completed = event_to_wire(DriverEvent::ReviewCompleted {
+            review: review.into(),
+        })
+        .unwrap();
+        assert_eq!(completed.kind, "reviewCompleted");
+        assert_eq!(completed.payload, json!({ "review": review }));
+        assert!(matches!(
+            event_from_wire(completed).unwrap(),
+            DriverEvent::ReviewCompleted { review: text } if text == review
+        ));
+        assert!(matches!(
+            event_from_wire(WireDriverEvent::new(
+                "textDelta",
+                Value::String("Review complete".into())
+            ))
+            .unwrap(),
+            DriverEvent::TextDelta(_)
+        ));
+    }
+
+    #[test]
+    fn review_completion_requires_an_explicit_string_result() {
+        for payload in [Value::Null, json!({}), json!({ "review": 1 })] {
+            assert!(event_from_wire(WireDriverEvent::new("reviewCompleted", payload)).is_err());
+        }
+        assert!(matches!(
+            event_from_wire(WireDriverEvent::new("reviewCompleted", json!({ "review": "" }))).unwrap(),
+            DriverEvent::ReviewCompleted { review } if review.is_empty()
+        ));
+    }
 
     #[test]
     fn goal_updates_round_trip_through_the_daemon_wire() {

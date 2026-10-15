@@ -561,6 +561,15 @@ mod tests {
             Some(turn_id)
         );
         assert_eq!(active.turn_for(&DriverEvent::TurnStarted), Some(turn_id));
+        assert_eq!(active.turn_for(&DriverEvent::ReviewStarted), Some(turn_id));
+        assert_eq!(
+            active.turn_for(&DriverEvent::ReviewCompleted {
+                review: "No findings".into()
+            }),
+            Some(turn_id)
+        );
+        // Review exit carries a result but only turn settlement closes the turn.
+        assert_eq!(active.turn_for(&DriverEvent::TurnStarted), Some(turn_id));
         assert_eq!(
             active.turn_for(&DriverEvent::Activity {
                 id: None,

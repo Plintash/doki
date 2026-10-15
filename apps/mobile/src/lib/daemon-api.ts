@@ -188,7 +188,8 @@ export function createProject(
   }
   const path = input === '/' ? input : input.replace(/[\\/]+$/, '');
   const name = path.split(/[\\/]/).filter(Boolean).at(-1) ?? 'Project';
-  return { id, name, path, created_at: createdAt };
+  // The daemon assigns canonical stage IDs when the project is persisted.
+  return { id, name, path, board: { revision: 0, stages: [] }, created_at: createdAt };
 }
 
 export async function persistProject(

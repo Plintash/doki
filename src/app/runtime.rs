@@ -231,6 +231,9 @@ pub(super) fn merge_remote_session_catalog(
                 local.auto_title = remote.auto_title;
                 local.project_id = remote.project_id;
                 local.workspace = remote.workspace;
+                local.review = remote.review;
+                local.stage_invocation = remote.stage_invocation;
+                local.review_correction_source_id = remote.review_correction_source_id;
                 local.task_id = remote.task_id;
                 local.provider = remote.provider;
                 local.model = remote.model;
@@ -264,6 +267,9 @@ pub(super) fn replace_hydrated_session(local: &mut AgentSession, mut hydrated: A
         hydrated.project_id = local.project_id;
         hydrated.task_id = local.task_id;
         hydrated.workspace = std::mem::take(&mut local.workspace);
+        hydrated.review = local.review.take();
+        hydrated.stage_invocation = local.stage_invocation.take();
+        hydrated.review_correction_source_id = local.review_correction_source_id;
         hydrated.provider = local.provider;
         hydrated.model = local.model.take();
         // Disk catalog skeletons carry placeholder provider options. Only a
@@ -1139,6 +1145,7 @@ impl Waku {
             snapshot.projects,
             &mut self.pending_project_registrations,
         );
+        self.reconcile_task_placement_saves(&snapshot.tasks);
         merge_remote_tasks(&mut self.state.tasks, snapshot.tasks);
 
         let attach = self
@@ -1339,6 +1346,7 @@ impl Waku {
                 return;
             }
             session.status = SessionStatus::Idle;
+            issue_review::settle_review(session, TurnStatus::Interrupted);
             let interrupted_turn_count = session
                 .turns
                 .last_mut()
@@ -1422,6 +1430,7 @@ impl Waku {
     ) -> Option<(Uuid, usize)> {
         let session = self.state.session_mut(session_id)?;
         let finished = session.finish_active_turn(status)?;
+        issue_review::settle_review(session, status);
         crate::diagnostics::record(cx, || {
             Some(crate::diagnostics::turn_settled(
                 session, finished.0, finished.1, status,
@@ -1707,7 +1716,7 @@ impl Waku {
     pub(super) fn model_picker_has_no_providers(&self) -> bool {
         let locked_provider = self
             .selected_session()
-            .filter(|session| !session.messages.is_empty())
+            .filter(|session| !session.messages.is_empty() || session.review.is_some())
             .map(|session| session.provider);
         super::composer::picker_has_no_providers(
             &self.probes,
@@ -3230,7 +3239,8 @@ impl Waku {
     }
 
     pub(super) fn session_can_steer(&self, session: &AgentSession) -> bool {
-        session_has_active_provider_turn(session)
+        session.review.is_none()
+            && session_has_active_provider_turn(session)
             && self
                 .runtimes
                 .get(&session.id)
@@ -3415,6 +3425,33 @@ impl Waku {
         else {
             return;
         };
+        if let Err(error) = self.validate_stage_submission(session) {
+            let source = session
+                .stage_invocation
+                .as_ref()
+                .and_then(|invocation| invocation.source.as_ref())
+                .map(|source| source.session_id);
+            if let Some(source) = source {
+                self.ensure_session_loaded(source, cx);
+            }
+            if selected {
+                self.restore_composer_submission(submission, cx);
+            }
+            self.show_toast(error);
+            cx.notify();
+            return;
+        }
+        if session.review.is_some()
+            && (session.provider != ProviderKind::Codex
+                || matches!(session.workspace, SessionWorkspace::NewWorktree { .. }))
+        {
+            if selected {
+                self.restore_composer_submission(submission, cx);
+                self.show_toast(tr!("review.invalid_session"));
+            }
+            cx.notify();
+            return;
+        }
         if self.ending_checkpoint_pending(session_id) {
             self.enqueue_follow_up_submission(session_id, submission, cx);
             self.defer_queue_drain(session_id);
@@ -3489,6 +3526,7 @@ impl Waku {
                 submission.annotations.clone(),
             );
             session.status = SessionStatus::Connecting;
+            issue_review::begin_review(session);
             session.touch();
             continued_task = session.task_id;
             selected.then_some(TranscriptAnchor {
@@ -3615,6 +3653,12 @@ impl Waku {
                 {
                     self.schedule_composer_draft_save(cx);
                 }
+                if let Some(session) = self.state.session_mut(session_id)
+                    && let Some(review) = session.review.as_mut()
+                {
+                    review.status = IssueReviewStatus::Draft;
+                    issue_review::touch_review(session);
+                }
                 if selected {
                     if self
                         .transcript_anchor
@@ -3734,9 +3778,26 @@ impl Waku {
         {
             runtime.compaction_turn = turn_id;
         }
+        let review_target = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.review.as_ref())
+            .map(|review| review.target.clone());
         let mut failed_to_start = false;
         match driver {
-            Ok(driver) => driver.prompt(driver_prompt, turn_id, message_id),
+            Ok(driver) => {
+                if let Some(target) = review_target {
+                    driver.review(
+                        issue_review::review_instructions(&target, &driver_prompt),
+                        turn_id,
+                        message_id,
+                    );
+                } else {
+                    driver.prompt(driver_prompt, turn_id, message_id);
+                }
+            }
             Err(error) => {
                 failed_to_start = true;
                 let message = tr!("errors.start_agent", error = error);
@@ -3894,6 +3955,8 @@ impl Waku {
                         | DriverEvent::PromptSubmitted { .. }
                         | DriverEvent::SteerAccepted { .. }
                         | DriverEvent::SteerRejected { .. }
+                        | DriverEvent::ReviewStarted
+                        | DriverEvent::ReviewCompleted { .. }
                         | DriverEvent::TurnFinished { .. }
                         | DriverEvent::Error(_)
                         | DriverEvent::ProcessExited

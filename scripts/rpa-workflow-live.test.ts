@@ -303,6 +303,8 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     expect(briefNodes.some(node => node.element_id === "new-task-layer")).toBe(false);
     expect(briefNodes.some(node => node.element_id === `task-project-${projectId}`)).toBe(false);
     expect(briefNodes.some(node => node.element_id === "task-detail-new-session")).toBe(false);
+    expect(briefNodes.some(node => node.element_id === "issue-start-review")).toBe(false);
+    expect(briefNodes.some(node => node.element_id === "issue-review-scope")).toBe(false);
     expect(briefNodes.find(node => node.element_id === "new-task-create")?.disabled).toBe(true);
     await client.automationCall(sessionId, { type: "type", text: "   ", target: { id: `issue-title-${draftIssueId}` } });
     const whitespace = await client.automationCall(sessionId, { type: "snapshot", sections: ["tree", "tasks", "sessions"] });
@@ -325,7 +327,7 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     const newIssueId = field(fresh.observed, "state", "task", "id") as string;
     const title = "Empty issue before any conversation";
     const description = "Keep the title, description, and chosen workspace together.";
-    await client.automationCall(sessionId, { type: "type", text: title, target: { id: `issue-title-${newIssueId}` } });
+    await client.automationCall(sessionId, { type: "type", text: `${title} (draft)`, target: { id: `issue-title-${newIssueId}` } });
     await client.automationCall(sessionId, { type: "type", text: description, target: { id: `issue-description-${newIssueId}` } });
     await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "task-detail-workspace" } });
     await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "task-workspace-local" } });
@@ -333,6 +335,11 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     await invoke("openTask", { id: issueId });
     await invoke("newTask");
     await wait({ on: "state", pointer: "/task/id", equals: newIssueId });
+    // An immediate edit + Create may share a timestamp. The same editor must
+    // still remeasure when its review/conversation controls become visible.
+    await client.automationCall(sessionId, { type: "act", action: "focus", target: { id: `issue-title-${newIssueId}` } });
+    await client.automationCall(sessionId, { type: "key", chord: process.platform === "darwin" ? "cmd-a" : "ctrl-a" });
+    await client.automationCall(sessionId, { type: "type", text: title, target: { id: `issue-title-${newIssueId}` } });
     await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "new-task-create" } });
     await wait({ on: "state", pointer: "/board/newTaskDraft", equals: null });
     await wait({ on: "state", pointer: "/board/savePending", equals: false });
@@ -349,6 +356,9 @@ liveTest("native Board issues and conversations keep distinct identities and iso
     const detailNodes = field(details.observed, "tree", "nodes") as { element_id?: string }[];
     expect(detailNodes.some(node => node.element_id === `issue-title-${newIssueId}`)).toBe(true);
     expect(detailNodes.some(node => node.element_id === `issue-description-${newIssueId}`)).toBe(true);
+    expect(detailNodes.some(node => node.element_id === "task-detail-new-session")).toBe(true);
+    expect(detailNodes.some(node => node.element_id === "issue-start-review")).toBe(true);
+    expect(detailNodes.some(node => node.element_id === "issue-review-scope")).toBe(true);
     // Menu triggers and entries must advertise real semantic Click actions.
     await client.automationCall(sessionId, { type: "act", action: "click", target: { id: "task-detail-workspace" } });
     await wait({ on: "node", id: "task-workspace-local", present: true });

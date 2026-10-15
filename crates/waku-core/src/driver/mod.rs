@@ -118,8 +118,12 @@ impl DriverHandle {
         self.inner.prompt(prompt);
     }
 
-    /// Whether this transport can inject a user message into the currently
-    /// running turn (steering) instead of starting a new one.
+    /// Run a provider-native review rather than a normal chat turn.
+    pub fn review(&self, prompt: String) -> anyhow::Result<()> {
+        self.inner.review(prompt)
+    }
+
+    /// Whether this transport can inject into the currently running turn.
     pub fn supports_steer(&self) -> bool {
         self.inner.supports_steer()
     }
@@ -200,6 +204,9 @@ impl DriverHandle {
 
 pub trait DriverControl: Send + Sync {
     fn prompt(&self, prompt: String);
+    fn review(&self, _prompt: String) -> anyhow::Result<()> {
+        anyhow::bail!("native code review is not supported by this provider")
+    }
     fn supports_steer(&self) -> bool {
         false
     }

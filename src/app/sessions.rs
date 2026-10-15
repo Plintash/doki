@@ -318,7 +318,11 @@ impl Waku {
         let Some(session) = self.selected_session_mut() else {
             return;
         };
-        if session.has_started() || session.is_busy() || session.workspace == workspace {
+        if session.has_started()
+            || session.is_busy()
+            || session.review.is_some()
+            || session.workspace == workspace
+        {
             return;
         }
         session.workspace = workspace;
