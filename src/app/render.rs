@@ -110,13 +110,19 @@ impl Waku {
 
     /// Settle both panel slides for this frame and publish the widths the
     /// pane islands — which render later, during layout — have to agree with.
-    fn settle_panel_slides(&mut self, window: &Window) -> PanelFrame {
+    fn settle_panel_slides(&mut self, window: &Window, cx: &App) -> PanelFrame {
         let was_sliding = self.panels_sliding();
-        if self.settings_page.is_some() || self.board_open {
-            // Settings and the board cover the workspace, so there is no edge on screen to
+        if self.settings_page.is_some() || cx.reduce_motion() {
+            // Settings covers the workspace, so there is no edge on screen to
             // move. Retire the slide rather than animate a layout nobody can
             // see; reopening the workspace finds the panels where they belong.
             self.sidebar_slide = None;
+            self.right_panel_slide = None;
+        }
+        if self.board_open {
+            // Board hides the right panel, but its sidebar remains visible
+            // and must keep animating. Do not resurrect right-panel chrome
+            // while the Board header is already drawing the window controls.
             self.right_panel_slide = None;
         }
         let (sidebar_content, right_panel_content) = self.effective_panel_widths(window);
@@ -238,8 +244,21 @@ impl Render for Waku {
         // Panel geometry first: the browser sync right below reads whether a
         // panel is mid-slide, and settling here rather than at the point of
         // use keeps the pane islands and the transcript on one set of widths.
-        let panels = self.settle_panel_slides(window);
-        if panels.sliding {
+        let titlebar_was_moving = self.titlebar_clearance.is_sliding();
+        let titlebar_moving = self.titlebar_clearance.settle(
+            super::window_chrome::native_titlebar_clearance(
+                cfg!(target_os = "macos"),
+                window.is_fullscreen(),
+            ),
+            cx.reduce_motion(),
+        );
+        if titlebar_was_moving && !titlebar_moving {
+            // Release the same pane-observer gate used by the panel slides.
+            let root = window.current_view();
+            window.on_next_frame(move |_, cx| cx.notify(root));
+        }
+        let panels = self.settle_panel_slides(window, cx);
+        if !cx.reduce_motion() && (panels.sliding || titlebar_moving) {
             // The manual drive for the width tweens — the same scheduling
             // `with_animation` would do, minus its element-id keying.
             window.request_animation_frame();
@@ -449,6 +468,7 @@ impl Render for Waku {
                         ),
                 )
             })
+            .child(self.render_titlebar_navigation(window, cx))
             .children(computer_use)
             .children(command_palette)
             .children(commit_dialog)

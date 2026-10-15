@@ -3,8 +3,7 @@
 /**
  * Where a task sits on the board.
  *
- * The three columns are fixed for now; user-defined columns come later. The
- * state is the user's own declaration — runtime activity never moves a task
- * on its own.
+ * Internal lifecycle compatibility, independent of project-owned stage IDs.
+ * The state is the user's declaration; runtime activity never moves a task.
  */
 export type TaskState = "backlog" | "doing" | "done";

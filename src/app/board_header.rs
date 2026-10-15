@@ -169,7 +169,7 @@ impl Waku {
                     .collect()
             },
         );
-        let complete = self.task_action_button(
+        let complete = self.task_icon_action(
             "board-detail-complete",
             if completing {
                 tr!("board.cancel_completion")
@@ -178,7 +178,13 @@ impl Waku {
             } else {
                 tr!("board.complete")
             },
-            false,
+            if completing {
+                "icons/x.svg"
+            } else if task_state.is_done() {
+                "icons/rewind.svg"
+            } else {
+                "icons/check.svg"
+            },
             true,
             move |this, window, cx| {
                 if completing {
@@ -219,15 +225,6 @@ impl Waku {
             .selected_task
             .and_then(|id| self.task_for_editor(id))
             .cloned();
-        let left_controls = (!self.sidebar_visible)
-            .then(|| {
-                self.render_client_window_controls(
-                    super::window_chrome::WindowControlSide::Left,
-                    window,
-                    cx,
-                )
-            })
-            .flatten();
         let right_controls = self.render_client_window_controls(
             super::window_chrome::WindowControlSide::Right,
             window,
@@ -244,10 +241,10 @@ impl Waku {
 
         if let Some(task) = selected_task {
             controls = controls
-                .child(self.task_action_button(
+                .child(self.task_icon_action(
                     "board-detail-back",
                     tr!("board.back_to_board"),
-                    false,
+                    "icons/arrow-left.svg",
                     true,
                     |this, window, cx| this.show_task_board(window, cx),
                     cx,
@@ -390,57 +387,11 @@ impl Waku {
             .flex()
             .items_start()
             .gap(px(8.0))
-            .pl(if self.sidebar_visible {
-                px(14.0 + (TRAFFIC_LIGHT_CLEARANCE - self.sidebar_rendered_width).max(0.0))
-            } else {
-                px(0.0)
-            })
+            .pl(px(self.titlebar_content_inset(window, cx)))
             .pr(px(14.0))
             .border_b_1()
             .border_color(theme.border)
             .bg(theme.surface)
-            .when(!self.sidebar_visible, |element| {
-                element.child(
-                    div()
-                        .h(px(48.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .children(left_controls)
-                        .child(
-                            self.window_drag_region(
-                                div()
-                                    .id("board-traffic-light-drag-region")
-                                    .w(px(TRAFFIC_LIGHT_CLEARANCE - 8.0))
-                                    .h_full()
-                                    .flex_none(),
-                                cx,
-                            ),
-                        )
-                        .child(
-                            self.task_action_button(
-                                "board-show-sidebar",
-                                "",
-                                false,
-                                true,
-                                |this, _, cx| this.set_sidebar_visible(true, cx),
-                                cx,
-                            )
-                            .w(px(26.0))
-                            .h(px(26.0))
-                            .px_0()
-                            .rounded(px(6.0))
-                            .bg(gpui::transparent_black())
-                            .border_color(gpui::transparent_black())
-                            .tooltip(Tooltip::text(tr!("menu.toggle_sidebar")))
-                            .child(icon(
-                                "icons/panel-left.svg",
-                                14.0,
-                                theme.text_tertiary,
-                            )),
-                        ),
-                )
-            })
             .child(controls)
             .when_some(right_controls, |element, controls| {
                 element.child(div().h(px(48.0)).flex_none().child(controls))

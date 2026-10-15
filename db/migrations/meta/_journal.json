@@ -57,6 +57,34 @@
       "when": 1791918081807,
       "tag": "0007_planned_issue_worktree",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1791959703221,
+      "tag": "0008_issue_review",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1791963103980,
+      "tag": "0009_review_correction_provenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1791982869841,
+      "tag": "0010_flowery_la_nuit",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1791983129690,
+      "tag": "0011_bumpy_nightcrawler",
+      "breakpoints": true
     }
   ]
 }

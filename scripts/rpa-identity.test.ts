@@ -99,8 +99,16 @@ test("Board controls expose semantic identity and disabled state", () => {
   expect(checkbox).toContain("semantic_control(gpui::Role::CheckBox, !enabled)");
   expect(checkbox).toContain("aria_toggled");
   const completion = read("src/app/task_completion.rs");
-  const rollback = completion.slice(completion.indexOf("if rollback.apply(*attempt, task)"), completion.indexOf("if rollback.apply(*attempt, task)") + 210);
-  expect(rollback).toContain("super::rpa::daemon::model_changed()");
+  const rollbackStart = completion.indexOf("fn settle_placement_saves(");
+  expect(rollbackStart).toBeGreaterThanOrEqual(0);
+  const rollback = completion.slice(rollbackStart, completion.indexOf("\n#[derive", rollbackStart));
+  expect(rollback).toContain("changed |= rollback.apply(sent.attempt, task)");
+  const settleStart = completion.indexOf("fn settle_task_completion_save(");
+  expect(settleStart).toBeGreaterThanOrEqual(0);
+  const settlement = completion.slice(settleStart, completion.indexOf("pub(super) fn confirm_task_completion", settleStart));
+  expect(settlement).toContain("if settle_placement_saves(");
+  expect(settlement).toContain("super::rpa::daemon::model_changed()");
+  expect(settlement).toContain("self.sidebar_rows_fingerprint.set(None)");
 });
 
 

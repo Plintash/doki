@@ -96,13 +96,32 @@ export function reduceRuntimeEvent(
       // submitter's ids so every client's projection names the same rows.
       const value = asRecord(payload)
       if (!value || typeof value.message !== 'string') break
-      adoptSubmittedPrompt(
+      const adopted = adoptSubmittedPrompt(
         session,
         value.message,
         typeof value.turnId === 'string' ? value.turnId : clock.randomUUID(),
         typeof value.messageId === 'string' ? value.messageId : clock.randomUUID(),
         clock,
       )
+      if (adopted && session.review) {
+        session.review.status = 'running'
+        session.review.summary = null
+        session.review.result_message_id = null
+        session.review.fix_session_id = null
+      }
+      break
+    }
+    case 'reviewStarted':
+      if (acceptsTurnOutput(session) && session.review && !session.review.result_message_id) {
+        session.review.status = 'running'
+      }
+      break
+    case 'reviewCompleted': {
+      const value = asRecord(payload)
+      if (!acceptsTurnOutput(session) || typeof value?.review !== 'string') break
+      finishStreamingMessages(session)
+      completeActivities(session)
+      recordReviewResult(session, value.review, clock)
       break
     }
     case 'turnStarted': {
@@ -244,7 +263,7 @@ export function reduceRuntimeEvent(
       const success = value?.success === true
       result.settled = settleTurn(
         session,
-        success ? 'completed' : 'failed',
+        value?.interrupted === true ? 'interrupted' : success ? 'completed' : 'failed',
         typeof value?.summary === 'string' ? value.summary : null,
         clock,
       )
@@ -255,6 +274,8 @@ export function reduceRuntimeEvent(
     case 'error': {
       if (typeof payload !== 'string') break
       result.error = payload
+      // Error notifications may be retryable. Only terminal settlement or
+      // process exit decides whether a native review failed.
       // An optimistic pursuit turn has no submission to fail with. Unwind it
       // so the error cannot strand a spinner; if the pursuit does start
       // later, its own start report recreates the turn.
@@ -289,6 +310,7 @@ export function reduceRuntimeEvent(
       break
     }
     case 'processExited':
+      failUnsettledReview(session)
       result.settled = settleTurn(
         session,
         'failed',
@@ -303,7 +325,10 @@ export function reduceRuntimeEvent(
       break
   }
 
-  session.updated_at = Math.max(session.updated_at, clock.nowSeconds())
+  const reviewChanged = current.review?.status !== session.review?.status
+    || current.review?.result_message_id !== session.review?.result_message_id
+    || current.review?.fix_session_id !== session.review?.fix_session_id
+  session.updated_at = Math.max(session.updated_at + (reviewChanged ? 1 : 0), clock.nowSeconds())
   return result
 }
 
@@ -351,7 +376,7 @@ function adoptSubmittedPrompt(
     const hasPrompt = session.messages.some(
       (candidate) => candidate.turn_id === active.id && candidate.role === 'user',
     )
-    if (hasPrompt) return
+    if (hasPrompt) return false
     session.messages.push({
       id: messageId,
       turn_id: active.id,
@@ -360,7 +385,7 @@ function adoptSubmittedPrompt(
       created_at: now,
       streaming: false,
     })
-    return
+    return true
   }
   setTitleFromPrompt(session, message)
   session.turns.push({
@@ -383,6 +408,43 @@ function adoptSubmittedPrompt(
   })
   session.status = 'connecting'
   session.last_reply_at = now
+  return true
+}
+
+function recordReviewResult(session: AgentSession, text: string, clock: ReducerClock) {
+  const review = session.review
+  const turn = activeTurn(session)
+  if (!text.trim() || !turn || !review || review.status !== 'running' || review.result_message_id) return
+  const id = clock.randomUUID()
+  session.messages.push({
+    id,
+    turn_id: turn.id,
+    role: 'assistant',
+    content: text,
+    created_at: clock.nowSeconds(),
+    streaming: false,
+  })
+  review.summary = reviewSummary(text)
+  review.result_message_id = id
+  review.status = 'completed'
+}
+
+function reviewSummary(text: string) {
+  // Bound work before splitting or copying the result, including a single
+  // unusually large token. Iteration preserves complete Unicode characters.
+  const excerpt: string[] = []
+  for (const character of text) {
+    if (excerpt.length === 400) break
+    excerpt.push(character)
+  }
+  return excerpt.join('').trim().split(/\s+/u).join(' ')
+}
+
+function failUnsettledReview(session: AgentSession) {
+  const review = session.review
+  if (review && (activeTurn(session) || review.status === 'draft' || review.status === 'running')) {
+    review.status = 'failed'
+  }
 }
 
 function appendText(session: AgentSession, delta: string, clock: ReducerClock) {
@@ -509,10 +571,15 @@ function settleTurn(
       streaming: false,
     })
   }
+  if (session.review) {
+    session.review.status = status === 'interrupted'
+      ? 'interrupted'
+      : status === 'completed' && session.review.result_message_id ? 'completed' : 'failed'
+  }
   turn.status = status
   turn.completed_at = clock.nowSeconds()
   session.last_reply_at = turn.completed_at
-  session.status = status === 'completed' ? 'idle' : 'failed'
+  session.status = status === 'completed' || status === 'interrupted' ? 'idle' : 'failed'
   return true
 }
 

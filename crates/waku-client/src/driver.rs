@@ -49,6 +49,11 @@ impl DriverHandle {
         self.inner.prompt(prompt, turn_id, message_id);
     }
 
+    /// Run a native review, preserving the submitting client's turn identity.
+    pub fn review(&self, prompt: String, turn_id: Option<Uuid>, message_id: Option<Uuid>) {
+        self.inner.review(prompt, turn_id, message_id);
+    }
+
     pub fn supports_steer(&self) -> bool {
         self.inner.supports_steer()
     }
@@ -135,6 +140,7 @@ impl DriverHandle {
 
 pub trait DriverControl: Send + Sync {
     fn prompt(&self, prompt: String, turn_id: Option<Uuid>, message_id: Option<Uuid>);
+    fn review(&self, prompt: String, turn_id: Option<Uuid>, message_id: Option<Uuid>);
     fn supports_steer(&self) -> bool {
         false
     }
@@ -192,4 +198,40 @@ pub struct SessionOptions {
     pub reasoning_effort: Option<String>,
     pub service_tier: Option<String>,
     pub context_window: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct ReviewControl(Mutex<Option<(String, Option<Uuid>, Option<Uuid>)>>);
+
+    impl DriverControl for ReviewControl {
+        fn prompt(&self, _: String, _: Option<Uuid>, _: Option<Uuid>) {
+            panic!("a native review must not be sent as a chat prompt");
+        }
+        fn review(&self, prompt: String, turn_id: Option<Uuid>, message_id: Option<Uuid>) {
+            *self.0.lock().unwrap() = Some((prompt, turn_id, message_id));
+        }
+        fn cancel(&self) {}
+        fn respond(&self, _: String, _: String) {}
+        fn rollback(&self, _: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn native_review_handle_preserves_client_submission_identity() {
+        let control = Arc::new(ReviewControl::default());
+        let handle = DriverHandle::from_control(control.clone());
+        let turn_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        handle.review("Review the issue".into(), Some(turn_id), Some(message_id));
+        assert_eq!(
+            control.0.lock().unwrap().take(),
+            Some(("Review the issue".into(), Some(turn_id), Some(message_id)))
+        );
+    }
 }
