@@ -23,7 +23,7 @@ mod platform {
     use std::time::{Duration, Instant};
 
     use alacritty_terminal::event::{OnResize as _, WindowSize};
-    use alacritty_terminal::tty::{self, EventedPty as _, EventedReadWrite as _, Shell};
+    use alacritty_terminal::tty::{self, EventedReadWrite as _, Shell};
     use anyhow::{Context as _, bail};
     use base64::Engine as _;
     use parking_lot::Mutex;
@@ -114,7 +114,9 @@ mod platform {
     }
 
     pub struct DaemonTerminal {
-        pty: Arc<Mutex<tty::Pty>>,
+        // Taken only by Drop, so the child can be reaped before its reader
+        // is stopped. Ordinary methods always observe Some while &self lives.
+        pty: Mutex<Option<tty::Pty>>,
         stopped: Arc<AtomicBool>,
         retained: Arc<Mutex<RetainedOutput>>,
         /// The last size applied to the PTY, so an attach can report the grid
@@ -199,10 +201,10 @@ mod platform {
             let pty = tty::new(&options, size, 0)
                 .with_context(|| format!("spawn terminal in {}", cwd.display()))?;
             let mut output = pty.file().try_clone().context("clone terminal output")?;
-            let pty = Arc::new(Mutex::new(pty));
+            let child_pid = pty.child().id() as libc::pid_t;
+            let pty = Mutex::new(Some(pty));
             let stopped = Arc::new(AtomicBool::new(false));
             let retained = Arc::new(Mutex::new(RetainedOutput::new(retained_bytes)));
-            let reader_pty = pty.clone();
             let reader_stopped = stopped.clone();
             let reader_retained = retained.clone();
             let reader = std::thread::Builder::new()
@@ -231,9 +233,10 @@ mod platform {
                             Err(error) if error.raw_os_error() == Some(libc::EIO) => {
                                 // A PTY master may report EIO briefly before the
                                 // freshly spawned child has attached its slave.
-                                // Only treat it as EOF after Alacritty's SIGCHLD
-                                // channel confirms the child actually exited.
-                                if reader_pty.lock().next_child_event().is_some() {
+                                // Observe exit without reaping: keeping the PID
+                                // owned also keeps its process-group identity
+                                // safe to signal when the terminal is closed.
+                                if child_has_exited(child_pid) {
                                     output_events.exited();
                                     break;
                                 }
@@ -277,6 +280,7 @@ mod platform {
                 return Ok(());
             }
             let mut pty = self.pty.lock();
+            let pty = pty.as_mut().context("terminal PTY already closed")?;
             pty.writer()
                 .write_all(&data)
                 .context("write terminal input")?;
@@ -285,42 +289,49 @@ mod platform {
 
         pub fn resize(&self, cols: u16, rows: u16) {
             *self.size.lock() = normalized_size(cols, rows);
-            self.pty.lock().on_resize(window_size(cols, rows));
+            if let Some(pty) = self.pty.lock().as_mut() {
+                pty.on_resize(window_size(cols, rows));
+            }
         }
     }
 
     impl Drop for DaemonTerminal {
         fn drop(&mut self) {
+            // Keep draining through the child's final wait, not just signal
+            // delivery. A killed macOS session leader can still need its
+            // queued terminal output drained before it finishes exiting.
+            if let Some(pty) = self.pty.get_mut().take() {
+                terminate_shell_group(&pty);
+                // Pty::drop reaps its direct child before closing its master.
+                // Taking the owner guarantees this is the only Pty destructor
+                // and keeps the original PGID pinned until signaling is done.
+                drop(pty);
+            }
             self.stopped.store(true, Ordering::Release);
-            // Alacritty's PTY destructor sends SIGHUP and then waits for the
-            // child without a timeout. A shell can ignore or defer SIGHUP,
-            // so bound its grace period before either join or PTY drop.
-            // Hold the lock so the reader cannot reap the child between our
-            // exit check and signal delivery.
-            terminate_shell(&self.pty.lock());
             if let Some(reader) = self.reader.take() {
                 let _ = reader.join();
             }
         }
     }
 
-    fn terminate_shell(pty: &tty::Pty) {
+    fn terminate_shell_group(pty: &tty::Pty) {
         let child_pid = pty.child().id() as libc::pid_t;
-        if child_has_exited(child_pid) {
-            return;
-        }
+        // Alacritty creates the shell with setsid(), so its PID owns this
+        // process group. Exit observations use WNOWAIT: only Pty::drop reaps
+        // the shell, preventing PID/group reuse until signaling is complete.
+        // Signal even an exited shell's group, which can still own children.
         unsafe {
-            libc::kill(child_pid, libc::SIGHUP);
+            libc::kill(-child_pid, libc::SIGHUP);
         }
         let deadline = Instant::now() + SHELL_SHUTDOWN_GRACE;
-        while !child_has_exited(child_pid) {
-            if Instant::now() >= deadline {
-                unsafe {
-                    libc::kill(child_pid, libc::SIGKILL);
-                }
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(4));
+        while !child_has_exited(child_pid) && Instant::now() < deadline {
+            std::thread::sleep(READ_RETRY_INTERVAL);
+        }
+        // A shell exiting does not imply its pipeline children exited. They
+        // can inherit ignored SIGHUP, so finish the group before Pty::drop's
+        // direct-child wait and before closing the reader's master handle.
+        unsafe {
+            libc::kill(-child_pid, libc::SIGKILL);
         }
     }
 
@@ -339,8 +350,7 @@ mod platform {
         if result == 0 {
             unsafe { status.si_pid() != 0 }
         } else {
-            // The output reader may already have reaped a naturally exited
-            // shell via next_child_event before shutdown began.
+            // Be tolerant of a child already reaped outside this owner.
             std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
         }
     }
