@@ -27,7 +27,9 @@ def verify(app):
             raise ValueError(f'Missing runtime: {relative}')
         # Native binaries must contain arm64 and no machine-local dylib paths.
         subprocess.run(['lipo', str(path), '-verify_arch', 'arm64'], check=True)
-        dependencies = subprocess.check_output(['otool', '-L', str(path)], text=True)
+        # Universal frameworks have one otool header per slice. Inspect the
+        # arm64 slice we just verified instead of treating another header as a dylib.
+        dependencies = subprocess.check_output(['otool', '-arch', 'arm64', '-L', str(path)], text=True)
         for line in dependencies.splitlines()[1:]:
             dependency = line.strip().split(' (', 1)[0]
             if not dependency.startswith(('@', '/System/Library/', '/usr/lib/')):

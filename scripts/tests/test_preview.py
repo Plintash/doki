@@ -50,6 +50,16 @@ class PreviewTests(unittest.TestCase):
             self.assertEqual(command[2:], ['-verify_arch', 'arm64'])
             self.assertEqual(invocation.kwargs, dict(check=True))
 
+    def test_dependencies_inspect_arm64_slice_only(self):
+        preview.verify(self.app)
+        self.assertEqual(self.otool.call_count, 6)
+        for invocation in self.otool.call_args_list:
+            command = invocation.args[0]
+            self.assertEqual(command[:4], ['otool', '-arch', 'arm64', '-L'])
+            self.assertEqual(len(command), 5)
+            self.assertTrue(pathlib.Path(command[4]).is_file())
+            self.assertEqual(invocation.kwargs, dict(text=True))
+
     def test_wrong_architecture_rejected(self):
         self.run.side_effect = subprocess.CalledProcessError(1, 'lipo')
         with self.assertRaises(subprocess.CalledProcessError):
