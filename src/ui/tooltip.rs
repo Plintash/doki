@@ -62,3 +62,50 @@ impl Render for Tooltip {
         )
     }
 }
+
+/// The same short name is available when an icon is reached with Tab. Kept
+/// outside layout so learning a control never shifts its neighbors.
+#[derive(gpui::IntoElement)]
+pub struct FocusHint {
+    focus: gpui::FocusHandle,
+    label: SharedString,
+}
+
+impl FocusHint {
+    pub fn new(focus: gpui::FocusHandle, label: impl Into<SharedString>) -> Self {
+        Self {
+            focus,
+            label: label.into(),
+        }
+    }
+}
+
+impl gpui::RenderOnce for FocusHint {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = Theme::current(cx);
+        let visible = self.focus.is_focused(window) && window.last_input_was_keyboard();
+        div().absolute().top_0().left_0().children(visible.then(|| {
+            gpui::deferred(
+                gpui::anchored()
+                    .offset(gpui::point(px(0.0), px(32.0)))
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(
+                        div()
+                            .px(px(7.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(theme.border_strong)
+                            .bg(theme.raised)
+                            .shadow_md()
+                            .text_size(sp(12.5))
+                            .line_height(sp(15.0))
+                            .text_color(theme.text_secondary)
+                            .whitespace_nowrap()
+                            .child(self.label),
+                    ),
+            )
+            .with_priority(2)
+        }))
+    }
+}

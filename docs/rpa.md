@@ -46,7 +46,7 @@ context, bounded history reads and native annotation evidence.
 
 - **Protocol** (`crates/waku-protocol/src/automation.rs`, `diagnostics.rs`)
   owns the shared automation and diagnostic shapes. The daemon wire version
-  is `PROTOCOL_VERSION = 18`.
+  is `PROTOCOL_VERSION = 19`.
 - **App** (`src/app/rpa.rs`, `src/app/rpa/daemon.rs`) registers its instance
   and build identity over its existing daemon connection. It owns UI truth,
   on-demand full-refresh observations, semantic input and action effects;

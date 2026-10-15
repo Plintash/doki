@@ -304,7 +304,7 @@ impl Waku {
                 self.window_drag_region(
                     div()
                         .id("settings-sidebar-traffic-light-drag-region")
-                        .w(px(TRAFFIC_LIGHT_CLEARANCE))
+                        .w(px(self.titlebar_clearance.width()))
                         .h_full()
                         .flex_none(),
                     cx,

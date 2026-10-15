@@ -25,6 +25,7 @@ const TASK_COMPLETION_DIALOG_CONTEXT: &str = "TaskCompletionDialog";
 /// mechanism the commit and goal dialogs use. (A raw key listener on the
 /// deferred overlay would depend on the binding path not consuming the key.)
 pub fn init(cx: &mut App) {
+    super::board_stages::init(cx);
     super::task_details::init_attach_picker_keys(cx);
     cx.bind_keys([KeyBinding::new(
         "escape",
@@ -35,8 +36,8 @@ pub fn init(cx: &mut App) {
 
 /// A card being dragged. The payload carries everything the drag preview
 /// needs, so the preview view never reads app state.
-struct TaskCardDrag {
-    task_id: Uuid,
+pub(super) struct TaskCardDrag {
+    pub(super) task_id: Uuid,
     title: SharedString,
 }
 
@@ -85,6 +86,7 @@ pub(super) struct TaskStats {
     running: HashMap<Uuid, usize>,
     attention_sessions: HashMap<Uuid, Vec<TaskAttention>>,
     progress: HashMap<Uuid, (u64, String)>,
+    reviews: HashMap<Uuid, ((u64, u64, Uuid), SessionReview)>,
 }
 
 struct TaskAttention {
@@ -143,6 +145,16 @@ impl TaskStats {
             return;
         };
         *self.conversations.entry(task_id).or_default() += 1;
+        if let Some(review) = session.review.as_ref() {
+            let at = issue_review::review_order(session);
+            if self
+                .reviews
+                .get(&task_id)
+                .is_none_or(|(previous, _)| at >= *previous)
+            {
+                self.reviews.insert(task_id, (at, review.clone()));
+            }
+        }
         // A parked foreground turn can still have a live background process.
         // Preserve both signals instead of letting attention hide running work.
         if session.status.is_busy() || background {
@@ -280,6 +292,12 @@ impl Waku {
                 )
             } else if session.status == SessionStatus::Waiting {
                 Some(tr!("board.awaiting_input"))
+            } else if session
+                .review
+                .as_ref()
+                .is_some_and(|review| review.status == IssueReviewStatus::Failed)
+            {
+                Some(tr!("review.failed"))
             } else {
                 None
             };
@@ -322,7 +340,7 @@ impl Waku {
     }
 
     /// Task ids in one column, in board order.
-    fn tasks_in_state(&self, state: TaskState) -> Vec<Uuid> {
+    pub(super) fn tasks_in_state(&self, state: TaskState) -> Vec<Uuid> {
         let stats = self.task_stats();
         let mut tasks = self
             .state
@@ -370,6 +388,9 @@ impl Waku {
     ) -> AnyElement {
         if let Some(task_id) = self.selected_task {
             return self.render_task_detail(task_id, window, cx);
+        }
+        if self.board_project_filter.is_some() {
+            return self.render_stage_board(window, cx);
         }
         let theme = Theme::current(cx);
         let stats = self.task_stats();
@@ -519,7 +540,7 @@ impl Waku {
             .into_any_element()
     }
 
-    fn render_board_card(
+    pub(super) fn render_board_card(
         &mut self,
         task_id: Uuid,
         stats: &TaskStats,
@@ -799,16 +820,45 @@ impl Waku {
             })
             .children(attention_rows)
             .when_some(more_attention, |element, menu| element.child(menu))
-            .when_some(stats.progress.get(&task_id), |element, (_, preview)| {
+            .when_some(stats.reviews.get(&task_id), |element, (_, review)| {
                 element.child(
                     div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
                         .text_size(sp(11.0))
-                        .text_color(theme.text_secondary)
-                        .whitespace_normal()
-                        .line_clamp(2)
-                        .child(tr!("board.latest_progress", progress = preview)),
+                        .child(
+                            div()
+                                .text_color(theme.text_secondary)
+                                .child(issue_review::review_status_label(review)),
+                        )
+                        .when_some(review.summary.clone(), |row, summary| {
+                            row.child(
+                                div()
+                                    .text_color(theme.text_tertiary)
+                                    .whitespace_normal()
+                                    .line_clamp(2)
+                                    .child(summary),
+                            )
+                        }),
                 )
             })
+            .when_some(
+                stats
+                    .progress
+                    .get(&task_id)
+                    .filter(|_| !stats.reviews.contains_key(&task_id)),
+                |element, (_, preview)| {
+                    element.child(
+                        div()
+                            .text_size(sp(11.0))
+                            .text_color(theme.text_secondary)
+                            .whitespace_normal()
+                            .line_clamp(2)
+                            .child(tr!("board.latest_progress", progress = preview)),
+                    )
+                },
+            )
             .when(!renaming, |element| {
                 element
                     .track_focus(&row_focus)
@@ -820,6 +870,12 @@ impl Waku {
                         if !event.keystroke.modifiers.modified() && matches!(key, "enter" | "space")
                         {
                             this.open_task_from_card(task_id, cx);
+                            cx.stop_propagation();
+                        } else if event.keystroke.modifiers.alt
+                            && matches!(key, "left" | "right")
+                            && this.board_project_filter.is_some()
+                        {
+                            this.move_stage_card_adjacent(task_id, key == "right", window, cx);
                             cx.stop_propagation();
                         } else if key == "f10" && event.keystroke.modifiers.shift {
                             keyboard_menu.open_context_menu(window, cx);
@@ -851,7 +907,7 @@ impl Waku {
                 card,
                 SharedString::from(format!("task-card-menu-{task_id}")),
                 &menu,
-                move |_| {
+                move |cx| {
                     let open_weak = open_weak.clone();
                     let rename_weak = rename_weak.clone();
                     let done_weak = done_weak.clone();
@@ -871,6 +927,39 @@ impl Waku {
                         });
                     }));
                     items.push(MenuItem::Separator);
+                    let stages = doing_weak.upgrade().and_then(|entity| {
+                        let this = entity.read(cx);
+                        let owner = task.project_id()?;
+                        if this.board_project_filter != Some(owner) {
+                            return None;
+                        }
+                        this.state
+                            .projects
+                            .iter()
+                            .find(|project| project.id == owner)
+                            .map(|project| project.board.stages.clone())
+                    });
+                    if let Some(stages) = stages {
+                        for stage in stages {
+                            if task.stage_id == Some(stage.id) {
+                                continue;
+                            }
+                            let move_weak = doing_weak.clone();
+                            let stage_id = stage.id;
+                            items.push(
+                                MenuItem::new(
+                                    format!("Move to {}", stage.name),
+                                    move |window, cx| {
+                                        let _ = move_weak.update(cx, |this, cx| {
+                                            this.move_stage_card(task_id, stage_id, window, cx);
+                                        });
+                                    },
+                                )
+                                .semantic_id(format!("task-move-stage-{stage_id}")),
+                            );
+                        }
+                        return items;
+                    }
                     if task.state != TaskState::Backlog {
                         items.push(MenuItem::new(
                             tr!("board.move_backlog"),
@@ -1302,7 +1391,6 @@ impl Waku {
     ) -> bool {
         // An explicit continuation supersedes a pending archive request.
         self.task_completion_stops.remove(&task_id);
-        self.task_completion_save_rollbacks.remove(&task_id);
         self.task_completion_preflights.remove(&task_id);
         if self
             .state
@@ -1317,8 +1405,13 @@ impl Waku {
         let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) else {
             return false;
         };
-        task.set_state(TaskState::Doing);
-        task.position = position;
+        let rollback = super::task_completion::TaskCompletionSaveRollback::move_to(
+            task,
+            TaskState::Doing,
+            None,
+            position,
+        );
+        self.register_task_placement_save(task_id, rollback);
         self.sidebar_rows_fingerprint.set(None);
         self.save_task_changes(cx);
         cx.notify();

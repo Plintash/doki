@@ -101,6 +101,7 @@ describe('mobile daemon API', () => {
       id: 'one',
       name: 'waku',
       path: '/srv/waku',
+      board: { revision: 0, stages: [] },
       created_at: 10,
     });
     expect(createProject('C:\\dev\\waku\\', 'two', 10).name).toBe('waku');

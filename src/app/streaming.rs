@@ -59,6 +59,7 @@ impl Waku {
         if !session.mark_active_prompt_undelivered(&reason) {
             return false;
         }
+        issue_review::settle_review(session, TurnStatus::Failed);
         runtime.last_driver_error = None;
         self.state.mark_session_dirty(session_id);
         true
@@ -548,6 +549,7 @@ impl Waku {
                 if let Some(session) = self.state.session_mut(session_id)
                     && session.adopt_submitted_prompt(&message, turn_id, message_id)
                 {
+                    issue_review::begin_review(session);
                     self.state.mark_session_dirty(session_id);
                 }
             }
@@ -902,6 +904,30 @@ impl Waku {
                     .map(|session| session.provider)
                 {
                     self.plan_usage.insert(provider, usage);
+                }
+            }
+            DriverEvent::ReviewStarted => {
+                if self.accepts_turn_output(session_id)
+                    && let Some(session) = self.state.session_mut(session_id)
+                    && let Some(review) = session.review.as_mut()
+                    && review.result_message_id.is_none()
+                {
+                    review.status = IssueReviewStatus::Running;
+                    issue_review::touch_review(session);
+                }
+            }
+            DriverEvent::ReviewCompleted { review } => {
+                if self.accepts_turn_output(session_id) {
+                    let previous_kinds = self.snapshot_selected_transcript_rows(session_id);
+                    self.finish_streaming_assistant(session_id);
+                    self.complete_turn_blocks(session_id);
+                    runtime.stream_phase = None;
+                    if let Some(session) = self.state.session_mut(session_id) {
+                        issue_review::record_review_result(session, review);
+                    }
+                    if let Some(previous_kinds) = previous_kinds.as_deref() {
+                        self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
+                    }
                 }
             }
             DriverEvent::GoalUpdated(goal) => {

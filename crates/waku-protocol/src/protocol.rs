@@ -21,9 +21,8 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-// Version 18 adds portable recording/replay, daemon-only executor identity,
-// unattended jobs and durable local schedule commands.
-pub const PROTOCOL_VERSION: u32 = 18;
+// Version 20 adds durable project boards and explicit compare-and-swap edits.
+pub const PROTOCOL_VERSION: u32 = 20;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -130,6 +129,14 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<Uuid>,
     },
+    /// Run the provider's native review workflow with an explicit review target.
+    Review {
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<Uuid>,
+    },
     Steer {
         prompt: String,
     },
@@ -208,6 +215,11 @@ pub enum Command {
         dirs: Vec<PathBuf>,
     },
     LoadTaskState,
+    SaveProjectBoard {
+        project_id: Uuid,
+        expected_revision: u64,
+        board: crate::model::ProjectBoard,
+    },
     SaveTaskState {
         projects: Vec<Project>,
         /// Tasks in `tasks` are merged by id, newest `updated_at` winning;
@@ -541,6 +553,9 @@ pub enum ResponsePayload {
         default_cwd: PathBuf,
         projectless_root: Option<PathBuf>,
     },
+    ProjectBoardSaved {
+        project: Project,
+    },
     TaskStateSaved {
         sessions: Vec<AgentSession>,
     },
@@ -653,6 +668,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_commands_preserve_submission_identity_and_allow_missing_ids() {
+        let turn_id = Uuid::from_u128(1);
+        let message_id = Uuid::from_u128(2);
+        let json = serde_json::to_value(Command::Review {
+            prompt: "Review the issue implementation".into(),
+            turn_id: Some(turn_id),
+            message_id: Some(message_id),
+        })
+        .unwrap();
+        assert_eq!(json["type"], "review");
+        assert_eq!(json["turnId"], turn_id.to_string());
+        assert_eq!(json["messageId"], message_id.to_string());
+        assert!(matches!(
+            serde_json::from_value::<Command>(json).unwrap(),
+            Command::Review { prompt, turn_id: Some(turn), message_id: Some(message) }
+                if prompt == "Review the issue implementation" && turn == turn_id && message == message_id
+        ));
+        assert!(matches!(
+            serde_json::from_value::<Command>(serde_json::json!({
+                "type": "review", "prompt": "Review changes"
+            }))
+            .unwrap(),
+            Command::Review {
+                turn_id: None,
+                message_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn binary_payloads_use_base64_json_strings() {
         let payload = ResponsePayload::BlobData {
             bytes: vec![0, 1, 2, 255],
@@ -738,7 +784,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 18);
+        assert_eq!(PROTOCOL_VERSION, 20);
     }
 
     #[test]
@@ -747,7 +793,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 18);
+        assert_eq!(PROTOCOL_VERSION, 20);
     }
 
     #[test]

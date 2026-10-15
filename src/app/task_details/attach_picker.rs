@@ -532,10 +532,21 @@ impl Waku {
         let picker = detail.attach_picker.clone();
         let handle = picker.read(cx).handle.clone();
         popover(
-            MenuChip::new("task-detail-attach")
-                .icon("icons/plus.svg", theme.text_tertiary)
-                .label(tr!("board.attach_session"))
-                .selected(handle.is_open()),
+            icon_button("task-detail-attach", "icons/paperclip.svg", theme)
+                .size(px(28.0))
+                .relative()
+                .child(crate::ui::tooltip::FocusHint::new(
+                    handle.trigger_focus_handle().clone(),
+                    tr!("board.attach_session"),
+                ))
+                .aria_label(tr!("board.attach_session"))
+                .tooltip(Tooltip::text(tr!("board.attach_session")))
+                .focus_visible(|style| {
+                    style
+                        .bg(theme.overlay_strong)
+                        .border_1()
+                        .border_color(theme.accent)
+                }),
             &handle,
             MenuAlign::BelowLeft,
             move |_, _, _| picker.clone().into_any_element(),
