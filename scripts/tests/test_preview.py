@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import plistlib
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -42,6 +43,22 @@ class PreviewTests(unittest.TestCase):
     def test_complete_bundle(self):
         preview.verify(self.app)
         self.assertEqual(self.run.call_count, 6)
+        for invocation in self.run.call_args_list:
+            command = invocation.args[0]
+            self.assertEqual(command[0], 'lipo')
+            self.assertTrue(pathlib.Path(command[1]).is_file())
+            self.assertEqual(command[2:], ['-verify_arch', 'arm64'])
+            self.assertEqual(invocation.kwargs, dict(check=True))
+
+    def test_wrong_architecture_rejected(self):
+        self.run.side_effect = subprocess.CalledProcessError(1, 'lipo')
+        with self.assertRaises(subprocess.CalledProcessError):
+            preview.verify(self.app)
+        self.otool.assert_not_called()
+
+    def test_no_empty_release_env(self):
+        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        self.assertNotRegex(workflow, r'(?m)^ +env:\s*\n +run:')
 
     def test_missing_daemon(self):
         (self.contents / 'MacOS/waku-daemon').unlink()
@@ -90,3 +107,4 @@ class PreviewTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

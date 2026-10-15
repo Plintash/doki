@@ -26,7 +26,7 @@ def verify(app):
         if not path.is_file():
             raise ValueError(f'Missing runtime: {relative}')
         # Native binaries must contain arm64 and no machine-local dylib paths.
-        subprocess.run(['lipo', '-verify_arch', 'arm64', str(path)], check=True)
+        subprocess.run(['lipo', str(path), '-verify_arch', 'arm64'], check=True)
         dependencies = subprocess.check_output(['otool', '-L', str(path)], text=True)
         for line in dependencies.splitlines()[1:]:
             dependency = line.strip().split(' (', 1)[0]
@@ -62,3 +62,4 @@ if __name__ == '__main__':
     verify(sys.argv[1])
     if '--smoke' in sys.argv[2:]:
         smoke_repl(sys.argv[1])
+

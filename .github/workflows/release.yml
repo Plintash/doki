@@ -117,7 +117,6 @@ jobs:
         run: rm -f target/release/waku-*.tar.gz
 
       - name: Bundle
-        env:
         run: ./scripts/bundle-linux.sh
 
       - uses: actions/upload-artifact@v7
@@ -178,7 +177,6 @@ jobs:
         run: rm -f target/release/waku-*.tar.gz
 
       - name: Bundle
-        env:
         run: ./scripts/bundle-linux.sh
 
       - uses: actions/upload-artifact@v7
@@ -451,3 +449,4 @@ jobs:
             artifacts/appcast-windows-*.xml
             artifacts/latest-linux.txt
             artifacts/latest-windows.txt
+
