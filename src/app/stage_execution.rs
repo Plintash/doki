@@ -153,61 +153,150 @@ fn apply_stage_defaults(session: &mut AgentSession, stage: &BoardStage) {
     session.agent_preset = None;
 }
 
+fn cold_stage_result_sessions(task: &Task, sessions: &[AgentSession]) -> Vec<Uuid> {
+    let Ok(workspace) = concrete_workspace(task) else {
+        return Vec::new();
+    };
+    sessions
+        .iter()
+        .filter(|session| {
+            source_session_matches(task, session, &workspace) && !session.detail_loaded
+        })
+        .map(|session| session.id)
+        .collect()
+}
+
+type StageResultChoices = Result<Vec<(StageResultSource, String)>, String>;
+
+fn stage_result_choices(task: &Task, sessions: &[AgentSession]) -> StageResultChoices {
+    let workspace = concrete_workspace(task)?;
+    if !cold_stage_result_sessions(task, sessions).is_empty() {
+        return Err("Loading prior results".into());
+    }
+    let mut choices = Vec::new();
+    for session in sessions
+        .iter()
+        .filter(|s| source_session_matches(task, s, &workspace))
+    {
+        let result_ids = successful_result_ids(session);
+        for message in &session.messages {
+            if result_ids.contains(&message.id) {
+                let excerpt = message
+                    .visible_content()
+                    .chars()
+                    .take(90)
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                choices.push((
+                    StageResultSource {
+                        session_id: session.id,
+                        message_id: message.id,
+                    },
+                    format!("{} · {}", session.display_title(), excerpt),
+                ));
+            }
+        }
+    }
+    Ok(choices)
+}
+
+/// Owned by one inspector visit and stage, never shared with another issue.
+/// Hydration only changes the choices; selecting a result remains explicit.
+pub(super) struct StageResultPicker {
+    task_id: Uuid,
+    stage_id: Uuid,
+    menu: ContextMenuHandle,
+    choices: Option<StageResultChoices>,
+    pending: HashSet<Uuid>,
+}
+
+impl StageResultPicker {
+    fn new(task_id: Uuid, stage_id: Uuid, menu: ContextMenuHandle) -> Self {
+        Self {
+            task_id,
+            stage_id,
+            menu,
+            choices: None,
+            pending: HashSet::new(),
+        }
+    }
+
+    fn matches(&self, task_id: Uuid, stage_id: Uuid) -> bool {
+        self.task_id == task_id && self.stage_id == stage_id
+    }
+
+    fn open(&mut self, task: &Task, sessions: &[AgentSession]) -> Vec<Uuid> {
+        let cold = cold_stage_result_sessions(task, sessions);
+        self.pending = cold.iter().copied().collect();
+        self.choices = Some(stage_result_choices(task, sessions));
+        cold
+    }
+
+    fn close(&mut self) {
+        self.pending.clear();
+        self.choices = None;
+    }
+
+    fn hydrated(
+        &mut self,
+        session_id: Uuid,
+        error: Option<String>,
+        task: Option<&Task>,
+        sessions: &[AgentSession],
+    ) {
+        if !self.menu.is_open() || !self.pending.remove(&session_id) {
+            return;
+        }
+        if let Some(error) = error {
+            self.pending.clear();
+            self.choices = Some(Err(error));
+        } else if self.pending.is_empty() {
+            self.choices = Some(
+                task.ok_or_else(|| "Issue not found".to_owned())
+                    .and_then(|task| stage_result_choices(task, sessions)),
+            );
+        } else {
+            return;
+        }
+        self.menu.refresh_items();
+    }
+}
+
 impl Waku {
     pub(super) fn load_stage_results(
         &mut self,
         task_id: Uuid,
         cx: &mut Context<Self>,
-    ) -> Result<Vec<(StageResultSource, String)>, String> {
+    ) -> StageResultChoices {
         let task = self
             .state
             .tasks
             .iter()
-            .find(|t| t.id == task_id)
+            .find(|task| task.id == task_id)
             .ok_or("Issue not found")?;
-        let workspace = concrete_workspace(task)?;
-        let cold = self
-            .state
-            .sessions
-            .iter()
-            .filter(|s| source_session_matches(task, s, &workspace) && !s.detail_loaded)
-            .map(|s| s.id)
-            .collect::<Vec<_>>();
-        if !cold.is_empty() {
-            for id in cold {
-                self.ensure_session_loaded(id, cx);
-            }
-            return Err("Loading prior results; reopen this menu when loading finishes".into());
+        let cold = cold_stage_result_sessions(task, &self.state.sessions);
+        let choices = stage_result_choices(task, &self.state.sessions);
+        for id in cold {
+            self.ensure_session_loaded(id, cx);
         }
-        let mut choices = Vec::new();
-        for session in self
-            .state
-            .sessions
-            .iter()
-            .filter(|s| source_session_matches(task, s, &workspace))
+        choices
+    }
+
+    pub(super) fn refresh_stage_result_picker(&mut self, session_id: Uuid, error: Option<String>) {
+        if let Some(picker) = self
+            .task_detail
+            .as_mut()
+            .and_then(|detail| detail.stage_result_picker.as_mut())
         {
-            let result_ids = successful_result_ids(session);
-            for message in &session.messages {
-                if result_ids.contains(&message.id) {
-                    let excerpt = message
-                        .visible_content()
-                        .chars()
-                        .take(90)
-                        .collect::<String>()
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    choices.push((
-                        StageResultSource {
-                            session_id: session.id,
-                            message_id: message.id,
-                        },
-                        format!("{} · {}", session.display_title(), excerpt),
-                    ));
-                }
-            }
+            let task = self
+                .state
+                .tasks
+                .iter()
+                .find(|task| task.id == picker.task_id);
+            picker.hydrated(session_id, error, task, &self.state.sessions);
         }
-        Ok(choices)
     }
 
     pub(super) fn prepare_stage_invocation(
@@ -367,6 +456,20 @@ impl Waku {
             .and_then(|id| self.state.projects.iter().find(|p| p.id == id))
             .and_then(|p| p.board.stage_for_task(task))
             .cloned();
+        let picker_stage = stage.as_ref().filter(|stage| {
+            !stage.state.is_done()
+                && stage.handoff == StageHandoff::PriorResult
+                && stage
+                    .provider
+                    .is_some_and(|provider| self.provider_enabled(provider))
+        });
+        if let Some(detail) = self.task_detail.as_mut()
+            && detail.stage_result_picker.as_ref().is_some_and(|picker| {
+                picker_stage.is_none_or(|stage| !picker.matches(task.id, stage.id))
+            })
+        {
+            detail.stage_result_picker = None;
+        }
         let Some(stage) = stage else {
             return div().into_any_element();
         };
@@ -431,18 +534,38 @@ impl Waku {
         } else {
             let weak = cx.entity().downgrade();
             let toggle_weak = weak.clone();
-            let handle = self.menu_handle_with(
-                format!("issue-stage-result-{task_id}-{stage_id}"),
-                cx,
-                move |open, _, cx| {
-                    if open {
-                        let _ = toggle_weak.update(cx, |this, cx| {
-                            this.stage_result_choices = Some(this.load_stage_results(task_id, cx));
-                            cx.notify();
-                        });
-                    }
-                },
-            );
+            let detail = self.task_detail.as_mut().expect("detail initialized");
+            let picker = detail.stage_result_picker.get_or_insert_with(|| {
+                let menu = ContextMenuHandle::new(cx).on_toggle(move |open, _, cx| {
+                    let _ = toggle_weak.update(cx, |this, cx| {
+                        let Some(picker) = this
+                            .task_detail
+                            .as_mut()
+                            .and_then(|detail| detail.stage_result_picker.as_mut())
+                            .filter(|picker| picker.matches(task_id, stage_id))
+                        else {
+                            return;
+                        };
+                        let cold = if open {
+                            let Some(task) =
+                                this.state.tasks.iter().find(|task| task.id == task_id)
+                            else {
+                                return;
+                            };
+                            picker.open(task, &this.state.sessions)
+                        } else {
+                            picker.close();
+                            Vec::new()
+                        };
+                        for id in cold {
+                            this.ensure_session_loaded(id, cx);
+                        }
+                        cx.notify();
+                    });
+                });
+                StageResultPicker::new(task_id, stage_id, menu)
+            });
+            let handle = picker.menu.clone();
             section = section.child(crate::ui::menu::dropdown_menu_list(
                 MenuChip::new("issue-stage-result")
                     .label(format!("Prepare {} with prior result", stage.name))
@@ -455,9 +578,15 @@ impl Waku {
                 &handle,
                 MenuAlign::BelowLeft,
                 move |cx: &mut App| {
-                    let result = weak
-                        .upgrade()
-                        .and_then(|entity| entity.read(cx).stage_result_choices.clone());
+                    let result = weak.upgrade().and_then(|entity| {
+                        entity
+                            .read(cx)
+                            .task_detail
+                            .as_ref()
+                            .and_then(|detail| detail.stage_result_picker.as_ref())
+                            .filter(|picker| picker.matches(task_id, stage_id))
+                            .and_then(|picker| picker.choices.clone())
+                    });
                     match result {
                         Some(Ok(choices)) if !choices.is_empty() => choices
                             .into_iter()
@@ -530,6 +659,156 @@ mod tests {
             source: None,
         });
         (task, stage, session)
+    }
+
+    fn completed_source(task: &Task) -> AgentSession {
+        let mut session = AgentSession::new(task.project_id().unwrap(), ProviderKind::Pi);
+        session.task_id = Some(task.id);
+        let turn = session.begin_turn("Work");
+        session.messages.push(Message::new_for_turn(
+            MessageRole::Assistant,
+            "Finished",
+            turn,
+        ));
+        session.finish_active_turn(TurnStatus::Completed);
+        session
+    }
+
+    #[gpui::test]
+    fn prior_result_picker_refreshes_only_after_its_hydrations_finish(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (task, stage, _) = fixture();
+        let mut sessions = vec![completed_source(&task), completed_source(&task)];
+        for session in &mut sessions {
+            session.detail_loaded = false;
+        }
+        let menu = cx.update(ContextMenuHandle::new);
+        let mut picker = StageResultPicker::new(task.id, stage.id, menu.clone());
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| menu.open_context_menu(window, cx));
+        assert_eq!(picker.open(&task, &sessions).len(), 2);
+        assert!(picker.choices.as_ref().unwrap().is_err());
+        picker.hydrated(Uuid::new_v4(), None, Some(&task), &sessions);
+        assert_eq!(
+            picker.pending.len(),
+            2,
+            "unrelated hydration must not refresh the picker"
+        );
+        sessions[1].detail_loaded = true;
+        picker.hydrated(sessions[1].id, None, Some(&task), &sessions);
+        assert!(picker.choices.as_ref().unwrap().is_err());
+        sessions[0].detail_loaded = true;
+        picker.hydrated(sessions[0].id, None, Some(&task), &sessions);
+        let choices = picker.choices.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].0.session_id, sessions[0].id);
+        assert_eq!(choices[1].0.session_id, sessions[1].id);
+        assert!(menu.is_open(), "hydration must preserve the open picker");
+        assert!(sessions.iter().all(|session| session.turns.len() == 1));
+        assert_eq!(task.stage_id, Some(stage.id));
+    }
+
+    #[gpui::test]
+    fn prior_result_picker_dismissal_and_issue_navigation_ignore_old_hydration(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (task, stage, _) = fixture();
+        let mut source = completed_source(&task);
+        source.detail_loaded = false;
+        let menu = cx.update(ContextMenuHandle::new);
+        let mut picker = StageResultPicker::new(task.id, stage.id, menu.clone());
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| menu.open_context_menu(window, cx));
+        picker.open(&task, std::slice::from_ref(&source));
+        cx.update(|window, cx| menu.close(window, cx));
+        picker.close();
+        source.detail_loaded = true;
+        picker.hydrated(source.id, None, Some(&task), std::slice::from_ref(&source));
+        assert!(picker.choices.is_none());
+        assert!(!menu.is_open());
+
+        // A new inspector visit owns a new picker, including when navigating
+        // Back to the same issue. Old session completions cannot repopulate it.
+        let (other, other_stage, _) = fixture();
+        let other_menu = cx.update(|_, cx| ContextMenuHandle::new(cx));
+        picker = StageResultPicker::new(other.id, other_stage.id, other_menu.clone());
+        cx.update(|window, cx| other_menu.open_context_menu(window, cx));
+        picker.open(&other, std::slice::from_ref(&source));
+        picker.hydrated(source.id, None, Some(&other), std::slice::from_ref(&source));
+        assert!(
+            picker
+                .choices
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!picker.matches(task.id, stage.id));
+        assert!(
+            !picker.matches(other.id, stage.id),
+            "stage changes need a fresh picker too"
+        );
+
+        let fresh_menu = cx.update(|_, cx| ContextMenuHandle::new(cx));
+        picker = StageResultPicker::new(task.id, stage.id, fresh_menu.clone());
+        picker.hydrated(source.id, None, Some(&task), std::slice::from_ref(&source));
+        assert!(picker.choices.is_none());
+        assert!(!fresh_menu.is_open());
+        cx.update(|window, cx| fresh_menu.open_context_menu(window, cx));
+        assert!(picker.open(&task, std::slice::from_ref(&source)).is_empty());
+        assert_eq!(picker.choices.as_ref().unwrap().as_ref().unwrap().len(), 1);
+    }
+
+    #[gpui::test]
+    fn prior_result_picker_failure_waits_for_explicit_retry_and_rechecks_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (mut task, stage, _) = fixture();
+        let mut source = completed_source(&task);
+        source.detail_loaded = false;
+        let menu = cx.update(ContextMenuHandle::new);
+        let mut picker = StageResultPicker::new(task.id, stage.id, menu.clone());
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| menu.open_context_menu(window, cx));
+        picker.open(&task, std::slice::from_ref(&source));
+        picker.hydrated(
+            source.id,
+            Some("load failed".into()),
+            Some(&task),
+            std::slice::from_ref(&source),
+        );
+        assert_eq!(picker.choices, Some(Err("load failed".into())));
+        assert!(
+            picker.pending.is_empty(),
+            "failure must not start a retry loop"
+        );
+        picker.hydrated(source.id, None, Some(&task), std::slice::from_ref(&source));
+        assert_eq!(picker.choices, Some(Err("load failed".into())));
+        cx.update(|window, cx| menu.close(window, cx));
+        picker.close();
+        cx.update(|window, cx| menu.open_context_menu(window, cx));
+        assert_eq!(
+            picker.open(&task, std::slice::from_ref(&source)),
+            vec![source.id]
+        );
+        source.detail_loaded = true;
+        task.workspace = Some(TaskWorkspace::Worktree {
+            project_id: task.project_id().unwrap(),
+            path: "/changed".into(),
+            branch: "changed".into(),
+        });
+        picker.hydrated(source.id, None, Some(&task), std::slice::from_ref(&source));
+        assert!(
+            picker
+                .choices
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

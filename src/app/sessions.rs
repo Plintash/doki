@@ -145,6 +145,10 @@ impl Waku {
                 .await;
             let _ = waku.update(cx, |waku, cx| {
                 waku.session_hydrations.remove(&session_id);
+                let hydration_error = result
+                    .as_ref()
+                    .err()
+                    .map(|error| tr!("errors.open_session", error = error));
                 match result {
                     Ok(session) => {
                         let replaced = if let Some(existing) = waku
@@ -188,6 +192,7 @@ impl Waku {
                         waku.show_toast(tr!("errors.open_session", error = error));
                     }
                 }
+                waku.refresh_stage_result_picker(session_id, hydration_error);
                 cx.notify();
             });
         })
