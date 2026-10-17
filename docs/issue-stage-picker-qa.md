@@ -48,8 +48,32 @@ The native menu's existing test suite covers focus, keyboard navigation,
 dismissal and virtualized long collections. These primitive tests and the new
 source/model tests do not establish a rendered acceptance pass for this control.
 
-Current verification is in progress. Final command/results and any limitations
-will be recorded before the change is declared ready for review.
+## Verification record
+
+Local verification on 2026-10-17 used Rust 1.96.0 on Linux and a dedicated
+Cargo target. The branch includes main `808611c` (including PRs #85, #100 and
+#101). The final stale-stage message uses the existing translation system in
+English, Simplified Chinese and Japanese.
+
+- `cargo test --locked -j2 --config 'profile.dev.debug=0' -p waku --lib
+  app::board_header::tests -- --test-threads=1`: **7 passed**
+- `cargo test --locked -j2 --config 'profile.dev.debug=0' -p waku --lib --
+  --test-threads=1`: **728 passed, 2 ignored, 0 failed**, repeated after the
+  final localization edit
+- Changed-file `rustfmt --check` and `git diff --check`: **passed**
+- `python3 scripts/tests/test_preview.py`: **12 passed**
+- Independent source review: **no remaining actionable findings** after fixing
+  cached menu ownership; localization and integration delta were re-reviewed
+
+Hosted checks for pre-localization checkpoint `d5a6d387` independently passed
+all 728 app tests, including these seven regressions, on Ubuntu. That overall
+[Tests run](https://github.com/Plintash/doki/actions/runs/39045973392) failed later
+on nine existing OpenCode-v2 prerequisite tests, tracked in
+[#88](https://github.com/Plintash/doki/issues/88). Its
+[macOS preview](https://github.com/Plintash/doki/actions/runs/39045973389) built,
+verified and uploaded an Apple Silicon app archive. That packaging result does
+not establish native interaction or final-head acceptance. Current-head checks
+and any later results are recorded on [PR #105](https://github.com/Plintash/doki/pull/105).
 
 ## Native acceptance checklist
 

@@ -368,7 +368,7 @@ impl Waku {
             return;
         };
         let Ok((state, stage)) = resolve_detail_stage(task, &self.state.projects, target) else {
-            self.show_toast("This issue's stages changed. Reopen the stage menu to choose again.");
+            self.show_toast(tr!("board.stages_changed"));
             cx.notify();
             return;
         };
