@@ -3633,6 +3633,37 @@ mod tests {
         second_server.join().unwrap();
     }
 
+    #[cfg(not(unix))]
+    #[test]
+    fn daemon_terminal_stub_retains_no_output_and_rejects_operations() {
+        use crate::terminal::DaemonTerminal;
+
+        let hub = Arc::new(Hub::default());
+        let error = DaemonTerminal::open(
+            std::path::Path::new("."),
+            80,
+            24,
+            hub.event_sink(Uuid::new_v4(), Uuid::new_v4()),
+        )
+        .err()
+        .expect("opening an unsupported terminal must fail");
+        assert_eq!(
+            error.to_string(),
+            "daemon terminals are not supported on this platform"
+        );
+
+        let terminal = DaemonTerminal;
+        terminal.resize(80, 24);
+        assert_eq!(terminal.size(), (0, 0));
+        assert_eq!(terminal.retained_snapshot(), (Vec::new(), 0));
+        for data in [Vec::new(), b"echo hello\n".to_vec()] {
+            assert_eq!(
+                terminal.write(data).unwrap_err().to_string(),
+                "daemon terminals are not supported on this platform"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn daemon_terminal_retains_a_bounded_recent_window() {
@@ -4154,7 +4185,8 @@ mod tests {
     }
 
     /// Removing a task disposes the terminals it owns — the shell ends with the
-    /// task — while another task's terminal keeps running.    #[cfg(unix)]
+    /// task — while another task's terminal keeps running.
+    #[cfg(unix)]
     #[test]
     fn websocket_removing_a_task_disposes_its_terminals() {
         let root = std::env::temp_dir().join(format!("waku-terminal-{}", Uuid::new_v4()));
