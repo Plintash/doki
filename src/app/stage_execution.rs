@@ -213,7 +213,15 @@ pub(super) struct StageResultPicker {
 }
 
 impl StageResultPicker {
-    fn new(task_id: Uuid, stage_id: Uuid, menu: ContextMenuHandle) -> Self {
+    fn new(
+        task_id: Uuid,
+        stage_id: Uuid,
+        menu: ContextMenuHandle,
+        menus: &mut HashMap<SharedString, ContextMenuHandle>,
+    ) -> Self {
+        // Window-wide overlays dismiss registered menus. Replace this one slot
+        // on every inspector visit so registration never revives an old picker.
+        menus.insert("issue-stage-result".into(), menu.clone());
         Self {
             task_id,
             stage_id,
@@ -534,15 +542,18 @@ impl Waku {
         } else {
             let weak = cx.entity().downgrade();
             let toggle_weak = weak.clone();
+            let menus = &self.menus;
             let detail = self.task_detail.as_mut().expect("detail initialized");
             let picker = detail.stage_result_picker.get_or_insert_with(|| {
-                let menu = ContextMenuHandle::new(cx).on_toggle(move |open, _, cx| {
+                let menu = ContextMenuHandle::new(cx);
+                let identity = menu.focus_handle().clone();
+                let menu = menu.on_toggle(move |open, _, cx| {
                     let _ = toggle_weak.update(cx, |this, cx| {
                         let Some(picker) = this
                             .task_detail
                             .as_mut()
                             .and_then(|detail| detail.stage_result_picker.as_mut())
-                            .filter(|picker| picker.matches(task_id, stage_id))
+                            .filter(|picker| picker.menu.focus_handle() == &identity)
                         else {
                             return;
                         };
@@ -563,7 +574,7 @@ impl Waku {
                         cx.notify();
                     });
                 });
-                StageResultPicker::new(task_id, stage_id, menu)
+                StageResultPicker::new(task_id, stage_id, menu, &mut menus.borrow_mut())
             });
             let handle = picker.menu.clone();
             section = section.child(crate::ui::menu::dropdown_menu_list(
@@ -684,7 +695,8 @@ mod tests {
             session.detail_loaded = false;
         }
         let menu = cx.update(ContextMenuHandle::new);
-        let mut picker = StageResultPicker::new(task.id, stage.id, menu.clone());
+        let mut menus = HashMap::new();
+        let mut picker = StageResultPicker::new(task.id, stage.id, menu.clone(), &mut menus);
         let cx = cx.add_empty_window();
         cx.update(|window, cx| menu.open_context_menu(window, cx));
         assert_eq!(picker.open(&task, &sessions).len(), 2);
@@ -717,11 +729,24 @@ mod tests {
         let mut source = completed_source(&task);
         source.detail_loaded = false;
         let menu = cx.update(ContextMenuHandle::new);
-        let mut picker = StageResultPicker::new(task.id, stage.id, menu.clone());
+        let mut menus = HashMap::new();
+        let mut picker = StageResultPicker::new(task.id, stage.id, menu.clone(), &mut menus);
         let cx = cx.add_empty_window();
         cx.update(|window, cx| menu.open_context_menu(window, cx));
         picker.open(&task, std::slice::from_ref(&source));
-        cx.update(|window, cx| menu.close(window, cx));
+        // Command palette/task switcher collect this registry before their
+        // deferred close. Hydration arriving after that close must stay inert.
+        let open_menus = menus
+            .values()
+            .filter(|menu| menu.is_open())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(open_menus.len(), 1);
+        cx.update(|window, cx| {
+            for menu in open_menus {
+                menu.close(window, cx);
+            }
+        });
         picker.close();
         source.detail_loaded = true;
         picker.hydrated(source.id, None, Some(&task), std::slice::from_ref(&source));
@@ -732,7 +757,13 @@ mod tests {
         // Back to the same issue. Old session completions cannot repopulate it.
         let (other, other_stage, _) = fixture();
         let other_menu = cx.update(|_, cx| ContextMenuHandle::new(cx));
-        picker = StageResultPicker::new(other.id, other_stage.id, other_menu.clone());
+        picker = StageResultPicker::new(other.id, other_stage.id, other_menu.clone(), &mut menus);
+        assert_eq!(menus.len(), 1, "a visit replaces the registered handle");
+        assert_ne!(picker.menu.focus_handle(), menu.focus_handle());
+        assert_eq!(
+            menus["issue-stage-result"].focus_handle(),
+            other_menu.focus_handle()
+        );
         cx.update(|window, cx| other_menu.open_context_menu(window, cx));
         picker.open(&other, std::slice::from_ref(&source));
         picker.hydrated(source.id, None, Some(&other), std::slice::from_ref(&source));
@@ -752,7 +783,7 @@ mod tests {
         );
 
         let fresh_menu = cx.update(|_, cx| ContextMenuHandle::new(cx));
-        picker = StageResultPicker::new(task.id, stage.id, fresh_menu.clone());
+        picker = StageResultPicker::new(task.id, stage.id, fresh_menu.clone(), &mut menus);
         picker.hydrated(source.id, None, Some(&task), std::slice::from_ref(&source));
         assert!(picker.choices.is_none());
         assert!(!fresh_menu.is_open());
@@ -769,7 +800,8 @@ mod tests {
         let mut source = completed_source(&task);
         source.detail_loaded = false;
         let menu = cx.update(ContextMenuHandle::new);
-        let mut picker = StageResultPicker::new(task.id, stage.id, menu.clone());
+        let mut menus = HashMap::new();
+        let mut picker = StageResultPicker::new(task.id, stage.id, menu.clone(), &mut menus);
         let cx = cx.add_empty_window();
         cx.update(|window, cx| menu.open_context_menu(window, cx));
         picker.open(&task, std::slice::from_ref(&source));
