@@ -6,17 +6,17 @@ use base64::Engine as _;
 /// Scrollbar and wheel input share the same one-way reserve consumption. The
 /// list has already moved by the time this adapter shortens the padding.
 #[derive(Clone)]
-struct BufferedTranscriptScroll {
-    rows: ListState,
-    buffer: Rc<RefCell<transcript_buffer::TranscriptBuffer>>,
-    padding: Rc<Cell<Pixels>>,
-    following: Rc<Cell<bool>>,
-    is_scrolled: Rc<Cell<bool>>,
-    recheck: Rc<Cell<bool>>,
+pub(super) struct BufferedTranscriptScroll {
+    pub(super) rows: ListState,
+    pub(super) buffer: Rc<RefCell<transcript_buffer::TranscriptBuffer>>,
+    pub(super) padding: Rc<Cell<Pixels>>,
+    pub(super) following: Rc<Cell<bool>>,
+    pub(super) is_scrolled: Rc<Cell<bool>>,
+    pub(super) recheck: Rc<Cell<bool>>,
 }
 
 impl BufferedTranscriptScroll {
-    fn scrolled(&self) -> f32 {
+    pub(super) fn scrolled(&self) -> f32 {
         f32::from(-self.rows.scroll_px_offset_for_scrollbar().y)
     }
 
@@ -84,7 +84,7 @@ impl scrollbar::Scrollable for BufferedTranscriptScroll {
     }
 }
 
-fn transcript_scroll_observer(scroll: BufferedTranscriptScroll) -> impl IntoElement {
+pub(super) fn transcript_scroll_observer(scroll: BufferedTranscriptScroll) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |_, _, window, _| {
@@ -115,9 +115,9 @@ fn transcript_scroll_observer(scroll: BufferedTranscriptScroll) -> impl IntoElem
 /// Padding is resolved against this frame's actual list bounds, not the
 /// previous paint's viewport. Otherwise shrinking a settled window can make
 /// GPUI skip every row for a frame (padding >= the new height).
-struct BufferedTranscriptList {
-    inner: gpui::List,
-    scroll: BufferedTranscriptScroll,
+pub(super) struct BufferedTranscriptList {
+    pub(super) inner: gpui::List,
+    pub(super) scroll: BufferedTranscriptScroll,
 }
 
 impl IntoElement for BufferedTranscriptList {
