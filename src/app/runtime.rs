@@ -3567,6 +3567,9 @@ impl Waku {
                 provisional = self.anchored_transcript_rows.viewport_bounds().size.height;
             }
             self.transcript_anchor_end_space.set(provisional);
+            self.transcript_buffer
+                .borrow_mut()
+                .reset(f32::from(provisional));
             self.transcript_anchor_following.set(true);
             self.splice_transcript_rows_after_visibility_change(&previous_kinds);
             self.scroll_transcript_to_anchor();
