@@ -3228,6 +3228,7 @@ mod tests {
 
     #[test]
     fn window_header_names_the_visible_surface_instead_of_the_previous_session() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let mut previous = AgentSession::new(Uuid::from_u128(1), ProviderKind::Codex);
         previous.title = "Previous conversation".to_owned();
 

@@ -783,6 +783,7 @@ mod tests {
 
     #[test]
     fn chip_label_reports_budget_consumption() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let goal = ThreadGoal {
             objective: "Ship it".into(),
             status: ThreadGoalStatus::Active,
@@ -795,6 +796,7 @@ mod tests {
 
     #[test]
     fn unbudgeted_pursuit_reports_live_elapsed_time() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let mut goal = ThreadGoal {
             objective: "Ship it".into(),
             status: ThreadGoalStatus::Active,

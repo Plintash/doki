@@ -1767,6 +1767,7 @@ mod tests {
 
     #[test]
     fn files_tab_uses_the_selected_file_name_and_icon() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let files = RightPanelSurface::Files;
         assert_eq!(right_panel_tab_label(&files, None), "Files");
         assert_eq!(
