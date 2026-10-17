@@ -2449,6 +2449,8 @@ board.retry_save:
   en: "Changes not saved · Retry"
 board.saving:
   en: "Saving…"
+board.stages_changed:
+  en: "Stages changed. Reopen the stage menu to choose again."
 
 # Board scope and live session signals
 board.all_projects:

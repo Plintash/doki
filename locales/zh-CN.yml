@@ -1203,6 +1203,7 @@ board.completion_waiting_for_runtime: "正在连接会话…"
 
 board.retry_save: "更改未保存 · 重试"
 board.saving: "正在保存…"
+board.stages_changed: "阶段已更改，请重新打开阶段菜单选择"
 
 # Board scope and live session signals
 board.all_projects: "全部项目"

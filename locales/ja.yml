@@ -1254,6 +1254,7 @@ board.completion_waiting_for_runtime: "会話に接続しています…"
 
 board.retry_save: "変更を保存できません · 再試行"
 board.saving: "保存中…"
+board.stages_changed: "ステージが変更されました。メニューを開き直して選択してください。"
 
 # Board scope and live session signals
 board.all_projects: "すべてのプロジェクト"
