@@ -148,42 +148,48 @@ impl NativeRpaClient {
             if matches!(command, AutomationCommand::RegisterExecutor { .. }) {
                 bail!("the REPL cannot register a UI executor");
             }
-            self.connect(deadline)?;
             if let AutomationCommand::Resume { session_id, after } = command {
                 // The transport activates a fresh receiver atomically with the
                 // successful replay. Pre-subscribing would preload stale local
                 // pending events and duplicate/overflow a complete retained tail.
-                let (result, receiver) = self
-                    .client
-                    .as_ref()
-                    .unwrap()
-                    .resume_automation_with_subscription(session_id, after, remaining(deadline)?)?;
+                let (client, timeout) = connect_with_remaining(
+                    deadline,
+                    |deadline| self.connect(deadline),
+                    Instant::now,
+                )?;
+                let (result, receiver) =
+                    client.resume_automation_with_subscription(session_id, after, timeout)?;
                 self.subscriptions.insert(session_id, receiver);
                 return Ok(serde_json::to_value(result)?);
             }
             let mut new_subscription = None;
-            if let AutomationCommand::Subscribe { session_id, .. } = &command {
-                if !self.subscriptions.contains_key(session_id) {
-                    new_subscription = Some(*session_id);
-                }
-                self.subscriptions.entry(*session_id).or_insert_with(|| {
-                    self.client
-                        .as_ref()
-                        .unwrap()
-                        .subscribe_automation(*session_id)
-                });
-            }
             let detach = if let AutomationCommand::Detach { session_id } = &command {
                 Some(*session_id)
             } else {
                 None
             };
-            let result = match remaining(deadline).and_then(|timeout| {
-                self.client
-                    .as_ref()
-                    .unwrap()
-                    .automation_with_timeout(command, timeout)
-            }) {
+            let connected = connect_with_remaining(
+                deadline,
+                |deadline| {
+                    self.connect(deadline)?;
+                    if let AutomationCommand::Subscribe { session_id, .. } = &command {
+                        if !self.subscriptions.contains_key(session_id) {
+                            new_subscription = Some(*session_id);
+                        }
+                        self.subscriptions.entry(*session_id).or_insert_with(|| {
+                            self.client
+                                .as_ref()
+                                .unwrap()
+                                .subscribe_automation(*session_id)
+                        });
+                    }
+                    Ok(self.client.as_ref().unwrap())
+                },
+                Instant::now,
+            );
+            let result = match connected
+                .and_then(|(client, timeout)| client.automation_with_timeout(command, timeout))
+            {
                 Ok(result) => result,
                 Err(error) => {
                     if let Some(session_id) = new_subscription {
@@ -210,9 +216,9 @@ impl NativeRpaClient {
             },
             _ => bail!("unsupported debug RPA operation"),
         };
-        let client = self.connect(deadline)?;
-        let response =
-            client.request_with_timeout(Uuid::nil(), Uuid::nil(), command, remaining(deadline)?)?;
+        let (client, timeout) =
+            connect_with_remaining(deadline, |deadline| self.connect(deadline), Instant::now)?;
+        let response = client.request_with_timeout(Uuid::nil(), Uuid::nil(), command, timeout)?;
         Ok(match response {
             ResponsePayload::DiagnosticLogs { result } => serde_json::to_value(result)?,
             ResponsePayload::DiagnosticTimeline { result } => serde_json::to_value(result)?,
@@ -223,8 +229,24 @@ impl NativeRpaClient {
     }
 }
 
+// Both automation and diagnostics must compute the RPC timeout only after
+// connection (and subscription setup) has consumed its share of the deadline.
+// Passing the clock keeps this accounting testable without timing OS scheduling.
+fn connect_with_remaining<T>(
+    deadline: Instant,
+    connect: impl FnOnce(Instant) -> anyhow::Result<T>,
+    now: impl FnOnce() -> Instant,
+) -> anyhow::Result<(T, Duration)> {
+    let client = connect(deadline)?;
+    Ok((client, remaining_at(deadline, now())?))
+}
+
 fn remaining(deadline: Instant) -> anyhow::Result<Duration> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
+    remaining_at(deadline, Instant::now())
+}
+
+fn remaining_at(deadline: Instant, now: Instant) -> anyhow::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
     if remaining.is_zero() {
         bail!("debug RPA execution deadline elapsed");
     }
@@ -373,36 +395,44 @@ mod tests {
 
     #[test]
     fn automation_repl_connection_and_rpc_share_one_execution_budget() {
-        for (method, args) in [
-            ("automation", json!({"type":"instances"})),
-            ("counters", json!({})),
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let mut fixture = Fixture::new(listener.local_addr().unwrap().to_string());
-            let (release, blocked) = crossbeam_channel::bounded::<()>(1);
-            let server = std::thread::spawn(move || {
-                let mut socket = accept_peer(&listener);
-                std::thread::sleep(Duration::from_millis(300));
-                send_hello(&mut socket);
-                assert_eq!(read_peer(&mut socket)["type"], "request");
-                let _ = blocked.recv_timeout(Duration::from_secs(2));
-            });
+        // Real transport coverage lives in the handshake and request fixtures.
+        // An elapsed wall-clock assertion here also measures descheduling of the
+        // test and its fake daemon, rather than just the budget passed to RPC.
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(500);
+        let now = std::cell::Cell::new(start);
+        let (connection, timeout) = connect_with_remaining(
+            deadline,
+            |connection_deadline| {
+                assert_eq!(connection_deadline, deadline);
+                now.set(start + Duration::from_millis(300));
+                Ok("connected")
+            },
+            || now.get(),
+        )
+        .unwrap();
+        assert_eq!(connection, "connected");
+        assert_eq!(timeout, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn automation_repl_connection_cannot_renew_an_exhausted_execution_budget() {
+        for connection_time_ms in [500, 700] {
             let start = Instant::now();
-            let result =
-                fixture
-                    .client
-                    .call(method, args, Some(start + Duration::from_millis(500)));
-            let elapsed = start.elapsed();
-            let _ = release.send(());
-            server.join().unwrap();
-            assert_eq!(result["ok"], false);
-            assert!(
-                fixture.client.client.is_some(),
-                "Hello must finish before the RPC times out"
+            let deadline = start + Duration::from_millis(500);
+            let now = std::cell::Cell::new(start);
+            let result = connect_with_remaining(
+                deadline,
+                |connection_deadline| {
+                    assert_eq!(connection_deadline, deadline);
+                    now.set(start + Duration::from_millis(connection_time_ms));
+                    Ok(())
+                },
+                || now.get(),
             );
-            assert!(
-                elapsed < Duration::from_millis(650),
-                "connection time was added back to the RPC budget: {elapsed:?}"
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "debug RPA execution deadline elapsed"
             );
         }
     }
