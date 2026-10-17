@@ -1830,6 +1830,7 @@ mod message_time_tests {
 
     #[test]
     fn message_time_includes_calendar_context_for_older_messages() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let now = local_datetime(2026, 8, 9, 16, 0); // Sunday
 
         assert_eq!(
@@ -1856,6 +1857,7 @@ mod message_time_tests {
 
     #[test]
     fn message_time_uses_correct_ordinal_suffixes() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let now = local_datetime(2026, 8, 9, 16, 0);
 
         for (day, suffix) in [
@@ -1932,6 +1934,7 @@ mod message_time_tests {
 
     #[test]
     fn activity_disclosure_keeps_arguments_and_output() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let activity = ActivityItem::new(
             Some("tool-1".into()),
             crate::model::ActivityKind::Tool,
@@ -1984,6 +1987,7 @@ mod message_time_tests {
 
     #[test]
     fn command_disclosure_shows_only_the_command_and_output() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let activity = ActivityItem::new(
             Some("command-1".into()),
             crate::model::ActivityKind::Command,
@@ -2017,6 +2021,7 @@ mod message_time_tests {
 
     #[test]
     fn retry_activity_exposes_attempt_and_cause_and_clears_live_wording() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let title = format!(
             "{} (2/3) — ai: system cpu overloaded",
             tr!("activity.provider_retrying")
@@ -2071,6 +2076,7 @@ mod message_time_tests {
 
     #[test]
     fn generic_tool_rows_keep_a_humanized_provider_name() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let named = ActivityItem::new(
             Some("tool-1".into()),
             crate::model::ActivityKind::Tool,
@@ -2095,6 +2101,7 @@ mod message_time_tests {
 
     #[test]
     fn ask_user_question_has_a_purpose_specific_label() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let activity = ActivityItem::new(
             Some("tool-1".into()),
             crate::model::ActivityKind::Tool,
@@ -2111,6 +2118,7 @@ mod message_time_tests {
 
     #[test]
     fn activity_header_summarizes_only_after_the_group_leaves_the_live_tail() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let reasoning = ActivityItem::from_reasoning(
             ReasoningBlock {
                 content: "Inspecting history".into(),
@@ -2157,6 +2165,7 @@ mod message_time_tests {
 
     #[test]
     fn file_edit_title_and_stats_follow_the_activity_state() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let mut activity = ActivityItem::new(
             Some("edit-1".into()),
             crate::model::ActivityKind::FileChange,
@@ -2185,6 +2194,7 @@ mod message_time_tests {
 
     #[test]
     fn multi_file_edits_use_a_compact_count() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let activity = ActivityItem::new(
             Some("edit-2".into()),
             crate::model::ActivityKind::FileChange,
@@ -2205,6 +2215,7 @@ mod message_time_tests {
 
     #[test]
     fn file_tool_titles_include_the_target_and_state() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let mut read = ActivityItem::new(
             Some("read-1".into()),
             crate::model::ActivityKind::FileRead,
@@ -2263,6 +2274,7 @@ mod message_time_tests {
 
     #[test]
     fn command_web_search_and_plan_titles_include_their_state() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let mut command = ActivityItem::new(
             Some("command-1".into()),
             crate::model::ActivityKind::Command,

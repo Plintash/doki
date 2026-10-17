@@ -1878,6 +1878,7 @@ mod tests {
 
     #[test]
     fn stage_draft_titles_use_the_persisted_stage_snapshot() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let project = Uuid::new_v4();
         let mut session = AgentSession::new(project, ProviderKind::Amp);
         assert_eq!(
