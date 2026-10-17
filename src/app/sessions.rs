@@ -963,6 +963,7 @@ impl Waku {
             .set(self.navigation_rail_reset_generation.get().wrapping_add(1));
         self.transcript_anchor.set(None);
         self.transcript_anchor_end_space.set(Pixels::ZERO);
+        self.transcript_buffer.borrow_mut().reset(0.0);
         self.transcript_anchor_following.set(false);
     }
 

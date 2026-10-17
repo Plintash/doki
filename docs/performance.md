@@ -224,6 +224,11 @@ and the boundary with
   ms in the debug build
   (`cargo test --locked -p waku --lib bench_markdown_frame -- --ignored
   --nocapture`).
+- Active sent-message anchors use the
+  [transcript-owned scroll reserve](streaming-scroll-reserve.md): measured
+  growth advances an explicit viewport offset, and upward input consumes
+  retained blank space. The Markdown-only spring below remains the
+  unanchored-session fallback.
 - The live response body **reports a leading container height**
   (`MarkdownView::advance_clip`, [src/md/render.rs](../src/md/render.rs)). Text
   layout grows the row in whole-line steps, and the row's height is what the

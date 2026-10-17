@@ -155,6 +155,7 @@ impl Waku {
         }
 
         self.transcript_anchor_following.set(false);
+        self.transcript_buffer.borrow_mut().adopt_position();
         self.transcript_is_scrolled.set(true);
         // The position above is deliberate, so a wheel scroll still waiting to
         // be classified must not re-engage following on top of it.
@@ -245,53 +246,97 @@ impl Waku {
         self.transcript_is_scrolled.set(true);
     }
 
-    pub(super) fn update_transcript_anchor_end_space(&self, window: &Window) -> Pixels {
+    pub(super) fn update_transcript_anchor_end_space(
+        &self,
+        window: &Window,
+        layout_invalidated: bool,
+        cx: &mut Context<Self>,
+    ) -> Pixels {
         let Some(anchor_row) = self.selected_transcript_anchor_row() else {
             self.transcript_anchor_end_space.set(Pixels::ZERO);
+            self.transcript_buffer.borrow_mut().reset(0.0);
             self.transcript_anchor_following.set(false);
             return Pixels::ZERO;
         };
-
-        let viewport_height = {
-            let measured = self.active_transcript_rows().viewport_bounds().size.height;
-            if measured > Pixels::ZERO {
-                measured
-            } else {
-                // The first sent message replaces the empty state, so the list
-                // has no prior bounds yet. The full window is a conservative
-                // first-frame fallback that still guarantees a top anchor.
-                window.viewport_size().height
-            }
+        let rows = self.active_transcript_rows();
+        let viewport = rows.viewport_bounds();
+        let viewport_height = if viewport.size.height > Pixels::ZERO {
+            viewport.size.height
+        } else {
+            window.viewport_size().height
         };
-        let transcript_rows = self.active_transcript_rows();
-        let last_row = transcript_rows.item_count().checked_sub(1);
-        let anchored_tail_height = last_row.and_then(|last_row| {
-            let anchor = transcript_rows.bounds_for_item(anchor_row)?;
-            let last = transcript_rows.bounds_for_item(last_row)?;
-            Some((last.bottom() - anchor.top()).max(Pixels::ZERO))
+        // The prompt disappears from bounds_for_item once it scrolls above
+        // the viewport. Only initialization needs its coordinate; the tail's
+        // viewport coordinate remains measurable throughout a long reply.
+        let viewport_y = |screen_y: Pixels| f32::from(screen_y - viewport.top());
+        let resolving_end =
+            rows.item_count() > 0 && rows.logical_scroll_top().item_ix >= rows.item_count();
+        if resolving_end {
+            // The user-requested end sentinel resolves during this layout.
+            // Reconcile its resulting explicit anchor once, even at rest.
+            let view = window.current_view();
+            window.on_next_frame(move |_, cx| cx.notify(view));
+        }
+        let content_bottom = (!layout_invalidated && !resolving_end)
+            .then(|| {
+                rows.item_count()
+                    .checked_sub(1)
+                    .and_then(|last| rows.bounds_for_item(last))
+                    .map(|bounds| viewport_y(bounds.bottom()))
+                    .or_else(|| {
+                        // A huge single response can put its footer outside the
+                        // list's overdraw. The measured-height summary retains
+                        // size hints through stream remeasurement, so it still
+                        // gives a viewport-relative tail without walking rows.
+                        // Its public max excludes padding and clamps at zero;
+                        // only a positive maximum reconstructs content height.
+                        let max = rows.max_offset_for_scrollbar().y;
+                        (max > Pixels::ZERO && viewport.size.height > Pixels::ZERO).then(|| {
+                            f32::from(
+                                max + viewport.size.height
+                                    + rows.scroll_px_offset_for_scrollbar().y,
+                            )
+                        })
+                    })
+            })
+            .flatten();
+        let anchor_top = rows
+            .bounds_for_item(anchor_row)
+            .map(|bounds| viewport_y(bounds.top()));
+        let running = self.transcript_anchor.get().is_some_and(|anchor| {
+            self.selected_session()
+                .is_some_and(|session| session.active_turn_id() == Some(anchor.turn_id))
         });
-        // Tail rows report no bounds for a frame whenever they are remeasured —
-        // which the stream pump does on every commit — and report none at all
-        // before the anchored list's first paint. Missing bounds mean unknown,
-        // not zero: a zero end space reads as "the reply filled the viewport",
-        // so the render's follow branch pins the list to its end, the next
-        // measured frame snaps back to the anchor, and the two alternate at
-        // stream cadence for the whole turn. Let the previous end space stand
-        // (the send path seeds a provisional full-viewport reservation) and
-        // keep asserting the anchor straight through the unmeasured frame —
-        // scroll_to is bounds-independent.
-        let end_space = match anchored_tail_height {
-            Some(height) => transcript_anchor_end_space(viewport_height, height),
-            None => self.transcript_anchor_end_space.get(),
-        };
+        let layout = self.transcript_buffer.borrow_mut().update(
+            transcript_buffer::BufferFrame {
+                content_bottom,
+                anchor_top,
+                viewport_height: f32::from(viewport_height),
+                width: f32::from(self.transcript_layout_width.get()),
+                running,
+                following: self.transcript_anchor_following.get(),
+                reduce_motion: cx.reduce_motion(),
+            },
+            Instant::now(),
+        );
+        let end_space = px(layout.padding);
         self.transcript_anchor_end_space.set(end_space);
-        if maintain_transcript_anchor(
-            transcript_rows,
-            anchor_row,
-            self.transcript_anchor_following.get(),
-            end_space,
-        ) {
-            self.transcript_is_scrolled.set(true);
+        if let Some(delta) = layout.scroll_by {
+            // Explicit offsets survive row-height commits. A past-the-end
+            // pin would turn every newly wrapped line into an immediate jump,
+            // before the reserve can spend that growth on the next frame.
+            rows.scroll_by(px(delta));
+            self.transcript_is_scrolled.set(false);
+        } else if !self.transcript_buffer.borrow().initialized() {
+            maintain_transcript_anchor(
+                rows,
+                anchor_row,
+                self.transcript_anchor_following.get(),
+                end_space,
+            );
+        }
+        if layout.animating {
+            motion::dissolve_lease(window.current_view(), self.state.dissolve_fps, cx);
         }
         end_space
     }
