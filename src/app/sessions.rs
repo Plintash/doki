@@ -145,6 +145,10 @@ impl Waku {
                 .await;
             let _ = waku.update(cx, |waku, cx| {
                 waku.session_hydrations.remove(&session_id);
+                let hydration_error = result
+                    .as_ref()
+                    .err()
+                    .map(|error| tr!("errors.open_session", error = error));
                 match result {
                     Ok(session) => {
                         let replaced = if let Some(existing) = waku
@@ -188,6 +192,7 @@ impl Waku {
                         waku.show_toast(tr!("errors.open_session", error = error));
                     }
                 }
+                waku.refresh_stage_result_picker(session_id, hydration_error);
                 cx.notify();
             });
         })
@@ -957,6 +962,15 @@ impl Waku {
         self.reasoning_window_starts.borrow_mut().clear();
         self.activity_scroll_viewports.borrow_mut().clear();
         self.menus.borrow_mut().clear();
+        // Transcript replacement can leave the issue inspector alive. Keep
+        // its picker reachable by palette/task-switcher dismissal afterward.
+        if let Some(picker) = self
+            .task_detail
+            .as_ref()
+            .and_then(|detail| detail.stage_result_picker.as_ref())
+        {
+            picker.register_menu(&mut self.menus.borrow_mut());
+        }
         self.message_edit = None;
         self.hide_toast();
         self.navigation_rail_reset_generation

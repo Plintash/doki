@@ -340,6 +340,17 @@ impl ContextMenuHandle {
         self.state.borrow_mut().pending_context_items = items;
     }
 
+    /// Rebuild a collection after its asynchronous source changes. The owner
+    /// must notify its view; this preserves focus and never opens a closed menu.
+    pub fn refresh_items(&self) {
+        let mut state = self.state.borrow_mut();
+        state.collection = None;
+        state.highlighted = None;
+        state.active_submenu = None;
+        state.submenu_highlighted = None;
+        state.submenu_focused = false;
+    }
+
     /// The card's focus handle, for content-focusing surfaces whose panel has
     /// no input of its own: focusing the card puts the menu key context on
     /// the dispatch path, which is what lets `escape` dismiss it.
@@ -2153,6 +2164,109 @@ mod tests {
             "visible rows keep native click handlers"
         );
         assert!(!handle.is_open());
+    }
+
+    struct RefreshCollectionHarness {
+        handle: ContextMenuHandle,
+        items: Rc<RefCell<Vec<MenuItem>>>,
+        builds: Rc<Cell<usize>>,
+    }
+
+    impl Render for RefreshCollectionHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let items = self.items.clone();
+            let builds = self.builds.clone();
+            dropdown_menu_list(
+                div().id("refresh-trigger").w(px(120.0)).h(px(32.0)),
+                "refresh-dropdown",
+                &self.handle,
+                MenuAlign::BelowLeft,
+                move |_| {
+                    builds.set(builds.get() + 1);
+                    items.borrow().clone()
+                },
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn collection_refresh_preserves_focus_and_requires_explicit_selection(cx: &mut TestAppContext) {
+        let handle = cx.update(ContextMenuHandle::new);
+        let items = Rc::new(RefCell::new(vec![
+            MenuItem::new("Loading", |_, _| {}).disabled(true),
+        ]));
+        let builds = Rc::new(Cell::new(0));
+        let activated = Rc::new(Cell::new(false));
+        let (_view, cx) = cx.add_window_view(|_, _| RefreshCollectionHarness {
+            handle: handle.clone(),
+            items: items.clone(),
+            builds: builds.clone(),
+        });
+        cx.run_until_parked();
+        cx.simulate_mouse_down(
+            point(px(10.0), px(10.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        cx.update(|window, cx| window.focus(handle.focus_handle(), cx));
+        assert_eq!(builds.get(), 1);
+        assert!(
+            handle
+                .state
+                .borrow()
+                .collection
+                .as_ref()
+                .unwrap()
+                .focusable
+                .is_empty()
+        );
+        let clicked = activated.clone();
+        *items.borrow_mut() = vec![MenuItem::new("Ready", move |_, _| clicked.set(true))];
+        handle.refresh_items();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(builds.get(), 2);
+        assert!(handle.is_open());
+        cx.update(|window, _| assert!(handle.focus_handle().is_focused(window)));
+        assert!(!activated.get(), "refresh must never choose a source");
+        assert_eq!(handle.state.borrow().highlighted, None);
+        cx.simulate_keystrokes("home enter");
+        assert!(activated.get());
+        assert!(!handle.is_open());
+
+        // Late refreshes after selection, Escape, or outside-click dismissal
+        // never reopen the menu or call its lazy builder.
+        handle.refresh_items();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(!handle.is_open());
+        assert_eq!(builds.get(), 2);
+        for dismiss in ["escape", "outside"] {
+            cx.simulate_mouse_down(
+                point(px(10.0), px(10.0)),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+            cx.update(|window, cx| window.focus(handle.focus_handle(), cx));
+            if dismiss == "escape" {
+                cx.simulate_keystrokes("escape");
+            } else {
+                cx.simulate_mouse_down(
+                    point(px(500.0), px(400.0)),
+                    MouseButton::Left,
+                    Modifiers::none(),
+                );
+            }
+            assert!(!handle.is_open());
+            let count = builds.get();
+            handle.refresh_items();
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            assert_eq!(builds.get(), count);
+            assert!(!handle.is_open());
+        }
     }
 
     struct CollectionGeometryHarness {

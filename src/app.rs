@@ -1542,7 +1542,6 @@ pub struct Waku {
     /// The board's per-column card lists, so long columns stay virtualized.
     board_column_lists: RefCell<[board::BoardColumnList; 3]>,
     board_stages: board_stages::StageBoard,
-    stage_result_choices: Option<Result<Vec<(crate::model::StageResultSource, String)>, String>>,
     /// The Settings archive's virtualized row list.
     archive_rows: RefCell<settings::ArchiveRows>,
     /// Stable focus for the archive surface itself, so restoring a row (which
@@ -3221,7 +3220,6 @@ impl Waku {
                 unconfirmed_task_closes: HashMap::new(),
                 task_stats_cache: RefCell::new(None),
                 board_stages: board_stages::StageBoard::new(),
-                stage_result_choices: None,
                 board_column_lists: RefCell::new([
                     board::BoardColumnList::new(),
                     board::BoardColumnList::new(),
