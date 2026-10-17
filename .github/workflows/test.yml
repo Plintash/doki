@@ -33,6 +33,14 @@ jobs:
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
 
+      # These service/API tests use disposable sessions, no credentials or
+      # model turns. Keep the real adapter coverage instead of skipping it.
+      # Pin the v2 API contract; opencode-ai is the incompatible v1 package.
+      - name: Install OpenCode 2.0.10 for live API tests
+        run: |
+          bun install --global --trust @opencode/cli@2.0.10
+          opencode --version
+
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -61,7 +69,7 @@ jobs:
           restore-keys: |
             ${{ matrix.os }}-rust-1.96.0-cargo-
 
-      - name: Run tests
+      - name: Run Rust tests including live OpenCode API acceptance
         run: cargo test --locked
 
       - name: Verify in-process Cua SDK and REPL lifecycle
