@@ -962,6 +962,15 @@ impl Waku {
         self.reasoning_window_starts.borrow_mut().clear();
         self.activity_scroll_viewports.borrow_mut().clear();
         self.menus.borrow_mut().clear();
+        // Transcript replacement can leave the issue inspector alive. Keep
+        // its picker reachable by palette/task-switcher dismissal afterward.
+        if let Some(picker) = self
+            .task_detail
+            .as_ref()
+            .and_then(|detail| detail.stage_result_picker.as_ref())
+        {
+            picker.register_menu(&mut self.menus.borrow_mut());
+        }
         self.message_edit = None;
         self.hide_toast();
         self.navigation_rail_reset_generation

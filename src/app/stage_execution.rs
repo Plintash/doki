@@ -219,16 +219,21 @@ impl StageResultPicker {
         menu: ContextMenuHandle,
         menus: &mut HashMap<SharedString, ContextMenuHandle>,
     ) -> Self {
-        // Window-wide overlays dismiss registered menus. Replace this one slot
-        // on every inspector visit so registration never revives an old picker.
-        menus.insert("issue-stage-result".into(), menu.clone());
-        Self {
+        let picker = Self {
             task_id,
             stage_id,
             menu,
             choices: None,
             pending: HashSet::new(),
-        }
+        };
+        picker.register_menu(menus);
+        picker
+    }
+
+    pub(super) fn register_menu(&self, menus: &mut HashMap<SharedString, ContextMenuHandle>) {
+        // Window-wide overlays dismiss registered menus. Replace this one slot
+        // on every inspector visit so registration never revives an old picker.
+        menus.insert("issue-stage-result".into(), self.menu.clone());
     }
 
     fn matches(&self, task_id: Uuid, stage_id: Uuid) -> bool {
@@ -734,6 +739,15 @@ mod tests {
         let cx = cx.add_empty_window();
         cx.update(|window, cx| menu.open_context_menu(window, cx));
         picker.open(&task, std::slice::from_ref(&source));
+        // Selected-session hydration/runtime replacement resets transcript
+        // menus while the inspector survives. Its own menu remains registered.
+        menus.clear();
+        picker.register_menu(&mut menus);
+        assert!(menus["issue-stage-result"].is_open());
+        assert_eq!(
+            menus["issue-stage-result"].focus_handle(),
+            menu.focus_handle()
+        );
         // Command palette/task switcher collect this registry before their
         // deferred close. Hydration arriving after that close must stay inert.
         let open_menus = menus
