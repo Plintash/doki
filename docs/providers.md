@@ -704,6 +704,37 @@ session, so its events are routed to a subscriber Waku never opens; what reaches
 the transcript is the parent's task tool row and, when the child finishes, the
 parent's `session.synthetic` note (`<subagent …>`) rendered as an activity.
 
+### OpenCode API tests
+
+The [Tests workflow](../.github/workflows/test.yml) deliberately runs both the
+deterministic adapter tests and the nine real-service API tests. It provisions
+the official v2 CLI, pinned to the API version exercised by these tests:
+
+```sh
+bun install --global --trust @opencode/cli@2.0.10
+opencode --version # opencode v2.0.10
+cargo test --locked
+```
+
+The [official v2 installer](https://opencode.ai/v2/docs) documents this package
+and the required Bun postinstall permission. Its platform packages select the
+native executable; `opencode-ai` is the separate v1 package. The Bun global bin
+directory must be on `PATH` (the workflow's setup-bun step provides it).
+
+The live harness starts its own loopback service with disposable data, state,
+config and work directories. These tests create synthetic sessions and inspect
+catalogues and API payloads; they require no provider credentials and do not
+execute a model turn. The cold model catalogue still needs network access to
+models.dev. A network or API incompatibility must fail visibly, not become a
+skip or a passing mock. Unfiltered `cargo test` retains all nine tests and the
+deterministic OpenCode coverage; no additional tests are ignored.
+
+This is service/API acceptance, not authenticated model-generation acceptance.
+When updating the CLI pin, run the full core suite against the new real service
+on the supported CI platforms and review any API changes before accepting it.
+The separately ignored transcript-import test still requires an explicitly
+provided completed session and is not enabled by this installation.
+
 ---
 
 ## Agent Client Protocol
