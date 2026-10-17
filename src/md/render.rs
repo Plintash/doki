@@ -46,6 +46,7 @@ use crate::ui::menu::{ContextMenuHandle, context_menu};
 use crate::ui::tooltip::Tooltip;
 
 mod math_text;
+mod row_window;
 
 #[cfg(test)]
 mod selection_tests;
@@ -546,6 +547,8 @@ pub struct MarkdownView {
     /// blocks near the viewport plus the volatile tail; the unrendered blocks
     /// stand in as spacers sized from these heights.
     heights: BlockHeights,
+    /// Measured list/table rows, reused only until content or geometry changes.
+    row_windows: RefCell<HashMap<usize, Rc<RefCell<row_window::Rows>>>>,
     /// Wrap width the recorded heights were measured at. A reflow invalidates
     /// every height, because a block's height is a function of its width.
     heights_width: Cell<Option<f32>>,
@@ -591,6 +594,7 @@ impl MarkdownView {
             style: Cell::new(None),
             veil: RefCell::new(RowVeil::default()),
             heights: Rc::new(RefCell::new(Vec::new())),
+            row_windows: RefCell::new(HashMap::new()),
             heights_width: Cell::new(None),
             copied_code_blocks: Rc::new(RefCell::new(HashMap::new())),
             streaming: Cell::new(false),
@@ -655,6 +659,10 @@ impl MarkdownView {
         // row on every frame, so a frame that changed neither input must not
         // pay for it.
         if changed || mend != was_streaming {
+            // Nested rows have no stable source ranges. A commit can re-mend a
+            // list or change every table column, so measure the whole container
+            // once rather than reusing a height from its previous shape.
+            self.row_windows.borrow_mut().clear();
             let tail = if mend {
                 self.parser.display_tail().unwrap_or_default()
             } else {
@@ -777,6 +785,7 @@ impl MarkdownView {
     /// frame that has since re-wrapped.
     fn forget_measured_geometry(&self) {
         self.heights.borrow_mut().clear();
+        self.row_windows.borrow_mut().clear();
         self.body_height.set(None);
         self.release_clip();
     }
@@ -1957,6 +1966,7 @@ pub fn markdown_windowed<'a>(
             &ctx,
             group.clone(),
             Some(&heights),
+            (!plan.starts.is_empty()).then_some((window, plan.starts.as_slice())),
         ));
     }
 
@@ -1977,6 +1987,8 @@ pub fn markdown_windowed<'a>(
 struct WindowPlan {
     groups: Vec<Range<usize>>,
     spacers: Vec<Option<Pixels>>,
+    /// Full-body offsets, available only when every block height is known.
+    starts: Vec<Pixels>,
 }
 
 impl WindowPlan {
@@ -2025,6 +2037,7 @@ fn window_plan(
         return WindowPlan {
             groups: vec![0..count],
             spacers: vec![None],
+            starts: Vec::new(),
         };
     };
 
@@ -2086,7 +2099,11 @@ fn window_plan(
         spacers.push(before);
     }
 
-    WindowPlan { groups, spacers }
+    WindowPlan {
+        groups,
+        spacers,
+        starts,
+    }
 }
 
 /// A spacer standing in for the dropped blocks between two groups. It is built
@@ -2110,7 +2127,7 @@ fn markdown_capped<'a>(
     } = begin_body(view, ctx, keeps_heights)?;
 
     let first = blocks.len().saturating_sub(max_blocks);
-    let children = render_block_range(&blocks, &ctx, first..blocks.len(), heights.as_ref());
+    let children = render_block_range(&blocks, &ctx, first..blocks.len(), heights.as_ref(), None);
     if animate {
         // Every element visible on the attach pass has synchronously adopted
         // its baseline. Elements introduced by later appends should now fade.
@@ -2174,11 +2191,19 @@ fn render_block_range(
     ctx: &Ctx,
     range: Range<usize>,
     heights: Option<&BlockHeights>,
+    window: Option<(MessageBodyWindow, &[Pixels])>,
 ) -> Vec<AnyElement> {
     let mut children = Vec::with_capacity(range.len());
     for block_ix in range {
         ctx.next_ordinal.set(block_ordinal_base(block_ix));
-        let rendered = render_block(&blocks[block_ix].block, ctx);
+        let block = &blocks[block_ix].block;
+        let inner_window = window.map(|(window, starts)| MessageBodyWindow {
+            visible_top: window.visible_top - f32::from(starts[block_ix]),
+            visible_height: window.visible_height,
+        });
+        let rendered = heights
+            .and_then(|_| row_window::render(block, ctx, inner_window))
+            .unwrap_or_else(|| render_block(block, ctx));
         debug_assert!(
             ctx.next_ordinal.get() - block_ordinal_base(block_ix) < 1 << BLOCK_ORDINAL_STRIDE_BITS,
             "a single block overflowed its ordinal stride"
@@ -2237,6 +2262,11 @@ fn measure_body(view: &MarkdownView, inner: AnyElement) -> AnyElement {
 enum MeasureSink {
     /// The streaming body's own height, for the clip controller.
     Body(Rc<Cell<Option<Pixels>>>),
+    /// One top-level list item or table row, for warm pulse-frame windowing.
+    Row {
+        rows: Rc<RefCell<row_window::Rows>>,
+        index: usize,
+    },
     /// One block's slot in the height ledger, for the window planner.
     Block {
         heights: BlockHeights,
@@ -2294,6 +2324,9 @@ impl Element for Measured {
     ) {
         match &self.sink {
             MeasureSink::Body(height) => height.set(Some(bounds.size.height)),
+            MeasureSink::Row { rows, index } => {
+                rows.borrow_mut().measure(*index, bounds.size.height);
+            }
             MeasureSink::Block {
                 heights,
                 index,
@@ -2428,58 +2461,66 @@ fn render_block(block: &Block, ctx: &Ctx) -> AnyElement {
 }
 
 fn render_list(ordered_start: Option<u64>, items: &[ListItem], ctx: &Ctx) -> AnyElement {
-    let marker_width = if ordered_start.is_some() { 22.0 } else { 14.0 };
-    let rendered = items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let marker = match (ordered_start, item.task) {
-                (_, Some(checked)) => div()
-                    .w(px(marker_width))
-                    .flex_none()
-                    .flex()
-                    .justify_start()
-                    .child(checkbox(checked, ctx))
-                    .into_any_element(),
-                (Some(start), None) => {
-                    marker_text(format!("{}.", start + index as u64), marker_width, ctx)
-                }
-                (None, None) => marker_text("•".to_owned(), marker_width, ctx),
-            };
-            let blocks = item
-                .blocks
-                .iter()
-                .map(|block| render_block(block, ctx))
-                .collect::<Vec<_>>();
-            div()
-                .w_full()
-                .min_w_0()
-                .flex()
-                .items_start()
-                .child(marker)
-                .child(
-                    div()
-                        // flex_auto, not flex_1: a zero flex-basis erases the
-                        // content's intrinsic width, collapsing shrink-wrapped
-                        // user bubbles to the marker column.
-                        .flex_auto()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap(px(ctx.metrics.block_gap * 0.6))
-                        .children(blocks),
-                )
-                .into_any_element()
-        })
-        .collect::<Vec<_>>();
+    list_column(
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| render_list_item(ordered_start, index, item, ctx))
+            .collect(),
+        ctx,
+    )
+}
 
+fn list_column(children: Vec<AnyElement>, ctx: &Ctx) -> AnyElement {
     div()
         .w_full()
         .min_w_0()
         .flex()
         .flex_col()
         .gap(px(ctx.metrics.block_gap * 0.5))
-        .children(rendered)
+        .children(children)
+        .into_any_element()
+}
+
+fn render_list_item(
+    ordered_start: Option<u64>,
+    index: usize,
+    item: &ListItem,
+    ctx: &Ctx,
+) -> AnyElement {
+    let marker_width = if ordered_start.is_some() { 22.0 } else { 14.0 };
+    let marker = match (ordered_start, item.task) {
+        (_, Some(checked)) => div()
+            .w(px(marker_width))
+            .flex_none()
+            .flex()
+            .justify_start()
+            .child(checkbox(checked, ctx))
+            .into_any_element(),
+        (Some(start), None) => marker_text(format!("{}.", start + index as u64), marker_width, ctx),
+        (None, None) => marker_text("•".to_owned(), marker_width, ctx),
+    };
+    let blocks = item
+        .blocks
+        .iter()
+        .map(|block| render_block(block, ctx))
+        .collect::<Vec<_>>();
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_start()
+        .child(marker)
+        .child(
+            div()
+                // Retain content's intrinsic width in shrink-wrapped bubbles.
+                .flex_auto()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(ctx.metrics.block_gap * 0.6))
+                .children(blocks),
+        )
         .into_any_element()
 }
 
@@ -2808,15 +2849,7 @@ fn render_table(
     }
     let widths = column_widths(header, rows, columns);
 
-    let mut table = div()
-        .w_full()
-        .min_w_0()
-        .rounded(px(8.0))
-        .border_1()
-        .border_color(ctx.palette.border)
-        .overflow_hidden()
-        .flex()
-        .flex_col();
+    let mut table = table_column(ctx);
 
     if !header.is_empty() {
         table = table.child(
@@ -2835,6 +2868,18 @@ fn render_table(
         ));
     }
     table.into_any_element()
+}
+
+fn table_column(ctx: &Ctx) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(ctx.palette.border)
+        .overflow_hidden()
+        .flex()
+        .flex_col()
 }
 
 fn table_row(
@@ -3368,8 +3413,8 @@ mod tests {
             }
             source
         };
-        // A single top-level block is one window group, so the window cannot
-        // bound its frame however tall it grows. Both shapes are timed.
+        // Lists also have a row window inside the top-level block. Compare
+        // many top-level blocks with one growing repeated-row container.
         for (label, source) in [
             ("50 paragraph blocks", paragraphs(50)),
             ("400 paragraph blocks", paragraphs(400)),
