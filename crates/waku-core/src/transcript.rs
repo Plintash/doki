@@ -516,6 +516,7 @@ mod tests {
             serde_json::to_value(first.page).unwrap(),
             serde_json::to_value(second.page).unwrap()
         );
+        drop(connection);
         std::fs::remove_file(path).unwrap();
     }
     #[test]
