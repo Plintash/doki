@@ -793,49 +793,6 @@ impl RightPanelSessionState {
     }
 }
 
-/// One choice in the model-traits menu: a label plus a badge marking the
-/// provider's own default, so the current selection and the default read apart.
-fn traits_choice(theme: Theme, label: String, is_default: bool, selected: bool) -> MenuItem {
-    MenuItem::custom(move |_, _| {
-        div()
-            .w(px(190.0))
-            .py(px(2.0))
-            .flex()
-            .items_center()
-            .gap(px(10.0))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
-                    .text_color(theme.text_secondary)
-                    .child(label.clone()),
-            )
-            .when(is_default, |element| {
-                element.child(
-                    div()
-                        .h(px(18.0))
-                        .px(px(5.0))
-                        .flex_none()
-                        .rounded(px(4.0))
-                        .border_1()
-                        .border_color(theme.border_strong)
-                        .bg(theme.overlay)
-                        .flex()
-                        .items_center()
-                        .text_size(sp(12.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.text_tertiary)
-                        .child(tr!("common.default")),
-                )
-            })
-            .when(selected, |element| {
-                element.child(icon("icons/check.svg", 11.0, theme.text_tertiary))
-            })
-            .into_any_element()
-    })
-}
-
 #[derive(Clone, Copy, Debug)]
 struct UserMessageAction {
     session_id: Uuid,
@@ -1321,6 +1278,8 @@ pub struct Waku {
     /// nothing to offer) and hides the control.
     open_in_apps: Rc<Vec<crate::platform::ExternalApp>>,
     model_picker_tab: ModelPickerTab,
+    /// The unified picker opens on effort controls; model navigation reveals the catalog.
+    model_picker_show_catalog: bool,
     /// Keyboard cursor over the model picker's filtered rows. `None` means the
     /// keyboard has not moved yet, so `enter` takes the first row.
     model_picker_highlight: Option<usize>,
@@ -3123,6 +3082,7 @@ impl Waku {
                 computer_use_app_icon_loads: RefCell::new(HashSet::new()),
                 open_in_apps: Rc::new(Vec::new()),
                 model_picker_tab,
+                model_picker_show_catalog: false,
                 model_picker_highlight: None,
                 model_picker_scroll: ScrollHandle::new(),
                 model_picker_scrollbar: ScrollbarState::new(),

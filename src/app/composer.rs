@@ -1,5 +1,7 @@
 use super::*;
 
+mod layout;
+
 use anyhow::Context as _;
 use base64::Engine as _;
 use std::borrow::Cow;
@@ -9,6 +11,28 @@ use crate::ui::{ActivationExt, SemanticControlExt};
 gpui::actions!(workspace_controls, [ToggleWorktreeCreation]);
 
 const WORKTREE_CHOICE_CONTEXT: &str = "WorktreeChoice";
+
+#[derive(Clone, Copy)]
+enum ComposerModelTrait {
+    ServiceTier,
+    ContextWindow,
+}
+
+impl ComposerModelTrait {
+    fn id(self) -> &'static str {
+        match self {
+            Self::ServiceTier => "service",
+            Self::ContextWindow => "context",
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::ServiceTier => tr!("models.service_tier"),
+            Self::ContextWindow => tr!("models.context_window"),
+        }
+    }
+}
 
 pub fn init_workspace_keys(cx: &mut App) {
     cx.bind_keys([
@@ -1151,8 +1175,10 @@ impl Waku {
             .map(|session| session.provider);
         let picker_enabled = session.is_some_and(|session| session.can_choose_model(provider));
 
-        if !picker_enabled {
+        if !picker_enabled && !self.selected_model_has_traits() {
             return div()
+                .min_w_0()
+                .flex_1()
                 .h(px(24.0))
                 .px(px(7.0))
                 .flex()
@@ -1165,7 +1191,7 @@ impl Waku {
                 ))
                 .child(
                     div()
-                        .max_w(px(210.0))
+                        .min_w_0()
                         .truncate()
                         .text_color(theme.text_secondary)
                         .child(SharedString::from(selected_model_name)),
@@ -1197,28 +1223,19 @@ impl Waku {
                 // The empty state draws no filter field, so the handle the
                 // deferred focus below targets depends on which body opened.
                 let mut empty = false;
+                let mut configuration_focus = None;
                 let _ = reset_weak.update(cx, |this, cx| {
                     if open {
                         empty = this.model_picker_has_no_providers();
-                        let provider = this
-                            .selected_session()
-                            .map(|session| session.provider)
-                            .unwrap_or_default();
-                        // A draft can sit on a provider that was since switched
-                        // off; open onto the first usable provider instead of a
-                        // tab whose rows the filter would leave empty.
-                        let locked = this.selected_session().is_some_and(|session| {
-                            !session.messages.is_empty() || session.review.is_some()
-                        });
-                        let provider =
-                            if !locked && this.state.disabled_providers.contains(&provider) {
-                                ProviderKind::ALL
-                                    .into_iter()
-                                    .find(|kind| this.provider_enabled(*kind))
-                                    .unwrap_or(provider)
-                            } else {
-                                provider
-                            };
+                        this.model_picker_show_catalog = !this.selected_model_has_traits();
+                        if !empty && !this.model_picker_show_catalog {
+                            configuration_focus = Some(this.model_configuration_focus(cx));
+                        }
+                        let provider = initial_picker_provider(
+                            this.selected_session(),
+                            &this.probes,
+                            &this.state.disabled_providers,
+                        );
                         this.model_picker_tab = ModelPickerTab::Provider(provider);
                         // Opening re-runs the tab's catalog discovery so models
                         // authored since launch appear without a restart; the
@@ -1245,7 +1262,7 @@ impl Waku {
                     let picker_focus = if empty {
                         empty_picker_focus.clone()
                     } else {
-                        picker_focus.clone()
+                        configuration_focus.unwrap_or_else(|| picker_focus.clone())
                     };
                     let reveal_weak = reset_weak.clone();
                     window.on_next_frame(move |window, _| {
@@ -1265,7 +1282,7 @@ impl Waku {
         // Built out here rather than in the body so the key handler and the
         // rendered rows index one ordering and cannot disagree about what
         // `enter` selects.
-        let available_models = Rc::new(if handle.is_open() {
+        let available_models = Rc::new(if handle.is_open() && self.model_picker_show_catalog {
             visible_picker_models(
                 &probes,
                 &favorites,
@@ -1287,6 +1304,8 @@ impl Waku {
         // be a lie. The chip says so instead, and stays a trigger because the
         // panel behind it is where the fix lives. Icon plus wording carry the
         // state on their own, so the warning tint is never the only signal.
+        let trigger_label = self.composer_model_label(&selected_model_name);
+        let show_catalog = self.model_picker_show_catalog;
         let trigger = if no_providers {
             MenuChip::new("composer-provider-model")
                 .icon("icons/alert.svg", theme.warning)
@@ -1294,19 +1313,34 @@ impl Waku {
         } else {
             MenuChip::new("composer-provider-model")
                 .provider(provider, provider_color(&theme, provider).opacity(0.9))
-                .label(selected_model_name)
+                .label(trigger_label.clone())
         };
 
         popover(
-            trigger.caret(false).selected(handle.is_open()),
+            trigger
+                .min_w_0()
+                .flex_1()
+                .tooltip(Tooltip::text(trigger_label.clone()))
+                .child(crate::ui::tooltip::FocusHint::new(
+                    handle.trigger_focus_handle().clone(),
+                    trigger_label,
+                ))
+                .caret(false)
+                .selected(handle.is_open()),
             &handle,
             MenuAlign::AboveLeft,
-            move |popover, _window, _cx| {
+            move |popover, window, cx| {
                 let popover = popover.clone();
                 let available_models = available_models.clone();
 
                 if no_providers {
                     return model_picker_empty_state(&theme, &empty_focus, popover, weak.clone());
+                }
+
+                if !show_catalog {
+                    return weak
+                        .update(cx, |this, cx| this.render_model_configuration(window, cx))
+                        .unwrap_or_else(|_| div().into_any_element());
                 }
 
                 let mut sidebar = div()
@@ -1419,6 +1453,15 @@ impl Waku {
                     );
                 }
 
+                let back_weak = weak.clone();
+                let back_focus = weak
+                    .update(cx, |this, cx| {
+                        this.transcript_control_focus("model-configuration-back", cx)
+                    })
+                    .ok();
+                let has_configuration = weak
+                    .read_with(cx, |this, _| this.selected_model_has_traits())
+                    .unwrap_or(false);
                 let search_input = div()
                     .h(px(52.0))
                     .px(px(12.0))
@@ -1427,9 +1470,48 @@ impl Waku {
                     .flex_none()
                     .flex()
                     .items_center()
+                    .gap(px(6.0))
+                    .when(has_configuration, |element| {
+                        element.child(
+                            icon_button("model-configuration-back", "icons/arrow-left.svg", theme)
+                                .aria_label(tr!("models.configuration"))
+                                .when_some(back_focus, |element, focus| {
+                                    element.track_focus(&focus).tab_index(0).relative().child(
+                                        crate::ui::tooltip::FocusHint::new(
+                                            focus,
+                                            tr!("models.configuration"),
+                                        ),
+                                    )
+                                })
+                                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                                .tooltip(Tooltip::text(tr!("models.configuration")))
+                                .on_click(move |_, window, cx| {
+                                    let _ = back_weak.update(cx, |this, cx| {
+                                        this.show_model_configuration(window, cx);
+                                    });
+                                })
+                                .on_key_down({
+                                    let weak = weak.clone();
+                                    move |event: &KeyDownEvent, window, cx| {
+                                        if !event.keystroke.modifiers.modified()
+                                            && matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            )
+                                        {
+                                            let _ = weak.update(cx, |this, cx| {
+                                                this.show_model_configuration(window, cx);
+                                            });
+                                            cx.stop_propagation();
+                                        }
+                                    }
+                                }),
+                        )
+                    })
                     .child(
                         div()
-                            .w_full()
+                            .flex_1()
+                            .min_w_0()
                             .h(px(34.0))
                             .px(px(10.0))
                             .rounded(px(9.0))
@@ -1585,10 +1667,15 @@ impl Waku {
                                     }),
                             )
                             .on_click(move |_, window, cx| {
-                                let _ = select_weak.update(cx, |this, cx| {
-                                    this.choose_model(kind, model_id.clone(), cx);
-                                });
-                                select_popover.close(window, cx);
+                                let keep_open = select_weak
+                                    .update(cx, |this, cx| {
+                                        this.choose_model(kind, model_id.clone(), cx);
+                                        this.show_model_configuration(window, cx)
+                                    })
+                                    .unwrap_or(false);
+                                if !keep_open {
+                                    select_popover.close(window, cx);
+                                }
                             }),
                     );
                 }
@@ -1602,6 +1689,7 @@ impl Waku {
                 let previous_tab_weak = weak.clone();
                 let confirm_weak = weak.clone();
                 let confirm_popover = popover.clone();
+                let dismiss_weak = weak.clone();
                 div()
                     .w(px(460.0))
                     .h(px(390.0))
@@ -1638,11 +1726,26 @@ impl Waku {
                         });
                     })
                     .on_action(move |_: &ConfirmEntry, window, cx| {
-                        let _ = confirm_weak.update(cx, |this, cx| {
-                            this.choose_highlighted_model(&confirm_models, cx);
-                        });
-                        confirm_popover.close(window, cx);
+                        let keep_open = confirm_weak
+                            .update(cx, |this, cx| {
+                                this.choose_highlighted_model(&confirm_models, cx);
+                                this.show_model_configuration(window, cx)
+                            })
+                            .unwrap_or(false);
+                        if !keep_open {
+                            confirm_popover.close(window, cx);
+                        }
                         window.refresh();
+                    })
+                    .on_action(move |_: &DismissMenu, window, cx| {
+                        if dismiss_weak
+                            .update(cx, |this, cx| this.show_model_configuration(window, cx))
+                            .unwrap_or(false)
+                        {
+                            cx.stop_propagation();
+                        } else {
+                            cx.propagate();
+                        }
                     })
                     .child(sidebar)
                     .child(
@@ -1756,228 +1859,394 @@ impl Waku {
         self.choose_model(kind, model_id, cx);
     }
 
-    pub(super) fn render_model_traits_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let theme = Theme::current(cx);
-        let session = self.selected_session()?;
-        let model = self.model_metadata_for_session(session)?;
-        if model.reasoning_efforts.is_empty()
-            && model.service_tiers.is_empty()
-            && model.context_windows.is_empty()
-        {
-            return None;
-        }
+    pub(super) fn selected_model_has_traits(&self) -> bool {
+        self.selected_session()
+            .and_then(|session| self.model_metadata_for_session(session))
+            .is_some_and(|model| {
+                !model.reasoning_efforts.is_empty()
+                    || !model.service_tiers.is_empty()
+                    || !model.context_windows.is_empty()
+            })
+    }
 
-        let cursor_suffix = (session.provider == ProviderKind::Cursor)
-            .then(|| self.model_for_session(session))
-            .flatten()
-            .and_then(|requested| {
-                self.provider_probe(session.provider).and_then(|probe| {
-                    waku_protocol::model_catalog::cursor_catalog_model(&probe.models, requested)
+    fn selected_model_traits(&self, model: &ProviderModel) -> super::sessions::ModelTraitSelection {
+        let session = self.selected_session();
+        let cursor_suffix = session
+            .filter(|session| session.provider == ProviderKind::Cursor)
+            .and_then(|session| {
+                self.model_for_session(session).and_then(|requested| {
+                    self.provider_probe(session.provider).and_then(|probe| {
+                        waku_protocol::model_catalog::cursor_catalog_model(&probe.models, requested)
+                    })
                 })
             })
             .map(|matched| matched.suffix)
             .unwrap_or_default();
-        let suffix_effort = waku_protocol::model_catalog::cursor_suffix_reasoning_effort(
+        super::sessions::resolved_model_traits(
+            model,
+            session.and_then(|session| session.reasoning_effort.as_deref()),
+            session.and_then(|session| session.service_tier.as_deref()),
+            session.and_then(|session| session.context_window.as_deref()),
             &cursor_suffix,
-            &model.reasoning_efforts,
-        );
-        let suffix_tier = waku_protocol::model_catalog::cursor_suffix_service_tier(
-            &cursor_suffix,
-            &model.service_tiers,
-        );
-
-        let selected_effort = session
-            .reasoning_effort
-            .as_deref()
-            .filter(|selected| {
-                model
-                    .reasoning_efforts
-                    .iter()
-                    .any(|option| option.id == *selected)
-            })
-            .or(suffix_effort.as_deref())
-            .or(model.default_reasoning_effort.as_deref())
-            .or_else(|| {
-                model
-                    .reasoning_efforts
-                    .first()
-                    .map(|option| option.id.as_str())
-            })
-            .map(str::to_owned);
-        let effort_label = selected_effort.as_deref().and_then(|selected| {
-            model
-                .reasoning_efforts
-                .iter()
-                .find(|option| option.id == selected)
-                .map(|option| option.label.clone())
-        });
-
-        let selected_tier = session
-            .service_tier
-            .as_deref()
-            .filter(|selected| {
-                *selected == "default"
-                    || model
-                        .service_tiers
-                        .iter()
-                        .any(|option| option.id == *selected)
-            })
-            .or(suffix_tier.as_deref())
-            .or(model.default_service_tier.as_deref())
-            .unwrap_or("default")
-            .to_owned();
-        let tier_label = if selected_tier == "default" {
-            tr!("models.standard")
-        } else {
-            model
-                .service_tiers
-                .iter()
-                .find(|option| option.id == selected_tier)
-                .map(|option| option.label.clone())
-                .unwrap_or_else(|| selected_tier.clone())
-        };
-        let selected_window = session
-            .context_window
-            .as_deref()
-            .filter(|selected| {
-                model
-                    .context_windows
-                    .iter()
-                    .any(|option| option.id == *selected)
-            })
-            .or(model.default_context_window.as_deref())
-            .or_else(|| {
-                model
-                    .context_windows
-                    .first()
-                    .map(|option| option.id.as_str())
-            })
-            .map(str::to_owned);
-        // A non-default window changes what the session costs and how much it
-        // can hold, so it reads on the chip rather than only inside the menu.
-        let window_label = selected_window
-            .as_deref()
-            .filter(|selected| model.default_context_window.as_deref() != Some(selected))
-            .and_then(|selected| {
-                model
-                    .context_windows
-                    .iter()
-                    .find(|option| option.id == selected)
-                    .map(|option| option.label.clone())
-            });
-
-        let fast = selected_tier == "fast" || tier_label.eq_ignore_ascii_case("fast");
-        let trigger_label = match (
-            effort_label.unwrap_or_else(|| tier_label.clone()),
-            window_label,
-        ) {
-            (label, Some(window)) => format!("{label} · {window}"),
-            (label, None) => label,
-        };
-        let reasoning_efforts = model.reasoning_efforts.clone();
-        let default_effort = model.default_reasoning_effort.clone();
-        let service_tiers = model.service_tiers.clone();
-        let context_windows = model.context_windows.clone();
-        let default_window = model.default_context_window.clone();
-        let default_tier = model
-            .default_service_tier
-            .clone()
-            .unwrap_or_else(|| "default".to_owned());
-        let weak = cx.entity().downgrade();
-        let handle = self.menu_handle("model-traits", cx);
-        Some(dropdown_menu(
-            MenuChip::new("model-traits")
-                .when(fast, |trigger| {
-                    trigger.icon("icons/zap.svg", theme.text_secondary)
-                })
-                .label(trigger_label)
-                .caret(false)
-                .selected(handle.is_open()),
-            "model-traits-menu",
-            &handle,
-            MenuAlign::AboveLeft,
-            move |_| {
-                let mut items = Vec::new();
-                if !reasoning_efforts.is_empty() {
-                    items.push(MenuItem::Header(tr!("models.reasoning").into()));
-                    for option in reasoning_efforts.clone() {
-                        let weak = weak.clone();
-                        let effort = option.id;
-                        let is_default = default_effort.as_deref() == Some(effort.as_str());
-                        let selected = selected_effort.as_deref() == Some(effort.as_str());
-                        items.push(
-                            traits_choice(theme, option.label, is_default, selected).on_click(
-                                move |_, cx| {
-                                    let _ = weak.update(cx, |this, cx| {
-                                        this.set_reasoning_effort(effort.clone(), cx);
-                                    });
-                                },
-                            ),
-                        );
-                    }
-                }
-                if !service_tiers.is_empty() {
-                    if !reasoning_efforts.is_empty() {
-                        items.push(MenuItem::Separator);
-                    }
-                    items.push(MenuItem::Header(tr!("models.service_tier").into()));
-                    let weak_standard = weak.clone();
-                    items.push(
-                        traits_choice(
-                            theme,
-                            tr!("models.standard"),
-                            default_tier == "default",
-                            selected_tier == "default",
-                        )
-                        .on_click(move |_, cx| {
-                            let _ = weak_standard.update(cx, |this, cx| {
-                                this.set_service_tier("default".to_owned(), cx);
-                            });
-                        }),
-                    );
-                    for option in service_tiers.clone() {
-                        let weak = weak.clone();
-                        let tier = option.id;
-                        let is_default = default_tier == tier;
-                        let selected = selected_tier == tier;
-                        items.push(
-                            traits_choice(theme, option.label, is_default, selected).on_click(
-                                move |_, cx| {
-                                    let _ = weak.update(cx, |this, cx| {
-                                        this.set_service_tier(tier.clone(), cx);
-                                    });
-                                },
-                            ),
-                        );
-                    }
-                }
-                if !context_windows.is_empty() {
-                    if !reasoning_efforts.is_empty() || !service_tiers.is_empty() {
-                        items.push(MenuItem::Separator);
-                    }
-                    items.push(MenuItem::Header(tr!("models.context_window").into()));
-                    for option in context_windows.clone() {
-                        let weak = weak.clone();
-                        let window = option.id;
-                        let is_default = default_window.as_deref() == Some(window.as_str());
-                        let selected = selected_window.as_deref() == Some(window.as_str());
-                        items.push(
-                            traits_choice(theme, option.label, is_default, selected).on_click(
-                                move |_, cx| {
-                                    let _ = weak.update(cx, |this, cx| {
-                                        this.set_context_window(window.clone(), cx);
-                                    });
-                                },
-                            ),
-                        );
-                    }
-                }
-                items
-            },
-        ))
+        )
     }
 
-    pub(super) fn render_access_control(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn composer_model_label(&self, model_name: &str) -> String {
+        let Some(model) = self
+            .selected_session()
+            .and_then(|session| self.model_metadata_for_session(session))
+        else {
+            return model_name.to_owned();
+        };
+        let selected = self.selected_model_traits(model);
+        let mut labels = vec![model_name.to_owned()];
+        if let Some(effort) = model
+            .reasoning_efforts
+            .iter()
+            .find(|option| Some(&option.id) == selected.reasoning_effort.as_ref())
+        {
+            labels.push(effort.label.clone());
+        }
+        // Keep cost-affecting overrides visible even though their controls now
+        // live together inside the model panel.
+        if let Some(tier) = model.service_tiers.iter().find(|option| {
+            Some(&option.id) == selected.service_tier.as_ref() && option.id != "default"
+        }) {
+            labels.push(tier.label.clone());
+        }
+        if selected.context_window != model.default_context_window {
+            if let Some(window) = model
+                .context_windows
+                .iter()
+                .find(|option| Some(&option.id) == selected.context_window.as_ref())
+            {
+                labels.push(window.label.clone());
+            }
+        }
+        labels.join(" · ")
+    }
+
+    fn model_configuration_focus(&self, cx: &mut App) -> FocusHandle {
+        let has_effort = self
+            .selected_session()
+            .and_then(|session| self.model_metadata_for_session(session))
+            .is_some_and(|model| model.reasoning_efforts.len() > 1);
+        self.transcript_control_focus(
+            if has_effort {
+                "model-effort-slider"
+            } else {
+                "model-configuration-model"
+            },
+            cx,
+        )
+    }
+
+    fn show_model_configuration(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.selected_model_has_traits() {
+            return false;
+        }
+        self.model_picker_show_catalog = false;
+        let focus = self.model_configuration_focus(cx);
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+        });
+        cx.notify();
+        true
+    }
+
+    fn show_model_catalog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(_) = self
+            .selected_session()
+            .filter(|session| session.can_choose_model(session.provider))
+            .map(|session| session.provider)
+        else {
+            return;
+        };
+        let provider = initial_picker_provider(
+            self.selected_session(),
+            &self.probes,
+            &self.state.disabled_providers,
+        );
+        self.model_picker_show_catalog = true;
+        self.model_picker_tab = ModelPickerTab::Provider(provider);
+        self.model_picker_highlight = None;
+        self.model_search.update(cx, |input, cx| input.clear(cx));
+        self.refresh_provider_model_discovery(provider);
+        self.reveal_selected_picker_model();
+        let focus = self.model_search.read(cx).focus_handle(cx);
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+        });
+        cx.notify();
+    }
+
+    fn render_model_configuration(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::current(cx);
+        let Some(session) = self.selected_session() else {
+            return div().into_any_element();
+        };
+        let model_name =
+            self.model_display_name(session.provider, self.catalog_model_id_for_session(session));
+        let model = self.model_metadata_for_session(session);
+        let selected = model.map(|model| self.selected_model_traits(model));
+        let options = model
+            .map(|model| model.reasoning_efforts.clone())
+            .unwrap_or_default();
+        let selected_index = selected
+            .as_ref()
+            .and_then(|selected| {
+                options
+                    .iter()
+                    .position(|option| Some(&option.id) == selected.reasoning_effort.as_ref())
+            })
+            .unwrap_or(0);
+        let effort_label = options
+            .get(selected_index)
+            .map(|option| option.label.clone());
+        let can_choose_model = session.can_choose_model(session.provider);
+        let model_focus = self.transcript_control_focus("model-configuration-model", cx);
+        let model_button = div()
+            .id("model-configuration-model")
+            .track_focus(&model_focus)
+            .tab_index(0)
+            .tab_stop(true)
+            .aria_label(format!("{}: {model_name}", tr!("models.choose")))
+            .min_w_0()
+            .w_full()
+            .h(px(30.0))
+            .px(px(7.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(4.0))
+            .text_size(sp(14.0))
+            .text_color(theme.text_secondary)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .when(can_choose_model, |element| {
+                element
+                    .cursor_default()
+                    .hover(|style| style.bg(theme.overlay))
+            })
+            .child(div().min_w_0().truncate().child(model_name.clone()))
+            .when(can_choose_model, |element| {
+                element.child(icon("icons/chevron-right.svg", 12.0, theme.text_tertiary))
+            })
+            .tooltip(Tooltip::text(model_name.clone()))
+            .relative()
+            .child(crate::ui::tooltip::FocusHint::new(model_focus, model_name))
+            .on_activation(cx, |this, window, cx| this.show_model_catalog(window, cx))
+            .semantic_control(gpui::Role::Button, !can_choose_model);
+        let mut panel = div()
+            .id("model-configuration")
+            .w(px(300.0).min((window.viewport_size().width - px(16.0)).max(px(0.0))))
+            .p(px(12.0))
+            .rounded(px(13.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.raised)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .tab_group()
+            .when_some(effort_label.clone(), |panel, label| {
+                let default_effort = model.and_then(|model| {
+                    super::sessions::resolved_model_traits(model, None, None, None, "")
+                        .reasoning_effort
+                });
+                panel.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .size(px(24.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon("icons/zap.svg", 15.0, theme.text_tertiary)),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .text_center()
+                                .truncate()
+                                .text_size(sp(17.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.gauge)
+                                .child(label),
+                        )
+                        .child(
+                            icon_button("model-effort-reset", "icons/rotate-cw.svg", theme)
+                                .flex_none()
+                                .track_focus(
+                                    &self.transcript_control_focus("model-effort-reset", cx),
+                                )
+                                .tab_index(0)
+                                .tab_stop(true)
+                                .aria_label(tr!("common.reset"))
+                                .tooltip(Tooltip::text(tr!("common.reset")))
+                                .relative()
+                                .child(crate::ui::tooltip::FocusHint::new(
+                                    self.transcript_control_focus("model-effort-reset", cx),
+                                    tr!("common.reset"),
+                                ))
+                                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                                .on_activation(cx, move |this, _, cx| {
+                                    if let Some(effort) = &default_effort {
+                                        this.set_reasoning_effort(effort.clone(), cx);
+                                    }
+                                }),
+                        ),
+                )
+            })
+            .child(model_button);
+        if let Some(label) = effort_label {
+            let focus = self.transcript_control_focus("model-effort-slider", cx);
+            panel = panel.child(
+                div().mt(px(10.0)).child(
+                    crate::ui::effort_slider::EffortSlider::new(
+                        "model-effort-slider",
+                        options.len(),
+                        selected_index,
+                        &focus,
+                    )
+                    .label(tr!("models.reasoning"))
+                    .value_label(label)
+                    .on_change(cx.listener(
+                        move |this, index: &usize, _, cx| {
+                            if let Some(option) = options.get(*index) {
+                                this.set_reasoning_effort(option.id.clone(), cx);
+                            }
+                        },
+                    )),
+                ),
+            );
+        }
+        // The original provider-specific controls stay in this same surface;
+        // no second composer entry and no nested popup to lose keyboard focus.
+        if let (Some(model), Some(selected)) = (model, selected) {
+            if !model.service_tiers.is_empty() {
+                let mut choices = vec![("default".to_owned(), tr!("models.standard"))];
+                choices.extend(
+                    model
+                        .service_tiers
+                        .iter()
+                        .filter(|option| option.id != "default")
+                        .map(|option| (option.id.clone(), option.label.clone())),
+                );
+                panel = panel.child(self.render_model_trait_choices(
+                    ComposerModelTrait::ServiceTier,
+                    choices,
+                    selected.service_tier.as_deref(),
+                    model.default_service_tier.as_deref().or(Some("default")),
+                    cx,
+                ));
+            }
+            if !model.context_windows.is_empty() {
+                let choices = model
+                    .context_windows
+                    .iter()
+                    .map(|option| (option.id.clone(), option.label.clone()))
+                    .collect();
+                panel = panel.child(self.render_model_trait_choices(
+                    ComposerModelTrait::ContextWindow,
+                    choices,
+                    selected.context_window.as_deref(),
+                    model.default_context_window.as_deref(),
+                    cx,
+                ));
+            }
+        }
+        panel.into_any_element()
+    }
+
+    fn render_model_trait_choices(
+        &self,
+        kind: ComposerModelTrait,
+        choices: Vec<(String, String)>,
+        selected: Option<&str>,
+        default: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = Theme::current(cx);
+        let label = kind.label();
+        let mut row = div().mt(px(6.0)).flex().flex_wrap().gap(px(4.0));
+        for (value, text) in choices {
+            let id = format!("model-{}-{value}", kind.id());
+            let focus = self.transcript_control_focus(id.clone(), cx);
+            let is_selected = selected == Some(value.as_str());
+            let is_default = default == Some(value.as_str());
+            let accessible_label = if is_default {
+                format!("{label}: {text}, {}", tr!("common.default"))
+            } else {
+                format!("{label}: {text}")
+            };
+            row = row.child(
+                div()
+                    .id(SharedString::from(id))
+                    .track_focus(&focus)
+                    .tab_index(0)
+                    .tab_stop(true)
+                    .aria_label(accessible_label)
+                    .aria_selected(is_selected)
+                    .h(px(28.0))
+                    .max_w_full()
+                    .px(px(8.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .text_size(sp(12.5))
+                    .text_color(theme.text_secondary)
+                    .cursor_default()
+                    .when(is_selected, |style| style.bg(theme.overlay_strong))
+                    .hover(|style| style.bg(theme.overlay))
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .when(is_selected, |element| {
+                        element.child(icon("icons/check.svg", 11.0, theme.text_secondary))
+                    })
+                    .child(div().min_w_0().truncate().child(text))
+                    .when(is_default, |element| {
+                        element.child(
+                            div()
+                                .flex_none()
+                                .text_size(sp(10.0))
+                                .text_color(theme.text_tertiary)
+                                .child(tr!("common.default")),
+                        )
+                    })
+                    .on_activation(cx, move |this, _, cx| match kind {
+                        ComposerModelTrait::ServiceTier => this.set_service_tier(value.clone(), cx),
+                        ComposerModelTrait::ContextWindow => {
+                            this.set_context_window(value.clone(), cx)
+                        }
+                    }),
+            );
+        }
+        div()
+            .mt(px(10.0))
+            .pt(px(9.0))
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_size(sp(11.5))
+                    .text_color(theme.text_tertiary)
+                    .child(label),
+            )
+            .child(row)
+    }
+
+    fn render_access_control(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
         let selected_mode = self
             .selected_session()
@@ -1986,11 +2255,22 @@ impl Waku {
         let weak = cx.entity().downgrade();
         let handle = self.menu_handle("runtime-mode", cx);
         dropdown_menu(
-            MenuChip::new("runtime-mode")
-                .icon(selected_mode.icon(), theme.text_tertiary)
-                .label(selected_mode.label())
-                .caret(false)
-                .selected(handle.is_open()),
+            layout::secondary_control(
+                MenuChip::new("runtime-mode")
+                    .icon(selected_mode.icon(), theme.text_tertiary)
+                    .label(selected_mode.label()),
+                compact,
+                148.0,
+            )
+            .when(compact, |element| {
+                element.child(crate::ui::tooltip::FocusHint::new(
+                    handle.trigger_focus_handle().clone(),
+                    selected_mode.label(),
+                ))
+            })
+            .tooltip(Tooltip::text(selected_mode.label()))
+            .caret(false)
+            .selected(handle.is_open()),
             "runtime-mode-menu",
             &handle,
             MenuAlign::AboveLeft,
@@ -2054,7 +2334,11 @@ impl Waku {
         )
     }
 
-    pub(super) fn render_agent_preset_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_agent_preset_control(
+        &self,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let session = self
             .selected_session()
             .filter(|session| session.provider == ProviderKind::DeepSeek)?;
@@ -2080,11 +2364,22 @@ impl Waku {
                 });
             }
         });
-        let trigger = MenuChip::new("agent-preset")
-            .icon("icons/bot.svg", theme.text_tertiary)
-            .label(selected_label)
-            .caret(false)
-            .selected(handle.is_open());
+        let trigger = layout::secondary_control(
+            MenuChip::new("agent-preset")
+                .icon("icons/bot.svg", theme.text_tertiary)
+                .label(selected_label.clone()),
+            compact,
+            120.0,
+        )
+        .when(compact, |element| {
+            element.child(crate::ui::tooltip::FocusHint::new(
+                handle.trigger_focus_handle().clone(),
+                selected_label.clone(),
+            ))
+        })
+        .tooltip(Tooltip::text(selected_label))
+        .caret(false)
+        .selected(handle.is_open());
 
         Some(dropdown_menu(
             trigger,
@@ -2174,7 +2469,7 @@ impl Waku {
     /// it pairs a target icon with the status phrase (and budget consumption)
     /// and opens the goal dialog. `/goal` is the keyboard route to the same
     /// surface.
-    pub(super) fn render_goal_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_goal_control(&self, compact: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
         let session = self.selected_session()?;
         let goal = session.thread_goal.as_ref()?;
         let session_id = session.id;
@@ -2188,29 +2483,45 @@ impl Waku {
         .flatten()
         .map_or(0, |observed| observed.elapsed().as_secs() as i64);
         let label = super::goal_dialog::goal_chip_label(goal, live_elapsed_seconds);
-        let objective = goal.objective.clone();
-        let weak = cx.entity().downgrade();
+        let detail = format!("{label}: {}", goal.objective);
+        let focus = self.transcript_control_focus("composer-goal", cx);
+        let status_icon = match goal.status {
+            crate::model::ThreadGoalStatus::Active => "icons/target.svg",
+            crate::model::ThreadGoalStatus::Complete => "icons/check.svg",
+            crate::model::ThreadGoalStatus::Paused => "icons/stop.svg",
+            crate::model::ThreadGoalStatus::Blocked
+            | crate::model::ThreadGoalStatus::UsageLimited
+            | crate::model::ThreadGoalStatus::BudgetLimited => "icons/circle-alert.svg",
+        };
         Some(
-            div()
-                .id("composer-goal")
-                .h(px(24.0))
-                .px(px(7.0))
-                .rounded(px(6.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
+            layout::goal_control()
+                .track_focus(&focus)
+                .tab_index(0)
+                .tab_stop(true)
+                .aria_label(detail.clone())
                 .cursor_default()
                 .text_size(sp(12.5))
                 .line_height(sp(14.0))
                 .text_color(color)
-                .child(icon("icons/target.svg", 10.5, color))
-                .child(div().max_w(px(220.0)).truncate().child(label))
+                .child(icon(
+                    if compact {
+                        status_icon
+                    } else {
+                        "icons/target.svg"
+                    },
+                    10.5,
+                    color,
+                ))
+                .when(!compact, |element| {
+                    element.child(div().min_w_0().truncate().child(label))
+                })
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
                 .hover(|element| element.bg(theme.overlay))
-                .tooltip(Tooltip::text(objective))
-                .on_click(move |_, _, cx| {
-                    let _ = weak.update(cx, |this, cx| {
-                        this.request_goal_dialog(session_id, None, false, cx);
-                    });
+                .tooltip(Tooltip::text(detail.clone()))
+                .relative()
+                .child(crate::ui::tooltip::FocusHint::new(focus, detail))
+                .on_activation(cx, move |this, _, cx| {
+                    this.request_goal_dialog(session_id, None, false, cx);
                 })
                 .into_any_element(),
         )
@@ -3645,6 +3956,13 @@ impl Waku {
 
     pub(super) fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
+        let toolbar_width = (f32::from(window.viewport_size().width)
+            - self.sidebar_rendered_width
+            - self.right_panel_rendered_width
+            - 40.0)
+            .clamp(0.0, CONTENT_MAX_WIDTH)
+            - 22.0;
+        let compact_controls = layout::compact_controls(toolbar_width);
         let session = self.selected_session();
         let preparing = session.is_some_and(|session| {
             self.submission_preparations.contains(&session.id)
@@ -3682,8 +4000,9 @@ impl Waku {
         // compositing over it.
         let drop_wash = theme.composer.blend(theme.overlay_strong);
         let drop_ring = theme.accent.opacity(0.7);
-        div().flex_none().px(px(20.0)).child(
+        div().flex_none().min_w_0().px(px(20.0)).child(
             div()
+                .min_w_0()
                 .w_full()
                 .max_w(px(CONTENT_MAX_WIDTH))
                 .mx_auto()
@@ -3757,161 +4076,158 @@ impl Waku {
                     card.child(self.render_composer_attachments(cx))
                 })
                 .child(div().pt(px(2.0)).child(self.composer.clone()))
-                .child(
-                    div()
-                        .mt(px(8.0))
-                        .px(px(10.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
-                        .text_size(sp(12.5))
-                        .line_height(sp(14.0))
-                        .child(self.render_provider_model_control(cx))
-                        .children(self.render_model_traits_control(cx))
-                        .children(self.render_agent_preset_control(cx))
-                        .child(self.render_access_control(cx))
-                        .children(self.render_goal_control(cx))
-                        .child(div().flex_1())
-                        .child(match submit_action {
-                            ComposerSubmitAction::Preparing => div()
-                                .id("send-or-stop")
-                                .role(gpui::Role::Button)
-                                .aria_label(tr!("composer.preparing_task"))
-                                .semantic_control(gpui::Role::Button, true)
-                                .w(px(26.0))
-                                .h(px(26.0))
-                                .rounded_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_default()
-                                .bg(theme.overlay_strong)
-                                .child(motion::spin(icon(
-                                    "icons/loader-circle.svg",
-                                    15.0,
-                                    theme.text_secondary,
-                                )))
-                                .tooltip(Tooltip::text(tr!("composer.preparing_task"))),
-                            ComposerSubmitAction::Stop => div()
-                                .id("working-actions")
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .child(
-                                    div()
-                                        .id("send-or-stop")
-                                        .role(gpui::Role::Button)
-                                        .aria_label(tr!("composer.stop"))
-                                        .w(px(26.0))
-                                        .h(px(26.0))
+                .child(layout::controls_row(
+                    self.render_provider_model_control(cx),
+                    self.render_agent_preset_control(compact_controls, cx),
+                    self.render_access_control(compact_controls, cx),
+                    self.render_goal_control(compact_controls, cx),
+                    match submit_action {
+                        ComposerSubmitAction::Preparing => layout::action_target("send-or-stop")
+                            .role(gpui::Role::Button)
+                            .aria_label(tr!("composer.preparing_task"))
+                            .semantic_control(gpui::Role::Button, true)
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_default()
+                            .bg(theme.overlay_strong)
+                            .child(motion::spin(icon(
+                                "icons/loader-circle.svg",
+                                15.0,
+                                theme.text_secondary,
+                            )))
+                            .tooltip(Tooltip::text(tr!("composer.preparing_task"))),
+                        ComposerSubmitAction::Stop => layout::working_actions()
+                            .child(
+                                layout::action_target("send-or-stop")
+                                    .track_focus(
+                                        &self.transcript_control_focus("composer-stop", cx),
+                                    )
+                                    .tab_index(0)
+                                    .tab_stop(true)
+                                    .focus_visible(|style| {
+                                        style.border_1().border_color(theme.accent)
+                                    })
+                                    .role(gpui::Role::Button)
+                                    .aria_label(tr!("composer.stop"))
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_default()
+                                    .bg(theme.overlay_strong)
+                                    .hover(|element| element.bg(theme.danger_soft))
+                                    .active(|element| element.opacity(0.8))
+                                    .when(escape_stop_armed, |element| {
+                                        element.child(
+                                            div()
+                                                .text_size(sp(12.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme.text)
+                                                .child("Esc"),
+                                        )
+                                    })
+                                    .when(!escape_stop_armed, |element| {
+                                        element.child(icon("icons/stop.svg", 18.0, theme.text))
+                                    })
+                                    .on_activation(cx, |this, _, cx| {
+                                        this.cancel_turn(cx);
+                                    }),
+                            )
+                            .when(can_send, |element| {
+                                element.child(
+                                    layout::action_target("follow-up-action")
+                                        .track_focus(
+                                            &self.transcript_control_focus("follow-up-action", cx),
+                                        )
+                                        .tab_index(0)
+                                        .tab_stop(true)
+                                        .aria_label(if follow_up_steers {
+                                            tr!("composer.steer_followup")
+                                        } else {
+                                            tr!("composer.queue_followup")
+                                        })
+                                        .focus_visible(|style| {
+                                            style.border_1().border_color(theme.accent)
+                                        })
                                         .rounded_full()
                                         .flex()
                                         .items_center()
                                         .justify_center()
                                         .cursor_default()
-                                        .bg(theme.overlay_strong)
-                                        .hover(|element| element.bg(theme.danger_soft))
-                                        .active(|element| element.opacity(0.8))
-                                        .when(escape_stop_armed, |element| {
-                                            element.child(
-                                                div()
-                                                    .text_size(sp(12.5))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(theme.text)
-                                                    .child("Esc"),
-                                            )
-                                        })
-                                        .when(!escape_stop_armed, |element| {
-                                            element.child(icon("icons/stop.svg", 18.0, theme.text))
-                                        })
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cancel_turn(cx);
-                                        })),
-                                )
-                                .when(can_send, |element| {
-                                    element.child(
-                                        div()
-                                            .id("follow-up-action")
-                                            .w(px(26.0))
-                                            .h(px(26.0))
-                                            .rounded_full()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_default()
-                                            .bg(theme.inverse)
-                                            .hover(|element| element.opacity(0.9))
-                                            .active(|element| element.opacity(0.8))
-                                            .child(icon(
-                                                "icons/arrow-up.svg",
-                                                16.0,
-                                                theme.on_inverse,
-                                            ))
-                                            .tooltip(Tooltip::text(if follow_up_steers {
-                                                tr!("composer.steer_followup")
-                                            } else {
-                                                tr!("composer.queue_followup")
-                                            }))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                let prompt =
-                                                    this.composer.read(cx).content(cx).to_owned();
-                                                if let Some(submission) =
-                                                    this.submission_with_attachments(&prompt, cx)
-                                                {
-                                                    this.composer
-                                                        .update(cx, |input, cx| input.clear(cx));
-                                                    this.submit_composer_submission(submission, cx);
-                                                }
-                                            })),
-                                    )
-                                }),
-                            ComposerSubmitAction::Send => div()
-                                .id("send-or-stop")
-                                .role(gpui::Role::Button)
-                                .aria_label(tr!("common.send"))
-                                .semantic_control(gpui::Role::Button, !can_send)
-                                .w(px(26.0))
-                                .h(px(26.0))
-                                .rounded_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .bg(if can_send {
-                                    theme.inverse
-                                } else {
-                                    theme.overlay_strong
-                                })
-                                .when(can_send, |element| {
-                                    element
-                                        .cursor_default()
+                                        .bg(theme.inverse)
                                         .hover(|element| element.opacity(0.9))
                                         .active(|element| element.opacity(0.8))
-                                })
-                                .child(icon(
-                                    "icons/arrow-up.svg",
-                                    16.0,
-                                    if can_send {
-                                        theme.on_inverse
-                                    } else {
-                                        theme.text_ghost
-                                    },
-                                ))
-                                // Says why the button is dead, for the case
-                                // the draft is ready and the machine is not.
-                                .when(no_providers, |element| {
-                                    element.tooltip(Tooltip::text(tr!("composer.no_providers")))
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let prompt = this.composer.read(cx).content(cx).to_owned();
-                                    if let Some(submission) =
-                                        this.submission_with_attachments(&prompt, cx)
-                                    {
-                                        this.composer.update(cx, |input, cx| input.clear(cx));
-                                        this.submit_composer_submission(submission, cx);
-                                    }
-                                })),
-                        }),
-                ),
+                                        .child(icon("icons/arrow-up.svg", 16.0, theme.on_inverse))
+                                        .tooltip(Tooltip::text(if follow_up_steers {
+                                            tr!("composer.steer_followup")
+                                        } else {
+                                            tr!("composer.queue_followup")
+                                        }))
+                                        .on_activation(cx, |this, _, cx| {
+                                            let prompt =
+                                                this.composer.read(cx).content(cx).to_owned();
+                                            if let Some(submission) =
+                                                this.submission_with_attachments(&prompt, cx)
+                                            {
+                                                this.composer
+                                                    .update(cx, |input, cx| input.clear(cx));
+                                                this.submit_composer_submission(submission, cx);
+                                            }
+                                        }),
+                                )
+                            }),
+                        ComposerSubmitAction::Send => layout::action_target("send-or-stop")
+                            .role(gpui::Role::Button)
+                            .track_focus(&self.transcript_control_focus("composer-send", cx))
+                            .tab_index(0)
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(theme.accent))
+                            .aria_label(tr!("common.send"))
+                            .semantic_control(gpui::Role::Button, !can_send)
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(if can_send {
+                                theme.inverse
+                            } else {
+                                theme.overlay_strong
+                            })
+                            .when(can_send, |element| {
+                                element
+                                    .cursor_default()
+                                    .hover(|element| element.opacity(0.9))
+                                    .active(|element| element.opacity(0.8))
+                            })
+                            .child(icon(
+                                "icons/arrow-up.svg",
+                                16.0,
+                                if can_send {
+                                    theme.on_inverse
+                                } else {
+                                    theme.text_ghost
+                                },
+                            ))
+                            // Says why the button is dead, for the case
+                            // the draft is ready and the machine is not.
+                            .when(no_providers, |element| {
+                                element.tooltip(Tooltip::text(tr!("composer.no_providers")))
+                            })
+                            .on_activation(cx, |this, _, cx| {
+                                let prompt = this.composer.read(cx).content(cx).to_owned();
+                                if let Some(submission) =
+                                    this.submission_with_attachments(&prompt, cx)
+                                {
+                                    this.composer.update(cx, |input, cx| input.clear(cx));
+                                    this.submit_composer_submission(submission, cx);
+                                }
+                            })
+                            .semantic_control(gpui::Role::Button, !can_send),
+                    }
+                    .into_any_element(),
+                )),
         )
     }
 
@@ -5389,6 +5705,31 @@ fn open_provider_settings_from_picker(
         this.open_settings_action(&OpenSettings, window, cx);
         this.open_settings_page(SettingsPage::Providers, cx);
     });
+}
+
+/// Both routes into the model catalog choose the same usable fallback for a
+/// disabled draft provider. An established conversation stays provider-locked.
+pub(super) fn initial_picker_provider(
+    session: Option<&AgentSession>,
+    probes: &[ProviderProbe],
+    disabled: &[ProviderKind],
+) -> ProviderKind {
+    let provider = session.map(|session| session.provider).unwrap_or_default();
+    let locked =
+        session.is_some_and(|session| !session.messages.is_empty() || session.review.is_some());
+    if !locked && disabled.contains(&provider) {
+        ProviderKind::ALL
+            .into_iter()
+            .find(|kind| {
+                !disabled.contains(kind)
+                    && probes
+                        .iter()
+                        .any(|probe| probe.provider == *kind && probe.installed)
+            })
+            .unwrap_or(provider)
+    } else {
+        provider
+    }
 }
 
 /// Whether the rail draws a tab for the provider at all, usable or not.

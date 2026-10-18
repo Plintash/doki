@@ -30,6 +30,118 @@ fn new_task_runtime_mode(current: Option<&AgentSession>, remembered: RuntimeMode
         .unwrap_or(remembered)
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(super) struct ModelTraitSelection {
+    pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub context_window: Option<String>,
+}
+
+/// Resolve only advertised choices, so the composer and saved session agree
+/// even after a provider removes an option from its catalog. Cursor's legacy
+/// model-id suffix is an implicit choice, below an explicit session setting.
+pub(super) fn resolved_model_traits(
+    model: &ProviderModel,
+    reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
+    context_window: Option<&str>,
+    cursor_suffix: &str,
+) -> ModelTraitSelection {
+    let supports_effort = |selected: &&str| {
+        model
+            .reasoning_efforts
+            .iter()
+            .any(|option| option.id == *selected)
+    };
+    let suffix_effort = waku_protocol::model_catalog::cursor_suffix_reasoning_effort(
+        cursor_suffix,
+        &model.reasoning_efforts,
+    );
+    let reasoning_effort = reasoning_effort
+        .filter(supports_effort)
+        .or(suffix_effort.as_deref())
+        .or(model
+            .default_reasoning_effort
+            .as_deref()
+            .filter(supports_effort))
+        .or_else(|| {
+            model
+                .reasoning_efforts
+                .first()
+                .map(|option| option.id.as_str())
+        })
+        .map(str::to_owned);
+
+    let service_tier = if model.service_tiers.is_empty() {
+        None
+    } else {
+        let supports_tier = |selected: &&str| {
+            *selected == "default"
+                || model
+                    .service_tiers
+                    .iter()
+                    .any(|option| option.id == *selected)
+        };
+        let suffix_tier = waku_protocol::model_catalog::cursor_suffix_service_tier(
+            cursor_suffix,
+            &model.service_tiers,
+        );
+        Some(
+            service_tier
+                .filter(supports_tier)
+                .or(suffix_tier.as_deref())
+                .or(model.default_service_tier.as_deref().filter(supports_tier))
+                .unwrap_or("default")
+                .to_owned(),
+        )
+    };
+    let supports_window = |selected: &&str| {
+        model
+            .context_windows
+            .iter()
+            .any(|option| option.id == *selected)
+    };
+    let context_window = context_window
+        .filter(supports_window)
+        .or(model
+            .default_context_window
+            .as_deref()
+            .filter(supports_window))
+        .or_else(|| {
+            model
+                .context_windows
+                .first()
+                .map(|option| option.id.as_str())
+        })
+        .map(str::to_owned);
+
+    ModelTraitSelection {
+        reasoning_effort,
+        service_tier,
+        context_window,
+    }
+}
+
+/// This setting changes only an advertised option. In particular, selecting a
+/// thinking level never creates a turn or consumes the composer's draft, and
+/// remains available while a provider applies live session options.
+pub(super) fn update_session_reasoning_effort(
+    session: &mut AgentSession,
+    model: &ProviderModel,
+    effort: &str,
+) -> bool {
+    if session.reasoning_effort.as_deref() == Some(effort)
+        || !model
+            .reasoning_efforts
+            .iter()
+            .any(|option| option.id == effort)
+    {
+        return false;
+    }
+    session.reasoning_effort = Some(effort.to_owned());
+    true
+}
+
 impl Waku {
     pub(crate) fn open_task_from_notification(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         self.select_session(session_id, cx);
@@ -1040,6 +1152,31 @@ impl Waku {
         self.remember_selected_model_traits();
         let (reasoning_effort, service_tier, context_window) =
             self.state.model_traits_for(provider, &model);
+        let traits = self
+            .provider_probe(provider)
+            .and_then(|probe| {
+                let metadata = probe.model(&model)?;
+                let cursor_suffix = (provider == ProviderKind::Cursor)
+                    .then(|| {
+                        waku_protocol::model_catalog::cursor_catalog_model(&probe.models, &model)
+                    })
+                    .flatten()
+                    .map(|matched| matched.suffix)
+                    .unwrap_or_default();
+                Some(resolved_model_traits(
+                    metadata,
+                    reasoning_effort.as_deref(),
+                    service_tier.as_deref(),
+                    context_window.as_deref(),
+                    &cursor_suffix,
+                ))
+            })
+            .unwrap_or_default();
+        let ModelTraitSelection {
+            reasoning_effort,
+            service_tier,
+            context_window,
+        } = traits;
         if let Some(session) = self.selected_session_mut() {
             session.provider = provider;
             session.model = Some(model.clone());
@@ -1055,6 +1192,7 @@ impl Waku {
             self.state.last_service_tier = service_tier;
             self.state.last_context_window = context_window;
             self.model_picker_tab = ModelPickerTab::Provider(provider);
+            self.remember_selected_model_traits();
             // A different provider is a different binary and protocol; only a
             // model change within one provider can be applied in session.
             if provider_changed {
@@ -1084,6 +1222,7 @@ impl Waku {
         if !self
             .selected_session()
             .is_some_and(|session| session.can_choose_model(session.provider))
+            && !self.selected_model_has_traits()
         {
             return;
         }
@@ -1189,11 +1328,17 @@ impl Waku {
     }
 
     pub(super) fn set_reasoning_effort(&mut self, effort: String, cx: &mut Context<Self>) {
+        let Some(model) = self
+            .selected_session()
+            .and_then(|session| self.model_metadata_for_session(session))
+            .cloned()
+        else {
+            return;
+        };
         if let Some(session) = self.selected_session_mut()
-            && session.reasoning_effort.as_deref() != Some(effort.as_str())
+            && update_session_reasoning_effort(session, &model, &effort)
         {
             let session_id = session.id;
-            session.reasoning_effort = Some(effort.clone());
             self.state.last_reasoning_effort = Some(effort);
             self.remember_selected_model_traits();
             self.apply_session_options(session_id, cx);

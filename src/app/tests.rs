@@ -2400,6 +2400,236 @@ fn model_picker_highlight_wraps_at_both_ends() {
 }
 
 #[test]
+fn composer_model_without_reasoning_ignores_stale_effort_and_rejects_settings() {
+    use super::sessions::{resolved_model_traits, update_session_reasoning_effort};
+    use crate::model::ProviderModel;
+
+    let mut model = ProviderModel::new("plain", "Plain");
+    // A stale default is not evidence that the provider supports the option.
+    model.default_reasoning_effort = Some("high".into());
+    model.default_service_tier = Some("fast".into());
+    model.default_context_window = Some("1m".into());
+    let selected = resolved_model_traits(
+        &model,
+        Some("xhigh"),
+        Some("fast"),
+        Some("1m"),
+        "thinking-high-fast",
+    );
+    assert_eq!(selected.reasoning_effort, None);
+    assert_eq!(selected.service_tier, None);
+    assert_eq!(selected.context_window, None);
+
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Amp);
+    let before = serde_json::to_value(&session).unwrap();
+    assert!(!update_session_reasoning_effort(
+        &mut session,
+        &model,
+        "high"
+    ));
+    assert_eq!(serde_json::to_value(&session).unwrap(), before);
+}
+
+#[test]
+fn composer_model_switch_drops_unsupported_remembered_traits() {
+    use super::sessions::resolved_model_traits;
+    use crate::model::{ProviderModel, ProviderModelOption};
+    use crate::persistence::PersistedState;
+
+    let model = ProviderModel::new("target", "Target")
+        .reasoning(
+            [
+                ProviderModelOption::new("low", "Low"),
+                ProviderModelOption::new("high", "High"),
+            ],
+            "high",
+        )
+        .service_tiers([ProviderModelOption::new("fast", "Fast")], "default")
+        .context_windows([ProviderModelOption::new("200k", "200K")], "200k");
+    let mut state = PersistedState::empty();
+    state.remember_model_traits(
+        ProviderKind::Codex,
+        &model.id,
+        Some("xhigh".into()),
+        Some("retired-tier".into()),
+        Some("1m".into()),
+    );
+    let (effort, tier, window) = state.model_traits_for(ProviderKind::Codex, &model.id);
+    let selected = resolved_model_traits(
+        &model,
+        effort.as_deref(),
+        tier.as_deref(),
+        window.as_deref(),
+        "",
+    );
+    assert_eq!(selected.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(selected.service_tier.as_deref(), Some("default"));
+    assert_eq!(selected.context_window.as_deref(), Some("200k"));
+    state.remember_model_traits(
+        ProviderKind::Codex,
+        &model.id,
+        selected.reasoning_effort,
+        selected.service_tier,
+        selected.context_window,
+    );
+    assert_eq!(
+        state.model_traits_for(ProviderKind::Codex, &model.id),
+        (
+            Some("high".into()),
+            Some("default".into()),
+            Some("200k".into())
+        )
+    );
+}
+
+#[test]
+fn composer_model_defaults_follow_each_catalog_instead_of_a_fixed_effort_ladder() {
+    use super::sessions::resolved_model_traits;
+    use crate::model::{ProviderModel, ProviderModelOption};
+
+    let first = ProviderModel::new("first", "First").reasoning(
+        [
+            ProviderModelOption::new("off", "Off"),
+            ProviderModelOption::new("deep", "Deep"),
+        ],
+        "deep",
+    );
+    let second = ProviderModel::new("second", "Second").reasoning(
+        [
+            ProviderModelOption::new("minimal", "Minimal"),
+            ProviderModelOption::new("max", "Max"),
+        ],
+        "minimal",
+    );
+    assert_eq!(
+        resolved_model_traits(&first, None, None, None, "")
+            .reasoning_effort
+            .as_deref(),
+        Some("deep")
+    );
+    assert_eq!(
+        resolved_model_traits(&second, Some("deep"), None, None, "")
+            .reasoning_effort
+            .as_deref(),
+        Some("minimal")
+    );
+    assert_eq!(
+        resolved_model_traits(&second, Some("max"), None, None, "")
+            .reasoning_effort
+            .as_deref(),
+        Some("max")
+    );
+
+    let mut invalid_default = second.clone();
+    invalid_default.default_reasoning_effort = Some("retired".into());
+    assert_eq!(
+        resolved_model_traits(&invalid_default, None, None, None, "")
+            .reasoning_effort
+            .as_deref(),
+        Some("minimal"),
+        "an invalid catalog default falls back to the first advertised choice"
+    );
+}
+
+#[test]
+fn composer_model_cursor_suffix_precedes_defaults_but_not_explicit_settings() {
+    use super::sessions::resolved_model_traits;
+    use crate::model::{ProviderModel, ProviderModelOption, ProviderProbe};
+
+    let model = ProviderModel::new("claude-opus-5", "Claude Opus 5")
+        .reasoning(
+            [
+                ProviderModelOption::new("low", "Low"),
+                ProviderModelOption::new("high", "High"),
+                ProviderModelOption::new("xhigh", "Extra High"),
+            ],
+            "low",
+        )
+        .service_tiers([ProviderModelOption::new("fast", "Fast")], "default");
+    let probe = ProviderProbe {
+        provider: ProviderKind::Cursor,
+        installed: true,
+        path: None,
+        models: vec![model],
+        agent_presets: Vec::new(),
+    };
+    let requested = "claude-opus-5-thinking-extra-high-fast";
+    let metadata = probe.model(requested).unwrap();
+    assert_eq!(metadata.id, "claude-opus-5");
+    let matched =
+        waku_protocol::model_catalog::cursor_catalog_model(&probe.models, requested).unwrap();
+    let selected = resolved_model_traits(metadata, Some("retired"), None, None, &matched.suffix);
+    assert_eq!(selected.reasoning_effort.as_deref(), Some("xhigh"));
+    assert_eq!(selected.service_tier.as_deref(), Some("fast"));
+
+    let explicit = resolved_model_traits(
+        metadata,
+        Some("high"),
+        Some("default"),
+        None,
+        &matched.suffix,
+    );
+    assert_eq!(explicit.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(explicit.service_tier.as_deref(), Some("default"));
+}
+
+#[test]
+fn composer_model_reasoning_setting_preserves_busy_turns_and_unsubmitted_sessions() {
+    use super::sessions::update_session_reasoning_effort;
+    use crate::model::{ProviderModel, ProviderModelOption};
+
+    let model = ProviderModel::new("live", "Live").reasoning(
+        [
+            ProviderModelOption::new("low", "Low"),
+            ProviderModelOption::new("high", "High"),
+        ],
+        "low",
+    );
+    for status in [
+        SessionStatus::Idle,
+        SessionStatus::Connecting,
+        SessionStatus::Working,
+        SessionStatus::Waiting,
+        SessionStatus::Background,
+    ] {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.model = Some(model.id.clone());
+        if status.is_busy() {
+            session.begin_turn("keep this active turn");
+        }
+        session.status = status;
+        session.reasoning_effort = Some("low".into());
+        let mut expected = serde_json::to_value(&session).unwrap();
+        expected["reasoning_effort"] = serde_json::json!("high");
+        assert!(update_session_reasoning_effort(
+            &mut session,
+            &model,
+            "high"
+        ));
+        assert_eq!(
+            serde_json::to_value(&session).unwrap(),
+            expected,
+            "changing a setting must not create, submit, stop, or modify a turn"
+        );
+        assert!(!update_session_reasoning_effort(
+            &mut session,
+            &model,
+            "high"
+        ));
+        assert!(!update_session_reasoning_effort(
+            &mut session,
+            &model,
+            "xhigh"
+        ));
+        assert_eq!(serde_json::to_value(&session).unwrap(), expected);
+        assert_eq!(
+            session.can_choose_model(ProviderKind::Codex),
+            !status.is_busy()
+        );
+    }
+}
+
+#[test]
 fn settings_search_filters_pages_for_arrow_cycling() {
     let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
     use super::SettingsPage;
@@ -3187,4 +3417,42 @@ fn cold_catalog_defaults_do_not_erase_hydrated_provider_options() {
     assert_eq!(skeleton.service_tier.as_deref(), Some("fast"));
     assert_eq!(skeleton.context_window.as_deref(), Some("1m"));
     assert_eq!(skeleton.agent_preset.as_deref(), Some("code"));
+}
+
+#[test]
+fn composer_model_catalog_navigation_keeps_disabled_draft_provider_fallback() {
+    use super::composer::initial_picker_provider;
+    use crate::model::ProviderProbe;
+    let probes = [ProviderKind::Claude, ProviderKind::Codex].map(|provider| ProviderProbe {
+        provider,
+        installed: true,
+        path: None,
+        models: Vec::new(),
+        agent_presets: Vec::new(),
+    });
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Claude);
+    assert_eq!(
+        initial_picker_provider(Some(&session), &probes, &[ProviderKind::Claude]),
+        ProviderKind::Codex
+    );
+    assert_eq!(
+        initial_picker_provider(Some(&session), &probes, &[]),
+        ProviderKind::Claude
+    );
+    // Existing conversations retain their provider even after it is disabled.
+    session.push_message(MessageRole::User, "Keep the current provider");
+    assert_eq!(
+        initial_picker_provider(Some(&session), &probes, &[ProviderKind::Claude]),
+        ProviderKind::Claude
+    );
+    // No usable replacement must retain a deterministic provider for the empty state.
+    session.messages.clear();
+    assert_eq!(
+        initial_picker_provider(
+            Some(&session),
+            &probes,
+            &[ProviderKind::Claude, ProviderKind::Codex]
+        ),
+        ProviderKind::Claude
+    );
 }
