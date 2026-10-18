@@ -5,6 +5,7 @@ mod layout;
 use anyhow::Context as _;
 use base64::Engine as _;
 use std::borrow::Cow;
+use waku_protocol::model::ProviderModelOption;
 
 use crate::ui::{ActivationExt, SemanticControlExt};
 
@@ -47,6 +48,40 @@ pub fn init_workspace_keys(cx: &mut App) {
             Some(WORKTREE_CHOICE_CONTEXT),
         ),
     ]);
+}
+
+fn highest_model_effort_index(
+    provider: ProviderKind,
+    options: &[ProviderModelOption],
+) -> Option<usize> {
+    let mut native = options.iter().enumerate().filter(|(_, option)| {
+        // Claude's appended Ultracode mode resolves to xhigh plus workflow
+        // orchestration. It is not a higher native effort than max.
+        provider != ProviderKind::Claude || option.id != "ultracode"
+    });
+    native.next()?;
+    native.last().map(|(index, _)| index)
+}
+
+fn effort_display_label(label: &str, index: usize, highest: Option<usize>) -> String {
+    if highest == Some(index) {
+        format!("Galaxy · {label}")
+    } else {
+        label.to_owned()
+    }
+}
+
+fn first_model_option_id(model: &ProviderModel) -> Option<String> {
+    if model.reasoning_efforts.len() > 1 {
+        Some("model-effort-slider".to_owned())
+    } else if !model.service_tiers.is_empty() {
+        Some("model-service-default".to_owned())
+    } else {
+        model
+            .context_windows
+            .first()
+            .map(|option| format!("model-context-{}", option.id))
+    }
 }
 
 const COMPUTER_USE_PREVIEW_WIDTH: f32 = 304.0;
@@ -1178,7 +1213,8 @@ impl Waku {
         if !picker_enabled && !self.selected_model_has_traits() {
             return div()
                 .min_w_0()
-                .flex_1()
+                .max_w(px(layout::MODEL_CONTROL_MAX_WIDTH))
+                .flex_shrink_1()
                 .h(px(24.0))
                 .px(px(7.0))
                 .flex()
@@ -1223,14 +1259,9 @@ impl Waku {
                 // The empty state draws no filter field, so the handle the
                 // deferred focus below targets depends on which body opened.
                 let mut empty = false;
-                let mut configuration_focus = None;
                 let _ = reset_weak.update(cx, |this, cx| {
                     if open {
                         empty = this.model_picker_has_no_providers();
-                        this.model_picker_show_catalog = !this.selected_model_has_traits();
-                        if !empty && !this.model_picker_show_catalog {
-                            configuration_focus = Some(this.model_configuration_focus(cx));
-                        }
                         let provider = initial_picker_provider(
                             this.selected_session(),
                             &this.probes,
@@ -1262,7 +1293,7 @@ impl Waku {
                     let picker_focus = if empty {
                         empty_picker_focus.clone()
                     } else {
-                        configuration_focus.unwrap_or_else(|| picker_focus.clone())
+                        picker_focus.clone()
                     };
                     let reveal_weak = reset_weak.clone();
                     window.on_next_frame(move |window, _| {
@@ -1282,7 +1313,7 @@ impl Waku {
         // Built out here rather than in the body so the key handler and the
         // rendered rows index one ordering and cannot disagree about what
         // `enter` selects.
-        let available_models = Rc::new(if handle.is_open() && self.model_picker_show_catalog {
+        let available_models = Rc::new(if handle.is_open() {
             visible_picker_models(
                 &probes,
                 &favorites,
@@ -1305,7 +1336,6 @@ impl Waku {
         // panel behind it is where the fix lives. Icon plus wording carry the
         // state on their own, so the warning tint is never the only signal.
         let trigger_label = self.composer_model_label(&selected_model_name);
-        let show_catalog = self.model_picker_show_catalog;
         let trigger = if no_providers {
             MenuChip::new("composer-provider-model")
                 .icon("icons/alert.svg", theme.warning)
@@ -1317,9 +1347,7 @@ impl Waku {
         };
 
         popover(
-            trigger
-                .min_w_0()
-                .flex_1()
+            layout::model_control(trigger)
                 .tooltip(Tooltip::text(trigger_label.clone()))
                 .child(crate::ui::tooltip::FocusHint::new(
                     handle.trigger_focus_handle().clone(),
@@ -1337,26 +1365,7 @@ impl Waku {
                     return model_picker_empty_state(&theme, &empty_focus, popover, weak.clone());
                 }
 
-                if !show_catalog {
-                    return weak
-                        .update(cx, |this, cx| this.render_model_configuration(window, cx))
-                        .unwrap_or_else(|_| div().into_any_element());
-                }
-
-                let mut sidebar = div()
-                    .w(px(50.0))
-                    .h_full()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(4.0))
-                    .p(px(5.0))
-                    .rounded_tl(px(12.0))
-                    .rounded_bl(px(12.0))
-                    .bg(theme.canvas)
-                    .border_r_1()
-                    .border_color(theme.border);
+                let mut sidebar = layout::model_picker_rail(&search_focus, theme);
 
                 let favorites_selected = selected_tab == ModelPickerTab::Favorites && !searching;
                 let favorite_weak = weak.clone();
@@ -1453,15 +1462,6 @@ impl Waku {
                     );
                 }
 
-                let back_weak = weak.clone();
-                let back_focus = weak
-                    .update(cx, |this, cx| {
-                        this.transcript_control_focus("model-configuration-back", cx)
-                    })
-                    .ok();
-                let has_configuration = weak
-                    .read_with(cx, |this, _| this.selected_model_has_traits())
-                    .unwrap_or(false);
                 let search_input = div()
                     .h(px(52.0))
                     .px(px(12.0))
@@ -1471,43 +1471,6 @@ impl Waku {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .when(has_configuration, |element| {
-                        element.child(
-                            icon_button("model-configuration-back", "icons/arrow-left.svg", theme)
-                                .aria_label(tr!("models.configuration"))
-                                .when_some(back_focus, |element, focus| {
-                                    element.track_focus(&focus).tab_index(0).relative().child(
-                                        crate::ui::tooltip::FocusHint::new(
-                                            focus,
-                                            tr!("models.configuration"),
-                                        ),
-                                    )
-                                })
-                                .focus_visible(|style| style.border_1().border_color(theme.accent))
-                                .tooltip(Tooltip::text(tr!("models.configuration")))
-                                .on_click(move |_, window, cx| {
-                                    let _ = back_weak.update(cx, |this, cx| {
-                                        this.show_model_configuration(window, cx);
-                                    });
-                                })
-                                .on_key_down({
-                                    let weak = weak.clone();
-                                    move |event: &KeyDownEvent, window, cx| {
-                                        if !event.keystroke.modifiers.modified()
-                                            && matches!(
-                                                event.keystroke.key.as_str(),
-                                                "enter" | "space"
-                                            )
-                                        {
-                                            let _ = weak.update(cx, |this, cx| {
-                                                this.show_model_configuration(window, cx);
-                                            });
-                                            cx.stop_propagation();
-                                        }
-                                    }
-                                }),
-                        )
-                    })
                     .child(
                         div()
                             .flex_1()
@@ -1583,6 +1546,9 @@ impl Waku {
                             .items_center()
                             .gap(px(10.0))
                             .cursor_default()
+                            .semantic_control(gpui::Role::Button, !picker_enabled)
+                            .aria_label(model.name.clone())
+                            .when(!picker_enabled, |element| element.opacity(0.55))
                             // Reserved on every row so highlighting one cannot
                             // resize it and shift the list by a pixel.
                             .border_1()
@@ -1670,7 +1636,7 @@ impl Waku {
                                 let keep_open = select_weak
                                     .update(cx, |this, cx| {
                                         this.choose_model(kind, model_id.clone(), cx);
-                                        this.show_model_configuration(window, cx)
+                                        this.focus_model_options(window, cx)
                                     })
                                     .unwrap_or(false);
                                 if !keep_open {
@@ -1689,11 +1655,16 @@ impl Waku {
                 let previous_tab_weak = weak.clone();
                 let confirm_weak = weak.clone();
                 let confirm_popover = popover.clone();
-                let dismiss_weak = weak.clone();
+                let model_options = weak
+                    .update(cx, |this, cx| this.render_model_options(cx))
+                    .ok()
+                    .flatten();
                 div()
-                    .w(px(460.0))
-                    .h(px(390.0))
-                    .rounded(px(13.0))
+                    .id("model-picker")
+                    .w(px(460.0).min((window.viewport_size().width - px(16.0)).max(px(0.0))))
+                    .h(px(390.0).min((window.viewport_size().height - px(16.0)).max(px(0.0))))
+                    .tab_group()
+                    .rounded(px(8.0))
                     .overflow_hidden()
                     .border_1()
                     .border_color(theme.border_strong)
@@ -1729,7 +1700,7 @@ impl Waku {
                         let keep_open = confirm_weak
                             .update(cx, |this, cx| {
                                 this.choose_highlighted_model(&confirm_models, cx);
-                                this.show_model_configuration(window, cx)
+                                this.focus_model_options(window, cx)
                             })
                             .unwrap_or(false);
                         if !keep_open {
@@ -1737,36 +1708,17 @@ impl Waku {
                         }
                         window.refresh();
                     })
-                    .on_action(move |_: &DismissMenu, window, cx| {
-                        if dismiss_weak
-                            .update(cx, |this, cx| this.show_model_configuration(window, cx))
-                            .unwrap_or(false)
-                        {
-                            cx.stop_propagation();
-                        } else {
-                            cx.propagate();
-                        }
-                    })
                     .child(sidebar)
-                    .child(
+                    .child(layout::model_picker_content(
+                        search_input.into_any_element(),
                         div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .rounded_tr(px(12.0))
-                            .rounded_br(px(12.0))
-                            .bg(theme.surface)
-                            .child(search_input)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .relative()
-                                    .child(rows)
-                                    .child(scrollbar::vertical(&scroll, &scrollbar_state)),
-                            ),
-                    )
+                            .size_full()
+                            .child(rows)
+                            .child(scrollbar::vertical(&scroll, &scrollbar_state))
+                            .into_any_element(),
+                        model_options,
+                        theme,
+                    ))
                     .into_any_element()
             },
         )
@@ -1926,71 +1878,30 @@ impl Waku {
         labels.join(" · ")
     }
 
-    fn model_configuration_focus(&self, cx: &mut App) -> FocusHandle {
-        let has_effort = self
+    /// Keep the catalog visible after choosing a configurable model. Keyboard
+    /// selection lands on its first adjustable option in the same surface.
+    fn focus_model_options(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(model) = self
             .selected_session()
             .and_then(|session| self.model_metadata_for_session(session))
-            .is_some_and(|model| model.reasoning_efforts.len() > 1);
-        self.transcript_control_focus(
-            if has_effort {
-                "model-effort-slider"
-            } else {
-                "model-configuration-model"
-            },
-            cx,
-        )
-    }
-
-    fn show_model_configuration(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.selected_model_has_traits() {
-            return false;
-        }
-        self.model_picker_show_catalog = false;
-        let focus = self.model_configuration_focus(cx);
-        window.on_next_frame(move |window, _| {
-            window.on_next_frame(move |window, cx| window.focus(&focus, cx));
-        });
-        cx.notify();
-        true
-    }
-
-    fn show_model_catalog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(_) = self
-            .selected_session()
-            .filter(|session| session.can_choose_model(session.provider))
-            .map(|session| session.provider)
         else {
-            return;
+            return false;
         };
-        let provider = initial_picker_provider(
-            self.selected_session(),
-            &self.probes,
-            &self.state.disabled_providers,
-        );
-        self.model_picker_show_catalog = true;
-        self.model_picker_tab = ModelPickerTab::Provider(provider);
-        self.model_picker_highlight = None;
-        self.model_search.update(cx, |input, cx| input.clear(cx));
-        self.refresh_provider_model_discovery(provider);
-        self.reveal_selected_picker_model();
-        let focus = self.model_search.read(cx).focus_handle(cx);
-        window.on_next_frame(move |window, _| {
-            window.on_next_frame(move |window, cx| window.focus(&focus, cx));
-        });
-        cx.notify();
+        if let Some(id) = first_model_option_id(model) {
+            let focus = self.transcript_control_focus(id, cx);
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+            });
+        }
+        self.selected_model_has_traits()
     }
 
-    fn render_model_configuration(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_model_options(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::current(cx);
-        let Some(session) = self.selected_session() else {
-            return div().into_any_element();
-        };
-        let model_name =
-            self.model_display_name(session.provider, self.catalog_model_id_for_session(session));
+        let session = self.selected_session()?;
+        if !self.selected_model_has_traits() {
+            return None;
+        }
         let model = self.model_metadata_for_session(session);
         let selected = model.map(|model| self.selected_model_traits(model));
         let options = model
@@ -2004,115 +1915,48 @@ impl Waku {
                     .position(|option| Some(&option.id) == selected.reasoning_effort.as_ref())
             })
             .unwrap_or(0);
+        let highest_index = highest_model_effort_index(session.provider, &options);
         let effort_label = options
             .get(selected_index)
-            .map(|option| option.label.clone());
-        let can_choose_model = session.can_choose_model(session.provider);
-        let model_focus = self.transcript_control_focus("model-configuration-model", cx);
-        let model_button = div()
-            .id("model-configuration-model")
-            .track_focus(&model_focus)
-            .tab_index(0)
-            .tab_stop(true)
-            .aria_label(format!("{}: {model_name}", tr!("models.choose")))
-            .min_w_0()
-            .w_full()
-            .h(px(30.0))
-            .px(px(7.0))
-            .rounded(px(6.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap(px(4.0))
-            .text_size(sp(14.0))
-            .text_color(theme.text_secondary)
-            .focus_visible(|style| style.border_1().border_color(theme.accent))
-            .when(can_choose_model, |element| {
-                element
-                    .cursor_default()
-                    .hover(|style| style.bg(theme.overlay))
-            })
-            .child(div().min_w_0().truncate().child(model_name.clone()))
-            .when(can_choose_model, |element| {
-                element.child(icon("icons/chevron-right.svg", 12.0, theme.text_tertiary))
-            })
-            .tooltip(Tooltip::text(model_name.clone()))
-            .relative()
-            .child(crate::ui::tooltip::FocusHint::new(model_focus, model_name))
-            .on_activation(cx, |this, window, cx| this.show_model_catalog(window, cx))
-            .semantic_control(gpui::Role::Button, !can_choose_model);
+            .map(|option| effort_display_label(&option.label, selected_index, highest_index));
         let mut panel = div()
-            .id("model-configuration")
-            .w(px(300.0).min((window.viewport_size().width - px(16.0)).max(px(0.0))))
-            .p(px(12.0))
-            .rounded(px(13.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.raised)
-            .shadow_lg()
+            .id("model-options")
+            .w_full()
+            .flex_none()
+            .px(px(12.0))
+            .py(px(9.0))
+            .border_t_1()
+            .border_color(theme.border)
             .flex()
             .flex_col()
-            .tab_group()
             .when_some(effort_label.clone(), |panel, label| {
-                let default_effort = model.and_then(|model| {
-                    super::sessions::resolved_model_traits(model, None, None, None, "")
-                        .reasoning_effort
-                });
                 panel.child(
                     div()
                         .w_full()
                         .flex()
                         .items_center()
-                        .gap(px(6.0))
+                        .justify_between()
+                        .gap(px(8.0))
+                        .text_size(sp(12.0))
                         .child(
                             div()
-                                .size(px(24.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(icon("icons/zap.svg", 15.0, theme.text_tertiary)),
+                                .text_color(theme.text_secondary)
+                                .child(tr!("models.reasoning")),
                         )
                         .child(
                             div()
                                 .min_w_0()
-                                .flex_1()
-                                .text_center()
                                 .truncate()
-                                .text_size(sp(17.0))
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.gauge)
+                                .text_color(theme.text)
                                 .child(label),
-                        )
-                        .child(
-                            icon_button("model-effort-reset", "icons/rotate-cw.svg", theme)
-                                .flex_none()
-                                .track_focus(
-                                    &self.transcript_control_focus("model-effort-reset", cx),
-                                )
-                                .tab_index(0)
-                                .tab_stop(true)
-                                .aria_label(tr!("common.reset"))
-                                .tooltip(Tooltip::text(tr!("common.reset")))
-                                .relative()
-                                .child(crate::ui::tooltip::FocusHint::new(
-                                    self.transcript_control_focus("model-effort-reset", cx),
-                                    tr!("common.reset"),
-                                ))
-                                .focus_visible(|style| style.border_1().border_color(theme.accent))
-                                .on_activation(cx, move |this, _, cx| {
-                                    if let Some(effort) = &default_effort {
-                                        this.set_reasoning_effort(effort.clone(), cx);
-                                    }
-                                }),
                         ),
                 )
-            })
-            .child(model_button);
+            });
         if let Some(label) = effort_label {
             let focus = self.transcript_control_focus("model-effort-slider", cx);
             panel = panel.child(
-                div().mt(px(10.0)).child(
+                div().mt(px(3.0)).child(
                     crate::ui::effort_slider::EffortSlider::new(
                         "model-effort-slider",
                         options.len(),
@@ -2121,6 +1965,7 @@ impl Waku {
                     )
                     .label(tr!("models.reasoning"))
                     .value_label(label)
+                    .highest_index(highest_index)
                     .on_change(cx.listener(
                         move |this, index: &usize, _, cx| {
                             if let Some(option) = options.get(*index) {
@@ -2131,8 +1976,8 @@ impl Waku {
                 ),
             );
         }
-        // The original provider-specific controls stay in this same surface;
-        // no second composer entry and no nested popup to lose keyboard focus.
+        // Provider-specific controls share the footer with effort; the catalog
+        // stays visible and no navigation step is needed to reach them.
         if let (Some(model), Some(selected)) = (model, selected) {
             if !model.service_tiers.is_empty() {
                 let mut choices = vec![("default".to_owned(), tr!("models.standard"))];
@@ -2166,7 +2011,7 @@ impl Waku {
                 ));
             }
         }
-        panel.into_any_element()
+        Some(panel.into_any_element())
     }
 
     fn render_model_trait_choices(
@@ -5958,5 +5803,86 @@ mod worktree_option_tests {
             .messages
             .push(Message::new(MessageRole::User, "already sent"));
         assert!(composer_toggled_worktree(&session, Some(&task), false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod model_option_focus_tests {
+    use super::*;
+
+    #[test]
+    fn galaxy_label_keeps_the_provider_level_and_does_not_alias_fixed_models() {
+        assert_eq!(effort_display_label("Max", 2, Some(2)), "Galaxy · Max");
+        assert_eq!(
+            effort_display_label("Extra high", 3, Some(3)),
+            "Galaxy · Extra high"
+        );
+        assert_eq!(effort_display_label("High", 1, Some(2)), "High");
+        assert_eq!(effort_display_label("Fixed", 0, None), "Fixed");
+        assert_eq!(effort_display_label("None", 0, None), "None");
+    }
+
+    #[test]
+    fn galaxy_maps_to_native_max_and_leaves_orchestration_options_unchanged() {
+        let options = ["low", "medium", "high", "xhigh", "max", "ultracode"]
+            .map(|id| ProviderModelOption::new(id, id));
+        let highest = highest_model_effort_index(ProviderKind::Claude, &options);
+        assert_eq!(highest, Some(4));
+        assert_eq!(
+            effort_display_label(&options[4].label, 4, highest),
+            "Galaxy · max"
+        );
+        assert_eq!(
+            effort_display_label(&options[5].label, 5, highest),
+            "ultracode"
+        );
+        assert_eq!(options[4].id, "max");
+        assert_eq!(options[5].id, "ultracode");
+        assert_eq!(
+            highest_model_effort_index(ProviderKind::Codex, &options[..4]),
+            Some(3)
+        );
+        assert_eq!(
+            highest_model_effort_index(ProviderKind::Claude, &options[4..]),
+            None
+        );
+        assert_eq!(highest_model_effort_index(ProviderKind::Pi, &[]), None);
+        assert_eq!(
+            highest_model_effort_index(ProviderKind::Pi, &options[..1]),
+            None
+        );
+    }
+
+    #[test]
+    fn footer_focus_uses_the_first_available_adjustable_control() {
+        let mut model = ProviderModel::new("test", "Test model");
+        assert_eq!(first_model_option_id(&model), None);
+        model.context_windows = vec![ProviderModelOption::new("long", "Long")];
+        assert_eq!(
+            first_model_option_id(&model).as_deref(),
+            Some("model-context-long")
+        );
+        model.service_tiers = vec![ProviderModelOption::new("fast", "Fast")];
+        assert_eq!(
+            first_model_option_id(&model).as_deref(),
+            Some("model-service-default")
+        );
+        model.reasoning_efforts = vec![ProviderModelOption::new("fixed", "Fixed")];
+        // The inert slider must never steal focus from an adjustable option.
+        assert_eq!(
+            first_model_option_id(&model).as_deref(),
+            Some("model-service-default")
+        );
+        model
+            .reasoning_efforts
+            .push(ProviderModelOption::new("high", "High"));
+        assert_eq!(
+            first_model_option_id(&model).as_deref(),
+            Some("model-effort-slider")
+        );
+        model.service_tiers.clear();
+        model.context_windows.clear();
+        model.reasoning_efforts.truncate(1);
+        assert_eq!(first_model_option_id(&model), None);
     }
 }

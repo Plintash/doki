@@ -1278,8 +1278,6 @@ pub struct Waku {
     /// nothing to offer) and hides the control.
     open_in_apps: Rc<Vec<crate::platform::ExternalApp>>,
     model_picker_tab: ModelPickerTab,
-    /// The unified picker opens on effort controls; model navigation reveals the catalog.
-    model_picker_show_catalog: bool,
     /// Keyboard cursor over the model picker's filtered rows. `None` means the
     /// keyboard has not moved yet, so `enter` takes the first row.
     model_picker_highlight: Option<usize>,
@@ -2240,6 +2238,7 @@ impl Waku {
         });
         let model_search = cx.new(|cx| {
             TextInput::new(window, cx)
+                .tab_stop(true)
                 .clear_on_escape()
                 .placeholder(tr!("input.search_models"))
         });
@@ -3082,7 +3081,6 @@ impl Waku {
                 computer_use_app_icon_loads: RefCell::new(HashSet::new()),
                 open_in_apps: Rc::new(Vec::new()),
                 model_picker_tab,
-                model_picker_show_catalog: false,
                 model_picker_highlight: None,
                 model_picker_scroll: ScrollHandle::new(),
                 model_picker_scrollbar: ScrollbarState::new(),
