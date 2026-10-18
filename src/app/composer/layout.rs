@@ -19,8 +19,63 @@ pub(super) fn model_control(chip: MenuChip) -> MenuChip {
         .max_w(px(MODEL_CONTROL_MAX_WIDTH))
 }
 
-/// Clicking the catalog rail leaves footer keyboard editing and returns the
-/// arrows/typing to model search, including an already-selected provider tab.
+pub(super) fn model_options_control(chip: MenuChip) -> MenuChip {
+    chip.flex_none().max_w(px(88.0))
+}
+
+/// Related settings stay adjacent, but each target opens only its own surface.
+/// The whole group yields space before fixed submission targets do.
+pub(super) fn model_controls_group(
+    model: AnyElement,
+    options: Option<AnyElement>,
+) -> Stateful<Div> {
+    div()
+        .id("composer-model-controls")
+        .role(gpui::Role::Group)
+        .min_w_0()
+        .flex_shrink_1()
+        .max_w(px(MODEL_CONTROL_MAX_WIDTH))
+        .flex()
+        .items_center()
+        .child(model)
+        .children(options)
+}
+
+pub(super) fn focus_model_options_after_open(
+    handle: crate::ui::menu::ContextMenuHandle,
+    focus: FocusHandle,
+    window: &mut gpui::Window,
+) {
+    window.on_next_frame(move |window, _| {
+        window.on_next_frame(move |window, cx| {
+            if handle.is_open() {
+                window.focus(&focus, cx);
+            }
+        });
+    });
+}
+
+pub(super) fn model_options_panel(
+    viewport_width: gpui::Pixels,
+    focus: &FocusHandle,
+    theme: Theme,
+) -> Stateful<Div> {
+    div()
+        .id("model-options-panel")
+        .track_focus(focus)
+        .role(gpui::Role::Group)
+        .w(px(280.0).min((viewport_width - px(16.0)).max(px(0.0))))
+        .p(px(14.0))
+        .tab_group()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(theme.border_strong)
+        .bg(theme.raised)
+        .shadow_lg()
+}
+
+/// Clicking the catalog rail returns arrows/typing to model search,
+/// including an already-selected provider tab.
 pub(super) fn model_picker_rail(search_focus: &FocusHandle, theme: Theme) -> Div {
     let focus = search_focus.clone();
     div()
@@ -42,12 +97,10 @@ pub(super) fn model_picker_rail(search_focus: &FocusHandle, theme: Theme) -> Div
         })
 }
 
-/// The catalog and the selected model's options are one visible surface.
-/// Footer space is reserved before sizing the scrollable model list.
+/// The model catalog keeps its full height; settings have a separate popover.
 pub(super) fn model_picker_content(
     search: AnyElement,
     list: AnyElement,
-    options: Option<AnyElement>,
     theme: Theme,
 ) -> Stateful<Div> {
     div()
@@ -70,13 +123,12 @@ pub(super) fn model_picker_content(
                 .relative()
                 .child(list),
         )
-        .children(options)
 }
 
 /// Width of the toolbar's content box, after the card border and row padding.
 /// Below this point secondary labels give their space back to the model.
 pub(super) fn compact_controls(toolbar_width: f32) -> bool {
-    toolbar_width < 560.0
+    toolbar_width < 640.0
 }
 
 /// A submission target keeps its full hit area when the toolbar gets narrow.
@@ -167,7 +219,9 @@ mod tests {
     const PRESET_LABEL: &str = "A deliberately long custom agent preset name";
     const ACCESS_LABEL: &str = "A deliberately long access permission description";
     const GOAL_LABEL: &str = "Pursuing a deliberately long goal label";
-    const TOOLBAR_WIDTHS: [f32; 8] = [278.0, 318.0, 418.0, 558.0, 559.0, 560.0, 561.0, 698.0];
+    const TOOLBAR_WIDTHS: [f32; 11] = [
+        278.0, 318.0, 418.0, 558.0, 559.0, 560.0, 561.0, 639.0, 640.0, 641.0, 698.0,
+    ];
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Actions {
@@ -200,7 +254,7 @@ mod tests {
         preset: bool,
         goal: bool,
         actions: Actions,
-        focus: [FocusHandle; 6],
+        focus: [FocusHandle; 7],
         activated: Vec<&'static str>,
     }
 
@@ -232,6 +286,16 @@ mod tests {
             .tab_index(0)
             .on_click(cx.listener(|this, _, _, _| this.activated.push("model")))
             .into_any_element();
+            let options = model_options_control(
+                MenuChip::new("composer-model-options")
+                    .label("Extra high · Fast")
+                    .caret(false),
+            )
+            .track_focus(&self.focus[6])
+            .tab_index(0)
+            .on_click(cx.listener(|this, _, _, _| this.activated.push("options")))
+            .into_any_element();
+            let model = model_controls_group(model, Some(options)).into_any_element();
             let preset = self.preset.then(|| {
                 secondary_control(
                     MenuChip::new("agent-preset")
@@ -387,9 +451,21 @@ mod tests {
             "actions must stay within row padding: {tree}"
         );
 
-        assert!(model.size.width <= px(MODEL_CONTROL_MAX_WIDTH));
+        let group = bounds(tree, "composer-model-controls");
+        let options = bounds(tree, "composer-model-options");
+        assert!(group.size.width <= px(MODEL_CONTROL_MAX_WIDTH));
+        assert_eq!(
+            model.right(),
+            options.left(),
+            "related triggers stay adjacent"
+        );
+        assert!(options.size.width > px(32.0));
+        assert_eq!(
+            node(tree, "composer-model-options")["label"],
+            "Extra high · Fast"
+        );
         let mut previous = bounds(tree, "composer-model-space");
-        assert!(model.right() <= previous.right());
+        assert!(options.right() <= previous.right());
         for (id, label, present, compact_width, full_width) in [
             ("agent-preset", PRESET_LABEL, preset, 26.0, 120.0),
             ("runtime-mode", ACCESS_LABEL, true, 26.0, 148.0),
@@ -413,7 +489,7 @@ mod tests {
                 "compaction must retain the full semantic label"
             );
             assert_eq!(node(tree, id)["role"], "Button");
-            // At 560px labels return. Exact icon-only widths also catch a
+            // At 640px labels return. Exact icon-only widths also catch a
             // hidden label/caret accidentally continuing to consume space.
             if compact_controls(width) {
                 approx(control.size.width, compact_width, "compact icon-only width");
@@ -439,8 +515,10 @@ mod tests {
     fn compact_controls_switch_at_the_toolbar_content_boundary() {
         assert!(compact_controls(278.0));
         assert!(compact_controls(559.0));
-        assert!(!compact_controls(560.0));
-        assert!(!compact_controls(561.0));
+        assert!(compact_controls(560.0));
+        assert!(compact_controls(639.0));
+        assert!(!compact_controls(640.0));
+        assert!(!compact_controls(641.0));
         assert!(!compact_controls(698.0));
     }
 
@@ -526,6 +604,7 @@ mod tests {
             let tree = snapshot(cx);
             for id in [
                 "composer-provider-model",
+                "composer-model-options",
                 "agent-preset",
                 "runtime-mode",
                 "composer-goal",
@@ -548,7 +627,7 @@ mod tests {
             }
             cx.run_until_parked();
             view.read_with(cx, |view, _| {
-                let mut expected = vec!["model", "preset", "access", "goal"];
+                let mut expected = vec!["model", "options", "preset", "access", "goal"];
                 if actions != Actions::Preparing {
                     expected.push("primary");
                 }
@@ -589,7 +668,7 @@ mod tests {
         cx.run_until_parked();
         let long = snapshot(cx);
         approx(
-            bounds(&long, "composer-provider-model").size.width,
+            bounds(&long, "composer-model-controls").size.width,
             MODEL_CONTROL_MAX_WIDTH,
             "long model cap",
         );
@@ -600,57 +679,44 @@ mod tests {
     struct PickerFixture {
         width: f32,
         height: f32,
-        options: bool,
     }
 
     impl Render for PickerFixture {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let block = |id: &'static str, height: f32| {
-                div()
-                    .id(id)
-                    .role(gpui::Role::Group)
-                    .h(px(height))
-                    .flex_none()
-                    .into_any_element()
-            };
             div()
                 .w(px(self.width))
                 .h(px(self.height))
                 .flex()
                 .child(model_picker_content(
-                    block("picker-search-fixture", 52.0),
+                    div()
+                        .id("picker-search-fixture")
+                        .role(gpui::Role::Group)
+                        .h(px(52.0))
+                        .flex_none()
+                        .into_any_element(),
                     div()
                         .id("picker-list-fixture")
                         .role(gpui::Role::List)
                         .size_full()
                         .into_any_element(),
-                    self.options.then(|| block("picker-options-fixture", 72.0)),
                     Theme::current(cx),
                 ))
         }
     }
 
     #[gpui::test]
-    fn model_catalog_and_options_share_one_surface_and_list_keeps_remaining_space(
-        cx: &mut TestAppContext,
-    ) {
+    fn catalog_uses_all_space_below_search_without_a_settings_footer(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|window, _| {
             window.set_a11y_automation(true);
             PickerFixture {
                 width: 408.0,
                 height: 388.0,
-                options: true,
             }
         });
-        for (width, height, options) in [
-            (408.0, 388.0, true),
-            (260.0, 300.0, true),
-            (408.0, 388.0, false),
-        ] {
+        for (width, height) in [(408.0, 388.0), (260.0, 300.0)] {
             view.update(cx, |view, cx| {
                 view.width = width;
                 view.height = height;
-                view.options = options;
                 cx.notify();
             });
             cx.run_until_parked();
@@ -660,23 +726,159 @@ mod tests {
             approx(search.size.height, 52.0, "search height");
             assert_eq!(search.bottom(), list.top());
             approx(list.size.width, width, "catalog width");
-            approx(
-                list.size.height,
-                height - 52.0 - if options { 72.0 } else { 0.0 },
-                "catalog remaining height",
-            );
-            if options {
-                let footer = bounds(&tree, "picker-options-fixture");
-                assert_eq!(list.bottom(), footer.top());
-                approx(footer.bottom(), height, "footer bottom");
-                approx(footer.size.width, width, "footer width");
-            }
+            approx(list.size.height, height - 52.0, "full catalog height");
+            approx(list.bottom(), height, "catalog bottom");
         }
+    }
+
+    struct OptionsPanelFixture {
+        viewport_width: f32,
+        focus: FocusHandle,
+    }
+
+    impl Render for OptionsPanelFixture {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().flex().items_start().child(
+                model_options_panel(px(self.viewport_width), &self.focus, Theme::current(cx))
+                    .child(
+                        div()
+                            .id("options-content-fixture")
+                            .role(gpui::Role::Group)
+                            .w_full()
+                            .h(px(96.0)),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn settings_popover_is_compact_and_clamped_to_narrow_windows(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            window.set_a11y_automation(true);
+            OptionsPanelFixture {
+                viewport_width: 1000.0,
+                focus: cx.focus_handle(),
+            }
+        });
+        for (width, expected) in [(1000.0, 280.0), (240.0, 224.0)] {
+            view.update(cx, |view, cx| {
+                view.viewport_width = width;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let tree = snapshot(cx);
+            let panel = bounds(&tree, "model-options-panel");
+            let content = bounds(&tree, "options-content-fixture");
+            approx(panel.size.width, expected, "compact options width");
+            approx(
+                content.left() - panel.left(),
+                15.0,
+                "comfortable content inset",
+            );
+            approx(content.size.width, expected - 30.0, "options content width");
+            approx(panel.size.height, 126.0, "content-sized options height");
+        }
+    }
+
+    struct FixedOptionsFixture {
+        handle: crate::ui::menu::ContextMenuHandle,
+        panel_focus: FocusHandle,
+        slider_focus: FocusHandle,
+    }
+
+    impl Render for FixedOptionsFixture {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let panel_focus = self.panel_focus.clone();
+            let slider_focus = self.slider_focus.clone();
+            crate::ui::menu::popover(
+                MenuChip::new("fixed-options-trigger").label("Fixed"),
+                &self.handle,
+                crate::ui::menu::MenuAlign::BelowLeft,
+                move |_, window, cx| {
+                    model_options_panel(
+                        window.viewport_size().width,
+                        &panel_focus,
+                        Theme::current(cx),
+                    )
+                    .child(
+                        crate::ui::effort_slider::EffortSlider::new(
+                            "fixed-effort",
+                            1,
+                            0,
+                            &slider_focus,
+                        )
+                        .value_labels(vec!["Fixed".into()]),
+                    )
+                    .into_any_element()
+                },
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn fixed_only_options_receive_focus_and_escape_without_stealing_focus_after_dismissal(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::ui::menu::init);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let panel_focus = cx.focus_handle();
+            let focus = panel_focus.clone();
+            let handle = crate::ui::menu::ContextMenuHandle::new(cx);
+            let focus_handle = handle.clone();
+            let handle = handle.on_toggle(move |open, window, _| {
+                if open {
+                    focus_model_options_after_open(focus_handle.clone(), focus.clone(), window);
+                }
+            });
+            FixedOptionsFixture {
+                handle,
+                panel_focus,
+                slider_focus: cx.focus_handle(),
+            }
+        });
+        cx.run_until_parked();
+        let handle = view.read_with(cx, |view, _| view.handle.clone());
+        cx.update(|window, cx| window.focus(handle.trigger_focus_handle(), cx));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(handle.is_open());
+        // The headless platform has no display frame loop.
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            cx.run_until_parked();
+        }
+        let panel_focus = view.read_with(cx, |view, _| view.panel_focus.clone());
+        cx.update(|window, _| assert!(panel_focus.is_focused(window)));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            !handle.is_open(),
+            "the inert fixed slider must not trap the popover"
+        );
+        // An open immediately followed by dismissal must not queue stale focus.
+        cx.update(|window, cx| {
+            crate::ui::menu::toggle_popover(
+                &handle,
+                crate::ui::menu::MenuAlign::BelowLeft,
+                window,
+                cx,
+            );
+            handle.close(window, cx);
+            window.focus(handle.trigger_focus_handle(), cx);
+        });
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            cx.run_until_parked();
+        }
+        cx.update(|window, _| assert!(handle.trigger_focus_handle().is_focused(window)));
     }
 
     struct PickerFocusFixture {
         search: gpui::Entity<crate::input::TextInput>,
-        slider_focus: FocusHandle,
         selected: usize,
         catalog_moves: usize,
     }
@@ -710,26 +912,13 @@ mod tests {
                         .child(self.search.clone())
                         .into_any_element(),
                     div().size_full().into_any_element(),
-                    Some(
-                        crate::ui::effort_slider::EffortSlider::new(
-                            "focused-effort",
-                            5,
-                            self.selected,
-                            &self.slider_focus,
-                        )
-                        .on_change(cx.listener(|this, index: &usize, _, cx| {
-                            this.selected = *index;
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                    ),
                     theme,
                 ))
         }
     }
 
     #[gpui::test]
-    fn rail_click_returns_footer_keyboard_input_to_catalog_search(cx: &mut TestAppContext) {
+    fn rail_click_returns_external_keyboard_focus_to_catalog_search(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::input::init(cx);
             crate::ui::menu::init(cx);
@@ -740,14 +929,12 @@ mod tests {
             window.focus(&slider_focus, cx);
             PickerFocusFixture {
                 search: cx.new(|cx| crate::input::TextInput::new(window, cx).tab_stop(true)),
-                slider_focus,
                 selected: 2,
                 catalog_moves: 0,
             }
         });
         cx.run_until_parked();
-        cx.simulate_keystrokes("right");
-        view.read_with(cx, |view, _| assert_eq!(view.selected, 3));
+
         let tree = snapshot(cx);
         cx.simulate_click(
             bounds(&tree, "rail-tab-fixture").center(),
@@ -758,7 +945,7 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.catalog_moves, 1);
             assert_eq!(
-                view.selected, 3,
+                view.selected, 2,
                 "catalog navigation must not edit the effort value"
             );
         });

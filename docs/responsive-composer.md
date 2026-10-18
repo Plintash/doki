@@ -3,83 +3,69 @@
 The composer reserves a fixed-size action area before distributing space to its
 settings. Send, preparing and stop each retain a 26 px target; a working turn
 with a follow-up draft reserves 58 px for stop, a 6 px gap and follow-up.
-The model entry sizes to its content, caps at 280 px, and truncates in a
-shrinkable slot. Unused space stays outside the actual hit/selection area;
-secondary controls and action targets keep their fixed positions.
+Model and effort are adjacent text targets in one content-sized group capped at
+280 px. The model name truncates first. Unused space stays outside the actual
+hit area; secondary controls and action targets keep their fixed positions.
 
-Below 560 px of toolbar content width, safety mode, agent preset and goal labels
-collapse to icons. The threshold is calculated from the current chat-column
-width, including panel animation, after composer margins/border/row padding.
-Full labels remain available through hover and keyboard focus, and goal status
-uses a distinct glyph rather than color alone. Wide layouts keep the labels.
+Below 640 px of toolbar content width, safety mode, agent preset and goal labels
+collapse to icons. The threshold uses the current chat-column width after
+composer margins/border/row padding. Full labels remain available through hover
+and keyboard focus; wide layouts keep the labels.
 
 ## Model and effort
 
-One entry opens the existing searchable provider/favorites catalog directly.
-Models with adjustable traits show a compact footer below the list, in the same
-surface:
+The model name opens the existing searchable provider/favorites catalog. The
+catalog has its full scrollable height below search, with no settings footer.
+Selecting a model closes the picker and returns focus to the composer. Provider
+locking, favorites, search, and model-picker keyboard navigation are unchanged.
 
-1. Current reasoning effort beside a small neutral label
-2. Thin discrete effort rail with visible stops and a 12 px thumb, retaining a
-   28 px pointer target and the catalog's option order
-3. Supported service-tier and context-window options, with provider defaults
+The adjacent actual effort label opens a separate content-sized options popover
+(280 px wide, clamped to narrow windows). Its reasoning control has a substantial
+neutral rounded rail, visible stops, and a circular thumb. Supported service-tier
+and context-window choices use short selected segments below it. Their full
+meaning and provider-default status remain available to assistive technology
+and tooltips, without a repeated heading, checkmark, or Default badge.
 
-No intermediate page, repeated model-name header, lightning icon, reset icon,
-or blue gauge styling remains. The footer uses Doki's neutral palette and the
-picker uses its compact corner treatment.
+Provider labels and IDs are used as supplied. The synthetic `default` service
+choice means the existing provider-default policy and is labelled Default unless
+the provider catalog supplies a label for that exact ID. No rendering or opening
+a menu writes a default value or clears an explicit selection.
 
-Selecting a model with traits leaves the catalog open and moves keyboard focus
-to the first adjustable footer control. Tab/Shift-Tab in search still cycle the
-provider/favorites rail; arrows and Enter select a model, then native Tab
-traversal moves through footer options and back to search. Clicking a provider or
-favorites tab returns focus from the footer to search, so arrows navigate the
-new catalog instead of changing effort. Escape closes the
-picker directly. Models without traits have no footer and selection closes the
-picker. A provider
-locked by an established conversation stays locked; a draft on a disabled
-provider opens the same usable fallback through either catalog-entry path.
+There is no special highest-level alias, texture, flourish, or animation clock.
+The slider locally previews the pointer and actual provider label continuously,
+then commits one discrete setting on normal release, including outside the
+track. Capture cancellation restores the committed value without writing. Session/model
+identity changes cancel local preview, and stale handlers cannot write after
+model changes or menu dismissal.
+Keyboard arrows, Home/End and accessibility increment/decrement commit directly.
+Disabled/fixed controls are inert. The app's existing settings/runtime path is
+used only for a committed value and never submits a model turn.
 
-The thumb follows the pointer continuously while the stored value snaps to the
-nearest real provider option. Release settles onto that detent in 120 ms.
-The highest of two or more choices displays `Galaxy · <provider label>` without
-changing its ID or adding a capability. Claude’s appended Ultracode orchestration
-mode remains separate from native Max and keeps its own name. Entering Galaxy
-plays a bounded 420 ms
-neutral star-gather/halo response, then leaves a quiet static rail texture.
-Reopening at the highest setting does not replay the flourish. Reduced motion
-settles immediately and disables the flourish; fixed/disabled sliders never
-animate. Both transitions use the existing self-parking 30 Hz pulse clock,
-with no repeating or display-rate animation.
-
-The slider supports click, captured drag, arrows, Home/End and accessibility
-increment/decrement actions. Models with no effort options get no slider;
-a single fixed option is shown inert. Settings only update session options,
-using the existing runtime path, and do not submit a model turn. Invalid stored
-options are resolved against the selected catalog; Cursor suffixes and valid
-per-model defaults are preserved.
+This change addresses two source-visible costs in the previous design: each
+detent invoked synchronous settings/state persistence (including fsync), and
+pointer notifications targeted the owning application while the catalog was
+open. Local preview avoids repeated persistence during capture, and the closed
+catalog no longer rebuilds its model rows during effort adjustment. These are
+source and automated-test findings, not a measured native frame-rate claim.
 
 ## Automated regression coverage
 
-- Shared production geometry tested at 278, 318, 418, 558, 559, 560, 561 and
-  698 px content widths, including continuous resizing, long ASCII/CJK names,
-  optional controls and all action states
-- Real GPUI bounds, semantic labels, pointer targets and trailing-edge hits
-- Content-sized short model names, capped long names, and one-surface catalog/
-  footer geometry at normal and narrow sizes
-- Footer focus chooses the first genuinely adjustable option and skips an inert
-  single-option slider
-- Slider endpoints, zero/one options, keyboard behavior inside the menu context,
-  accessibility values/actions and captured drag across rerenders
-- Capability/default/remembered-state resolution, Cursor suffixes, disabled
-  provider fallback and unchanged session state apart from requested options
+- Shared production geometry at 278, 318, 418, 558, 559, 560, 561, 639, 640, 641 and 698 px
+  content widths, including long ASCII/CJK names, optional controls and every
+  action state
+- Adjacent model/options hit targets, independent popover bounds, full-height
+  catalog geometry, and fixed trailing-edge submission targets
+- Actual provider effort labels, distinct native/orchestration values, and
+  explicit/default service-tier semantics
+- Slider pointer preview and release/cancellation, keyboard/accessibility,
+  local notification counts, and zero/one-option behavior
+- Existing capability/default/remembered-state resolution and provider fallback
 
 ```sh
 cargo test --locked -p waku --lib
-cargo test --locked -p waku-protocol --lib
 cargo build --locked -p waku --bin waku
 cargo fmt --all -- --check
 ```
 
-Native/device visual acceptance is intentionally owned by the user for this
-change. Automated geometry tests do not claim visual inspection of a running
-native build.
+Native/device visual acceptance remains user-owned. Automated geometry tests do
+not claim visual inspection of a running native build.

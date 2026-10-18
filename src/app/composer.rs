@@ -50,25 +50,30 @@ pub fn init_workspace_keys(cx: &mut App) {
     ]);
 }
 
-fn highest_model_effort_index(
-    provider: ProviderKind,
-    options: &[ProviderModelOption],
-) -> Option<usize> {
-    let mut native = options.iter().enumerate().filter(|(_, option)| {
-        // Claude's appended Ultracode mode resolves to xhigh plus workflow
-        // orchestration. It is not a higher native effort than max.
-        provider != ProviderKind::Claude || option.id != "ultracode"
-    });
-    native.next()?;
-    native.last().map(|(index, _)| index)
+/// Keep the provider's wording and IDs intact, including orchestration options.
+fn effort_labels(options: &[ProviderModelOption]) -> Vec<SharedString> {
+    options
+        .iter()
+        .map(|option| option.label.clone().into())
+        .collect()
 }
 
-fn effort_display_label(label: &str, index: usize, highest: Option<usize>) -> String {
-    if highest == Some(index) {
-        format!("Galaxy · {label}")
-    } else {
-        label.to_owned()
-    }
+fn service_tier_choices(model: &ProviderModel) -> Vec<(String, String)> {
+    let default_label = model
+        .service_tiers
+        .iter()
+        .find(|option| option.id == "default")
+        .map(|option| option.label.clone())
+        .unwrap_or_else(|| tr!("common.default"));
+    let mut choices = vec![("default".to_owned(), default_label)];
+    choices.extend(
+        model
+            .service_tiers
+            .iter()
+            .filter(|option| option.id != "default")
+            .map(|option| (option.id.clone(), option.label.clone())),
+    );
+    choices
 }
 
 fn first_model_option_id(model: &ProviderModel) -> Option<String> {
@@ -1200,6 +1205,61 @@ impl Waku {
     // ── Composer ───────────────────────────────────────────────────────────
 
     pub(super) fn render_provider_model_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        layout::model_controls_group(
+            self.render_model_picker_control(cx),
+            self.render_model_options_control(cx),
+        )
+        .into_any_element()
+    }
+
+    fn render_model_options_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.selected_model_has_traits() {
+            return None;
+        }
+        let weak = cx.entity().downgrade();
+        let focus_weak = weak.clone();
+        let handle = self.menu_handle_with("model-options-menu", cx, move |open, window, cx| {
+            let _ = focus_weak.update(cx, |this, cx| {
+                if open {
+                    this.focus_model_options(window, cx);
+                } else {
+                    let focus = this.composer.read(cx).focus();
+                    window.focus(&focus, cx);
+                }
+                cx.notify();
+            });
+        });
+        let panel_focus = self.transcript_control_focus("model-options-panel", cx);
+        let label = self.composer_model_options_label();
+        let tooltip = format!("{}: {}", tr!("common.settings"), label);
+        Some(popover(
+            layout::model_options_control(
+                MenuChip::new("composer-model-options")
+                    .label(label.clone())
+                    .caret(false)
+                    .selected(handle.is_open()),
+            )
+            .tooltip(Tooltip::text(tooltip.clone()))
+            .child(crate::ui::tooltip::FocusHint::new(
+                handle.trigger_focus_handle().clone(),
+                tooltip,
+            )),
+            &handle,
+            MenuAlign::AboveLeft,
+            move |_, window, cx| {
+                let theme = Theme::current(cx);
+                let options = weak
+                    .update(cx, |this, cx| this.render_model_options(cx))
+                    .ok()
+                    .flatten();
+                layout::model_options_panel(window.viewport_size().width, &panel_focus, theme)
+                    .children(options)
+                    .into_any_element()
+            },
+        ))
+    }
+
+    fn render_model_picker_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
         let session = self.selected_session();
         let provider = session.map(|session| session.provider).unwrap_or_default();
@@ -1240,10 +1300,6 @@ impl Waku {
         let searching = !normalized_query.is_empty();
         let selected_tab = self.model_picker_tab;
         let selected_model = selected_model.map(str::to_owned);
-        let probes = self.probes.clone();
-        let disabled_providers = self.state.disabled_providers.clone();
-        let pending_discoveries = self.provider_model_discoveries_pending.clone();
-        let favorites = self.state.favorite_models.clone();
         let weak = cx.entity().downgrade();
         let search = self.model_search.clone();
         let search_focus = search.read(cx).focus_handle(cx);
@@ -1308,6 +1364,20 @@ impl Waku {
             })
         };
 
+        // Effort preview may repaint ancestors, but a closed catalog must not
+        // clone every provider's model metadata or rebuild its model rows.
+        let open = handle.is_open();
+        let probes = open.then(|| self.probes.clone()).unwrap_or_default();
+        let disabled_providers = open
+            .then(|| self.state.disabled_providers.clone())
+            .unwrap_or_default();
+        let pending_discoveries = open
+            .then(|| self.provider_model_discoveries_pending.clone())
+            .unwrap_or_default();
+        let favorites = open
+            .then(|| self.state.favorite_models.clone())
+            .unwrap_or_default();
+
         // Only while the panel is open: this clones every installed provider's
         // model list, and the closed picker is on the composer's every frame.
         // Built out here rather than in the body so the key handler and the
@@ -1335,7 +1405,7 @@ impl Waku {
         // be a lie. The chip says so instead, and stays a trigger because the
         // panel behind it is where the fix lives. Icon plus wording carry the
         // state on their own, so the warning tint is never the only signal.
-        let trigger_label = self.composer_model_label(&selected_model_name);
+        let trigger_label = selected_model_name;
         let trigger = if no_providers {
             MenuChip::new("composer-provider-model")
                 .icon("icons/alert.svg", theme.warning)
@@ -1357,7 +1427,7 @@ impl Waku {
                 .selected(handle.is_open()),
             &handle,
             MenuAlign::AboveLeft,
-            move |popover, window, cx| {
+            move |popover, window, _cx| {
                 let popover = popover.clone();
                 let available_models = available_models.clone();
 
@@ -1633,15 +1703,10 @@ impl Waku {
                                     }),
                             )
                             .on_click(move |_, window, cx| {
-                                let keep_open = select_weak
-                                    .update(cx, |this, cx| {
-                                        this.choose_model(kind, model_id.clone(), cx);
-                                        this.focus_model_options(window, cx)
-                                    })
-                                    .unwrap_or(false);
-                                if !keep_open {
-                                    select_popover.close(window, cx);
-                                }
+                                let _ = select_weak.update(cx, |this, cx| {
+                                    this.choose_model(kind, model_id.clone(), cx);
+                                });
+                                select_popover.close(window, cx);
                             }),
                     );
                 }
@@ -1655,10 +1720,6 @@ impl Waku {
                 let previous_tab_weak = weak.clone();
                 let confirm_weak = weak.clone();
                 let confirm_popover = popover.clone();
-                let model_options = weak
-                    .update(cx, |this, cx| this.render_model_options(cx))
-                    .ok()
-                    .flatten();
                 div()
                     .id("model-picker")
                     .w(px(460.0).min((window.viewport_size().width - px(16.0)).max(px(0.0))))
@@ -1697,15 +1758,10 @@ impl Waku {
                         });
                     })
                     .on_action(move |_: &ConfirmEntry, window, cx| {
-                        let keep_open = confirm_weak
-                            .update(cx, |this, cx| {
-                                this.choose_highlighted_model(&confirm_models, cx);
-                                this.focus_model_options(window, cx)
-                            })
-                            .unwrap_or(false);
-                        if !keep_open {
-                            confirm_popover.close(window, cx);
-                        }
+                        let _ = confirm_weak.update(cx, |this, cx| {
+                            this.choose_highlighted_model(&confirm_models, cx);
+                        });
+                        confirm_popover.close(window, cx);
                         window.refresh();
                     })
                     .child(sidebar)
@@ -1716,7 +1772,6 @@ impl Waku {
                             .child(rows)
                             .child(scrollbar::vertical(&scroll, &scrollbar_state))
                             .into_any_element(),
-                        model_options,
                         theme,
                     ))
                     .into_any_element()
@@ -1843,15 +1898,39 @@ impl Waku {
         )
     }
 
-    fn composer_model_label(&self, model_name: &str) -> String {
+    /// Bind transient controls to the session/provider/model that rendered them.
+    /// Menu dismissal can precede the next paint, while old event handlers still exist.
+    fn model_options_identity(&self) -> Option<(Uuid, ProviderKind, String)> {
+        let session = self.selected_session()?;
+        let model = self.model_metadata_for_session(session)?;
+        Some((
+            session.id,
+            session.provider,
+            self.model_for_session(session)
+                .unwrap_or(&model.id)
+                .to_owned(),
+        ))
+    }
+
+    fn model_options_are_current(&self, expected: &Option<(Uuid, ProviderKind, String)>) -> bool {
+        expected.is_some()
+            && self.model_options_identity().as_ref() == expected.as_ref()
+            && self
+                .menus
+                .borrow()
+                .get("model-options-menu")
+                .is_some_and(|handle| handle.is_open())
+    }
+
+    fn composer_model_options_label(&self) -> String {
         let Some(model) = self
             .selected_session()
             .and_then(|session| self.model_metadata_for_session(session))
         else {
-            return model_name.to_owned();
+            return tr!("common.settings");
         };
         let selected = self.selected_model_traits(model);
-        let mut labels = vec![model_name.to_owned()];
+        let mut labels = Vec::new();
         if let Some(effort) = model
             .reasoning_efforts
             .iter()
@@ -1859,8 +1938,7 @@ impl Waku {
         {
             labels.push(effort.label.clone());
         }
-        // Keep cost-affecting overrides visible even though their controls now
-        // live together inside the model panel.
+        // Cost-affecting overrides remain in the adjacent options label and its tooltip.
         if let Some(tier) = model.service_tiers.iter().find(|option| {
             Some(&option.id) == selected.service_tier.as_ref() && option.id != "default"
         }) {
@@ -1875,11 +1953,14 @@ impl Waku {
                 labels.push(window.label.clone());
             }
         }
-        labels.join(" · ")
+        if labels.is_empty() {
+            tr!("common.settings")
+        } else {
+            labels.join(" · ")
+        }
     }
 
-    /// Keep the catalog visible after choosing a configurable model. Keyboard
-    /// selection lands on its first adjustable option in the same surface.
+    /// The separate options popover takes focus only when opened explicitly.
     fn focus_model_options(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(model) = self
             .selected_session()
@@ -1887,17 +1968,15 @@ impl Waku {
         else {
             return false;
         };
-        if let Some(id) = first_model_option_id(model) {
-            let focus = self.transcript_control_focus(id, cx);
-            window.on_next_frame(move |window, _| {
-                window.on_next_frame(move |window, cx| window.focus(&focus, cx));
-            });
+        let id = first_model_option_id(model).unwrap_or_else(|| "model-options-panel".to_owned());
+        let focus = self.transcript_control_focus(id, cx);
+        if let Some(handle) = self.menus.borrow().get("model-options-menu").cloned() {
+            layout::focus_model_options_after_open(handle, focus, window);
         }
         self.selected_model_has_traits()
     }
 
     fn render_model_options(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let theme = Theme::current(cx);
         let session = self.selected_session()?;
         if !self.selected_model_has_traits() {
             return None;
@@ -1915,79 +1994,40 @@ impl Waku {
                     .position(|option| Some(&option.id) == selected.reasoning_effort.as_ref())
             })
             .unwrap_or(0);
-        let highest_index = highest_model_effort_index(session.provider, &options);
-        let effort_label = options
-            .get(selected_index)
-            .map(|option| effort_display_label(&option.label, selected_index, highest_index));
         let mut panel = div()
             .id("model-options")
             .w_full()
             .flex_none()
-            .px(px(12.0))
-            .py(px(9.0))
-            .border_t_1()
-            .border_color(theme.border)
             .flex()
             .flex_col()
-            .when_some(effort_label.clone(), |panel, label| {
-                panel.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(8.0))
-                        .text_size(sp(12.0))
-                        .child(
-                            div()
-                                .text_color(theme.text_secondary)
-                                .child(tr!("models.reasoning")),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.text)
-                                .child(label),
-                        ),
-                )
-            });
-        if let Some(label) = effort_label {
+            .gap(px(12.0));
+        if !options.is_empty() {
+            let identity = self.model_options_identity();
             let focus = self.transcript_control_focus("model-effort-slider", cx);
             panel = panel.child(
-                div().mt(px(3.0)).child(
-                    crate::ui::effort_slider::EffortSlider::new(
-                        "model-effort-slider",
-                        options.len(),
-                        selected_index,
-                        &focus,
-                    )
-                    .label(tr!("models.reasoning"))
-                    .value_label(label)
-                    .highest_index(highest_index)
-                    .on_change(cx.listener(
-                        move |this, index: &usize, _, cx| {
-                            if let Some(option) = options.get(*index) {
-                                this.set_reasoning_effort(option.id.clone(), cx);
-                            }
-                        },
-                    )),
-                ),
+                crate::ui::effort_slider::EffortSlider::new(
+                    "model-effort-slider",
+                    options.len(),
+                    selected_index,
+                    &focus,
+                )
+                .label(tr!("models.reasoning"))
+                .value_labels(effort_labels(&options))
+                .context_key(format!("{identity:?}"))
+                .on_change(cx.listener(move |this, index: &usize, _, cx| {
+                    if !this.model_options_are_current(&identity) {
+                        return;
+                    }
+                    if let Some(option) = options.get(*index) {
+                        this.set_reasoning_effort(option.id.clone(), cx);
+                    }
+                })),
             );
         }
-        // Provider-specific controls share the footer with effort; the catalog
-        // stays visible and no navigation step is needed to reach them.
+        // Compact, accurately named provider options stay next to the effort control.
         if let (Some(model), Some(selected)) = (model, selected) {
             if !model.service_tiers.is_empty() {
-                let mut choices = vec![("default".to_owned(), tr!("models.standard"))];
-                choices.extend(
-                    model
-                        .service_tiers
-                        .iter()
-                        .filter(|option| option.id != "default")
-                        .map(|option| (option.id.clone(), option.label.clone())),
-                );
+                let choices = service_tier_choices(model);
                 panel = panel.child(self.render_model_trait_choices(
                     ComposerModelTrait::ServiceTier,
                     choices,
@@ -2021,11 +2061,18 @@ impl Waku {
         selected: Option<&str>,
         default: Option<&str>,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> Stateful<Div> {
         let theme = Theme::current(cx);
         let label = kind.label();
-        let mut row = div().mt(px(6.0)).flex().flex_wrap().gap(px(4.0));
+        let mut row = div()
+            .id(SharedString::from(format!("model-{}-choices", kind.id())))
+            .role(gpui::Role::Group)
+            .aria_label(label.clone())
+            .flex()
+            .flex_wrap()
+            .gap(px(4.0));
         for (value, text) in choices {
+            let identity = self.model_options_identity();
             let id = format!("model-{}-{value}", kind.id());
             let focus = self.transcript_control_focus(id.clone(), cx);
             let is_selected = selected == Some(value.as_str());
@@ -2041,7 +2088,7 @@ impl Waku {
                     .track_focus(&focus)
                     .tab_index(0)
                     .tab_stop(true)
-                    .aria_label(accessible_label)
+                    .aria_label(accessible_label.clone())
                     .aria_selected(is_selected)
                     .h(px(28.0))
                     .max_w_full()
@@ -2055,40 +2102,35 @@ impl Waku {
                     .cursor_default()
                     .when(is_selected, |style| style.bg(theme.overlay_strong))
                     .hover(|style| style.bg(theme.overlay))
-                    .focus_visible(|style| style.border_1().border_color(theme.accent))
-                    .when(is_selected, |element| {
-                        element.child(icon("icons/check.svg", 11.0, theme.text_secondary))
+                    .focus_visible(|style| style.border_1().border_color(theme.text_tertiary))
+                    .relative()
+                    .tooltip(Tooltip::text(accessible_label.clone()))
+                    .child(crate::ui::tooltip::FocusHint::new(
+                        focus.clone(),
+                        accessible_label.clone(),
+                    ))
+                    .font_weight(if is_selected {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
                     })
                     .child(div().min_w_0().truncate().child(text))
-                    .when(is_default, |element| {
-                        element.child(
-                            div()
-                                .flex_none()
-                                .text_size(sp(10.0))
-                                .text_color(theme.text_tertiary)
-                                .child(tr!("common.default")),
-                        )
-                    })
-                    .on_activation(cx, move |this, _, cx| match kind {
-                        ComposerModelTrait::ServiceTier => this.set_service_tier(value.clone(), cx),
-                        ComposerModelTrait::ContextWindow => {
-                            this.set_context_window(value.clone(), cx)
+                    .on_activation(cx, move |this, _, cx| {
+                        if !this.model_options_are_current(&identity) {
+                            return;
+                        }
+                        match kind {
+                            ComposerModelTrait::ServiceTier => {
+                                this.set_service_tier(value.clone(), cx)
+                            }
+                            ComposerModelTrait::ContextWindow => {
+                                this.set_context_window(value.clone(), cx)
+                            }
                         }
                     }),
             );
         }
-        div()
-            .mt(px(10.0))
-            .pt(px(9.0))
-            .border_t_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_size(sp(11.5))
-                    .text_color(theme.text_tertiary)
-                    .child(label),
-            )
-            .child(row)
+        row
     }
 
     fn render_access_control(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -5811,50 +5853,56 @@ mod model_option_focus_tests {
     use super::*;
 
     #[test]
-    fn galaxy_label_keeps_the_provider_level_and_does_not_alias_fixed_models() {
-        assert_eq!(effort_display_label("Max", 2, Some(2)), "Galaxy · Max");
+    fn effort_labels_are_exact_provider_labels_without_aliases() {
+        let options = ["Low", "High", "Max", "Ultracode"]
+            .map(|label| ProviderModelOption::new(label.to_lowercase(), label));
         assert_eq!(
-            effort_display_label("Extra high", 3, Some(3)),
-            "Galaxy · Extra high"
+            effort_labels(&options),
+            options
+                .iter()
+                .map(|option| SharedString::from(option.label.clone()))
+                .collect::<Vec<_>>()
         );
-        assert_eq!(effort_display_label("High", 1, Some(2)), "High");
-        assert_eq!(effort_display_label("Fixed", 0, None), "Fixed");
-        assert_eq!(effort_display_label("None", 0, None), "None");
+        assert_eq!(options[2].id, "max");
+        assert_eq!(options[3].id, "ultracode");
+        assert!(effort_labels(&[]).is_empty());
     }
 
     #[test]
-    fn galaxy_maps_to_native_max_and_leaves_orchestration_options_unchanged() {
-        let options = ["low", "medium", "high", "xhigh", "max", "ultracode"]
-            .map(|id| ProviderModelOption::new(id, id));
-        let highest = highest_model_effort_index(ProviderKind::Claude, &options);
-        assert_eq!(highest, Some(4));
+    fn service_tier_labels_preserve_provider_default_semantics() {
+        let mut model = ProviderModel::new("test", "Test");
+        model.service_tiers = vec![ProviderModelOption::new("fast", "Fast")];
+        let choices = service_tier_choices(&model);
+        assert_eq!(choices[0], ("default".into(), tr!("common.default")));
+        assert_eq!(choices[1], ("fast".into(), "Fast".into()));
+        model
+            .service_tiers
+            .insert(0, ProviderModelOption::new("default", "Standard"));
         assert_eq!(
-            effort_display_label(&options[4].label, 4, highest),
-            "Galaxy · max"
+            service_tier_choices(&model),
+            vec![
+                ("default".into(), "Standard".into()),
+                ("fast".into(), "Fast".into())
+            ]
+        );
+        model.default_service_tier = Some("fast".into());
+        assert_eq!(service_tier_choices(&model)[0].0, "default");
+        assert_eq!(
+            super::super::sessions::resolved_model_traits(&model, None, None, None, "")
+                .service_tier
+                .as_deref(),
+            Some("fast")
         );
         assert_eq!(
-            effort_display_label(&options[5].label, 5, highest),
-            "ultracode"
-        );
-        assert_eq!(options[4].id, "max");
-        assert_eq!(options[5].id, "ultracode");
-        assert_eq!(
-            highest_model_effort_index(ProviderKind::Codex, &options[..4]),
-            Some(3)
-        );
-        assert_eq!(
-            highest_model_effort_index(ProviderKind::Claude, &options[4..]),
-            None
-        );
-        assert_eq!(highest_model_effort_index(ProviderKind::Pi, &[]), None);
-        assert_eq!(
-            highest_model_effort_index(ProviderKind::Pi, &options[..1]),
-            None
+            super::super::sessions::resolved_model_traits(&model, None, Some("default"), None, "")
+                .service_tier
+                .as_deref(),
+            Some("default")
         );
     }
 
     #[test]
-    fn footer_focus_uses_the_first_available_adjustable_control() {
+    fn options_focus_uses_the_first_available_adjustable_control() {
         let mut model = ProviderModel::new("test", "Test model");
         assert_eq!(first_model_option_id(&model), None);
         model.context_windows = vec![ProviderModelOption::new("long", "Long")];
