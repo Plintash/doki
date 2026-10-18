@@ -206,6 +206,7 @@ struct ProjectCatalogEntry {
     board: crate::model::ProjectBoard,
     name: String,
     path: std::path::PathBuf,
+    worktree_base_branch: Option<String>,
     created_at: u64,
 }
 
@@ -215,6 +216,7 @@ impl From<&Project> for ProjectCatalogEntry {
             board: project.board.clone(),
             name: project.name.clone(),
             path: project.path.clone(),
+            worktree_base_branch: project.worktree_base_branch.clone(),
             created_at: project.created_at,
         }
     }
@@ -2267,6 +2269,108 @@ mod tests {
             observer_rx.recv_timeout(Duration::from_secs(1)),
             Ok(ServerMessage::TaskStateChanged { revision: 1 })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_worktree_base_saves_notify_other_clients_and_round_trip() {
+        let root = std::env::temp_dir().join(format!("waku-project-base-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("app.db");
+        let backend = Arc::new(
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(database.clone()),
+            )
+            .unwrap(),
+        );
+        let hub = Arc::new(Hub::default());
+        let (source_tx, source_rx) = unbounded();
+        let source_id = hub.subscribe(&[], None, Subscriber::new(source_tx).0);
+        let (observer_tx, observer_rx) = unbounded();
+        hub.subscribe(&[], None, Subscriber::new(observer_tx).0);
+        let (outgoing, _responses) = unbounded();
+        let request = |command: Command| {
+            handle_request(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: Uuid::nil(),
+                    runtime_id: Uuid::nil(),
+                    command,
+                },
+                outgoing.clone(),
+                source_id,
+                backend.clone(),
+                hub.clone(),
+            )
+            .outcome
+        };
+        let mut project = Project::from_path(root.join("repo"));
+
+        for (index, reference) in [
+            None,
+            Some("refs/heads/main"),
+            Some("refs/remotes/origin/main"),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            project.worktree_base_branch = reference.map(str::to_owned);
+            let save = Command::SaveTaskState {
+                projects: vec![project.clone()],
+                tasks: Vec::new(),
+                live_session_ids: Vec::new(),
+                skeleton_session_ids: Vec::new(),
+                sessions: Vec::new(),
+            };
+            assert!(matches!(
+                request(save.clone()),
+                ResponseOutcome::Ok {
+                    payload: ResponsePayload::TaskStateSaved { .. }
+                }
+            ));
+            assert!(matches!(
+                observer_rx.try_recv(),
+                Ok(ServerMessage::TaskStateChanged { revision }) if revision == index as u64 + 1
+            ));
+            assert!(
+                source_rx.try_recv().is_err(),
+                "no echo to the saving client"
+            );
+
+            let ResponseOutcome::Ok {
+                payload: ResponsePayload::TaskState { projects, .. },
+            } = request(Command::LoadTaskState)
+            else {
+                panic!("expected daemon task state");
+            };
+            let loaded = projects
+                .iter()
+                .find(|stored| stored.id == project.id)
+                .unwrap();
+            assert_eq!(loaded.worktree_base_branch.as_deref(), reference);
+            let stored = StateStore::daemon(database.clone()).load().unwrap();
+            let persisted = stored
+                .projects
+                .iter()
+                .find(|stored| stored.id == project.id)
+                .unwrap();
+            assert_eq!(persisted.worktree_base_branch.as_deref(), reference);
+
+            // Ordinary saves of the same setting must not refresh other clients.
+            assert!(matches!(
+                request(save),
+                ResponseOutcome::Ok {
+                    payload: ResponsePayload::TaskStateSaved { .. }
+                }
+            ));
+            assert!(observer_rx.try_recv().is_err());
+            assert!(source_rx.try_recv().is_err());
+        }
+
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

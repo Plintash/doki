@@ -80,7 +80,7 @@ settings.providers: 服务商
 settings.usage: 用量
 settings.daemon: 守护进程
 settings.computer_use: 电脑操作
-settings.general_keywords: 通用 本地 项目 对话 隐私 更新 自动 版本 数学 公式 表达式 math latex 后续 排队 引导 enter
+settings.general_keywords: 通用 本地 项目 对话 隐私 更新 自动 版本 数学 公式 表达式 math latex 后续 排队 引导 enter worktree git 工作树 起点 分支
 settings.appearance_keywords: 外观 主题 系统 浅色 深色 语言 英语 中文 简体 字号 字体 大小 编辑器
 settings.providers_keywords: 服务商 智能体 模型 命令行 版本 安装 检测 claude codex cursor opencode amp grok pi
 settings.skills: 技能
@@ -1254,3 +1254,16 @@ review.invalid_session: "审查需要使用 Codex 和原有工作区"
 review.composer_scope: "Codex 审查 · %{scope}"
 review.loading_context: "正在读取开发上下文…"
 review.context_hint: "沿用此 issue 的工作区和最新开发上下文"
+
+worktree_base.settings_title: 新工作树的起点分支
+worktree_base.settings_hint: 新工作树默认使用此起点，草稿可单独覆盖。使用本地已有的提交，不会 fetch。
+worktree_base.composer_hint: 此工作树的起点分支。未单独指定时使用项目默认值；不会 fetch 或切换原工作区。
+worktree_base.starting_branch: 起点分支
+worktree_base.local: 本地 · %{branch}
+worktree_base.remote: 远端 · %{branch}
+worktree_base.automatic: 自动
+worktree_base.automatic_resolved: 自动 · %{branch}
+worktree_base.project_default: 项目默认 · %{branch}
+worktree_base.loading: 正在读取分支…
+worktree_base.unavailable: 起点不可用
+worktree_base.missing: "%{branch}（不可用）"

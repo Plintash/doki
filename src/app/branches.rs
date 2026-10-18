@@ -36,7 +36,9 @@ impl Waku {
                 Ok(Some(snapshot)) => {
                     let snapshot = snapshot.clone();
                     self.cache_sidebar_branch_label(&workspace_path, snapshot.display_branch());
-                    self.visible_branch_snapshot = Some((workspace_path, snapshot.clone()));
+                    if self.selected_workspace_path() == Some(workspace_path.as_path()) {
+                        self.visible_branch_snapshot = Some((workspace_path, snapshot.clone()));
+                    }
                     Some(snapshot)
                 }
                 Ok(None) => {
@@ -114,8 +116,8 @@ impl Waku {
                                 Ok(None) => waku.visible_branch_snapshot = None,
                                 Err(_) => {}
                             }
-                            cx.notify();
                         }
+                        cx.notify();
                     });
                 })
                 .detach();
@@ -188,6 +190,26 @@ impl Waku {
             return true;
         }
         self.start_branch_operation(path, BranchOperation::Checkout(branch), cx);
+        true
+    }
+
+    pub(super) fn reset_worktree_base(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.branch_operation_pending {
+            return false;
+        }
+        let Some(session) = self
+            .selected_session_mut()
+            .filter(|session| !session.is_busy())
+        else {
+            return false;
+        };
+        let SessionWorkspace::NewWorktree { base_branch } = &mut session.workspace else {
+            return false;
+        };
+        if base_branch.take().is_some() {
+            self.save(cx);
+            cx.notify();
+        }
         true
     }
 
@@ -297,6 +319,7 @@ impl Waku {
             return false;
         };
         match action {
+            BranchPickerAction::UseProjectDefault => self.reset_worktree_base(cx),
             BranchPickerAction::Checkout(branch) => {
                 self.choose_workspace_branch(branch.clone(), cx)
             }
@@ -376,5 +399,134 @@ impl Waku {
             });
         })
         .detach();
+    }
+}
+
+/// New choices are canonical refs. Older drafts stored a local branch name.
+pub(super) fn canonical_worktree_base(reference: &str) -> String {
+    let reference = reference.trim();
+    if reference.starts_with("refs/") {
+        reference.to_owned()
+    } else {
+        format!("refs/heads/{reference}")
+    }
+}
+
+pub(super) fn worktree_base_label(reference: &str) -> String {
+    if let Some(branch) = reference.strip_prefix("refs/heads/") {
+        tr!("worktree_base.local", branch = branch)
+    } else if let Some(branch) = reference.strip_prefix("refs/remotes/") {
+        tr!("worktree_base.remote", branch = branch)
+    } else {
+        reference.to_owned()
+    }
+}
+
+pub(super) fn planned_worktree_base(
+    project: &Project,
+    override_branch: Option<&str>,
+    snapshot: &BranchSnapshot,
+) -> Option<String> {
+    let requested = project.worktree_base_branch(override_branch);
+    snapshot
+        .worktree_base_choice(requested)
+        .map(str::to_owned)
+        .or_else(|| requested.map(canonical_worktree_base))
+}
+
+pub(super) fn planned_worktree_base_label(
+    project: &Project,
+    override_branch: Option<&str>,
+    snapshot: &BranchSnapshot,
+) -> String {
+    let Some(reference) = planned_worktree_base(project, override_branch, snapshot) else {
+        return tr!("worktree_base.unavailable");
+    };
+    let label = worktree_base_label(&reference);
+    if snapshot
+        .worktree_base_choice(project.worktree_base_branch(override_branch))
+        .is_none()
+    {
+        tr!("worktree_base.missing", branch = label)
+    } else {
+        label
+    }
+}
+
+#[cfg(test)]
+mod worktree_base_display_tests {
+    use super::*;
+
+    fn snapshot() -> BranchSnapshot {
+        BranchSnapshot {
+            repository: PathBuf::from("/tmp/project"),
+            current: Some("feature".into()),
+            detached_head: None,
+            default_branch: Some("feature".into()),
+            worktree_base_ref: Some("refs/remotes/origin/main".into()),
+            worktree_base_refs: vec![
+                "refs/heads/feature".into(),
+                "refs/remotes/origin/main".into(),
+            ],
+            branches: Vec::new(),
+            additions: 0,
+            deletions: 0,
+        }
+    }
+
+    #[test]
+    fn planned_base_display_uses_daemon_resolution_and_override_precedence() {
+        let mut project = Project::from_path(PathBuf::from("/tmp/project"));
+        let snapshot = snapshot();
+        assert_eq!(
+            planned_worktree_base(&project, None, &snapshot).as_deref(),
+            Some("refs/remotes/origin/main")
+        );
+        project.worktree_base_branch = Some("refs/heads/feature".into());
+        assert_eq!(
+            planned_worktree_base(&project, None, &snapshot).as_deref(),
+            Some("refs/heads/feature")
+        );
+        assert_eq!(
+            planned_worktree_base(&project, Some("refs/remotes/origin/main"), &snapshot).as_deref(),
+            Some("refs/remotes/origin/main")
+        );
+        assert_eq!(
+            planned_worktree_base(&project, Some("feature"), &snapshot).as_deref(),
+            Some("refs/heads/feature")
+        );
+    }
+
+    #[test]
+    fn missing_explicit_base_is_visible_and_never_displays_an_automatic_fallback() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
+        let mut project = Project::from_path(PathBuf::from("/tmp/project"));
+        let snapshot = snapshot();
+        project.worktree_base_branch = Some("refs/heads/deleted".into());
+        assert_eq!(
+            planned_worktree_base(&project, None, &snapshot).as_deref(),
+            Some("refs/heads/deleted")
+        );
+        assert_eq!(
+            planned_worktree_base_label(&project, None, &snapshot),
+            "Local · deleted (unavailable)"
+        );
+        assert_eq!(
+            planned_worktree_base_label(&project, Some("refs/remotes/origin/main"), &snapshot),
+            "Remote · origin/main"
+        );
+    }
+
+    #[test]
+    fn automatic_detached_or_unavailable_base_never_uses_current_branch_label() {
+        let project = Project::from_path(PathBuf::from("/tmp/project"));
+        let mut snapshot = snapshot();
+        snapshot.worktree_base_ref = Some("HEAD".into());
+        assert_eq!(
+            planned_worktree_base(&project, None, &snapshot).as_deref(),
+            Some("HEAD")
+        );
+        snapshot.worktree_base_ref = None;
+        assert_eq!(planned_worktree_base(&project, None, &snapshot), None);
     }
 }

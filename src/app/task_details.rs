@@ -1941,6 +1941,32 @@ mod tests {
     }
 
     #[test]
+    fn issue_worktree_drafts_keep_the_project_default_until_submission() {
+        let mut project = Project::from_path(PathBuf::from("/tmp/worktree-base-project"));
+        project.worktree_base_branch = Some("refs/remotes/origin/main".into());
+        let mut task = Task::new("Start isolated", TaskState::Backlog, 0);
+        task.workspace = Some(TaskWorkspace::NewWorktree {
+            project_id: project.id,
+        });
+        let SessionWorkspace::NewWorktree { base_branch } = task_session_workspace(&task) else {
+            panic!("issue should prepare an unmaterialized worktree");
+        };
+        assert_eq!(base_branch, None);
+        assert_eq!(
+            project.worktree_base_branch(base_branch.as_deref()),
+            Some("refs/remotes/origin/main")
+        );
+        task.workspace = Some(TaskWorkspace::Worktree {
+            project_id: project.id,
+            path: PathBuf::from("/tmp/existing-issue-worktree"),
+            branch: "waku/existing-issue".into(),
+        });
+        assert!(
+            matches!(task_session_workspace(&task), SessionWorkspace::Worktree { branch, .. } if branch == "waku/existing-issue")
+        );
+    }
+
+    #[test]
     fn session_metadata_is_hidden_only_for_the_same_concrete_default() {
         let project_id = Uuid::new_v4();
         let mut task = Task::new("Keep the user's title", TaskState::Doing, 0);

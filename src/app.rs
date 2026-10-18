@@ -208,6 +208,7 @@ enum BranchPickerMode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BranchPickerAction {
+    UseProjectDefault,
     Checkout(String),
     Create,
 }
@@ -1340,6 +1341,7 @@ pub struct Waku {
     /// Git subprocess results per concrete workspace path. Render only reads
     /// this in-memory cache; misses are fulfilled on the background executor.
     branch_snapshots: QueryCache<PathBuf, Result<Option<BranchSnapshot>, String>>,
+    worktree_settings_project: Option<Uuid>,
     /// Stale-while-revalidate value for the selected path, avoiding label
     /// flicker when app activation invalidates the query.
     visible_branch_snapshot: Option<(PathBuf, BranchSnapshot)>,
@@ -3126,6 +3128,7 @@ impl Waku {
                 branch_picker_list_state,
                 branch_picker_row_cache: RefCell::new(Vec::new()),
                 branch_snapshots: QueryCache::new(MAX_CACHED_WORKSPACES),
+                worktree_settings_project: None,
                 visible_branch_snapshot: None,
                 branch_operation_pending: false,
                 commit_dialog: None,

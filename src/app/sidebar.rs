@@ -3260,6 +3260,7 @@ mod tests {
             id: Uuid::from_u128(1),
             name: "Task".to_owned(),
             path: root.join("2026-08-23/task"),
+            worktree_base_branch: None,
             created_at: 0,
         };
         let ordinary = Project {
@@ -3267,6 +3268,7 @@ mod tests {
             id: Uuid::from_u128(2),
             name: "Ordinary".to_owned(),
             path: PathBuf::from("/tmp/dev/ordinary"),
+            worktree_base_branch: None,
             created_at: 0,
         };
 

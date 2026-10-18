@@ -103,6 +103,36 @@ pub fn inspect(cwd: &Path) -> anyhow::Result<Option<BranchSnapshot>> {
         .filter(|branch| branches.iter().any(|entry| entry.name == *branch))
         .map(str::to_owned)
         .or_else(|| current.clone());
+    // Worktree creation can use a remote default even when no local branch
+    // has that name. Keep review's historical `default_branch` unchanged and
+    // expose the separate, canonical worktree choices for the task picker.
+    let worktree_refs = git_stdout(
+        cwd,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(symref)",
+            "--sort=refname",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    let worktree_base_refs = worktree_refs
+        .lines()
+        .filter_map(|line| {
+            let (name, symbolic_target) = line.split_once('\0')?;
+            if name.starts_with("refs/remotes/")
+                && name.ends_with("/HEAD")
+                && !symbolic_target.is_empty()
+            {
+                return None;
+            }
+            Some(name.to_owned())
+        })
+        .collect::<Vec<_>>();
+    // An unborn branch or a broken origin/HEAD must not advertise a fallback
+    // that creation will not use. Keep branch/review discovery available while
+    // representing an unusable automatic worktree base as unknown.
+    let worktree_base_ref = crate::worktree::resolve_base(cwd, None).ok();
     let (additions, deletions) = worktree_line_counts(&repository);
 
     Ok(Some(BranchSnapshot {
@@ -110,6 +140,8 @@ pub fn inspect(cwd: &Path) -> anyhow::Result<Option<BranchSnapshot>> {
         current,
         detached_head,
         default_branch,
+        worktree_base_ref,
+        worktree_base_refs,
         branches,
         additions,
         deletions,
@@ -376,6 +408,60 @@ mod tests {
                 .unwrap()
                 .checked_out_elsewhere
         );
+    }
+
+    #[test]
+    fn exposes_sorted_canonical_worktree_choices_without_remote_symbolic_head() {
+        let repository = repository();
+        run_git(
+            &repository,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        run_git(
+            &repository,
+            &["update-ref", "refs/remotes/upstream/release", "HEAD"],
+        );
+        run_git(
+            &repository,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        run_git(&repository, &["checkout", "feature"]);
+
+        let snapshot = inspect(&repository).unwrap().unwrap();
+        assert_eq!(snapshot.current.as_deref(), Some("feature"));
+        assert_eq!(snapshot.default_branch.as_deref(), Some("main"));
+        assert_eq!(
+            snapshot.worktree_base_ref.as_deref(),
+            Some("refs/heads/main")
+        );
+        assert_eq!(
+            snapshot.worktree_base_refs,
+            [
+                "refs/heads/feature",
+                "refs/heads/main",
+                "refs/remotes/origin/main",
+                "refs/remotes/upstream/release",
+            ]
+        );
+        fs::remove_dir_all(repository).ok();
+    }
+
+    #[test]
+    fn unborn_branch_has_no_usable_worktree_base() {
+        let repository = std::env::temp_dir().join(format!("waku-unborn-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&repository).unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+
+        let snapshot = inspect(&repository).unwrap().unwrap();
+        assert_eq!(snapshot.current.as_deref(), Some("main"));
+        assert_eq!(snapshot.default_branch.as_deref(), Some("main"));
+        assert_eq!(snapshot.worktree_base_ref, None);
+        assert!(snapshot.worktree_base_refs.is_empty());
+        fs::remove_dir_all(repository).ok();
     }
 
     #[test]

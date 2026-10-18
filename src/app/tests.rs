@@ -2426,6 +2426,7 @@ fn settings_search_filters_pages_for_arrow_cycling() {
     all_pages.push(SettingsPage::Archive);
     assert_eq!(pages(""), all_pages);
 
+    assert_eq!(pages("worktree"), vec![SettingsPage::General]);
     assert_eq!(pages("theme"), vec![SettingsPage::Appearance]);
     assert_eq!(pages("skill"), vec![SettingsPage::Skills]);
 

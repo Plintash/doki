@@ -19,6 +19,8 @@ export const projects = sqliteTable("projects", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   path: text("path").notNull(),
+  /** Full local/remote ref for new worktrees; null keeps automatic selection. */
+  worktreeBaseBranch: text("worktree_base_branch"),
   /** Order shown in the sidebar. */
   position: integer("position").notNull(),
   /** When the project was added, unix seconds. */

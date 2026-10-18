@@ -1123,7 +1123,10 @@ impl StateStore {
         }
 
         let mut projects = connection
-            .prepare("SELECT id, name, path, created_at, board FROM projects ORDER BY position")
+            .prepare(
+                "SELECT id, name, path, created_at, board, worktree_base_branch
+                 FROM projects ORDER BY position",
+            )
             .map_err(to_io_error)?;
         state.projects = projects
             .query_map([], |row| {
@@ -1133,25 +1136,29 @@ impl StateStore {
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })
             .map_err(to_io_error)?
             .filter_map(Result::ok)
-            .map(|(id, name, path, created_at, board)| {
-                let id = Uuid::parse_str(&id).map_err(to_io_error)?;
-                let mut board: crate::model::ProjectBoard =
-                    serde_json::from_str(&board).map_err(to_io_error)?;
-                if board.stages.is_empty() {
-                    board = crate::model::ProjectBoard::canonical(id);
-                }
-                Ok(Project {
-                    board,
-                    id,
-                    name,
-                    path: PathBuf::from(path),
-                    created_at: created_at as u64,
-                })
-            })
+            .map(
+                |(id, name, path, created_at, board, worktree_base_branch)| {
+                    let id = Uuid::parse_str(&id).map_err(to_io_error)?;
+                    let mut board: crate::model::ProjectBoard =
+                        serde_json::from_str(&board).map_err(to_io_error)?;
+                    if board.stages.is_empty() {
+                        board = crate::model::ProjectBoard::canonical(id);
+                    }
+                    Ok(Project {
+                        board,
+                        id,
+                        name,
+                        path: PathBuf::from(path),
+                        worktree_base_branch,
+                        created_at: created_at as u64,
+                    })
+                },
+            )
             .collect::<io::Result<Vec<_>>>()?;
         drop(projects);
 
@@ -1440,7 +1447,8 @@ impl StateStore {
                             project.path.to_string_lossy(),
                             position as i64,
                             project.created_at as i64,
-                            serde_json::to_string(&project.board).map_err(to_io_error)?
+                            serde_json::to_string(&project.board).map_err(to_io_error)?,
+                            project.worktree_base_branch
                         ],
                     )
                     .map_err(to_io_error)?;
@@ -2067,14 +2075,16 @@ const UPSERT_SESSION: &str = "INSERT INTO sessions(
          review_correction_source_id = excluded.review_correction_source_id,
          stage_invocation = excluded.stage_invocation";
 
-const INSERT_PROJECT: &str = "INSERT INTO projects(id, name, path, position, created_at, board)
-     VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+const INSERT_PROJECT: &str = "INSERT INTO projects(
+         id, name, path, position, created_at, board, worktree_base_branch
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
      ON CONFLICT(id) DO UPDATE SET
          name       = excluded.name,
          path       = excluded.path,
          position   = excluded.position,
          created_at = excluded.created_at,
-         board = excluded.board";
+         board = excluded.board,
+         worktree_base_branch = excluded.worktree_base_branch";
 
 const INSERT_TASK: &str = "INSERT INTO tasks(
          id, title, state, position, project_id, path, branch, worktree,
@@ -2646,6 +2656,113 @@ mod tests {
         assert_eq!(restored.projects[0].name, project.name);
         assert_eq!(restored.projects[0].path, project.path);
         assert_eq!(restored.projects[0].created_at, project.created_at);
+        assert!(restored.projects[0].worktree_base_branch.is_none());
+
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn project_worktree_base_changes_and_reset_survive_restart_independently() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let mut other_project = Project::from_path(PathBuf::from("/tmp/other-project"));
+        other_project.worktree_base_branch = Some("refs/heads/develop".to_owned());
+        state.projects.push(other_project);
+
+        for reference in [
+            None,
+            Some("refs/heads/main"),
+            Some("refs/remotes/origin/main"),
+            Some("refs/heads/missing"),
+            Some(""),
+            None,
+        ] {
+            state.projects[0].worktree_base_branch = reference.map(str::to_owned);
+            store.save(&mut state).unwrap();
+
+            let connection = Connection::open(directory.join("app.db")).unwrap();
+            let saved: Option<String> = connection
+                .query_row(
+                    "SELECT worktree_base_branch FROM projects WHERE id = ?1",
+                    params![state.projects[0].id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(saved.as_deref(), reference);
+            drop(connection);
+
+            let restored = store_in(&directory).load().unwrap();
+            assert_eq!(
+                restored.projects[0].worktree_base_branch.as_deref(),
+                reference
+            );
+            assert_eq!(
+                restored.projects[1].worktree_base_branch.as_deref(),
+                Some("refs/heads/develop")
+            );
+        }
+
+        drop(store);
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn project_worktree_base_migration_preserves_legacy_projects() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        connection.execute_batch(MIGRATIONS_TABLE).unwrap();
+        let migration_index = MIGRATIONS
+            .iter()
+            .position(|(tag, _)| *tag == "0012_project_worktree_base")
+            .unwrap();
+        for (tag, sql) in &MIGRATIONS[..migration_index] {
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO migrations(tag, applied_at) VALUES(?1, 0)",
+                    params![tag],
+                )
+                .unwrap();
+        }
+        let project = Project::from_path(PathBuf::from("/tmp/legacy-project"));
+        connection
+            .execute(
+                "INSERT INTO projects(id, name, path, position, created_at, board)
+                 VALUES(?1, ?2, ?3, 0, ?4, ?5)",
+                params![
+                    project.id.to_string(),
+                    project.name,
+                    project.path.to_string_lossy(),
+                    project.created_at as i64,
+                    serde_json::to_string(&project.board).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            apply_migrations(&connection).unwrap(),
+            MIGRATIONS.len() - migration_index
+        );
+        assert_eq!(apply_migrations(&connection).unwrap(), 0);
+        let saved: Option<String> = connection
+            .query_row(
+                "SELECT worktree_base_branch FROM projects WHERE id = ?1",
+                params![project.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(saved.is_none());
+        drop(connection);
+
+        let restored = store_in(&directory).load().unwrap();
+        assert_eq!(restored.projects.len(), 1);
+        assert_eq!(restored.projects[0].id, project.id);
+        assert_eq!(restored.projects[0].name, project.name);
+        assert_eq!(restored.projects[0].path, project.path);
+        assert_eq!(restored.projects[0].created_at, project.created_at);
+        assert_eq!(restored.projects[0].board, project.board);
+        assert!(restored.projects[0].worktree_base_branch.is_none());
 
         fs::remove_dir_all(directory).ok();
     }
