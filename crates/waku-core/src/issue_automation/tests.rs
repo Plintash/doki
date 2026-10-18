@@ -182,7 +182,38 @@ struct Fixture {
     client: DaemonClient,
     runs: IssueRunClient,
     task: Task,
-    server: Option<std::thread::JoinHandle<()>>,
+    server: Option<FixtureServer>,
+    cleanup_safe: bool,
+}
+
+struct FixtureServer {
+    thread: std::thread::JoinHandle<()>,
+    shutdown: Arc<AtomicBool>,
+    harness: std::sync::Weak<FixtureHarness>,
+}
+
+// One instance per daemon, unlike the externally retained FakeHarness. Its
+// lifetime includes the manager and stage workers, not just the listener.
+struct FixtureHarness(Arc<FakeHarness>);
+
+impl IssueHarness for FixtureHarness {
+    fn validate(
+        &self,
+        stage: &IssueWorkflowStage,
+        settings: &waku_protocol::DaemonSettings,
+    ) -> anyhow::Result<()> {
+        self.0.validate(stage, settings)
+    }
+
+    fn start(
+        &self,
+        stage: &IssueWorkflowStage,
+        cwd: PathBuf,
+        settings: &waku_protocol::DaemonSettings,
+        events: DriverEventSender,
+    ) -> anyhow::Result<DriverHandle> {
+        self.0.start(stage, cwd, settings, events)
+    }
 }
 impl Fixture {
     fn new(harness: Arc<FakeHarness>) -> Self {
@@ -214,12 +245,12 @@ impl Fixture {
             client,
             task,
             server: Some(server),
+            cleanup_safe: false,
         }
     }
-    fn connect(
-        root: &Path,
-        harness: Arc<FakeHarness>,
-    ) -> (DaemonClient, std::thread::JoinHandle<()>) {
+    fn connect(root: &Path, harness: Arc<FakeHarness>) -> (DaemonClient, FixtureServer) {
+        let harness = Arc::new(FixtureHarness(harness));
+        let harness_lifetime = Arc::downgrade(&harness);
         let backend = crate::daemon::WakuBackend::new(
             DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
             StateStore::daemon(root.join("app.db")),
@@ -228,12 +259,14 @@ impl Fixture {
         .with_issue_harness(harness);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let thread = std::thread::spawn(move || {
             crate::server::serve(
                 listener,
                 "fixture-token".into(),
                 Arc::new(backend),
-                Arc::new(AtomicBool::new(false)),
+                server_shutdown,
                 crate::server::ServerOptions {
                     allow_shutdown: true,
                     ..Default::default()
@@ -242,7 +275,14 @@ impl Fixture {
             .unwrap()
         });
         let client = DaemonClient::connect(&address.to_string(), "fixture-token".into()).unwrap();
-        (client, server)
+        (
+            client,
+            FixtureServer {
+                thread,
+                shutdown,
+                harness: harness_lifetime,
+            },
+        )
     }
     fn start(&self) -> IssueRun {
         self.runs
@@ -296,10 +336,39 @@ impl Fixture {
         }
     }
     fn stop(&mut self) {
-        self.client.shutdown();
-        if let Some(server) = self.server.take() {
-            server.join().unwrap();
+        self.try_stop().unwrap();
+    }
+
+    fn try_stop(&mut self) -> anyhow::Result<()> {
+        let Some(server) = self.server.take() else {
+            return Ok(());
+        };
+        self.cleanup_safe = false;
+        // This fixture owns the listener. Teardown must not depend on a
+        // best-effort protocol message surviving a disconnected client.
+        server.shutdown.store(true, Ordering::Release);
+        self.client.disconnect();
+        // The manager's Drop can wait ten seconds for stage workers. Give
+        // that path room, but fail locally instead of hanging the CI job.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !server.thread.is_finished() || server.harness.strong_count() != 0 {
+            if Instant::now() >= deadline {
+                bail!(
+                    "fixture shutdown timed out: listener_finished={}, runtime_owners={}; retained {}",
+                    server.thread.is_finished(),
+                    server.harness.strong_count(),
+                    self.root.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
+        // Connection/request threads can outlive serve(). The per-daemon
+        // harness must be released too before editing its journal or SQLite.
+        self.cleanup_safe = true;
+        server
+            .thread
+            .join()
+            .map_err(|_| anyhow!("fixture daemon thread panicked"))
     }
     fn restart(&mut self, harness: Arc<FakeHarness>) {
         self.stop();
@@ -307,12 +376,22 @@ impl Fixture {
         self.runs = IssueRunClient::new(client.clone());
         self.client = client;
         self.server = Some(server);
+        self.cleanup_safe = false;
     }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        self.stop();
-        let _ = fs::remove_dir_all(&self.root);
+        let result = self.try_stop();
+        if self.cleanup_safe {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+        if let Err(error) = result {
+            if std::thread::panicking() {
+                eprintln!("fixture cleanup failed during unwinding: {error:#}");
+            } else {
+                panic!("fixture cleanup failed: {error:#}");
+            }
+        }
     }
 }
 
@@ -552,6 +631,24 @@ fn daemon_restart_and_reconnect_do_not_replay_reserved_attempts() {
     fixture.runs.control(run.id, IssueRunAction::Retry).unwrap();
     let done = fixture.wait(IssueRunStatus::Completed);
     assert_eq!(done.attempts.len(), 5);
+}
+
+#[test]
+fn daemon_restart_after_client_disconnect_does_not_hang_or_replay_work() {
+    let harness = FakeHarness::new(vec![Behavior::Hold]);
+    let mut fixture = Fixture::new(harness.clone());
+    let initial = fixture.start();
+    fixture.wait_starts(&harness, 1);
+
+    // A lost client cannot deliver the fixture's protocol shutdown message.
+    fixture.client.disconnect();
+    let replacement = FakeHarness::new(vec![]);
+    fixture.restart(replacement.clone());
+
+    let blocked = fixture.wait(IssueRunStatus::Blocked);
+    assert_eq!(blocked.id, initial.id);
+    assert_eq!(blocked.attempts[0].status, IssueAttemptStatus::Blocked);
+    assert!(replacement.starts.lock().is_empty());
 }
 
 #[test]
