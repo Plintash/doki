@@ -25,6 +25,13 @@ price:
 | `window.refresh()` | Re-renders everything and **bypasses every cached pane** | Genuine whole-window invalidation only: hover transitions, drags, theme |
 | `request_animation_frame` | Display-rate (120 Hz) re-render of the current view for as long as it re-arms | Nothing during streaming. One mounted repeating `with_animation` pinned the window at 120 Hz for a whole turn (~36% CPU by itself). The one sanctioned transient: the 200 ms panel show/hide and titlebar-clearance slides ([src/app/render.rs](../src/app/render.rs)), which re-arms only while an edge is moving and gates the pane fan-out (below) |
 
+The annotation creation composer also has a bounded 180 ms size/position and
+button-feedback transition. It lives in its own child entity, measures natural
+text height only after layout changes, and requests frames only while an edge
+is moving. Retargeting starts from the current value; edits that keep the same
+wrapped height never restart it. Reduced motion settles immediately. This is
+not a root notify or a repeating pulse.
+
 The root `Waku` view re-renders on every frame regardless of what is dirty, so
 it must stay thin: the sidebar, transcript, and right panel are `WakuPane`
 islands ([src/app.rs](../src/app.rs)) embedded with the fork's

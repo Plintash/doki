@@ -896,6 +896,7 @@ pub(super) struct SelectionAnnotation {
 /// mouse-down handler clears the selection before the click handler runs.
 struct SelectionToolbar {
     anchor: Point<Pixels>,
+    selection_bounds: Bounds<Pixels>,
     annotation: SelectionAnnotation,
     /// Whether "Add to chat" has opened the comment field.
     comment_open: bool,
@@ -1407,7 +1408,7 @@ pub struct Waku {
     /// The floating selection action, and its comment field once opened.
     selection_toolbar: RefCell<Option<SelectionToolbar>>,
     /// The one comment field the selection toolbar's "Add to chat" opens.
-    annotation_prompt_input: RefCell<Option<Entity<TextInput>>>,
+    annotation_prompt_input: RefCell<Option<Entity<annotation_prompt::AnnotationPrompt>>>,
     /// The annotation whose spans are highlighted and whose editor is open.
     /// Nothing is highlighted while this is `None`.
     active_annotation: Cell<Option<Uuid>>,
@@ -1861,6 +1862,7 @@ pub struct Waku {
 
 mod activity_diff;
 mod annotation_projection;
+mod annotation_prompt;
 mod annotation_resolution;
 mod autocomplete;
 mod background_work;

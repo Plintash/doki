@@ -1123,7 +1123,7 @@ impl Waku {
                     "selectionActive": !self.transcript_selection.selection.borrow().is_empty(),
                     "toolbarVisible": self.selection_toolbar.borrow().is_some(),
                     "commentOpen": self.selection_toolbar.borrow().as_ref().is_some_and(|toolbar| toolbar.comment_open),
-                    "commentText": self.selection_toolbar.borrow().as_ref().filter(|toolbar| toolbar.comment_open).and_then(|_| self.annotation_prompt_input.borrow().as_ref().map(|input| input.read(cx).content().to_owned())),
+                    "commentText": self.selection_toolbar.borrow().as_ref().filter(|toolbar| toolbar.comment_open).and_then(|_| self.annotation_prompt_input.borrow().as_ref().map(|input| input.read(cx).content(cx).to_owned())),
                     "editor": self.annotation_editor.borrow().as_ref().map(|editor| json!({"annotationId":editor.id, "text":self.annotation_editor_input.borrow().as_ref().map(|input| input.read(cx).content().to_owned())})),
                     "previewVisible": self.annotation_preview_visible.get(),
                 },

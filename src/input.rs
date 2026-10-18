@@ -628,6 +628,14 @@ fn pasted_text_for_mode(mode: FieldMode, text: &str) -> String {
     }
 }
 
+/// Natural text metrics, independent of an animated or capped viewport. Only
+/// auto-height fields emit this, and only when their measured height changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InputLayoutEvent {
+    pub content_height: Pixels,
+    pub line_height: Pixels,
+}
+
 /// Tallest an [`auto_height`](TextInput::auto_height) field grows before
 /// its text scrolls under an overlay scrollbar instead of growing the card.
 const AUTO_HEIGHT_MAX: Pixels = px(300.);
@@ -649,6 +657,8 @@ pub struct TextInput {
     /// multi-line field inherits the embedding view's metrics.
     auto_height: bool,
     auto_height_max: Pixels,
+    auto_height_viewport: Option<Pixels>,
+    measured_layout: Option<InputLayoutEvent>,
     /// Image and file pastes surface as [`MediaPaste`] instead of being
     /// swallowed by the text path.
     accepts_media_paste: bool,
@@ -752,6 +762,8 @@ impl TextInput {
             submit_on_enter: false,
             auto_height: false,
             auto_height_max: AUTO_HEIGHT_MAX,
+            auto_height_viewport: None,
+            measured_layout: None,
             accepts_media_paste: false,
             clear_on_escape: false,
             select_all_on_focus_click: false,
@@ -903,6 +915,24 @@ impl TextInput {
     pub fn auto_height(mut self) -> Self {
         self.auto_height = true;
         self
+    }
+
+    /// Let a hosting surface animate the viewport without changing the text's
+    /// natural measurement. Caret following also runs when the viewport shrinks.
+    pub fn set_auto_height_viewport(&mut self, height: Pixels, cx: &mut Context<Self>) {
+        let height = height.max(px(24.0));
+        if self.auto_height_viewport != Some(height) {
+            self.auto_height_viewport = Some(height);
+            self.caret_reconciled = None;
+            cx.notify();
+        }
+    }
+
+    /// Button and keyboard submission share the composition guard.
+    pub fn submit(&mut self, cx: &mut Context<Self>) {
+        if self.marked_range.is_none() {
+            cx.emit(InputEvent::Submit(self.content.to_string()));
+        }
     }
 
     /// Fit an auto-height field into its host's available space. Keep a full
@@ -1727,7 +1757,7 @@ impl TextInput {
         // "find next", not "send" — and goes out untrimmed because leading or
         // trailing spaces are part of what is searched for. An owner that
         // consumes what it submits (the composer wrapper) trims and clears.
-        cx.emit(InputEvent::Submit(self.content.to_string()));
+        self.submit(cx);
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
@@ -2097,6 +2127,7 @@ fn word_range_at(content: &str, offset: usize) -> Range<usize> {
 }
 
 impl EventEmitter<InputEvent> for TextInput {}
+impl EventEmitter<InputLayoutEvent> for TextInput {}
 impl EventEmitter<MediaPaste> for TextInput {}
 
 impl EntityInputHandler for TextInput {
@@ -2706,6 +2737,16 @@ impl Element for InputElement {
         );
         let theme = Theme::current(cx);
         let layout = layout_state.text.layout().clone();
+        self.input.update(cx, |input, cx| {
+            let measured = InputLayoutEvent {
+                content_height: layout.bounds().size.height,
+                line_height: layout.line_height(),
+            };
+            if input.auto_height && input.measured_layout != Some(measured) {
+                input.measured_layout = Some(measured);
+                cx.emit(measured);
+            }
+        });
         let (cursor_position, cursor, follow) = {
             let input = self.input.read(cx);
             let cursor = input.cursor_offset();
@@ -2891,6 +2932,7 @@ impl Render for TextInput {
                 field
                     .min_h(px(24.0))
                     .max_h(self.auto_height_max)
+                    .when_some(self.auto_height_viewport, |field, height| field.h(height))
                     .overflow_y_scroll()
                     .track_scroll(&scroll_handle)
                     .px(padding_x)
