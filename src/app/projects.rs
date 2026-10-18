@@ -208,12 +208,16 @@ mod tests {
     #[test]
     fn distinct_directories_names_worktrees_and_unresolved_parents_stay_distinct() {
         let fixture = Fixture::new();
+        // Windows can resolve missing/../one/repo to the existing directory.
+        // Keep the destination missing too so this exercises exact-path fallback.
+        let unresolved = fixture.0.join("missing/../unavailable/repo");
+        assert!(unresolved.canonicalize().is_err());
         let paths = [
             fixture.directory("one/repo"),
             fixture.directory("two/repo"),
             fixture.directory("worktrees/branch"),
             fixture.directory("other"),
-            fixture.0.join("missing/../one/repo"),
+            unresolved,
         ];
         let mut projects = Vec::new();
         let ids = paths
@@ -222,6 +226,56 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(ids.len(), 5);
         assert_eq!(picker_projects(&projects, None).len(), 5);
+    }
+
+    #[test]
+    fn unresolved_paths_keep_exact_identity_and_stable_ids() {
+        let fixture = Fixture::new();
+        let paths = [
+            fixture.0.join("missing/../unavailable/repo"),
+            fixture.0.join("unavailable/repo"),
+        ];
+        let mut projects = Vec::new();
+        let mut ids = HashSet::new();
+        for path in &paths {
+            assert!(path.canonicalize().is_err());
+            let id = register_project(&mut projects, path.clone(), None, ProjectPathHost::Local);
+            assert!(ids.insert(id), "unresolved spellings stay distinct");
+            assert_eq!(
+                register_project(&mut projects, path.clone(), None, ProjectPathHost::Local),
+                id
+            );
+        }
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].path, paths[0]);
+        assert_eq!(projects[1].path, paths[1]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolvable_missing_parent_alias_is_local_only() {
+        let fixture = Fixture::new();
+        let path = fixture.directory("one/repo");
+        let alias = fixture.0.join("missing/../one/repo");
+        assert!(!fixture.0.join("missing").exists());
+        assert_eq!(alias.canonicalize().unwrap(), path.canonicalize().unwrap());
+        let mut projects = vec![Project::from_path(path.clone())];
+        let first = projects[0].id;
+        assert_eq!(
+            register_project(&mut projects, alias.clone(), None, ProjectPathHost::Local),
+            first
+        );
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, path);
+
+        let remote = register_project(&mut projects, alias.clone(), None, ProjectPathHost::Remote);
+        assert_ne!(remote, first);
+        assert_eq!(
+            register_project(&mut projects, alias.clone(), None, ProjectPathHost::Remote),
+            remote
+        );
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[1].path, alias);
     }
 
     #[test]
