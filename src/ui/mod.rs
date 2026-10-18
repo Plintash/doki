@@ -5,6 +5,7 @@ use gpui::{
     svg,
 };
 
+pub mod effort_slider;
 pub mod menu;
 pub mod motion;
 pub mod scrollbar;
@@ -267,6 +268,7 @@ pub struct MenuChip {
     base: Stateful<Div>,
     icon: Option<(&'static str, Hsla)>,
     label: SharedString,
+    icon_only: bool,
     caret: bool,
     outlined: bool,
     selected: bool,
@@ -281,6 +283,7 @@ impl MenuChip {
             base: div().id(id),
             icon: None,
             label: SharedString::default(),
+            icon_only: false,
             caret: true,
             outlined: false,
             selected: false,
@@ -319,6 +322,12 @@ impl MenuChip {
 
     pub fn label(mut self, label: impl Into<SharedString>) -> Self {
         self.label = label.into();
+        self
+    }
+
+    /// Keep the full accessible label while compacting a toolbar control.
+    pub fn icon_only(mut self, icon_only: bool) -> Self {
+        self.icon_only = icon_only;
         self
     }
 
@@ -370,6 +379,7 @@ impl RenderOnce for MenuChip {
         self.base
             .semantic_control(gpui::Role::Button, self.disabled)
             .aria_label(self.label.clone())
+            .min_w_0()
             .h(self
                 .height
                 .unwrap_or(if self.outlined { px(30.0) } else { px(26.0) }))
@@ -396,14 +406,16 @@ impl RenderOnce for MenuChip {
             .when_some(self.icon, |element, (path, color)| {
                 element.child(icon(path, 12.0, color))
             })
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(theme.text_secondary)
-                    .child(self.label),
-            )
-            .when(self.caret, |element| {
+            .when(!self.icon_only, |element| {
+                element.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.text_secondary)
+                        .child(self.label),
+                )
+            })
+            .when(self.caret && !self.icon_only, |element| {
                 element.child(icon("icons/chevron-down.svg", 10.5, theme.text_ghost))
             })
     }

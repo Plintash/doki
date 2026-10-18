@@ -1270,3 +1270,5 @@ worktree_base.missing: "%{branch}（不可用）"
 
 project.settings: 项目设置
 worktree_base.section: 工作树
+
+models.configuration: 模型设置

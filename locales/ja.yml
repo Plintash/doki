@@ -1321,3 +1321,5 @@ worktree_base.missing: "%{branch}（利用不可）"
 
 project.settings: プロジェクト設定
 worktree_base.section: ワークツリー
+
+models.configuration: モデル設定

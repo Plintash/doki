@@ -2577,3 +2577,6 @@ project.settings:
   en: Project settings
 worktree_base.section:
   en: Worktree
+
+models.configuration:
+  en: Model settings
