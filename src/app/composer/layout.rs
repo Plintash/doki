@@ -2,10 +2,76 @@
 //! the headless GPUI regressions identical: the model yields available space
 //! while the secondary controls and submission targets retain their hit areas.
 
-use gpui::{AnyElement, Div, ElementId, ParentElement, Stateful, Styled, div, prelude::*, px};
+use gpui::{
+    AnyElement, Div, ElementId, FocusHandle, MouseButton, ParentElement, Stateful, Styled, div,
+    prelude::*, px,
+};
 
-use crate::theme::sp;
+use crate::theme::{Theme, sp};
 use crate::ui::MenuChip;
+
+/// A model name is a compact menu trigger, not a fill-width selected bar.
+pub(super) const MODEL_CONTROL_MAX_WIDTH: f32 = 280.0;
+
+pub(super) fn model_control(chip: MenuChip) -> MenuChip {
+    chip.min_w_0()
+        .flex_shrink_1()
+        .max_w(px(MODEL_CONTROL_MAX_WIDTH))
+}
+
+/// Clicking the catalog rail leaves footer keyboard editing and returns the
+/// arrows/typing to model search, including an already-selected provider tab.
+pub(super) fn model_picker_rail(search_focus: &FocusHandle, theme: Theme) -> Div {
+    let focus = search_focus.clone();
+    div()
+        .w(px(50.0))
+        .h_full()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(4.0))
+        .p(px(5.0))
+        .rounded_tl(px(7.0))
+        .rounded_bl(px(7.0))
+        .bg(theme.canvas)
+        .border_r_1()
+        .border_color(theme.border)
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            window.focus(&focus, cx)
+        })
+}
+
+/// The catalog and the selected model's options are one visible surface.
+/// Footer space is reserved before sizing the scrollable model list.
+pub(super) fn model_picker_content(
+    search: AnyElement,
+    list: AnyElement,
+    options: Option<AnyElement>,
+    theme: Theme,
+) -> Stateful<Div> {
+    div()
+        .id("model-picker-content")
+        .role(gpui::Role::Group)
+        .min_w_0()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .rounded_tr(px(7.0))
+        .rounded_br(px(7.0))
+        .bg(theme.surface)
+        .child(search)
+        .child(
+            div()
+                .id("model-picker-scroll-area")
+                .role(gpui::Role::Group)
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .child(list),
+        )
+        .children(options)
+}
 
 /// Width of the toolbar's content box, after the card border and row padding.
 /// Below this point secondary labels give their space back to the model.
@@ -69,7 +135,16 @@ pub(super) fn controls_row(
                 .flex()
                 .items_center()
                 .gap(px(4.0))
-                .child(model)
+                .child(
+                    div()
+                        .id("composer-model-space")
+                        .role(gpui::Role::Group)
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .child(model),
+                )
                 .children(preset)
                 .child(access)
                 .children(goal),
@@ -83,8 +158,8 @@ mod tests {
     use crate::theme::Theme;
     use crate::ui::{SemanticControlExt, icon};
     use gpui::{
-        Bounds, Context, FocusHandle, IntoElement, Modifiers, Pixels, Render, TestAppContext,
-        VisualTestContext, Window, point,
+        Bounds, Context, FocusHandle, Focusable, IntoElement, Modifiers, Pixels, Render,
+        TestAppContext, VisualTestContext, Window, point,
     };
     use serde_json::Value;
 
@@ -147,16 +222,16 @@ mod tests {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let theme = Theme::current(cx);
             let compact = compact_controls(self.width);
-            let model = MenuChip::new("composer-provider-model")
-                .icon("icons/bot.svg", theme.text_secondary)
-                .label(self.model_label)
-                .caret(false)
-                .min_w_0()
-                .flex_1()
-                .track_focus(&self.focus[0])
-                .tab_index(0)
-                .on_click(cx.listener(|this, _, _, _| this.activated.push("model")))
-                .into_any_element();
+            let model = model_control(
+                MenuChip::new("composer-provider-model")
+                    .icon("icons/bot.svg", theme.text_secondary)
+                    .label(self.model_label)
+                    .caret(false),
+            )
+            .track_focus(&self.focus[0])
+            .tab_index(0)
+            .on_click(cx.listener(|this, _, _, _| this.activated.push("model")))
+            .into_any_element();
             let preset = self.preset.then(|| {
                 secondary_control(
                     MenuChip::new("agent-preset")
@@ -312,7 +387,9 @@ mod tests {
             "actions must stay within row padding: {tree}"
         );
 
-        let mut previous = model;
+        assert!(model.size.width <= px(MODEL_CONTROL_MAX_WIDTH));
+        let mut previous = bounds(tree, "composer-model-space");
+        assert!(model.right() <= previous.right());
         for (id, label, present, compact_width, full_width) in [
             ("agent-preset", PRESET_LABEL, preset, 26.0, 120.0),
             ("runtime-mode", ACCESS_LABEL, true, 26.0, 148.0),
@@ -400,7 +477,7 @@ mod tests {
         // both directions; no stale minimum-content width should survive.
         for width in [698.0, 278.0, 560.0, 559.0, 561.0, 318.0] {
             for (preset, goal) in [(true, true), (false, true), (true, false), (false, false)] {
-                let mut model_width = None;
+                let mut action_left = None;
                 for label in [
                     "Short",
                     MODEL_LABEL,
@@ -417,14 +494,14 @@ mod tests {
                     cx.run_until_parked();
                     let tree = snapshot(cx);
                     assert_geometry(&tree, width, Actions::StopAndFollowUp, preset, goal);
-                    let measured = bounds(&tree, "composer-provider-model").size.width;
-                    if let Some(previous) = model_width {
+                    let measured = bounds(&tree, "send-or-stop").left();
+                    if let Some(previous) = action_left {
                         assert_eq!(
                             measured, previous,
                             "model content must not change reserved action geometry"
                         );
                     }
-                    model_width = Some(measured);
+                    action_left = Some(measured);
                     assert_eq!(node(&tree, "composer-provider-model")["label"], label);
                 }
             }
@@ -484,5 +561,206 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[gpui::test]
+    fn model_trigger_fits_short_names_and_caps_long_names_without_moving_actions(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            window.set_a11y_automation(true);
+            let mut fixture = ToolbarFixture::new(cx);
+            fixture.width = 698.0;
+            fixture.preset = false;
+            fixture.goal = false;
+            fixture.model_label = "Short";
+            fixture
+        });
+        cx.run_until_parked();
+        let short = snapshot(cx);
+        let short_model = bounds(&short, "composer-provider-model");
+        let short_action = bounds(&short, "send-or-stop");
+        assert!(short_model.size.width < px(150.0));
+        assert!(short_model.right() < bounds(&short, "composer-model-space").right());
+        view.update(cx, |view, cx| {
+            view.model_label = MODEL_LABEL;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let long = snapshot(cx);
+        approx(
+            bounds(&long, "composer-provider-model").size.width,
+            MODEL_CONTROL_MAX_WIDTH,
+            "long model cap",
+        );
+        assert_eq!(bounds(&long, "send-or-stop"), short_action);
+        assert!(bounds(&long, "composer-provider-model").size.width > short_model.size.width);
+    }
+
+    struct PickerFixture {
+        width: f32,
+        height: f32,
+        options: bool,
+    }
+
+    impl Render for PickerFixture {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let block = |id: &'static str, height: f32| {
+                div()
+                    .id(id)
+                    .role(gpui::Role::Group)
+                    .h(px(height))
+                    .flex_none()
+                    .into_any_element()
+            };
+            div()
+                .w(px(self.width))
+                .h(px(self.height))
+                .flex()
+                .child(model_picker_content(
+                    block("picker-search-fixture", 52.0),
+                    div()
+                        .id("picker-list-fixture")
+                        .role(gpui::Role::List)
+                        .size_full()
+                        .into_any_element(),
+                    self.options.then(|| block("picker-options-fixture", 72.0)),
+                    Theme::current(cx),
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn model_catalog_and_options_share_one_surface_and_list_keeps_remaining_space(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|window, _| {
+            window.set_a11y_automation(true);
+            PickerFixture {
+                width: 408.0,
+                height: 388.0,
+                options: true,
+            }
+        });
+        for (width, height, options) in [
+            (408.0, 388.0, true),
+            (260.0, 300.0, true),
+            (408.0, 388.0, false),
+        ] {
+            view.update(cx, |view, cx| {
+                view.width = width;
+                view.height = height;
+                view.options = options;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let tree = snapshot(cx);
+            let search = bounds(&tree, "picker-search-fixture");
+            let list = bounds(&tree, "picker-list-fixture");
+            approx(search.size.height, 52.0, "search height");
+            assert_eq!(search.bottom(), list.top());
+            approx(list.size.width, width, "catalog width");
+            approx(
+                list.size.height,
+                height - 52.0 - if options { 72.0 } else { 0.0 },
+                "catalog remaining height",
+            );
+            if options {
+                let footer = bounds(&tree, "picker-options-fixture");
+                assert_eq!(list.bottom(), footer.top());
+                approx(footer.bottom(), height, "footer bottom");
+                approx(footer.size.width, width, "footer width");
+            }
+        }
+    }
+
+    struct PickerFocusFixture {
+        search: gpui::Entity<crate::input::TextInput>,
+        slider_focus: FocusHandle,
+        selected: usize,
+        catalog_moves: usize,
+    }
+
+    impl Render for PickerFocusFixture {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let theme = Theme::current(cx);
+            let search_focus = self.search.read(cx).focus_handle(cx);
+            div()
+                .w(px(460.0))
+                .h(px(390.0))
+                .key_context("WakuMenu")
+                .flex()
+                .on_action(
+                    cx.listener(|this, _: &crate::ui::menu::SelectNextEntry, _, _| {
+                        this.catalog_moves += 1
+                    }),
+                )
+                .child(
+                    model_picker_rail(&search_focus, theme).child(
+                        div()
+                            .id("rail-tab-fixture")
+                            .role(gpui::Role::Button)
+                            .size(px(38.0)),
+                    ),
+                )
+                .child(model_picker_content(
+                    div()
+                        .h(px(52.0))
+                        .flex_none()
+                        .child(self.search.clone())
+                        .into_any_element(),
+                    div().size_full().into_any_element(),
+                    Some(
+                        crate::ui::effort_slider::EffortSlider::new(
+                            "focused-effort",
+                            5,
+                            self.selected,
+                            &self.slider_focus,
+                        )
+                        .on_change(cx.listener(|this, index: &usize, _, cx| {
+                            this.selected = *index;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                    ),
+                    theme,
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn rail_click_returns_footer_keyboard_input_to_catalog_search(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::input::init(cx);
+            crate::ui::menu::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            window.set_a11y_automation(true);
+            let slider_focus = cx.focus_handle();
+            window.focus(&slider_focus, cx);
+            PickerFocusFixture {
+                search: cx.new(|cx| crate::input::TextInput::new(window, cx).tab_stop(true)),
+                slider_focus,
+                selected: 2,
+                catalog_moves: 0,
+            }
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("right");
+        view.read_with(cx, |view, _| assert_eq!(view.selected, 3));
+        let tree = snapshot(cx);
+        cx.simulate_click(
+            bounds(&tree, "rail-tab-fixture").center(),
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.catalog_moves, 1);
+            assert_eq!(
+                view.selected, 3,
+                "catalog navigation must not edit the effort value"
+            );
+        });
     }
 }
