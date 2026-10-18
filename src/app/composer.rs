@@ -3920,18 +3920,19 @@ impl Waku {
         let session = self.selected_session()?;
         let workspace = session.workspace.clone();
         let workspace_path = self.workspace_path_for_session(session)?.to_path_buf();
-        self.selected_project()
-            .filter(|project| !project.is_projectless())?;
+        let project = self
+            .selected_project()
+            .filter(|project| !project.is_projectless())?
+            .clone();
         let branch_enabled =
             !session.is_busy() && session.review.is_none() && !self.branch_operation_pending;
         let planned_worktree = matches!(workspace, SessionWorkspace::NewWorktree { .. });
         let snapshot = self.branch_snapshot_for_workspace(&workspace_path, cx)?;
         let selected_branch = match &workspace {
             SessionWorkspace::Local => snapshot.display_branch().map(str::to_owned),
-            SessionWorkspace::NewWorktree { base_branch } => base_branch
-                .clone()
-                .or_else(|| snapshot.default_branch.clone())
-                .or_else(|| snapshot.display_branch().map(str::to_owned)),
+            SessionWorkspace::NewWorktree { base_branch } => {
+                super::branches::planned_worktree_base(&project, base_branch.as_deref(), &snapshot)
+            }
             SessionWorkspace::Worktree { branch, .. } => snapshot
                 .current
                 .clone()
@@ -3939,6 +3940,21 @@ impl Waku {
                 .or_else(|| snapshot.detached_head.clone()),
         }
         .unwrap_or_else(|| tr!("branches.detached_head"));
+        let (display_branch, uses_project_default) = match &workspace {
+            SessionWorkspace::NewWorktree { base_branch } => (
+                super::branches::planned_worktree_base_label(
+                    &project,
+                    base_branch.as_deref(),
+                    &snapshot,
+                ),
+                base_branch.is_none(),
+            ),
+            _ => (selected_branch.clone(), false),
+        };
+        let default_base_label = tr!(
+            "worktree_base.project_default",
+            branch = super::branches::planned_worktree_base_label(&project, None, &snapshot)
+        );
 
         let weak = cx.entity().downgrade();
         let search = self.branch_search.clone();
@@ -3988,7 +4004,10 @@ impl Waku {
             .label(if self.branch_operation_pending {
                 tr!("branches.switching")
             } else {
-                selected_branch.clone()
+                display_branch
+            })
+            .when(planned_worktree, |element| {
+                element.tooltip(Tooltip::text(tr!("worktree_base.composer_hint")))
             })
             .caret(false)
             .disabled(!branch_enabled)
@@ -4006,17 +4025,35 @@ impl Waku {
             .to_ascii_lowercase();
         let visible_branches = Rc::new(
             if handle.is_open() && self.branch_picker_mode == BranchPickerMode::Browse {
-                visible_branch_entries(&snapshot.branches, &selected_branch, &normalized_query)
+                let branches = if planned_worktree {
+                    snapshot
+                        .worktree_base_refs
+                        .iter()
+                        .map(|reference| crate::git_branch::BranchEntry {
+                            name: reference.clone(),
+                            checked_out_elsewhere: false,
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    snapshot.branches.clone()
+                };
+                visible_branch_entries(&branches, &selected_branch, &normalized_query)
             } else {
                 Vec::new()
             },
         );
         let allow_create = !planned_worktree;
+        let show_project_default = planned_worktree && normalized_query.is_empty();
         let actions = Rc::new(
-            visible_branches
-                .iter()
-                .filter(|branch| planned_worktree || !branch.checked_out_elsewhere)
-                .map(|branch| BranchPickerAction::Checkout(branch.name.clone()))
+            show_project_default
+                .then_some(BranchPickerAction::UseProjectDefault)
+                .into_iter()
+                .chain(
+                    visible_branches
+                        .iter()
+                        .filter(|branch| planned_worktree || !branch.checked_out_elsewhere)
+                        .map(|branch| BranchPickerAction::Checkout(branch.name.clone())),
+                )
                 .chain(allow_create.then_some(BranchPickerAction::Create))
                 .collect::<Vec<_>>(),
         );
@@ -4112,7 +4149,8 @@ impl Waku {
                                     let Some(branch) = list_branches.get(index) else {
                                         return div().into_any_element();
                                     };
-                                    let selected = branch.name == list_selected_branch;
+                                    let selected = branch.name == list_selected_branch
+                                        && !uses_project_default;
                                     let disabled =
                                         branch.checked_out_elsewhere && !planned_worktree;
                                     let highlighted = highlight
@@ -4159,7 +4197,13 @@ impl Waku {
                                                 .text_size(sp(12.5))
                                                 .line_height(sp(15.0))
                                                 .text_color(color)
-                                                .child(SharedString::from(branch.name.clone())),
+                                                .child(SharedString::from(if planned_worktree {
+                                                    super::branches::worktree_base_label(
+                                                        &branch.name,
+                                                    )
+                                                } else {
+                                                    branch.name.clone()
+                                                })),
                                         )
                                         .when(selected, |element| {
                                             element.child(icon(
@@ -4196,6 +4240,46 @@ impl Waku {
                             .into_any_element()
                     };
 
+                    let default_row = show_project_default.then(|| {
+                        let reset_weak = weak.clone();
+                        let reset_popover = popover.clone();
+                        div()
+                            .id("worktree-project-default")
+                            .mx(px(4.0))
+                            .h(px(BRANCH_PICKER_ROW_HEIGHT))
+                            .px(px(8.0))
+                            .rounded(px(6.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .cursor_default()
+                            .when(
+                                highlight.and_then(|index| actions.get(index))
+                                    == Some(&BranchPickerAction::UseProjectDefault),
+                                |element| element.bg(theme.overlay_strong),
+                            )
+                            .hover(|element| element.bg(theme.overlay))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_size(sp(12.5))
+                                    .child(default_base_label.clone()),
+                            )
+                            .when(uses_project_default, |element| {
+                                element.child(icon("icons/check.svg", 11.0, theme.text_secondary))
+                            })
+                            .on_click(move |_, window, cx| {
+                                let should_close = reset_weak
+                                    .update(cx, |this, cx| this.reset_worktree_base(cx))
+                                    .unwrap_or(false);
+                                if should_close {
+                                    reset_popover.close(window, cx);
+                                    window.refresh();
+                                }
+                            })
+                    });
                     let create_row = allow_create.then(|| {
                         let create_weak = weak.clone();
                         div()
@@ -4265,8 +4349,13 @@ impl Waku {
                                 .text_size(sp(12.5))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text_tertiary)
-                                .child(tr!("branches.title")),
+                                .child(if planned_worktree {
+                                    tr!("worktree_base.starting_branch")
+                                } else {
+                                    tr!("branches.title")
+                                }),
                         )
+                        .children(default_row)
                         .child(rows)
                         .when_some(create_row, |element, create_row| {
                             element
@@ -4279,7 +4368,7 @@ impl Waku {
 
                 div()
                     .w(px(360.0))
-                    .max_h(px(390.0))
+                    .max_h(px(if planned_worktree { 420.0 } else { 390.0 }))
                     .rounded(px(13.0))
                     .overflow_hidden()
                     .border_1()
@@ -4368,16 +4457,22 @@ impl Waku {
             && self
                 .selected_session()
                 .is_some_and(|session| session.task_id.is_none());
+        let settings_project_id = self
+            .selected_project()
+            .filter(|project| !project.is_projectless())
+            .map(|project| project.id);
+        let can_open_project_menu = can_choose_project || settings_project_id.is_some();
         let project_handle = self.menu_handle("workspace-project", cx);
         let project_trigger = MenuChip::new("workspace-project")
             .icon("icons/folder.svg", theme.text_tertiary)
             .label(project_name)
             .caret(false)
-            .disabled(!can_choose_project)
-            .selected(can_choose_project && project_handle.is_open())
+            .disabled(!can_open_project_menu)
+            .selected(can_open_project_menu && project_handle.is_open())
             .max_w(px(190.0));
-        let project_selector = if can_choose_project {
+        let project_selector = if can_open_project_menu {
             let weak = cx.entity().downgrade();
+            let return_focus = project_handle.trigger_focus_handle().clone();
             dropdown_menu(
                 project_trigger,
                 "workspace-project-menu",
@@ -4388,46 +4483,71 @@ impl Waku {
                         return Vec::new();
                     };
                     let this = entity.read(cx);
-                    let mut items =
-                        projects::picker_projects(&this.state.projects, selected_project_id)
-                            .into_iter()
-                            .map(|project| {
-                                let project_id = project.id;
-                                let project_name = project.display_name();
-                                let weak = weak.clone();
-                                MenuItem::new(project_name, move |_, cx| {
-                                    if Some(project_id) != selected_project_id {
-                                        let _ = weak.update(cx, |this, cx| {
-                                            this.select_project_from_composer(project_id, cx);
-                                        });
-                                    }
+                    let mut items = Vec::new();
+                    if can_choose_project {
+                        items =
+                            projects::picker_projects(&this.state.projects, selected_project_id)
+                                .into_iter()
+                                .map(|project| {
+                                    let project_id = project.id;
+                                    let project_name = project.display_name();
+                                    let weak = weak.clone();
+                                    MenuItem::new(project_name, move |_, cx| {
+                                        if Some(project_id) != selected_project_id {
+                                            let _ = weak.update(cx, |this, cx| {
+                                                this.select_project_from_composer(project_id, cx);
+                                            });
+                                        }
+                                    })
+                                    .semantic_id(format!("composer-project-{project_id}"))
+                                    .selected(Some(project_id) == selected_project_id)
                                 })
-                                .semantic_id(format!("composer-project-{project_id}"))
-                                .selected(Some(project_id) == selected_project_id)
+                                .collect::<Vec<_>>();
+                        if !items.is_empty() {
+                            items.push(MenuItem::Separator);
+                        }
+                        let add_project = weak.clone();
+                        items.push(
+                            MenuItem::new(tr!("project.new_project"), move |_, cx| {
+                                let _ = add_project.update(cx, |this, cx| this.add_project(cx));
                             })
-                            .collect::<Vec<_>>();
-                    if !items.is_empty() {
-                        items.push(MenuItem::Separator);
+                            .icon("icons/folder-new.svg"),
+                        );
+                        let projectless = weak.clone();
+                        items.push(
+                            MenuItem::new(tr!("project.no_project"), move |_, cx| {
+                                let _ = projectless.update(cx, |this, cx| {
+                                    if !this.selected_project().is_some_and(Project::is_projectless)
+                                    {
+                                        this.create_projectless_session_from_composer(cx);
+                                    }
+                                });
+                            })
+                            .icon("icons/x.svg")
+                            .selected(projectless_selected),
+                        );
                     }
-                    let add_project = weak.clone();
-                    items.push(
-                        MenuItem::new(tr!("project.new_project"), move |_, cx| {
-                            let _ = add_project.update(cx, |this, cx| this.add_project(cx));
-                        })
-                        .icon("icons/folder-new.svg"),
-                    );
-                    let projectless = weak.clone();
-                    items.push(
-                        MenuItem::new(tr!("project.no_project"), move |_, cx| {
-                            let _ = projectless.update(cx, |this, cx| {
-                                if !this.selected_project().is_some_and(Project::is_projectless) {
-                                    this.create_projectless_session_from_composer(cx);
-                                }
-                            });
-                        })
-                        .icon("icons/x.svg")
-                        .selected(projectless_selected),
-                    );
+                    if let Some(project_id) = settings_project_id {
+                        if !items.is_empty() {
+                            items.push(MenuItem::Separator);
+                        }
+                        let settings = weak.clone();
+                        let return_focus = return_focus.clone();
+                        items.push(
+                            MenuItem::new(tr!("project.settings"), move |window, cx| {
+                                let _ = settings.update(cx, |this, cx| {
+                                    this.open_project_settings(
+                                        project_id,
+                                        return_focus.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            })
+                            .semantic_id(format!("composer-project-settings-{project_id}"))
+                            .icon("icons/settings.svg"),
+                        );
+                    }
                     items
                 },
             )
@@ -5447,6 +5567,15 @@ mod worktree_option_tests {
             SessionWorkspace::NewWorktree {
                 base_branch: Some("issue-one".into())
             }
+        );
+        let mut project = Project::from_path(PathBuf::from("/project"));
+        project.worktree_base_branch = Some("refs/remotes/origin/main".into());
+        let SessionWorkspace::NewWorktree { base_branch } = &session.workspace else {
+            unreachable!()
+        };
+        assert_eq!(
+            project.worktree_base_branch(base_branch.as_deref()),
+            Some("issue-one")
         );
         assert_eq!(
             composer_toggled_worktree(&session, Some(&task), false),

@@ -85,6 +85,13 @@
       "when": 1791983129690,
       "tag": "0011_bumpy_nightcrawler",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1792309284032,
+      "tag": "0012_project_worktree_base",
+      "breakpoints": true
     }
   ]
 }

@@ -1254,3 +1254,19 @@ review.invalid_session: "审查需要使用 Codex 和原有工作区"
 review.composer_scope: "Codex 审查 · %{scope}"
 review.loading_context: "正在读取开发上下文…"
 review.context_hint: "沿用此 issue 的工作区和最新开发上下文"
+
+worktree_base.settings_title: 默认起点分支
+worktree_base.settings_hint: 新工作树默认使用此起点，草稿可单独覆盖。使用本地已有的提交，不会 fetch。
+worktree_base.composer_hint: 此工作树的起点分支。未单独指定时使用项目默认值；不会 fetch 或切换原工作区。
+worktree_base.starting_branch: 起点分支
+worktree_base.local: 本地 · %{branch}
+worktree_base.remote: 远端 · %{branch}
+worktree_base.automatic: 自动
+worktree_base.automatic_resolved: 自动 · %{branch}
+worktree_base.project_default: 项目默认 · %{branch}
+worktree_base.loading: 正在读取分支…
+worktree_base.unavailable: 起点不可用
+worktree_base.missing: "%{branch}（不可用）"
+
+project.settings: 项目设置
+worktree_base.section: 工作树

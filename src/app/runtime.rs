@@ -311,7 +311,9 @@ fn prepare_submission(
                     project_id: project.id,
                     session_id,
                     prompt: prompt.to_owned(),
-                    base_branch,
+                    base_branch: project
+                        .worktree_base_branch(base_branch.as_deref())
+                        .map(str::to_owned),
                 })? {
                     waku_client::WorkspaceResult::WorktreeCreated { worktree } => worktree,
                     _ => anyhow::bail!("the daemon returned an invalid worktree response"),

@@ -2547,3 +2547,33 @@ review.loading_context:
   en: "Loading development context…"
 review.context_hint:
   en: "Uses this issue’s workspace and latest development context"
+
+worktree_base.settings_title:
+  en: Default starting branch
+worktree_base.settings_hint:
+  en: Applies to new worktrees unless a draft selects its own base. Uses committed local refs; does not fetch.
+worktree_base.composer_hint:
+  en: Starting branch for this worktree. The project default applies until overridden; no fetch or checkout.
+worktree_base.starting_branch:
+  en: Starting branch
+worktree_base.local:
+  en: Local · %{branch}
+worktree_base.remote:
+  en: Remote · %{branch}
+worktree_base.automatic:
+  en: Automatic
+worktree_base.automatic_resolved:
+  en: Auto · %{branch}
+worktree_base.project_default:
+  en: Project default · %{branch}
+worktree_base.loading:
+  en: Loading branches…
+worktree_base.unavailable:
+  en: Base unavailable
+worktree_base.missing:
+  en: "%{branch} (unavailable)"
+
+project.settings:
+  en: Project settings
+worktree_base.section:
+  en: Worktree

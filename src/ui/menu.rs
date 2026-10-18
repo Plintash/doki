@@ -783,7 +783,7 @@ pub fn dropdown_menu<E>(
 where
     E: ParentElement + Styled + StatefulInteractiveElement + IntoElement + 'static,
 {
-    dropdown_menu_inner(trigger, id.into(), handle, align, false, items)
+    dropdown_menu_inner(trigger, id.into(), handle, align, false, 1, items)
 }
 
 /// A bounded dropdown for a potentially large collection. It keeps the same
@@ -800,7 +800,23 @@ pub fn dropdown_menu_list<E>(
 where
     E: ParentElement + Styled + StatefulInteractiveElement + IntoElement + 'static,
 {
-    dropdown_menu_inner(trigger, id.into(), handle, align, true, items)
+    dropdown_menu_inner(trigger, id.into(), handle, align, true, 1, items)
+}
+
+/// A collection menu inside an already deferred overlay. GPUI globally orders
+/// deferred draws, so the menu must paint above its containing modal layer.
+pub fn dropdown_menu_list_with_priority<E>(
+    trigger: E,
+    id: impl Into<ElementId>,
+    handle: &ContextMenuHandle,
+    align: MenuAlign,
+    priority: usize,
+    items: impl Fn(&mut App) -> Vec<MenuItem> + 'static,
+) -> AnyElement
+where
+    E: ParentElement + Styled + StatefulInteractiveElement + IntoElement + 'static,
+{
+    dropdown_menu_inner(trigger, id.into(), handle, align, true, priority, items)
 }
 
 fn dropdown_menu_inner<E>(
@@ -809,21 +825,29 @@ fn dropdown_menu_inner<E>(
     handle: &ContextMenuHandle,
     align: MenuAlign,
     virtualized: bool,
+    priority: usize,
     items: impl Fn(&mut App) -> Vec<MenuItem> + 'static,
 ) -> AnyElement
 where
     E: ParentElement + Styled + StatefulInteractiveElement + IntoElement + 'static,
 {
     let items = Rc::new(items);
-    anchored_surface(trigger, handle, align, SurfaceFocus::Card, move |handle| {
-        MenuCard {
-            id: id.clone(),
-            handle: handle.clone(),
-            items: items.clone(),
-            virtualized,
-        }
-        .into_any_element()
-    })
+    anchored_surface(
+        trigger,
+        handle,
+        align,
+        SurfaceFocus::Card,
+        priority,
+        move |handle| {
+            MenuCard {
+                id: id.clone(),
+                handle: handle.clone(),
+                items: items.clone(),
+                virtualized,
+            }
+            .into_any_element()
+        },
+    )
 }
 
 /// A dropdown-anchored panel holding arbitrary content.
@@ -848,6 +872,7 @@ where
         handle,
         align,
         SurfaceFocus::Content,
+        1,
         move |handle| {
             PopoverCard {
                 handle: handle.clone(),
@@ -891,6 +916,7 @@ fn anchored_surface<E>(
     handle: &ContextMenuHandle,
     align: MenuAlign,
     focus_target: SurfaceFocus,
+    priority: usize,
     card: impl Fn(&ContextMenuHandle) -> AnyElement + 'static,
 ) -> AnyElement
 where
@@ -939,7 +965,7 @@ where
                 px(TRIGGER_GAP),
                 px(8.0),
             ))
-            .with_priority(1),
+            .with_priority(priority),
         )
         .into_any_element()
 }

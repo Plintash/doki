@@ -1305,3 +1305,19 @@ review.invalid_session: "レビューには Codex と元のワークスペース
 review.composer_scope: "Codex レビュー · %{scope}"
 review.loading_context: "開発のコンテキストを読み込み中…"
 review.context_hint: "この issue のワークスペースと最新の開発コンテキストを使用"
+
+worktree_base.settings_title: デフォルトの開始ブランチ
+worktree_base.settings_hint: 下書きで個別に指定しない限り、新しいワークツリーに適用します。保存済みのコミットを使い、fetch は行いません。
+worktree_base.composer_hint: このワークツリーの開始ブランチ。個別に指定しない場合はプロジェクトの既定値を使用します。fetch や切り替えは行いません。
+worktree_base.starting_branch: 開始ブランチ
+worktree_base.local: ローカル · %{branch}
+worktree_base.remote: リモート · %{branch}
+worktree_base.automatic: 自動
+worktree_base.automatic_resolved: 自動 · %{branch}
+worktree_base.project_default: プロジェクトの既定値 · %{branch}
+worktree_base.loading: ブランチを読み込み中…
+worktree_base.unavailable: 開始点が利用できません
+worktree_base.missing: "%{branch}（利用不可）"
+
+project.settings: プロジェクト設定
+worktree_base.section: ワークツリー

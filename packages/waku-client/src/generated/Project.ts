@@ -3,6 +3,11 @@ import type { ProjectBoard } from "./ProjectBoard";
 
 export type Project = { board: ProjectBoard, id: string, name: string, path: string,
 /**
+ * Default base for new worktrees, stored as a full local or remote ref.
+ * `None` keeps automatic base selection.
+ */
+worktree_base_branch?: string | null,
+/**
  * When the project was added, unix seconds.
  */
 created_at: number, };

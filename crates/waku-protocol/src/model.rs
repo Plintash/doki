@@ -610,6 +610,10 @@ pub struct Project {
     pub id: Uuid,
     pub name: String,
     pub path: PathBuf,
+    /// Default base for new worktrees, stored as a full local or remote ref.
+    /// `None` keeps automatic base selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_base_branch: Option<String>,
     /// When the project was added, unix seconds.
     #[serde(default)]
     pub created_at: u64,
@@ -683,12 +687,20 @@ impl Project {
             id,
             name,
             path,
+            worktree_base_branch: None,
             created_at: unix_time(),
         }
     }
 
     pub fn is_projectless(&self) -> bool {
         crate::projectless::is_projectless_path(&self.path)
+    }
+
+    /// An explicit creation-time choice takes precedence over the project
+    /// default. Preserve invalid choices so worktree creation can report them
+    /// rather than silently falling back to a different base.
+    pub fn worktree_base_branch<'a>(&'a self, override_branch: Option<&'a str>) -> Option<&'a str> {
+        override_branch.or(self.worktree_base_branch.as_deref())
     }
 }
 
@@ -5178,6 +5190,64 @@ mod tests {
         assert!(legacy_dated.is_projectless());
         assert!(project.is_projectless());
         assert!(!ordinary.is_projectless());
+    }
+
+    #[test]
+    fn project_worktree_base_defaults_to_automatic_for_new_and_legacy_projects() {
+        let project = Project::from_path(PathBuf::from("/tmp/project"));
+        assert!(project.worktree_base_branch.is_none());
+        assert_eq!(project.worktree_base_branch(None), None);
+
+        let serialized = serde_json::to_value(&project).unwrap();
+        assert!(serialized.get("worktree_base_branch").is_none());
+        let restored: Project = serde_json::from_value(serialized).unwrap();
+        assert!(restored.worktree_base_branch.is_none());
+
+        let legacy: Project = serde_json::from_value(serde_json::json!({
+            "id": project.id,
+            "name": "Legacy project",
+            "path": "/tmp/project"
+        }))
+        .unwrap();
+        assert!(legacy.worktree_base_branch.is_none());
+        assert_eq!(legacy.worktree_base_branch(None), None);
+    }
+
+    #[test]
+    fn project_worktree_base_round_trip_preserves_local_and_remote_identity() {
+        for reference in ["refs/heads/main", "refs/remotes/origin/main"] {
+            let mut project = Project::from_path(PathBuf::from("/tmp/project"));
+            project.worktree_base_branch = Some(reference.to_owned());
+
+            let serialized = serde_json::to_value(&project).unwrap();
+            assert_eq!(serialized["worktree_base_branch"], reference);
+            let restored: Project = serde_json::from_value(serialized).unwrap();
+            assert_eq!(restored.worktree_base_branch.as_deref(), Some(reference));
+            assert_eq!(restored.worktree_base_branch(None), Some(reference));
+        }
+    }
+
+    #[test]
+    fn project_worktree_base_respects_explicit_choices_without_silent_fallback() {
+        let mut project = Project::from_path(PathBuf::from("/tmp/project"));
+        assert_eq!(
+            project.worktree_base_branch(Some("refs/heads/release")),
+            Some("refs/heads/release")
+        );
+        project.worktree_base_branch = Some("refs/remotes/origin/main".to_owned());
+        assert_eq!(
+            project.worktree_base_branch(None),
+            Some("refs/remotes/origin/main")
+        );
+        assert_eq!(
+            project.worktree_base_branch(Some("refs/heads/release")),
+            Some("refs/heads/release")
+        );
+        for invalid in ["", "refs/heads/missing", "invalid ref"] {
+            assert_eq!(project.worktree_base_branch(Some(invalid)), Some(invalid));
+            project.worktree_base_branch = Some(invalid.to_owned());
+            assert_eq!(project.worktree_base_branch(None), Some(invalid));
+        }
     }
 
     #[test]
