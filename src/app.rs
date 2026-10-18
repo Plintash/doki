@@ -1341,7 +1341,7 @@ pub struct Waku {
     /// Git subprocess results per concrete workspace path. Render only reads
     /// this in-memory cache; misses are fulfilled on the background executor.
     branch_snapshots: QueryCache<PathBuf, Result<Option<BranchSnapshot>, String>>,
-    worktree_settings_project: Option<Uuid>,
+    project_settings: Option<project_settings::ProjectSettingsState>,
     /// Stale-while-revalidate value for the selected path, avoiding label
     /// flicker when app activation invalidates the query.
     visible_branch_snapshot: Option<(PathBuf, BranchSnapshot)>,
@@ -1879,6 +1879,7 @@ mod file_search;
 mod goal_dialog;
 mod image_preview;
 mod issue_review;
+mod project_settings;
 mod projects;
 mod render;
 mod right_panel;
@@ -1915,6 +1916,7 @@ use components::*;
 pub use composer::init_workspace_keys;
 pub use goal_dialog::init as init_goal_dialog_keys;
 pub use image_preview::init as init_image_preview_keys;
+pub use project_settings::init as init_project_settings_keys;
 pub use settings::init as init_settings_keys;
 pub use sidebar::init as init_sidebar_keys;
 use sidebar::{SidebarGroup, SidebarRow};
@@ -3128,7 +3130,7 @@ impl Waku {
                 branch_picker_list_state,
                 branch_picker_row_cache: RefCell::new(Vec::new()),
                 branch_snapshots: QueryCache::new(MAX_CACHED_WORKSPACES),
-                worktree_settings_project: None,
+                project_settings: None,
                 visible_branch_snapshot: None,
                 branch_operation_pending: false,
                 commit_dialog: None,

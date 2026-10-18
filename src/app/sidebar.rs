@@ -1899,6 +1899,79 @@ impl Waku {
                 )
         });
 
+        // Settings belongs to the project identified by this header, even
+        // when another project's conversation or draft is currently active.
+        let project_menu = match group {
+            SidebarGroup::Project(project_id) => Some((
+                project_id,
+                self.menu_handle(format!("sidebar-project-settings-{project_id}"), cx),
+            )),
+            _ => None,
+        };
+        let project_menu_trigger = project_menu.as_ref().map(|(project_id, menu)| {
+            let click_menu = menu.clone();
+            let keyboard_menu = menu.clone();
+            div()
+                .w(px(20.0))
+                .h(px(22.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_end()
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "sidebar-project-settings-trigger-{project_id}"
+                        )))
+                        .semantic_control(gpui::Role::Button, false)
+                        .aria_label(tr!("project.settings"))
+                        .aria_expanded(menu.is_open())
+                        .track_focus(menu.trigger_focus_handle())
+                        .tab_index(0)
+                        .tab_stop(true)
+                        .w_0()
+                        .h(px(22.0))
+                        .overflow_hidden()
+                        .rounded(px(4.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_default()
+                        .opacity(0.0)
+                        .when(menu.is_open(), |style| {
+                            style.w(px(20.0)).opacity(1.0).bg(theme.overlay_strong)
+                        })
+                        .group_hover(group_name.clone(), |style| style.w(px(20.0)).opacity(1.0))
+                        .focus_visible(|style| {
+                            style
+                                .w(px(20.0))
+                                .opacity(1.0)
+                                .border_1()
+                                .border_color(theme.accent)
+                        })
+                        .hover(|style| style.bg(theme.overlay))
+                        .active(|style| style.bg(theme.overlay_strong))
+                        .tooltip(Tooltip::text(tr!("project.settings")))
+                        .child(icon("icons/ellipsis.svg", 14.0, theme.text_secondary))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            click_menu.open_context_menu(window, cx);
+                        })
+                        .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                            let key = event.keystroke.key.as_str();
+                            if (!event.keystroke.modifiers.modified()
+                                && matches!(key, "enter" | "space"))
+                                || (key == "f10" && event.keystroke.modifiers.shift)
+                            {
+                                keyboard_menu.open_context_menu(window, cx);
+                                cx.stop_propagation();
+                            }
+                        }),
+                )
+        });
+        let keyboard_project_menu = project_menu.as_ref().map(|(_, menu)| menu.clone());
+
         let header = session_group_header(&theme)
             .id(SharedString::from(format!(
                 "sidebar-group-toggle-{group_key}"
@@ -1964,6 +2037,9 @@ impl Waku {
                 )
             })
             .when_some(compose, |element, compose| element.child(compose))
+            .when_some(project_menu_trigger, |element, trigger| {
+                element.child(trigger)
+            })
             .when(first, |element| {
                 element.child(self.render_sidebar_header_actions(cx))
             })
@@ -1974,7 +2050,15 @@ impl Waku {
                     this.toggle_sidebar_group(group, cx);
                 }
             }))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "f10"
+                    && event.keystroke.modifiers.shift
+                    && let Some(menu) = &keyboard_project_menu
+                {
+                    menu.open_context_menu(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 match event.keystroke.key.as_str() {
                     "enter" | "space" => {
                         if let SidebarGroup::Task(task_id) = group {
@@ -1995,6 +2079,37 @@ impl Waku {
                     _ => {}
                 }
             }));
+
+        let header = if let Some((project_id, menu)) = project_menu {
+            let weak = cx.entity().downgrade();
+            let return_focus = menu.trigger_focus_handle().clone();
+            context_menu(
+                div().w_full().child(header),
+                SharedString::from(format!("sidebar-project-settings-menu-{project_id}")),
+                &menu,
+                move |_| {
+                    let weak = weak.clone();
+                    let return_focus = return_focus.clone();
+                    vec![
+                        MenuItem::new(tr!("project.settings"), move |window, cx| {
+                            cx.stop_propagation();
+                            let _ = weak.update(cx, |this, cx| {
+                                this.open_project_settings(
+                                    project_id,
+                                    return_focus.clone(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        })
+                        .semantic_id(format!("sidebar-project-settings-open-{project_id}"))
+                        .icon("icons/settings.svg"),
+                    ]
+                },
+            )
+        } else {
+            header.into_any_element()
+        };
 
         div()
             .w_full()

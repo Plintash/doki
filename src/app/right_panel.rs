@@ -2993,6 +2993,7 @@ impl Waku {
             || self.command_palette.is_open()
             || self.task_switcher.is_open()
             || self.commit_dialog.is_some()
+            || self.project_settings.is_some()
             || self.image_preview.is_some()
             // The close confirmation is a full-window modal: a webview left up
             // would cover the choices that have to be answered.

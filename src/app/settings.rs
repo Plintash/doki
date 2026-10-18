@@ -117,11 +117,7 @@ pub(super) fn visible_settings_pages(
 }
 
 impl Waku {
-    pub(super) fn render_settings(
-        &mut self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(super) fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
 
         div()
@@ -321,7 +317,7 @@ impl Waku {
             )
     }
 
-    fn render_settings_content(&mut self, window: &Window, cx: &mut Context<Self>) -> Div {
+    fn render_settings_content(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
         let page = self.settings_page.unwrap_or(SettingsPage::General);
         let right_window_controls = self.render_client_window_controls(
@@ -458,9 +454,8 @@ impl Waku {
             )
     }
 
-    fn render_general_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_general_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
-        let worktree_settings = self.render_worktree_settings(cx);
         let updater_available = cx
             .try_global::<crate::updater::UpdaterState>()
             .is_some_and(|updater| updater.0.is_some());
@@ -519,7 +514,6 @@ impl Waku {
             },
         );
         div()
-            .child(worktree_settings)
             .child(
                 div()
                     .mt(px(15.0))
@@ -706,203 +700,6 @@ impl Waku {
                 )
             })
             .into_any_element()
-    }
-
-    fn render_worktree_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        use super::branches::{planned_worktree_base_label, worktree_base_label};
-        let theme = Theme::current(cx);
-        let selected_id = self
-            .worktree_settings_project
-            .or_else(|| self.selected_project().map(|project| project.id));
-        let projects = projects::picker_projects(&self.state.projects, selected_id)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        if projects.is_empty() {
-            return div().into_any_element();
-        }
-        let project = projects
-            .iter()
-            .find(|project| Some(project.id) == selected_id)
-            .unwrap_or(&projects[0])
-            .clone();
-        let project_id = project.id;
-        let weak = cx.entity().downgrade();
-        let project_handle = self.menu_handle("worktree-settings-project", cx);
-        let project_selector = crate::ui::menu::dropdown_menu_list(
-            MenuChip::new("worktree-settings-project")
-                .label(project.display_name())
-                .selected(project_handle.is_open())
-                .max_w(px(220.0))
-                .tooltip(Tooltip::text(project.path.to_string_lossy().into_owned())),
-            "worktree-settings-project-menu",
-            &project_handle,
-            MenuAlign::BelowLeft,
-            move |_| {
-                projects
-                    .iter()
-                    .map(|project| {
-                        let id = project.id;
-                        let weak = weak.clone();
-                        MenuItem::new(project.display_name(), move |_, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                this.worktree_settings_project = Some(id);
-                                this.refresh_worktree_settings();
-                                cx.notify();
-                            });
-                        })
-                        .semantic_id(format!("worktree-base-project-{id}"))
-                        .selected(id == project_id)
-                    })
-                    .collect()
-            },
-        );
-        let section = div()
-            .mt(px(15.0))
-            .px(px(20.0))
-            .py(px(12.0))
-            .rounded(px(13.0))
-            .bg(theme.raised)
-            .child(
-                div()
-                    .text_size(sp(13.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(tr!("worktree_base.settings_title")),
-            );
-        let snapshot = self.branch_snapshot_for_workspace(&project.path, cx);
-        let configured = project.worktree_base_branch.clone();
-        let label = snapshot
-            .as_ref()
-            .map(|snapshot| {
-                let resolved = planned_worktree_base_label(&project, None, snapshot);
-                if configured.is_none() {
-                    tr!("worktree_base.automatic_resolved", branch = resolved)
-                } else {
-                    resolved
-                }
-            })
-            .unwrap_or_else(|| {
-                if matches!(
-                    self.branch_snapshots.observe(&project.path),
-                    crate::query::QueryState::Ready(_)
-                ) {
-                    tr!("worktree_base.unavailable")
-                } else {
-                    tr!("worktree_base.loading")
-                }
-            });
-        let refs = snapshot
-            .map(|snapshot| snapshot.worktree_base_refs)
-            .unwrap_or_default();
-        let weak = cx.entity().downgrade();
-        let id = SharedString::from(format!("project-worktree-base-{project_id}"));
-        let handle = self.menu_handle(id.clone(), cx);
-        let loading = matches!(
-            self.branch_snapshots.observe(&project.path),
-            crate::query::QueryState::Missing | crate::query::QueryState::Pending
-        );
-        let trigger = MenuChip::new(id.clone())
-            .label(label)
-            .outlined()
-            .selected(handle.is_open())
-            .max_w(px(300.0))
-            .tooltip(Tooltip::text(tr!("worktree_base.settings_hint")))
-            .disabled(loading);
-        let selector = if loading {
-            trigger.into_any_element()
-        } else {
-            crate::ui::menu::dropdown_menu_list(
-                trigger,
-                SharedString::from(format!("{id}-menu")),
-                &handle,
-                MenuAlign::BelowRight,
-                move |_| {
-                    let reset_weak = weak.clone();
-                    let mut items = vec![
-                        MenuItem::new(tr!("worktree_base.automatic"), move |_, cx| {
-                            let _ = reset_weak.update(cx, |this, cx| {
-                                this.set_project_worktree_base(project_id, None, cx);
-                            });
-                        })
-                        .semantic_id("worktree-base-automatic")
-                        .selected(configured.is_none()),
-                    ];
-                    items.extend(refs.iter().map(|reference| {
-                        let reference = reference.clone();
-                        let selected = configured.as_deref() == Some(reference.as_str());
-                        let semantic_id = format!("worktree-base-ref-{reference}");
-                        let weak = weak.clone();
-                        MenuItem::new(worktree_base_label(&reference), move |_, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                this.set_project_worktree_base(
-                                    project_id,
-                                    Some(reference.clone()),
-                                    cx,
-                                );
-                            });
-                        })
-                        .semantic_id(semantic_id)
-                        .selected(selected)
-                    }));
-                    items
-                },
-            )
-        };
-        section
-            .child(
-                div()
-                    .mt(px(10.0))
-                    .min_h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(16.0))
-                    .child(project_selector)
-                    .child(selector),
-            )
-            .into_any_element()
-    }
-
-    pub(super) fn refresh_worktree_settings(&mut self) {
-        let selected_id = self
-            .worktree_settings_project
-            .or_else(|| self.selected_project().map(|project| project.id));
-        let project = self
-            .state
-            .projects
-            .iter()
-            .find(|project| Some(project.id) == selected_id && !project.is_projectless())
-            .or_else(|| {
-                self.state
-                    .projects
-                    .iter()
-                    .find(|project| !project.is_projectless())
-            });
-        if let Some(project) = project {
-            self.branch_snapshots.invalidate(&project.path);
-        }
-    }
-
-    fn set_project_worktree_base(
-        &mut self,
-        project_id: Uuid,
-        reference: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(project) = self
-            .state
-            .projects
-            .iter_mut()
-            .find(|project| project.id == project_id)
-        else {
-            return;
-        };
-        if project.is_projectless() || project.worktree_base_branch == reference {
-            return;
-        }
-        project.worktree_base_branch = reference;
-        self.save(cx);
-        cx.notify();
     }
 
     fn set_automatic_updates_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {

@@ -165,7 +165,7 @@ settings.daemon:
 settings.computer_use:
   en: Computer Use
 settings.general_keywords:
-  en: general worktree starting branch git local projects conversations privacy updates automatic sparkle version math latex formula expression follow-up steer queue enter
+  en: general local projects conversations privacy updates automatic sparkle version math latex formula expression follow-up steer queue enter
 settings.appearance_keywords:
   en: appearance theme system light dark language english chinese simplified font size text editor
 settings.providers_keywords:
@@ -2549,7 +2549,7 @@ review.context_hint:
   en: "Uses this issue’s workspace and latest development context"
 
 worktree_base.settings_title:
-  en: New worktree starting branch
+  en: Default starting branch
 worktree_base.settings_hint:
   en: Applies to new worktrees unless a draft selects its own base. Uses committed local refs; does not fetch.
 worktree_base.composer_hint:
@@ -2572,3 +2572,8 @@ worktree_base.unavailable:
   en: Base unavailable
 worktree_base.missing:
   en: "%{branch} (unavailable)"
+
+project.settings:
+  en: Project settings
+worktree_base.section:
+  en: Worktree

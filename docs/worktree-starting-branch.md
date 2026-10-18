@@ -1,7 +1,11 @@
 # Worktree starting branch
 
-Settings → General → **New worktree starting branch** selects a project and its
-optional default. Local and remote-tracking branches are separate choices, stored
+Open a project’s sidebar menu → **Project settings** → **Worktree** →
+**Default starting branch** to configure that project’s optional default.
+The dialog is fixed to the project it was opened for; it does not switch the
+active conversation or change an issue’s project binding. The current-project
+composer menu also opens these settings when the sidebar uses another grouping.
+Local and remote-tracking branches are separate choices, stored
 as `refs/heads/...` and `refs/remotes/...`; remote-tracking refs are the repository's
 existing local Git metadata, not a fresh network read.
 
@@ -43,8 +47,13 @@ Only committed files from the starting ref are present in the new worktree.
 
 ## Native acceptance
 
-In a freshly rebuilt signed app, configure two projects differently, reopen
-Settings, and confirm persistence. For a draft and a new-worktree issue, try the
+In a freshly rebuilt signed app, open project settings from the sidebar project
+menu and the current-project composer menu. Configure two projects differently,
+reopen each project’s dialog, and confirm persistence without changing the active
+conversation, issue binding, or draft text. Confirm the control is absent from
+application General settings. Test repeated Tab/Shift+Tab stays within the dialog,
+including from an open dropdown; Escape dismisses the menu before the dialog, and
+closing returns focus to the initiating project control. For a draft and a new-worktree issue, try the
 project default, local and remote overrides, and reset. Verify both click and
 keyboard menu paths, search, Escape/reopen, project switching, and repeated clicks.
 With a dirty source checkout, submit and compare the new worktree's commit with

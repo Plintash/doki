@@ -4457,16 +4457,22 @@ impl Waku {
             && self
                 .selected_session()
                 .is_some_and(|session| session.task_id.is_none());
+        let settings_project_id = self
+            .selected_project()
+            .filter(|project| !project.is_projectless())
+            .map(|project| project.id);
+        let can_open_project_menu = can_choose_project || settings_project_id.is_some();
         let project_handle = self.menu_handle("workspace-project", cx);
         let project_trigger = MenuChip::new("workspace-project")
             .icon("icons/folder.svg", theme.text_tertiary)
             .label(project_name)
             .caret(false)
-            .disabled(!can_choose_project)
-            .selected(can_choose_project && project_handle.is_open())
+            .disabled(!can_open_project_menu)
+            .selected(can_open_project_menu && project_handle.is_open())
             .max_w(px(190.0));
-        let project_selector = if can_choose_project {
+        let project_selector = if can_open_project_menu {
             let weak = cx.entity().downgrade();
+            let return_focus = project_handle.trigger_focus_handle().clone();
             dropdown_menu(
                 project_trigger,
                 "workspace-project-menu",
@@ -4477,46 +4483,71 @@ impl Waku {
                         return Vec::new();
                     };
                     let this = entity.read(cx);
-                    let mut items =
-                        projects::picker_projects(&this.state.projects, selected_project_id)
-                            .into_iter()
-                            .map(|project| {
-                                let project_id = project.id;
-                                let project_name = project.display_name();
-                                let weak = weak.clone();
-                                MenuItem::new(project_name, move |_, cx| {
-                                    if Some(project_id) != selected_project_id {
-                                        let _ = weak.update(cx, |this, cx| {
-                                            this.select_project_from_composer(project_id, cx);
-                                        });
-                                    }
+                    let mut items = Vec::new();
+                    if can_choose_project {
+                        items =
+                            projects::picker_projects(&this.state.projects, selected_project_id)
+                                .into_iter()
+                                .map(|project| {
+                                    let project_id = project.id;
+                                    let project_name = project.display_name();
+                                    let weak = weak.clone();
+                                    MenuItem::new(project_name, move |_, cx| {
+                                        if Some(project_id) != selected_project_id {
+                                            let _ = weak.update(cx, |this, cx| {
+                                                this.select_project_from_composer(project_id, cx);
+                                            });
+                                        }
+                                    })
+                                    .semantic_id(format!("composer-project-{project_id}"))
+                                    .selected(Some(project_id) == selected_project_id)
                                 })
-                                .semantic_id(format!("composer-project-{project_id}"))
-                                .selected(Some(project_id) == selected_project_id)
+                                .collect::<Vec<_>>();
+                        if !items.is_empty() {
+                            items.push(MenuItem::Separator);
+                        }
+                        let add_project = weak.clone();
+                        items.push(
+                            MenuItem::new(tr!("project.new_project"), move |_, cx| {
+                                let _ = add_project.update(cx, |this, cx| this.add_project(cx));
                             })
-                            .collect::<Vec<_>>();
-                    if !items.is_empty() {
-                        items.push(MenuItem::Separator);
+                            .icon("icons/folder-new.svg"),
+                        );
+                        let projectless = weak.clone();
+                        items.push(
+                            MenuItem::new(tr!("project.no_project"), move |_, cx| {
+                                let _ = projectless.update(cx, |this, cx| {
+                                    if !this.selected_project().is_some_and(Project::is_projectless)
+                                    {
+                                        this.create_projectless_session_from_composer(cx);
+                                    }
+                                });
+                            })
+                            .icon("icons/x.svg")
+                            .selected(projectless_selected),
+                        );
                     }
-                    let add_project = weak.clone();
-                    items.push(
-                        MenuItem::new(tr!("project.new_project"), move |_, cx| {
-                            let _ = add_project.update(cx, |this, cx| this.add_project(cx));
-                        })
-                        .icon("icons/folder-new.svg"),
-                    );
-                    let projectless = weak.clone();
-                    items.push(
-                        MenuItem::new(tr!("project.no_project"), move |_, cx| {
-                            let _ = projectless.update(cx, |this, cx| {
-                                if !this.selected_project().is_some_and(Project::is_projectless) {
-                                    this.create_projectless_session_from_composer(cx);
-                                }
-                            });
-                        })
-                        .icon("icons/x.svg")
-                        .selected(projectless_selected),
-                    );
+                    if let Some(project_id) = settings_project_id {
+                        if !items.is_empty() {
+                            items.push(MenuItem::Separator);
+                        }
+                        let settings = weak.clone();
+                        let return_focus = return_focus.clone();
+                        items.push(
+                            MenuItem::new(tr!("project.settings"), move |window, cx| {
+                                let _ = settings.update(cx, |this, cx| {
+                                    this.open_project_settings(
+                                        project_id,
+                                        return_focus.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            })
+                            .semantic_id(format!("composer-project-settings-{project_id}"))
+                            .icon("icons/settings.svg"),
+                        );
+                    }
                     items
                 },
             )
