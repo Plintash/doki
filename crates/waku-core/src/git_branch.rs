@@ -413,6 +413,17 @@ mod tests {
     #[test]
     fn exposes_sorted_canonical_worktree_choices_without_remote_symbolic_head() {
         let repository = repository();
+        for branch in ["develop", "dev", "release/1.0"] {
+            run_git(&repository, &["branch", branch]);
+            run_git(
+                &repository,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/origin/{branch}"),
+                    "HEAD",
+                ],
+            );
+        }
         run_git(
             &repository,
             &["update-ref", "refs/remotes/origin/main", "HEAD"],
@@ -441,12 +452,34 @@ mod tests {
         assert_eq!(
             snapshot.worktree_base_refs,
             [
+                "refs/heads/dev",
+                "refs/heads/develop",
                 "refs/heads/feature",
                 "refs/heads/main",
+                "refs/heads/release/1.0",
+                "refs/remotes/origin/dev",
+                "refs/remotes/origin/develop",
                 "refs/remotes/origin/main",
+                "refs/remotes/origin/release/1.0",
                 "refs/remotes/upstream/release",
             ]
         );
+        for branch in ["develop", "dev", "release/1.0"] {
+            for namespace in ["refs/heads", "refs/remotes/origin"] {
+                let reference = format!("{namespace}/{branch}");
+                assert_eq!(
+                    snapshot.worktree_base_choice(Some(&reference)),
+                    Some(reference.as_str()),
+                    "{reference} must be selectable"
+                );
+            }
+            let local_reference = format!("refs/heads/{branch}");
+            assert_eq!(
+                snapshot.worktree_base_choice(Some(branch)),
+                Some(local_reference.as_str()),
+                "legacy short local choice {branch} must remain selectable"
+            );
+        }
         fs::remove_dir_all(repository).ok();
     }
 

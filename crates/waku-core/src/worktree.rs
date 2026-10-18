@@ -494,6 +494,70 @@ mod tests {
     }
 
     #[test]
+    fn develop_and_remote_dev_project_defaults_allow_a_release_override_without_mutation() {
+        let fixture = RepositoryFixture::new();
+        let repository = &fixture.repository;
+        run_git(repository, &["checkout", "-b", "develop"]);
+        let develop_commit = fixture.commit("develop\n");
+        run_git(repository, &["checkout", "-b", "dev"]);
+        let remote_dev_commit = fixture.commit("remote dev\n");
+        run_git(
+            repository,
+            &["update-ref", "refs/remotes/origin/dev", &remote_dev_commit],
+        );
+        run_git(repository, &["checkout", "-b", "release/1.0"]);
+        let release_commit = fixture.commit("release\n");
+        run_git(repository, &["checkout", "main"]);
+        assert_ne!(develop_commit, remote_dev_commit);
+        assert_ne!(develop_commit, release_commit);
+        assert_ne!(remote_dev_commit, release_commit);
+
+        let mut develop_project = crate::model::Project::from_path(repository.clone());
+        develop_project.worktree_base_branch = Some("refs/heads/develop".to_owned());
+        let mut remote_dev_project = crate::model::Project::from_path(repository.clone());
+        remote_dev_project.worktree_base_branch = Some("refs/remotes/origin/dev".to_owned());
+        for (index, (project, override_branch, expected_commit)) in [
+            (&develop_project, None, develop_commit.as_str()),
+            (&remote_dev_project, None, remote_dev_commit.as_str()),
+            (
+                &develop_project,
+                Some("refs/heads/release/1.0"),
+                release_commit.as_str(),
+            ),
+            (&develop_project, None, develop_commit.as_str()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let created = create_in(
+                &project.path,
+                &fixture.worktrees,
+                project.id,
+                Uuid::new_v4(),
+                &format!("project branch selection {index}"),
+                project.worktree_base_branch(override_branch),
+            )
+            .unwrap();
+            assert_eq!(
+                git_stdout(&created.path, &["rev-parse", "HEAD"]).unwrap(),
+                expected_commit
+            );
+            assert_eq!(
+                develop_project.worktree_base_branch.as_deref(),
+                Some("refs/heads/develop")
+            );
+            assert_eq!(
+                remote_dev_project.worktree_base_branch.as_deref(),
+                Some("refs/remotes/origin/dev")
+            );
+        }
+        assert_eq!(
+            git_stdout(repository, &["branch", "--show-current"]).unwrap(),
+            "main"
+        );
+    }
+
+    #[test]
     fn pathological_full_ref_ambiguity_is_an_error_not_a_different_commit() {
         let fixture = RepositoryFixture::new();
         let repository = &fixture.repository;

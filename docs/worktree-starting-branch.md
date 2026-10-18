@@ -5,6 +5,11 @@ optional default. Local and remote-tracking branches are separate choices, store
 as `refs/heads/...` and `refs/remotes/...`; remote-tracking refs are the repository's
 existing local Git metadata, not a fresh network read.
 
+Each project has its own choice from all of its local and remote-tracking
+branches, including `develop`, `dev`, and `release/1.0`; there is no
+`main`/`master` restriction. For example, one project can default to local
+`develop` while another defaults to remote `origin/dev`.
+
 For a planned worktree, the composer branch picker chooses a one-off starting
 branch. **Project default** clears that override. The effective order is:
 
