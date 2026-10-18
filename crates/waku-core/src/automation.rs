@@ -1443,11 +1443,15 @@ impl Runtime {
     }
 
     pub(super) fn tick(&self, hub: &Hub) {
+        self.tick_with_clock(hub, Instant::now);
+    }
+
+    fn tick_with_clock(&self, hub: &Hub, now: impl FnOnce() -> Instant) {
         if !cfg!(debug_assertions) {
             return;
         }
         let mut state = self.state.lock();
-        let now = Instant::now();
+        let now = now();
         let elapsed: Vec<_> = state
             .waits
             .iter()
