@@ -131,12 +131,16 @@ impl AnnotationPrompt {
     }
 
     pub(super) fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let single_line = f32::from(self.measured.line_height).max(MIN_INPUT);
         self.input.update(cx, |input, cx| {
             input.clear(cx);
-            input.set_auto_height_viewport(px(MIN_INPUT), cx);
+            input.set_auto_height_viewport(px(single_line), cx);
         });
-        self.measured.content_height = px(0.0);
-        self.height = Transition::settled(MIN_INPUT);
+        // Layout events are deduplicated by natural metrics, so reopening an
+        // already single-line field may not emit another one. Keep its font's
+        // known line height instead of waiting for an identical measurement.
+        self.measured.content_height = self.measured.line_height;
+        self.height = Transition::settled(single_line);
         self.expansion = Transition::settled(0.0);
         self.feedback = Transition::settled(0.0);
         self.hovered = false;
@@ -615,5 +619,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[gpui::test]
+    fn reopening_an_empty_prompt_keeps_cached_font_metrics(cx: &mut TestAppContext) {
+        let (prompt, cx) = setup(cx);
+        cx.simulate_input("single line");
+        cx.update(|window, cx| prompt.update(cx, |prompt, cx| prompt.reset(window, cx)));
+        cx.run_until_parked();
+        cx.read_entity(&prompt, |prompt, cx| {
+            assert_eq!(prompt.content(cx), "");
+            assert_eq!(
+                prompt.height.target,
+                f32::from(prompt.measured.line_height).max(MIN_INPUT)
+            );
+            assert_eq!(prompt.expansion.target, 0.0);
+        });
     }
 }
