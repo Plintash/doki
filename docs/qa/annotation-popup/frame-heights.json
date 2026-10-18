@@ -1,0 +1,90 @@
+{
+  "source_recording": "native-growth-contraction.mp4 (full local capture; not the excerpt)",
+  "source_duration_seconds": 56.6667,
+  "source_stored_frames": 3232,
+  "analysis": {
+    "method": "ffmpeg resampled to 60 fps; first grayscale border pixel < 222 at x=620 within y=330..629; height = 616 - top",
+    "coordinate_space": "full native desktop capture pixels",
+    "samples": 3400,
+    "indices": "frame values below index resampled source samples, not the published excerpt"
+  },
+  "published_excerpt": {
+    "file": "motion.mp4",
+    "duration_seconds": 4.04241,
+    "stored_frames": 182,
+    "description": "cropped growth and contraction excerpts; idle portions removed",
+    "crop": "420x260 at desktop x430,y440",
+    "source_intervals_seconds": [
+      [
+        27.1,
+        30.0
+      ],
+      [
+        53.65,
+        54.8
+      ]
+    ]
+  },
+  "runs": [
+    {
+      "frame": 0,
+      "top": 568,
+      "height": 48
+    },
+    {
+      "frame": 1663,
+      "top": 534,
+      "height": 82
+    },
+    {
+      "frame": 1670,
+      "top": 520,
+      "height": 96
+    },
+    {
+      "frame": 1677,
+      "top": 516,
+      "height": 100
+    },
+    {
+      "frame": 1718,
+      "top": 498,
+      "height": 118
+    },
+    {
+      "frame": 1733,
+      "top": 494,
+      "height": 122
+    },
+    {
+      "frame": 1759,
+      "top": 474,
+      "height": 142
+    },
+    {
+      "frame": 1762,
+      "top": 472,
+      "height": 144
+    },
+    {
+      "frame": 3241,
+      "top": 531,
+      "height": 85
+    },
+    {
+      "frame": 3243,
+      "top": 553,
+      "height": 63
+    },
+    {
+      "frame": 3246,
+      "top": 564,
+      "height": 52
+    },
+    {
+      "frame": 3248,
+      "top": 568,
+      "height": 48
+    }
+  ]
+}

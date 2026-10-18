@@ -715,23 +715,27 @@ impl Waku {
             .selection_toolbar_bounds(&spans)
             .map(|bounds| SelectionToolbar {
                 anchor: point(bounds.left(), bounds.top()),
+                selection_bounds: bounds,
                 annotation,
                 comment_open: false,
             });
     }
 
-    /// The top-left of the selection's first line, in window coordinates, so
-    /// the toolbar sits above the selection rather than over it.
+    /// The visible selected text bounds, in window coordinates. The creation
+    /// popup can choose space above or below the whole selection as it grows.
     fn selection_toolbar_bounds(&self, spans: &[md::selection::Span]) -> Option<Bounds<Pixels>> {
-        let first = spans.first()?;
         let registry = self.transcript_selection.registry.borrow();
-        let entry = registry
-            .entries()
+        spans
             .iter()
-            .find(|entry| entry.key == first.key)?;
-        md::render::text_range_bounds(&entry.geometry, &first.range)
-            .into_iter()
-            .next()
+            .flat_map(|span| {
+                registry
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.key == span.key)
+                    .map(|entry| md::render::text_range_bounds(&entry.geometry, &span.range))
+                    .unwrap_or_default()
+            })
+            .reduce(|bounds, next| bounds.union(&next))
     }
 
     /// The floating action beside the selection, and its comment field once
@@ -742,37 +746,14 @@ impl Waku {
         let toolbar = toolbar.as_ref()?;
         let theme = Theme::current(cx);
         let position = point(toolbar.anchor.x, toolbar.anchor.y - px(46.0));
-        let card: AnyElement = if toolbar.comment_open {
+        if toolbar.comment_open {
             let input = self.annotation_prompt_input.borrow().clone()?;
-            div()
-                .id("annotation-comment-field")
-                .role(gpui::Role::Group)
-                .aria_label(tr!("annotation.comment_placeholder"))
-                .w(px(360.0))
-                .h(px(36.0))
-                .px(px(14.0))
-                .flex()
-                .items_center()
-                .rounded(px(18.0))
-                .border_1()
-                .border_color(theme.border_strong)
-                .bg(theme.raised)
-                .shadow_md()
-                .occlude()
-                .key_context("AnnotationEditor")
-                .on_action(cx.listener(|this, _: &DismissAnnotationEditor, _, cx| {
-                    this.dismiss_annotation_overlays(cx);
-                }))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.dismiss_annotation_overlays(cx);
-                }))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                )
-                .child(div().flex_1().min_w_0().child(input))
-                .into_any_element()
-        } else {
+            input.update(cx, |input, cx| {
+                input.set_bounds(toolbar.selection_bounds, self.annotation_safe_bounds(), cx);
+            });
+            return Some(input.into_any_element());
+        }
+        let card: AnyElement = {
             let focus = self.annotation_control_focus("selection-add-to-chat", cx);
             div()
                 .id("selection-toolbar")
@@ -1340,7 +1321,7 @@ impl Waku {
     /// Open the comment field over the selection the toolbar captured.
     pub(super) fn begin_annotation_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input = self.annotation_prompt_input(window, cx);
-        input.update(cx, |input, cx| input.set_content("", cx));
+        input.update(cx, |input, cx| input.reset(window, cx));
         {
             let mut guard = self.selection_toolbar.borrow_mut();
             let Some(toolbar) = guard.as_mut() else {
@@ -1348,8 +1329,6 @@ impl Waku {
             };
             toolbar.comment_open = true;
         }
-        let focus = input.read(cx).focus();
-        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -1358,23 +1337,22 @@ impl Waku {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<TextInput> {
+    ) -> Entity<annotation_prompt::AnnotationPrompt> {
         if let Some(input) = self.annotation_prompt_input.borrow().clone() {
             return input;
         }
-        let input = cx.new(|cx| {
-            TextInput::new(window, cx)
-                .semantic_id("annotation-comment-input")
-                .placeholder(tr!("annotation.comment_placeholder"))
-        });
+        let input = cx.new(|cx| annotation_prompt::AnnotationPrompt::new(window, cx));
         self.annotation_prompt_input
             .borrow_mut()
             .replace(input.clone());
-        cx.subscribe(&input, |this, input, event, cx| {
-            if !matches!(event, InputEvent::Submit(_)) {
-                return;
-            }
-            let comment = input.read(cx).content().to_owned();
+        cx.subscribe_in(&input, window, |this, _, event, window, cx| {
+            let comment = match event {
+                annotation_prompt::PromptEvent::Submit(comment) => comment,
+                annotation_prompt::PromptEvent::Dismiss => {
+                    this.dismiss_annotation_overlays(cx);
+                    return;
+                }
+            };
             let selection = this
                 .selection_toolbar
                 .borrow()
@@ -1383,13 +1361,14 @@ impl Waku {
             let Some(selection) = selection else {
                 return;
             };
-            let comment = super::composer::annotation_comment_value(&comment);
+            let comment = super::composer::annotation_comment_value(comment);
             let changed = this.stage_selection_annotation(selection, comment, cx);
             *this.selection_toolbar.borrow_mut() = None;
             if changed {
                 this.transcript_selection.selection.borrow_mut().clear();
                 this.capture_and_save_current_composer_draft(cx);
             }
+            window.focus(&this.composer.read(cx).focus(), cx);
             cx.notify();
         })
         .detach();
