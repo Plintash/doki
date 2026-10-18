@@ -411,6 +411,7 @@ impl Waku {
             .iter()
             .find(|session| {
                 session.project_id == project_id
+                    && !session.is_global_assistant()
                     && session.task_id.is_none()
                     && !session.has_started()
             })
@@ -640,10 +641,14 @@ impl Waku {
     pub(super) fn toggle_right_panel_action(
         &mut self,
         _: &ToggleRightPanel,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_right_panel_visible(!self.right_panel_visible, cx);
+        if self.assistant.open {
+            self.toggle_assistant_action(&crate::ToggleAssistant, window, cx);
+        } else {
+            self.set_right_panel_visible(!self.right_panel_visible, cx);
+        }
     }
 
     pub(super) fn toggle_fps_counter_action(
@@ -755,7 +760,7 @@ impl Waku {
         fitted_panel_widths(
             f32::from(window.viewport_size().width),
             self.sidebar_visible || self.sidebar_slide.is_some(),
-            self.right_panel_visible || self.right_panel_slide.is_some(),
+            self.assistant.open || self.right_panel_visible || self.right_panel_slide.is_some(),
             self.sidebar_width,
             self.right_panel_width,
         )
@@ -1957,6 +1962,7 @@ impl Waku {
             .iter()
             .find(|session| {
                 !session.has_started()
+                    && !session.is_global_assistant()
                     && session.task_id.is_none()
                     && self.state.projects.iter().any(|project| {
                         project.id == session.project_id

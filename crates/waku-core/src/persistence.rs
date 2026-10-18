@@ -1513,11 +1513,12 @@ impl StateStore {
         // disk — which would make the next save skip them for good.
         let mut written_messages = Vec::new();
         let mut persisted_sessions = Vec::new();
-        for session in state
-            .sessions
-            .iter()
-            .filter(|session| include_empty || session.has_started() || session.task_id.is_some())
-        {
+        for session in state.sessions.iter().filter(|session| {
+            include_empty
+                || session.has_started()
+                || session.task_id.is_some()
+                || session.is_global_assistant()
+        }) {
             live.insert(session.id);
             // A skeleton's empty transcript means "not fetched", not "empty".
             // Its promoted list columns may still have changed (for example,

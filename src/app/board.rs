@@ -782,6 +782,7 @@ impl Waku {
                     })
                     .child(conversations_label(conversations)),
             )
+            .children(self.render_issue_workflow_status(task_id, cx))
             .when(running > 0 || attention > 0, |element| {
                 element.child(
                     div()
@@ -1008,6 +1009,7 @@ impl Waku {
         self.capture_and_save_current_composer_draft(cx);
         self.settings_page = None;
         self.board_open = true;
+        self.start_assistant_workflow_poll(cx);
         if self.selected_task != Some(task_id) {
             self.task_detail = None;
         }
@@ -1058,6 +1060,7 @@ impl Waku {
             .clone();
         self.settings_page = None;
         self.board_open = true;
+        self.start_assistant_workflow_poll(cx);
         self.selected_task = Some(task.id);
         self.ensure_task_detail(&task, window, cx);
         cx.notify();

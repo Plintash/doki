@@ -1143,6 +1143,8 @@ pub struct Waku {
     /// without consulting the environment or account database in a frame.
     home_directory: Option<PathBuf>,
     composer: Entity<ComposerInput>,
+    assistant: global_assistant::AssistantUi,
+    assistant_workflows: global_assistant_workflows::AssistantWorkflows,
     user_input_answer: Entity<TextInput>,
     /// The approval card's optional denial note. Only a provider whose
     /// rejection accepts an explanation shows the field (see the composer
@@ -1835,6 +1837,9 @@ mod components;
 mod composer;
 mod drafts;
 mod file_search;
+mod global_assistant;
+mod global_assistant_context;
+mod global_assistant_workflows;
 mod goal_dialog;
 mod image_preview;
 mod issue_review;
@@ -2290,6 +2295,12 @@ impl Waku {
             cx.new(|cx| TextInput::new(window, cx).placeholder(tr!("input.filter_projects")));
         let right_panel_diff_filter =
             cx.new(|cx| TextInput::new(window, cx).placeholder(tr!("diff.filter_files")));
+        let assistant = global_assistant::AssistantUi::new(
+            state.assistant_panel_open,
+            &composer_drafts,
+            window,
+            cx,
+        );
         let navigation_rail = cx.new(|_| ConversationNavigationRail::new());
         let sidebar_pane = WakuPane::new(Waku::sidebar_pane_content, cx);
         let transcript_pane = WakuPane::new(Waku::transcript_pane_content, cx);
@@ -2707,6 +2718,16 @@ impl Waku {
             )
             .detach();
 
+            cx.subscribe(
+                &assistant.input,
+                |this: &mut Self, _, event: &InputEvent, cx| match event {
+                    InputEvent::Submit(text) => this.submit_assistant(text.clone(), cx),
+                    InputEvent::Edited => this.capture_assistant_draft(cx),
+                    _ => {}
+                },
+            )
+            .detach();
+
             // Enter in the denial note confirms the denied answer with the
             // explanation; the field keeps its text until the card closes, so
             // a refused reply can re-open the same note.
@@ -3002,6 +3023,8 @@ impl Waku {
                 store,
                 home_directory,
                 composer,
+                assistant,
+                assistant_workflows: global_assistant_workflows::AssistantWorkflows::new(),
                 user_input_answer,
                 permission_note,
                 composer_drafts,
@@ -3372,7 +3395,11 @@ impl Waku {
         // first frame.
         entity.update(cx, |this, cx| {
             this.restart_task_state_sync();
+            this.start_assistant_workflow_poll(cx);
             this.restore_persisted_right_panels(cx);
+            if this.assistant.open {
+                this.ensure_session_loaded(AgentSession::GLOBAL_ASSISTANT_ID, cx);
+            }
             for session_id in startup_live_session_ids {
                 this.start_runtime_attachment(session_id, cx);
             }

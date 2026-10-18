@@ -2637,6 +2637,8 @@ impl Waku {
         surface: RightPanelSurface,
         cx: &mut Context<Self>,
     ) {
+        self.assistant.open = false;
+        self.state.assistant_panel_open = false;
         let reusable_index = reusable_surface_index(&self.right_panel_surfaces, &surface);
         if matches!(&surface, RightPanelSurface::File(_)) {
             self.ensure_initial_right_panel_file_editor_width();
@@ -3028,6 +3030,7 @@ impl Waku {
         let active_browser = if !playground_open
             && self.settings_page.is_none()
             && !self.board_open
+            && !self.assistant.open
             && self.right_panel_visible
             && self.right_panel_slide.is_none()
         {

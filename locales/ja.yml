@@ -1323,3 +1323,22 @@ project.settings: プロジェクト設定
 worktree_base.section: ワークツリー
 
 models.configuration: モデル設定
+
+assistant.title: "アシスタント"
+assistant.toggle: "アシスタントを切り替え（⌘/Ctrl ⇧ A）"
+assistant.placeholder: "作業について質問、または /status…"
+assistant.empty: "プロジェクトをまたぐ会話です。課題や進捗について質問できます。/status でローカルの状況を確認。"
+assistant.wait: "応答を待つか、先に停止してください"
+assistant.status: "作業状況を確認"
+assistant.close: "アシスタントを閉じる"
+assistant.you: "あなた"
+assistant.local_result: "Doki · ローカル結果"
+assistant.issue_opened: "課題を開きました"
+assistant.workflow_unavailable: "このビルドではワークフロー操作はまだ利用できません。課題を開いて既存のステージ操作を使用してください。"
+assistant.all_projects: "すべてのプロジェクト"
+assistant.working: "処理中…"
+assistant.needs_attention: "承認または入力が必要"
+assistant.review_request: "リクエストを確認"
+assistant.stop: "応答を停止"
+assistant.send: "送信"
+assistant.provider_default: 既定のモデル

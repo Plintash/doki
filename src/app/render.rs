@@ -119,7 +119,7 @@ impl Waku {
             self.sidebar_slide = None;
             self.right_panel_slide = None;
         }
-        if self.board_open {
+        if self.board_open && !self.assistant.open {
             // Board hides the right panel, but its sidebar remains visible
             // and must keep animating. Do not resurrect right-panel chrome
             // while the Board header is already drawing the window controls.
@@ -136,7 +136,7 @@ impl Waku {
         );
         let right_panel = slide_width(
             &mut self.right_panel_slide,
-            if self.right_panel_visible && !self.board_open {
+            if self.assistant.open || (self.right_panel_visible && !self.board_open) {
                 right_panel_content
             } else {
                 0.0
@@ -217,6 +217,11 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (_, right_panel_width) = self.effective_panel_widths(window);
+        if self.assistant.open {
+            return self
+                .render_assistant_panel(right_panel_width, window, cx)
+                .into_any_element();
+        }
         self.render_right_panel(right_panel_width, window, cx)
             .into_any_element()
     }
@@ -343,6 +348,7 @@ impl Render for Waku {
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::toggle_right_panel_action))
+            .on_action(cx.listener(Self::toggle_assistant_action))
             .on_action(cx.listener(Self::toggle_command_palette_action))
             .on_action(cx.listener(Self::open_resume_picker_action))
             .on_action(cx.listener(Self::toggle_fps_counter_action))

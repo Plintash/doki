@@ -31,6 +31,9 @@ import {
   type DiagnosticCounterReport,
   type DiagnosticCounters,
   type DiagnosticVerbosity,
+  type IssueRun,
+  type IssueRunAction,
+  type IssueWorkflow,
   type ReplayCursor,
   type ResponsePayload,
   type RpcError,
@@ -420,6 +423,42 @@ export class WakuClient {
         reject(asError(error));
       }
     });
+  }
+
+  /** Lists durable workflow state; reconnecting never restarts an agent. */
+  async listIssueRuns(taskId: string | null = null, options: RequestOptions = {}): Promise<IssueRun[]> {
+    const response = await this.request(
+      { type: "listIssueRuns", taskId }, NIL_UUID, NIL_UUID, options,
+    );
+    if (response.type !== "issueRuns") throw new Error("Waku daemon returned an invalid issue-runs response");
+    return response.runs;
+  }
+
+  /** Keep requestId for retries after a timeout or reconnect. It identifies the
+   * user's start intent, independently of this transport request's UUID. */
+  async startIssueRun(
+    taskId: string,
+    requestId: string,
+    workflow: IssueWorkflow,
+    options: RequestOptions = {},
+  ): Promise<IssueRun> {
+    const response = await this.request(
+      { type: "startIssueRun", taskId, requestId, workflow }, NIL_UUID, NIL_UUID, options,
+    );
+    if (response.type !== "issueRun") throw new Error("Waku daemon returned an invalid issue-run response");
+    return response.run;
+  }
+
+  async controlIssueRun(
+    runId: string,
+    action: IssueRunAction,
+    options: RequestOptions = {},
+  ): Promise<IssueRun> {
+    const response = await this.request(
+      { type: "controlIssueRun", runId, action }, NIL_UUID, NIL_UUID, options,
+    );
+    if (response.type !== "issueRun") throw new Error("Waku daemon returned an invalid issue-run response");
+    return response.run;
   }
 
   async notify(

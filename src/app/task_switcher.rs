@@ -308,7 +308,7 @@ impl Waku {
             .state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| session.has_started() && !session.is_global_assistant())
             .map(|session| session.id)
             .collect::<Vec<_>>();
         let ordered = ordered_task_ids(

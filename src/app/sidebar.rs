@@ -305,7 +305,7 @@ fn project_sidebar_groups(
 fn sidebar_session_visible(session: &AgentSession, grouping: SidebarGrouping) -> bool {
     // An issue can have a new conversation before its first turn. Keep those
     // drafts, and standalone drafts, reachable when navigating by task.
-    session.has_started() || grouping == SidebarGrouping::Task
+    !session.is_global_assistant() && (session.has_started() || grouping == SidebarGrouping::Task)
 }
 
 fn task_sidebar_groups(
@@ -2679,7 +2679,8 @@ impl Waku {
         let agent_preset_label = session
             .filter(|session| session.provider == ProviderKind::DeepSeek && session.has_started())
             .and_then(|session| self.agent_preset_label_for_session(session));
-        let right_panel_visible = self.right_panel_visible && !self.board_open;
+        let right_panel_visible =
+            self.assistant.open || (self.right_panel_visible && !self.board_open);
         let right_window_controls = (!right_panel_visible)
             .then(|| {
                 self.render_client_window_controls(
@@ -2782,6 +2783,7 @@ impl Waku {
             .when(!self.board_open, |element| {
                 element.child(self.render_background_work_summary(cx))
             })
+            .child(self.render_assistant_toggle(cx))
             .when(!right_panel_visible, |element| {
                 element
                     .when(self.fps_counter_visible, |element| {
@@ -3033,6 +3035,19 @@ fn sidebar_session_selected(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn global_assistant_never_appears_in_project_task_history() {
+        let mut assistant = AgentSession::global_assistant(Uuid::new_v4(), ProviderKind::Codex);
+        assistant.push_message(MessageRole::User, "Status?");
+        for grouping in [
+            SidebarGrouping::Project,
+            SidebarGrouping::Updated,
+            SidebarGrouping::Task,
+        ] {
+            assert!(!sidebar_session_visible(&assistant, grouping));
+        }
+    }
+
     use super::*;
 
     #[test]

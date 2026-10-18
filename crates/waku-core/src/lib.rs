@@ -47,6 +47,7 @@ pub mod grok_session;
 mod http_wire;
 pub mod i18n;
 pub mod identity;
+mod issue_automation;
 pub mod kimi_session;
 #[cfg(test)]
 mod live_service;

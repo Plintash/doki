@@ -127,6 +127,21 @@ pub struct EventSink {
 }
 
 impl EventSink {
+    /// Internal orchestration uses the same replay/runtime identity boundary as
+    /// an ordinary Start request, even when no desktop client is connected.
+    pub(crate) fn for_runtime(&self, session_id: Uuid, runtime_id: Uuid) -> Self {
+        self.hub.begin_runtime(session_id, runtime_id);
+        Self {
+            session_id,
+            runtime_id,
+            hub: self.hub.clone(),
+        }
+    }
+
+    pub(crate) fn end_runtime(&self) {
+        self.hub.end_runtime(self.session_id, Some(self.runtime_id));
+    }
+
     /// A daemon-originated task mutation must refresh the submitting client
     /// as well as observers; no client owns this change optimistically.
     pub(crate) fn task_state_changed(&self) {
@@ -1563,7 +1578,8 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
             projects: projects.clone(),
             tasks: tasks.clone(),
         },
-        Command::SaveProjectBoard { .. }
+        Command::EnsureGlobalAssistant { .. }
+        | Command::SaveProjectBoard { .. }
         | Command::RemoveSession
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. } => TaskCatalogAction::Changed,

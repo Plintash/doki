@@ -21,8 +21,8 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-// Version 20 adds durable project boards and explicit compare-and-swap edits.
-pub const PROTOCOL_VERSION: u32 = 20;
+// Version 21 adds daemon-owned issue workflow controls and durable run outcomes.
+pub const PROTOCOL_VERSION: u32 = 21;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -213,6 +213,23 @@ pub enum Command {
     },
     TrashSkills {
         dirs: Vec<PathBuf>,
+    },
+    ListIssueRuns {
+        task_id: Option<Uuid>,
+    },
+    StartIssueRun {
+        task_id: Uuid,
+        request_id: Uuid,
+        workflow: crate::IssueWorkflow,
+    },
+    ControlIssueRun {
+        run_id: Uuid,
+        action: crate::IssueRunAction,
+    },
+    /// Create or load the daemon's global assistant without starting a provider.
+    EnsureGlobalAssistant {
+        provider: crate::model::ProviderKind,
+        model: Option<String>,
     },
     LoadTaskState,
     SaveProjectBoard {
@@ -494,6 +511,12 @@ pub enum ResponseOutcome {
     rename_all_fields = "camelCase"
 )]
 pub enum ResponsePayload {
+    IssueRuns {
+        runs: Vec<crate::IssueRun>,
+    },
+    IssueRun {
+        run: crate::IssueRun,
+    },
     Transcript {
         result: Result<crate::TranscriptResult, crate::TranscriptError>,
     },
@@ -561,6 +584,10 @@ pub enum ResponsePayload {
     },
     Session {
         session: Option<AgentSession>,
+    },
+    GlobalAssistant {
+        project: Project,
+        session: AgentSession,
     },
     SessionMessageMatches {
         matches: Vec<SessionMessageMatch>,
@@ -784,7 +811,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 20);
+        assert_eq!(PROTOCOL_VERSION, 21);
     }
 
     #[test]
@@ -793,7 +820,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 20);
+        assert_eq!(PROTOCOL_VERSION, 21);
     }
 
     #[test]

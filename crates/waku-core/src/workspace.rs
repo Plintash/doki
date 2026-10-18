@@ -17,6 +17,44 @@ pub use waku_protocol::workspace::{
     ReviewDiffData, ReviewDiffSource, WorkingTreeEntry, WorkspaceOperation, WorkspaceResult,
 };
 
+/// Workspace operations that can change files, Git state or launch a writer
+/// must hold the issue-run reservation for their target until they finish.
+/// Read-only inspection remains available while an automatic stage is running.
+pub(crate) fn mutation_path(operation: &WorkspaceOperation) -> Option<PathBuf> {
+    match operation {
+        WorkspaceOperation::WriteTextFile {
+            root,
+            relative_path,
+            ..
+        } => Some(root.join(relative_path)),
+        WorkspaceOperation::MigrateProjectlessWorkspace { path } => Some(path.clone()),
+        WorkspaceOperation::CreateWorktree { project_path, .. } => Some(project_path.clone()),
+        WorkspaceOperation::CheckoutBranch { cwd, .. }
+        | WorkspaceOperation::GenerateCommitMessage { cwd, .. }
+        | WorkspaceOperation::Commit { cwd, .. }
+        | WorkspaceOperation::Push { cwd }
+        | WorkspaceOperation::CaptureTurnStart { cwd, .. }
+        | WorkspaceOperation::CaptureTurn { cwd, .. }
+        | WorkspaceOperation::CaptureRef { cwd, .. }
+        | WorkspaceOperation::RestoreRef { cwd, .. }
+        | WorkspaceOperation::DeleteRef { cwd, .. }
+        | WorkspaceOperation::DeleteTurnRefsAfter { cwd, .. }
+        | WorkspaceOperation::DeleteSessionRefs { cwd, .. }
+        | WorkspaceOperation::CopySessionRefs { cwd, .. } => Some(cwd.clone()),
+        WorkspaceOperation::ListTree { .. }
+        | WorkspaceOperation::BrowseDirectory { .. }
+        | WorkspaceOperation::ReadTextFile { .. }
+        | WorkspaceOperation::ListProjectFiles { .. }
+        | WorkspaceOperation::DiscoverSlashCommands { .. }
+        | WorkspaceOperation::CreateProjectlessWorkspace { .. }
+        | WorkspaceOperation::InspectBranches { .. }
+        | WorkspaceOperation::InspectCommit { .. }
+        | WorkspaceOperation::HasRef { .. }
+        | WorkspaceOperation::SessionTurnRefs { .. }
+        | WorkspaceOperation::CollectReviewDiff { .. } => None,
+    }
+}
+
 pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult> {
     Ok(match operation {
         WorkspaceOperation::ListTree {
