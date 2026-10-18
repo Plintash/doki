@@ -246,15 +246,23 @@ fn sessions_resume_independently_and_name_retention_and_lifetime_expiry() {
     assert_eq!(expired.events.len(), MAX_AUTOMATION_EVENTS);
     assert_eq!(expired.events[0].cursor.sequence, 7);
     f.hub.unsubscribe(a);
+    // Advance the maintenance clock instead of backdating an Instant: a fresh
+    // Windows runner may not have SESSION_IDLE worth of representable past.
+    let touched = f.hub.automation.state.lock().sessions[&first.session_id].touched;
     f.hub
         .automation
-        .state
-        .lock()
-        .sessions
-        .get_mut(&first.session_id)
-        .unwrap()
-        .touched = Instant::now() - SESSION_IDLE;
-    f.hub.automation.tick(&f.hub);
+        .tick_with_clock(&f.hub, || touched + SESSION_IDLE - Duration::from_nanos(1));
+    assert!(
+        f.hub
+            .automation
+            .state
+            .lock()
+            .sessions
+            .contains_key(&first.session_id)
+    );
+    f.hub
+        .automation
+        .tick_with_clock(&f.hub, || touched + SESSION_IDLE);
     assert!(
         matches!(f.command(a, AutomationCommand::Resume { session_id:first.session_id, after:Some(after) }), AutomationResult::Error { error } if error.code == "session_expired")
     );
