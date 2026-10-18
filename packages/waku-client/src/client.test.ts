@@ -7,7 +7,10 @@ import {
   daemonUrl,
   type WebSocketLike,
 } from "./client";
-import { MAX_AUTOMATION_EVENTS, PROTOCOL_VERSION, type AgentSession, type Task } from "./generated";
+import {
+  MAX_AUTOMATION_EVENTS, PROTOCOL_VERSION, type AgentSession, type Task,
+  type IssueRun, type IssueRunAction, type IssueWorkflow,
+} from "./generated";
 
 class FakeSocket implements WebSocketLike {
   readyState = 0;
@@ -81,6 +84,107 @@ async function connect(client: WakuClient, sockets: FakeSocket[]): Promise<FakeS
   await connected;
   return socket;
 }
+
+function issueWorkflowFixture(): { workflow: IssueWorkflow; run: IssueRun } {
+  const workflow: IssueWorkflow = {
+    stages: [{
+      id: "report-stage", board_stage_id: null, name: "Report", role: "report",
+      provider: "pi", model: null, instructions: "Report verified evidence",
+    }],
+    max_review_retries: 2,
+  };
+  return {
+    workflow,
+    run: {
+      id: "run", request_id: "intent", task_id: "issue", project_id: "project",
+      issue_title: "Issue", issue_description: "Brief", workflow,
+      status: "running", current_stage: 0, attempts: [], review_retries: 0,
+      report: null, error: null, created_at: 100, updated_at: 100,
+    },
+  };
+}
+
+function replyToLast(socket: FakeSocket, payload: unknown): void {
+  const request = JSON.parse(socket.sent.at(-1)!);
+  socket.receive({
+    type: "response", requestId: request.requestId,
+    outcome: { status: "ok", payload },
+  });
+}
+
+describe("issue workflow client", () => {
+  test("lists global or issue-scoped durable state without starting work", async () => {
+    const { client, sockets } = fixture();
+    const socket = await connect(client, sockets);
+    const { run } = issueWorkflowFixture();
+    for (const taskId of [null, "issue"]) {
+      const response = client.listIssueRuns(taskId);
+      expect(JSON.parse(socket.sent.at(-1)!).command).toEqual({ type: "listIssueRuns", taskId });
+      replyToLast(socket, { type: "issueRuns", runs: [run] });
+      await expect(response).resolves.toEqual([run]);
+    }
+    expect(socket.sent).toHaveLength(3);
+    client.disconnect();
+  });
+
+  test("keeps the caller's start intent after a lost response and reconnect", async () => {
+    const { client, sockets } = fixture();
+    const first = await connect(client, sockets);
+    const { workflow, run } = issueWorkflowFixture();
+    const lost = client.startIssueRun("issue", "intent", workflow);
+    const lostResult = lost.catch((error: unknown) => error);
+    const firstRequest = JSON.parse(first.sent.at(-1)!);
+    first.emitClose();
+    expect(await lostResult).toBeInstanceOf(WakuConnectionError);
+
+    const second = await connect(client, sockets);
+    expect(second.sent).toHaveLength(1); // reconnect is read-only until an explicit retry
+    const retry = client.startIssueRun("issue", "intent", workflow);
+    const secondRequest = JSON.parse(second.sent.at(-1)!);
+    expect(secondRequest.requestId).not.toBe(firstRequest.requestId);
+    expect(secondRequest.command).toEqual(firstRequest.command);
+    expect(secondRequest.command.requestId).toBe("intent");
+    replyToLast(second, { type: "issueRun", run });
+    await expect(retry).resolves.toEqual(run);
+    client.disconnect();
+  });
+
+  test("sends explicit controls and preserves pending cancellation and blocker reasons", async () => {
+    const { client, sockets } = fixture();
+    const socket = await connect(client, sockets);
+    const { run } = issueWorkflowFixture();
+    for (const action of ["pause", "resume", "cancel", "retry"] satisfies IssueRunAction[]) {
+      const response = client.controlIssueRun("run", action);
+      expect(JSON.parse(socket.sent.at(-1)!).command).toEqual({
+        type: "controlIssueRun", runId: "run", action,
+      });
+      const returned: IssueRun = { ...run, status: "cancelRequested", error: "Waiting for provider shutdown" };
+      replyToLast(socket, { type: "issueRun", run: returned });
+      await expect(response).resolves.toEqual(returned);
+    }
+    client.disconnect();
+  });
+
+  test("rejects mismatched responses and propagates daemon refusal without retrying", async () => {
+    const { client, sockets } = fixture();
+    const socket = await connect(client, sockets);
+    const listing = client.listIssueRuns();
+    replyToLast(socket, { type: "ack" });
+    await expect(listing).rejects.toThrow("invalid issue-runs response");
+    const starting = client.startIssueRun("issue", "intent", issueWorkflowFixture().workflow);
+    replyToLast(socket, { type: "issueRuns", runs: [] });
+    await expect(starting).rejects.toThrow("invalid issue-run response");
+    const controlling = client.controlIssueRun("run", "retry");
+    const request = JSON.parse(socket.sent.at(-1)!);
+    socket.receive({
+      type: "response", requestId: request.requestId,
+      outcome: { status: "error", error: { message: "The previous provider is still running" } },
+    });
+    await expect(controlling).rejects.toThrow("The previous provider is still running");
+    expect(socket.sent).toHaveLength(4);
+    client.disconnect();
+  });
+});
 
 describe("WakuClient", () => {
   test("reports connection state changes, including remote closure", async () => {

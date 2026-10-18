@@ -40,6 +40,7 @@ mod driver_wire;
 pub mod git;
 pub mod i18n;
 pub mod identity;
+pub mod issue_automation;
 pub mod model;
 pub mod model_catalog;
 pub mod persistence;
@@ -61,6 +62,7 @@ pub use automation_jobs::*;
 pub use automation_recording::*;
 pub use automation_schedule::*;
 pub use diagnostics::*;
+pub use issue_automation::*;
 pub use driver_wire::{decode_enum, encode_enum, event_from_wire, event_to_wire};
 pub use protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,

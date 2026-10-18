@@ -565,6 +565,7 @@ impl Waku {
         self.selected_task = None;
         self.task_detail = None;
         self.board_open = true;
+        self.start_assistant_workflow_poll(cx);
         if self.task_detail_save.take_pending() {
             self.save_task_changes(cx);
         }

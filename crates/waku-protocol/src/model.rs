@@ -1425,6 +1425,23 @@ fn detail_loaded_default() -> bool {
 impl AgentSession {
     pub const DEFAULT_TITLE: &'static str = "New task";
 
+    /// One durable assistant conversation per daemon database. A reserved
+    /// identity survives catalog projections without adding transcript-only
+    /// metadata or binding the assistant to whichever project is selected.
+    pub const GLOBAL_ASSISTANT_ID: Uuid = Uuid::from_u128(0x646f6b69_6173_4973_8474_616e74000001);
+
+    pub fn is_global_assistant(&self) -> bool {
+        self.id == Self::GLOBAL_ASSISTANT_ID
+    }
+
+    pub fn global_assistant(project_id: Uuid, provider: ProviderKind) -> Self {
+        let mut session = Self::new(project_id, provider);
+        session.id = Self::GLOBAL_ASSISTANT_ID;
+        session.title = "Assistant".to_owned();
+        session.runtime_mode = RuntimeMode::Ask;
+        session
+    }
+
     pub fn new(project_id: Uuid, provider: ProviderKind) -> Self {
         let now = unix_time();
         Self {
@@ -5264,6 +5281,23 @@ mod tests {
             "build a really polished local agent interface"
         );
         assert_eq!(session.title, AgentSession::DEFAULT_TITLE);
+    }
+
+    #[test]
+    fn global_assistant_identity_is_independent_of_project_and_catalog_hydration() {
+        let assistant = AgentSession::global_assistant(Uuid::new_v4(), ProviderKind::Codex);
+        let other = AgentSession::global_assistant(Uuid::new_v4(), ProviderKind::Claude);
+        assert_eq!(assistant.id, other.id);
+        assert!(assistant.is_global_assistant());
+        assert!(assistant.list_projection().is_global_assistant());
+        assert_eq!(assistant.runtime_mode, RuntimeMode::Ask);
+        assert!(assistant.task_id.is_none());
+        assert!(
+            !AgentSession::new(assistant.project_id, ProviderKind::Codex).is_global_assistant()
+        );
+        let restored: AgentSession =
+            serde_json::from_str(&serde_json::to_string(&assistant).unwrap()).unwrap();
+        assert!(restored.is_global_assistant());
     }
 
     #[test]

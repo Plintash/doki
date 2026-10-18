@@ -9,6 +9,7 @@ pub mod command_env;
 pub mod composer_complete;
 pub mod computer_use;
 pub mod driver;
+pub mod issue_automation;
 pub mod persistence;
 mod process;
 mod workspace_client;
@@ -23,6 +24,7 @@ pub use process::{
 };
 pub use waku_protocol::*;
 pub use workspace_client::WorkspaceClient;
+pub use issue_automation::IssueRunClient;
 
 pub mod git_branch {
     pub use waku_protocol::git::{BranchEntry, BranchSnapshot};

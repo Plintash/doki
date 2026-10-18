@@ -2580,3 +2580,40 @@ worktree_base.section:
 
 models.configuration:
   en: Model settings
+
+assistant.title:
+  en: "Assistant"
+assistant.toggle:
+  en: "Toggle assistant (⌘/Ctrl ⇧ A)"
+assistant.placeholder:
+  en: "Ask about your work, or /status…"
+assistant.empty:
+  en: "One conversation across your projects. Ask about issues, progress, or blockers. Use /status for a local snapshot."
+assistant.wait:
+  en: "Wait for this reply, or stop it first"
+assistant.status:
+  en: "Refresh work status"
+assistant.close:
+  en: "Close assistant"
+assistant.you:
+  en: "You"
+assistant.local_result:
+  en: "Doki · local result"
+assistant.issue_opened:
+  en: "Opened the issue"
+assistant.workflow_unavailable:
+  en: "Workflow controls are not available in this build yet. Open an issue to use its current stage actions."
+assistant.all_projects:
+  en: "All projects"
+assistant.working:
+  en: "Working…"
+assistant.needs_attention:
+  en: "Approval or input needed"
+assistant.review_request:
+  en: "Review request"
+assistant.stop:
+  en: "Stop reply"
+assistant.send:
+  en: "Send"
+assistant.provider_default:
+  en: Provider default

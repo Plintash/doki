@@ -414,6 +414,8 @@ struct AppState {
     sidebar_visible: bool,
     #[serde(default = "default_right_panel_visibility")]
     right_panel_visible: bool,
+    #[serde(default)]
+    assistant_panel_open: bool,
     #[serde(default = "default_sidebar_width")]
     sidebar_width: f32,
     #[serde(default)]
@@ -486,6 +488,8 @@ pub struct PersistedState {
     pub sidebar_visible: bool,
     #[serde(default = "default_right_panel_visibility")]
     pub right_panel_visible: bool,
+    #[serde(default)]
+    pub assistant_panel_open: bool,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
     #[serde(default)]
@@ -565,6 +569,7 @@ impl PersistedState {
             open_in_app: None,
             sidebar_visible: true,
             right_panel_visible: false,
+            assistant_panel_open: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_grouping: SidebarGrouping::default(),
             sidebar_grouping_chosen: false,
@@ -711,6 +716,7 @@ impl PersistedState {
             remembered_model_traits: self.remembered_model_traits.clone(),
             sidebar_visible: self.sidebar_visible,
             right_panel_visible: self.right_panel_visible,
+            assistant_panel_open: self.assistant_panel_open,
             sidebar_width: self.sidebar_width,
             sidebar_grouping: self.sidebar_grouping,
             sidebar_grouping_chosen: self.sidebar_grouping_chosen,
@@ -747,6 +753,7 @@ impl PersistedState {
         self.remembered_model_traits = app_state.remembered_model_traits;
         self.sidebar_visible = app_state.sidebar_visible;
         self.right_panel_visible = app_state.right_panel_visible;
+        self.assistant_panel_open = app_state.assistant_panel_open;
         self.sidebar_width = app_state.sidebar_width;
         self.sidebar_grouping = sidebar_grouping_for(
             app_state.sidebar_grouping_chosen,
@@ -1498,6 +1505,20 @@ mod tests {
         .unwrap();
         assert_eq!(reads, 1, "a store without a snapshot reads the file");
         assert_eq!(applied.theme, ThemePreference::System);
+    }
+
+    #[test]
+    fn assistant_open_state_is_independent_and_legacy_safe() {
+        let legacy: AppState = serde_json::from_str(r#"{"app_state_version":1}"#).unwrap();
+        assert!(!legacy.assistant_panel_open);
+        let mut state = PersistedState::empty();
+        state.assistant_panel_open = true;
+        state.right_panel_visible = false;
+        let encoded = serde_json::to_string(&state.app_state()).unwrap();
+        let mut restored = PersistedState::empty();
+        restored.apply_app_state(serde_json::from_str(&encoded).unwrap());
+        assert!(restored.assistant_panel_open);
+        assert!(!restored.right_panel_visible);
     }
 
     #[test]

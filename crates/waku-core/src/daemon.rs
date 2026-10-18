@@ -1,6 +1,7 @@
 //! Provider backend and driver-event wire translation for `waku-daemon`.
 
 mod automation_headless;
+mod global_assistant;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -60,22 +61,22 @@ struct OwnedTerminal {
 /// of client subscriptions. Shared services retain their user-owned process.
 /// A timed-out close keeps this latch, so a retry cannot mistake absence for exit.
 #[derive(Default)]
-struct RuntimeExit {
+pub(crate) struct RuntimeExit {
     close_requested: AtomicBool,
     exited: Mutex<bool>,
     changed: Condvar,
 }
 
 impl RuntimeExit {
-    fn request_close(&self) {
+    pub(crate) fn request_close(&self) {
         self.close_requested.store(true, Ordering::Release);
     }
 
-    fn is_unconfirmed_close(&self) -> bool {
+    pub(crate) fn is_unconfirmed_close(&self) -> bool {
         self.close_requested.load(Ordering::Acquire) && !*self.exited.lock()
     }
 
-    fn observe(&self) {
+    pub(crate) fn observe(&self) {
         *self.exited.lock() = true;
         self.changed.notify_all();
     }
@@ -100,14 +101,15 @@ pub struct WakuBackend {
     automation_jobs: Option<
         Result<crate::automation_jobs::AutomationJobManager, waku_protocol::AutomationError>,
     >,
-    sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
-    runtime_exits: Mutex<HashMap<(Uuid, Uuid), Arc<RuntimeExit>>>,
+    sessions: Arc<Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>>,
+    runtime_exits: Arc<Mutex<HashMap<(Uuid, Uuid), Arc<RuntimeExit>>>>,
     terminals: Mutex<HashMap<Uuid, OwnedTerminal>>,
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
-    settings: DaemonSettingsStore,
-    task_store: StateStore,
-    task_state: Mutex<PersistedState>,
+    settings: Arc<DaemonSettingsStore>,
+    task_store: Arc<StateStore>,
+    task_state: Arc<Mutex<PersistedState>>,
+    issue_runs: crate::issue_automation::IssueRunManager,
     removed_session_ids: Mutex<HashSet<Uuid>>,
     composer_drafts: ComposerDraftStore,
     attachments: AttachmentStore,
@@ -118,6 +120,14 @@ pub struct WakuBackend {
 }
 
 impl WakuBackend {
+    #[cfg(test)]
+    pub(crate) fn with_issue_harness(
+        self,
+        harness: Arc<dyn crate::issue_automation::IssueHarness>,
+    ) -> Self {
+        self.issue_runs.set_harness(harness);
+        self
+    }
     pub fn new(settings: DaemonSettingsStore, task_store: StateStore) -> anyhow::Result<Self> {
         let mut task_state = task_store
             .load()
@@ -142,18 +152,31 @@ impl WakuBackend {
         let automation_jobs = cfg!(debug_assertions).then(|| {
             crate::automation_jobs::AutomationJobManager::new(scratch.clone(), &usage_rates_dir)
         });
+        let settings = Arc::new(settings);
+        let task_store = Arc::new(task_store);
+        let task_state = Arc::new(Mutex::new(task_state));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let runtime_exits = Arc::new(Mutex::new(HashMap::new()));
+        let issue_runs = crate::issue_automation::IssueRunManager::new(
+            task_store.clone(),
+            task_state.clone(),
+            settings.clone(),
+            sessions.clone(),
+            runtime_exits.clone(),
+        )?;
         Ok(Self {
             headless_identity: OnceLock::new(),
             automation_jobs,
             scratch,
-            sessions: Mutex::new(HashMap::new()),
-            runtime_exits: Mutex::new(HashMap::new()),
+            sessions,
+            runtime_exits,
             terminals: Mutex::new(HashMap::new()),
             #[cfg(all(test, unix))]
             terminal_shell: None,
             settings,
             task_store,
-            task_state: Mutex::new(task_state),
+            task_state,
+            issue_runs,
             removed_session_ids: Mutex::new(HashSet::new()),
             composer_drafts,
             attachments,
@@ -544,6 +567,24 @@ impl Backend for WakuBackend {
                 crate::skills::trash_skills(&dirs).map_err(|error| anyhow!(error))?;
                 Ok(ResponsePayload::Ack)
             }
+            Command::EnsureGlobalAssistant { provider, model } => {
+                self.ensure_global_assistant(provider, model)
+            }
+            Command::ListIssueRuns { task_id } => Ok(ResponsePayload::IssueRuns {
+                runs: self.issue_runs.list(task_id)?,
+            }),
+            Command::StartIssueRun {
+                task_id,
+                request_id,
+                workflow,
+            } => Ok(ResponsePayload::IssueRun {
+                run: self
+                    .issue_runs
+                    .start(task_id, request_id, workflow, events)?,
+            }),
+            Command::ControlIssueRun { run_id, action } => Ok(ResponsePayload::IssueRun {
+                run: self.issue_runs.control(run_id, action, events)?,
+            }),
             Command::LoadTaskState => {
                 let state = self.task_state.lock();
                 Ok(ResponsePayload::TaskState {
@@ -591,6 +632,8 @@ impl Backend for WakuBackend {
                 skeleton_session_ids,
                 sessions,
             } => {
+                let automation_guard = self.issue_runs.mutation_guard();
+                let automation_sessions = automation_guard.owned_sessions();
                 let active_runtimes = self
                     .sessions
                     .lock()
@@ -598,6 +641,7 @@ impl Backend for WakuBackend {
                     .map(|(session_id, (runtime_id, _))| (*session_id, *runtime_id))
                     .collect::<HashMap<_, _>>();
                 let mut state = self.task_state.lock();
+                automation_guard.validate_changes(&state, &tasks, &projects, &sessions)?;
                 let removed_session_ids = self.removed_session_ids.lock();
                 validate_task_completions(
                     &state,
@@ -701,6 +745,12 @@ impl Backend for WakuBackend {
                     .map(|session| session.id)
                     .collect::<Vec<_>>();
                 for mut session in sessions {
+                    // Automatic attempt transcripts and execution identity are
+                    // daemon-owned, including after completion. A reconnecting
+                    // client's old projection must never erase their evidence.
+                    if automation_sessions.contains(&session.id) {
+                        continue;
+                    }
                     if let Some(existing) = state
                         .sessions
                         .iter_mut()
@@ -763,6 +813,7 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::TaskStateSaved { sessions })
             }
             Command::RemoveSession => {
+                self.issue_runs.ensure_session_mutable(session_id)?;
                 {
                     let mut state = self.task_state.lock();
                     self.removed_session_ids.lock().insert(session_id);
@@ -1057,6 +1108,8 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             Command::ForkSessionFromResponse { turn_count } => {
+                self.issue_runs.ensure_session_mutable(session_id)?;
+                let _work_guard = self.issue_runs.ensure_manual_work_allowed(session_id)?;
                 let (session, checkpoint_warning) =
                     self.fork_session_from_response(session_id, turn_count)?;
                 Ok(ResponsePayload::SessionForked {
@@ -1065,6 +1118,10 @@ impl Backend for WakuBackend {
                 })
             }
             Command::RewindSessionToMessage { turn_count } => {
+                self.issue_runs.ensure_session_mutable(session_id)?;
+                // Keep the reservation locked through checkpoint/provider/DB
+                // mutation, not just through this initial ownership check.
+                let _work_guard = self.issue_runs.ensure_manual_work_allowed(session_id)?;
                 let (session, cleanup_warning) =
                     self.rewind_session_to_message(session_id, turn_count)?;
                 Ok(ResponsePayload::SessionRewound {
@@ -1084,14 +1141,50 @@ impl Backend for WakuBackend {
                         session_id,
                         turn_count,
                     },
-            } => Ok(ResponsePayload::Workspace {
-                result: WorkspaceResult::Checkpoint {
-                    checkpoint: self.capture_turn_checkpoint(cwd, session_id, turn_count)?,
-                },
-            }),
-            Command::Workspace { operation } => Ok(ResponsePayload::Workspace {
-                result: crate::workspace::execute(operation)?,
-            }),
+            } => {
+                if self.issue_runs.session_is_owned(session_id) {
+                    // Every client observes TurnFinished and may request this
+                    // checkpoint after the next automatic stage has started.
+                    // Never snapshot another stage's files or mutate Git from
+                    // that delayed callback. Existing evidence stays readable.
+                    let mut state = self.task_state.lock();
+                    let session = state.session_mut(session_id).ok_or_else(|| {
+                        anyhow!("The automatic stage conversation is unavailable")
+                    })?;
+                    self.task_store.hydrate(session)?;
+                    let turn = session
+                        .turns
+                        .iter()
+                        .find(|turn| turn.turn_count == turn_count)
+                        .ok_or_else(|| anyhow!("The automatic stage turn is unavailable"))?;
+                    let checkpoint = turn.checkpoint.clone().unwrap_or_else(|| Checkpoint {
+                        turn_count,
+                        git_ref: crate::checkpoint::checkpoint_ref(session_id, turn_count),
+                        status: CheckpointStatus::Unavailable,
+                        files: Vec::new(),
+                        additions: 0,
+                        deletions: 0,
+                        created_at: crate::model::unix_time(),
+                    });
+                    return Ok(ResponsePayload::Workspace {
+                        result: WorkspaceResult::Checkpoint { checkpoint },
+                    });
+                }
+                let _work_guard = self.issue_runs.ensure_workspace_mutation_allowed(&cwd)?;
+                Ok(ResponsePayload::Workspace {
+                    result: WorkspaceResult::Checkpoint {
+                        checkpoint: self.capture_turn_checkpoint(cwd, session_id, turn_count)?,
+                    },
+                })
+            }
+            Command::Workspace { operation } => {
+                let _work_guard = crate::workspace::mutation_path(&operation)
+                    .map(|path| self.issue_runs.ensure_workspace_mutation_allowed(&path))
+                    .transpose()?;
+                Ok(ResponsePayload::Workspace {
+                    result: crate::workspace::execute(operation)?,
+                })
+            }
             Command::OpenTerminal {
                 task_id,
                 cwd,
@@ -1184,6 +1277,9 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             Command::Start { options } => {
+                self.issue_runs.ensure_session_mutable(session_id)?;
+                let _work_guard = self.issue_runs.ensure_manual_work_allowed(session_id)?;
+                _work_guard.ensure_workspace_mutation_allowed(&options.cwd)?;
                 let previous_id = self.sessions.lock().get(&session_id).map(|(id, _)| *id);
                 if let Some(previous_id) = previous_id {
                     self.note_runtime_close_requested(session_id, previous_id);
@@ -1265,6 +1361,13 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Started { supports_steer })
             }
             Command::CloseSessionAndWait => {
+                if self.issue_runs.session_is_owned(session_id)
+                    && !self.sessions.lock().contains_key(&session_id)
+                    && !self.unconfirmed_shutdown_sessions().contains(&session_id)
+                {
+                    return Ok(ResponsePayload::Ack);
+                }
+                self.issue_runs.ensure_session_mutable(session_id)?;
                 self.close_session_and_wait(
                     session_id,
                     runtime_id,
@@ -1273,6 +1376,13 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             Command::CloseSession => {
+                if self.issue_runs.session_is_owned(session_id)
+                    && !self.sessions.lock().contains_key(&session_id)
+                    && !self.unconfirmed_shutdown_sessions().contains(&session_id)
+                {
+                    return Ok(ResponsePayload::Ack);
+                }
+                self.issue_runs.ensure_session_mutable(session_id)?;
                 self.note_runtime_close_requested(session_id, runtime_id);
                 self.confirm_shared_session_shutdown(session_id, runtime_id)?;
                 let removed = {
@@ -1287,6 +1397,30 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             command => {
+                if matches!(&command, Command::Cancel)
+                    && let Some(run_id) = self.issue_runs.run_for_session(session_id)
+                {
+                    self.issue_runs.control(
+                        run_id,
+                        waku_protocol::IssueRunAction::Cancel,
+                        events,
+                    )?;
+                    return Ok(ResponsePayload::Ack);
+                }
+                if !matches!(
+                    &command,
+                    Command::Respond { .. }
+                        | Command::RespondUserInput { .. }
+                        | Command::RefreshBackgroundWork
+                        | Command::CancelComputerUse
+                ) {
+                    self.issue_runs.ensure_session_mutable(session_id)?;
+                }
+                let _work_guard = if command_starts_issue_work(&command) {
+                    Some(self.issue_runs.ensure_manual_work_allowed(session_id)?)
+                } else {
+                    None
+                };
                 let driver = {
                     let sessions = self.sessions.lock();
                     let (active_runtime_id, driver) = sessions
@@ -2422,6 +2556,10 @@ fn handle_driver_command(
         | Command::LoadSkills { .. }
         | Command::SetSkillsEnabled { .. }
         | Command::TrashSkills { .. }
+        | Command::EnsureGlobalAssistant { .. }
+        | Command::ListIssueRuns { .. }
+        | Command::StartIssueRun { .. }
+        | Command::ControlIssueRun { .. }
         | Command::LoadTaskState
         | Command::SaveTaskState { .. }
         | Command::SaveProjectBoard { .. }
@@ -2457,7 +2595,7 @@ fn handle_driver_command(
     Ok(ResponsePayload::Ack)
 }
 
-fn ensure_shell_environment() {
+pub(crate) fn ensure_shell_environment() {
     static REFRESHED: OnceLock<()> = OnceLock::new();
     REFRESHED.get_or_init(|| {
         crate::command_env::refresh_from_default_shell();

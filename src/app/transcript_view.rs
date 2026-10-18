@@ -649,11 +649,10 @@ impl Waku {
     pub(super) fn copy_selection_action(
         &mut self,
         _: &CopySelection,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let selected = self
-            .right_panel_visible
+        let selected = (self.right_panel_visible && !self.assistant.open)
             .then(|| {
                 self.right_panel_active_surface
                     .and_then(|index| self.right_panel_surfaces.get(index))
@@ -670,6 +669,11 @@ impl Waku {
                     .and_then(|session_id| self.background_work.get(&session_id))
                     .and_then(BackgroundWorkRegistry::selected_text),
                 _ => None,
+            })
+            .or_else(|| {
+                (self.assistant.open && self.assistant.transcript_focus.is_focused(window))
+                    .then(|| self.assistant.selection.selection.borrow().selected_text())
+                    .flatten()
             })
             .or_else(|| self.toast_selection.selection.borrow().selected_text())
             .or_else(|| self.skills_selection.selection.borrow().selected_text())

@@ -1272,3 +1272,22 @@ project.settings: 项目设置
 worktree_base.section: 工作树
 
 models.configuration: 模型设置
+
+assistant.title: "助手"
+assistant.toggle: "切换全局助手（⌘/Ctrl ⇧ A）"
+assistant.placeholder: "询问工作进展，或输入 /status…"
+assistant.empty: "跨项目保留同一个对话。可以询问 issue、进展和阻塞，输入 /status 查看本地概览。"
+assistant.wait: "请等待本次回复，或先停止"
+assistant.status: "查看工作状态"
+assistant.close: "收起助手"
+assistant.you: "你"
+assistant.local_result: "Doki · 本地结果"
+assistant.issue_opened: "已打开 issue"
+assistant.workflow_unavailable: "此版本尚未接入工作流控制。请打开 issue 使用现有阶段操作。"
+assistant.all_projects: "全部项目"
+assistant.working: "处理中…"
+assistant.needs_attention: "需要批准或输入"
+assistant.review_request: "查看请求"
+assistant.stop: "停止回复"
+assistant.send: "发送"
+assistant.provider_default: 默认模型

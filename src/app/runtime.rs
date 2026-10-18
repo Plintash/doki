@@ -3409,7 +3409,7 @@ impl Waku {
         );
     }
 
-    fn submit_submission_for_session(
+    pub(super) fn submit_submission_for_session(
         &mut self,
         session_id: Uuid,
         submission: ComposerSubmission,
@@ -3676,6 +3676,17 @@ impl Waku {
                     self.splice_transcript_rows_after_visibility_change(&previous_kinds);
                     self.restore_selected_composer_draft(cx);
                     self.show_toast(tr!("errors.create_worktree", error = error));
+                }
+                if session_id == AgentSession::GLOBAL_ASSISTANT_ID {
+                    let draft = self
+                        .composer_drafts
+                        .get(crate::persistence::ComposerDraftKey::Session(session_id))
+                        .map(|draft| draft.text.clone())
+                        .unwrap_or_default();
+                    self.assistant
+                        .input
+                        .update(cx, |input, cx| input.set_content(draft, cx));
+                    self.assistant.notice = Some(error.to_string());
                 }
                 self.save(cx);
                 cx.notify();

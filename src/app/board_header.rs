@@ -387,11 +387,15 @@ impl Waku {
             .selected_task
             .and_then(|id| self.task_for_editor(id))
             .cloned();
-        let right_controls = self.render_client_window_controls(
-            super::window_chrome::WindowControlSide::Right,
-            window,
-            cx,
-        );
+        let right_controls = (!self.assistant.open)
+            .then(|| {
+                self.render_client_window_controls(
+                    super::window_chrome::WindowControlSide::Right,
+                    window,
+                    cx,
+                )
+            })
+            .flatten();
         let mut controls = div()
             .min_w_0()
             .flex_1()
@@ -555,6 +559,13 @@ impl Waku {
             .border_color(theme.border)
             .bg(theme.surface)
             .child(controls)
+            .child(
+                div()
+                    .h(px(48.0))
+                    .flex()
+                    .items_center()
+                    .child(self.render_assistant_toggle(cx)),
+            )
             .when_some(right_controls, |element, controls| {
                 element.child(div().h(px(48.0)).flex_none().child(controls))
             })
