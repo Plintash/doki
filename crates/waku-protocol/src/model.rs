@@ -605,6 +605,8 @@ pub fn parse_cli_version(output: &str) -> Option<String> {
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct Project {
+    #[serde(default)]
+    pub board: ProjectBoard,
     pub id: Uuid,
     pub name: String,
     pub path: PathBuf,
@@ -675,8 +677,10 @@ impl Project {
             .filter(|value| !value.is_empty())
             .unwrap_or("Project")
             .to_owned();
+        let id = Uuid::new_v4();
         Self {
-            id: Uuid::new_v4(),
+            board: ProjectBoard::canonical(id),
+            id,
             name,
             path,
             created_at: unix_time(),
@@ -690,9 +694,8 @@ impl Project {
 
 /// Where a task sits on the board.
 ///
-/// The three columns are fixed for now; user-defined columns come later. The
-/// state is the user's own declaration — runtime activity never moves a task
-/// on its own.
+/// Internal lifecycle compatibility, independent of project-owned stage IDs.
+/// The state is the user's declaration; runtime activity never moves a task.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum TaskState {
@@ -726,6 +729,137 @@ impl TaskState {
     }
 }
 
+/// Persisted execution intent. Moving a card never invokes a provider.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum StageHandoff {
+    #[default]
+    BriefOnly,
+    PriorResult,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct BoardStage {
+    pub id: Uuid,
+    pub name: String,
+    pub state: TaskState,
+    pub provider: Option<ProviderKind>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub instructions: String,
+    #[serde(default)]
+    pub handoff: StageHandoff,
+}
+
+/// Explicitly selected prior result; never implies copying provider-private history.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct StageResultSource {
+    pub session_id: Uuid,
+    pub message_id: Uuid,
+}
+
+/// Immutable intent snapshot for an attempt. Several sessions may share an
+/// invocation; renaming a stage does not rewrite conversation provenance.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct SessionStageInvocation {
+    pub id: Uuid,
+    pub stage: BoardStage,
+    pub board_revision: u64,
+    pub source: Option<StageResultSource>,
+}
+
+/// Ordered, project-ID-owned catalog. A revision describes the entire catalog,
+/// so a stale reorder cannot revive a deleted stage. Path aliases do not share
+/// execution defaults implicitly.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct ProjectBoard {
+    pub revision: u64,
+    pub stages: Vec<BoardStage>,
+}
+
+/// Reserved deterministic IDs, without changing any existing issue IDs.
+pub fn canonical_stage_id(project_id: Uuid, state: TaskState) -> Uuid {
+    let mut bytes = *project_id.as_bytes();
+    bytes[0] ^= 0xb0;
+    bytes[15] ^= state.ordinal() as u8;
+    Uuid::from_bytes(bytes)
+}
+
+impl ProjectBoard {
+    pub fn canonical(project_id: Uuid) -> Self {
+        Self {
+            revision: 0,
+            stages: [
+                (TaskState::Backlog, "Backlog"),
+                (TaskState::Doing, "Doing"),
+                (TaskState::Done, "Done"),
+            ]
+            .into_iter()
+            .map(|(state, name)| BoardStage {
+                id: canonical_stage_id(project_id, state),
+                name: name.into(),
+                state,
+                provider: None,
+                model: None,
+                instructions: String::new(),
+                handoff: StageHandoff::BriefOnly,
+            })
+            .collect(),
+        }
+    }
+
+    pub fn stage_for_task(&self, task: &Task) -> Option<&BoardStage> {
+        self.stages
+            .iter()
+            .find(|stage| Some(stage.id) == task.stage_id && stage.state == task.state)
+    }
+
+    pub fn validate(&self, project_id: Uuid) -> Result<(), String> {
+        let mut ids = std::collections::HashSet::new();
+        for stage in &self.stages {
+            if stage.name.trim().is_empty() || !ids.insert(stage.id) {
+                return Err("stage names must be nonempty and stage IDs unique".into());
+            }
+            if stage.provider.is_none() && stage.model.is_some() {
+                return Err("choose a harness before setting a model override".into());
+            }
+            if stage
+                .model
+                .as_ref()
+                .is_some_and(|model| model.trim().is_empty())
+            {
+                return Err("use provider default instead of an empty model override".into());
+            }
+        }
+        for state in [TaskState::Backlog, TaskState::Doing, TaskState::Done] {
+            if !self.stages.iter().any(|stage| {
+                stage.id == canonical_stage_id(project_id, state) && stage.state == state
+            }) {
+                return Err(
+                    "canonical lifecycle destinations cannot be removed or recategorized".into(),
+                );
+            }
+        }
+        if self
+            .stages
+            .iter()
+            .filter(|stage| stage.state.is_done())
+            .count()
+            != 1
+        {
+            return Err("the board must have exactly one terminal stage".into());
+        }
+        if !self
+            .stages
+            .last()
+            .is_some_and(|stage| stage.state.is_done())
+        {
+            return Err("the terminal stage must remain last".into());
+        }
+        Ok(())
+    }
+}
+
 /// A user-declared unit of work that groups conversations.
 ///
 /// A task exists on its own: it may have no conversations yet, and several
@@ -733,6 +867,8 @@ impl TaskState {
 /// It is the unit the board arranges and the unit that survives archiving.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct Task {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_id: Option<Uuid>,
     pub id: Uuid,
     pub title: String,
     /// The issue brief, separate from any conversation or execution prompt.
@@ -780,6 +916,7 @@ impl Task {
         Self {
             id: Uuid::new_v4(),
             title: title.into(),
+            stage_id: None,
             description: String::new(),
             state,
             position,
@@ -796,8 +933,33 @@ impl Task {
             return;
         }
         self.state = state;
+        self.stage_id = self.project_id().map(|id| canonical_stage_id(id, state));
         self.touch();
         self.completed_at = state.is_done().then(unix_time);
+    }
+
+    /// Caller must pass the existing completion acknowledgment boundary before
+    /// selecting a terminal destination. One revision covers the whole move.
+    pub fn set_stage(&mut self, stage: &BoardStage, position: i64) {
+        if self.stage_id == Some(stage.id) && self.state == stage.state && self.position == position
+        {
+            return;
+        }
+        if self.state != stage.state {
+            self.completed_at = stage.state.is_done().then(unix_time);
+        }
+        self.state = stage.state;
+        self.stage_id = Some(stage.id);
+        self.position = position;
+        self.touch();
+    }
+
+    pub fn project_id(&self) -> Option<Uuid> {
+        match self.workspace.as_ref()? {
+            TaskWorkspace::Local { project_id }
+            | TaskWorkspace::NewWorktree { project_id }
+            | TaskWorkspace::Worktree { project_id, .. } => Some(*project_id),
+        }
     }
 
     /// Marks any other user-driven mutation (a rename, an inferred workspace)
@@ -1076,6 +1238,54 @@ pub struct RuntimeEventCursor {
     pub sequence: u64,
 }
 
+/// The exact repository changes a native issue review was asked to inspect.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum IssueReviewTarget {
+    UncommittedChanges,
+    BaseBranch {
+        branch: String,
+    },
+    Commit {
+        sha: String,
+    },
+    /// The exact two-dot diff from base to head, without merge-base expansion.
+    CommitRange {
+        base: String,
+        head: String,
+    },
+}
+
+/// Review lifecycle, independent of whether the review found any problems.
+/// `Completed` means the review finished; it does not mean the changes passed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum IssueReviewStatus {
+    #[default]
+    Draft,
+    Running,
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+/// Compact issue-review metadata available without loading the transcript.
+/// The complete result remains an assistant message; the UI bounds `summary`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct SessionReview {
+    pub target: IssueReviewTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<Uuid>,
+    pub status: IssueReviewStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_message_id: Option<Uuid>,
+    /// The fix conversation already created from this review, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_session_id: Option<Uuid>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct AgentSession {
     pub id: Uuid,
@@ -1090,6 +1300,16 @@ pub struct AgentSession {
     /// The task this conversation is filed under, when the user has filed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<Uuid>,
+    /// Present only for an issue-centered native review conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<SessionReview>,
+    /// The Codex review this correction conversation originated from. Kept on
+    /// the correction itself so rerunning or removing its source review never
+    /// turns it into an ordinary development draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_correction_source_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_invocation: Option<SessionStageInvocation>,
     /// Local project checkout or an isolated Git worktree for this task.
     #[serde(default, skip_serializing_if = "SessionWorkspace::is_local")]
     pub workspace: SessionWorkspace,
@@ -1201,6 +1421,9 @@ impl AgentSession {
             auto_title: None,
             project_id,
             task_id: None,
+            review: None,
+            review_correction_source_id: None,
+            stage_invocation: None,
             workspace: SessionWorkspace::Local,
             provider,
             model: None,
@@ -1249,6 +1472,9 @@ impl AgentSession {
             auto_title: self.auto_title.clone(),
             project_id: self.project_id,
             task_id: self.task_id,
+            review: self.review.clone(),
+            review_correction_source_id: self.review_correction_source_id,
+            stage_invocation: self.stage_invocation.clone(),
             is_draft: !self.has_started(),
             workspace: self.workspace.clone(),
             provider: self.provider,
@@ -1400,7 +1626,9 @@ impl AgentSession {
     }
 
     pub fn can_choose_model(&self, provider: ProviderKind) -> bool {
-        !self.status.is_busy() && (self.messages.is_empty() || self.provider == provider)
+        !self.status.is_busy()
+            && (self.review.is_none() || provider == ProviderKind::Codex)
+            && (self.messages.is_empty() || self.provider == provider)
     }
 
     pub fn migrate_legacy_state(&mut self) {
@@ -1680,8 +1908,7 @@ impl AgentSession {
             return;
         }
         self.turns.pop();
-        self.messages
-            .retain(|message| message.turn_id != Some(turn_id));
+        self.retain_messages(|message| message.turn_id != Some(turn_id));
         if self.messages.is_empty() {
             self.auto_title = None;
         }
@@ -1755,6 +1982,13 @@ impl AgentSession {
                 continue;
             };
             let mut message = self.messages.remove(index);
+            if self
+                .review
+                .as_ref()
+                .is_some_and(|review| review.result_message_id == Some(message.id))
+            {
+                self.clear_removed_review_result();
+            }
             message.pending = false;
             taken.push(message);
             taken_at.push(index);
@@ -1928,6 +2162,37 @@ impl AgentSession {
         id
     }
 
+    /// Removes transcript messages while invalidating only a review result
+    /// actually removed by this operation. Unloaded projections and cache
+    /// eviction must never make an existing result appear to have vanished.
+    fn retain_messages(&mut self, mut keep: impl FnMut(&Message) -> bool) {
+        let result_message_id = self
+            .review
+            .as_ref()
+            .and_then(|review| review.result_message_id);
+        let mut result_removed = false;
+        self.messages.retain(|message| {
+            let retained = keep(message);
+            result_removed |= !retained && result_message_id == Some(message.id);
+            retained
+        });
+        if result_removed {
+            self.clear_removed_review_result();
+        }
+    }
+
+    fn clear_removed_review_result(&mut self) {
+        if let Some(review) = self.review.as_mut() {
+            review.result_message_id = None;
+            review.summary = None;
+            review.fix_session_id = None;
+            review.status = IssueReviewStatus::Interrupted;
+            // Destructive history edits own a new metadata revision too. A
+            // queued same-second catalog must not restore the removed result.
+            self.updated_at = unix_time().max(self.updated_at.saturating_add(1));
+        }
+    }
+
     pub fn truncate_after_turn(&mut self, turn_count: usize) {
         let retained = self
             .turns
@@ -1936,7 +2201,7 @@ impl AgentSession {
             .map(|turn| turn.id)
             .collect::<std::collections::HashSet<_>>();
         self.turns.truncate(turn_count);
-        self.messages.retain(|message| {
+        self.retain_messages(|message| {
             message
                 .turn_id
                 .is_none_or(|turn_id| retained.contains(&turn_id))
@@ -1997,6 +2262,11 @@ impl AgentSession {
         fork.updated_at = now;
         fork.provider_cursor = Some(provider_cursor);
         fork.provider_session_id = None;
+        // An ordinary conversation fork is not a new native review. Its
+        // remapped messages and independent fixes must not retain review IDs.
+        fork.review = None;
+        // Correction provenance is independent of a native review result:
+        // forks of a correction remain corrections of the same source review.
         // A fork snapshots the conversation, not the pending follow-ups its
         // source session is still holding for the live agent.
         fork.queued_messages.clear();
@@ -2427,6 +2697,12 @@ pub enum DriverEvent {
         message_id: Uuid,
     },
     TurnStarted,
+    /// The provider entered its native review mode for the current turn.
+    ReviewStarted,
+    /// The full native review result, to be retained in the transcript.
+    ReviewCompleted {
+        review: String,
+    },
     /// The provider's turn ended while detached work it will wake the
     /// session for is still running. The turn stays open — the wake's
     /// `TurnStarted` continues it — and the session shows it is waiting.
@@ -4152,6 +4428,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn board_same_lifecycle_move_and_wire_roundtrip_preserve_identity() {
+        let project = Project::from_path("/tmp/board".into());
+        let mut stage = project.board.stages[1].clone();
+        stage.id = Uuid::new_v4();
+        stage.name = "Review".into();
+        let mut task = Task::new("Issue", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local {
+            project_id: project.id,
+        });
+        let id = task.id;
+        let revision = task.updated_at;
+        task.set_stage(&stage, 8);
+        assert_eq!(task.id, id);
+        assert_eq!(task.state, TaskState::Doing);
+        assert_eq!(task.stage_id, Some(stage.id));
+        assert!(task.updated_at > revision);
+        let decoded: Task = serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
+        assert_eq!(decoded, task);
+        task.set_state(TaskState::Done);
+        assert_eq!(
+            task.stage_id,
+            Some(canonical_stage_id(project.id, TaskState::Done))
+        );
+        task.set_state(TaskState::Doing);
+        assert!(task.completed_at.is_none());
+    }
+
+    #[test]
+    fn stage_invocation_wire_and_list_projection_retain_snapshot() {
+        let project = Project::from_path("/tmp/board".into());
+        let mut session = AgentSession::new(project.id, ProviderKind::Pi);
+        let invocation = SessionStageInvocation {
+            id: Uuid::new_v4(),
+            stage: project.board.stages[1].clone(),
+            board_revision: 0,
+            source: None,
+        };
+        session.stage_invocation = Some(invocation.clone());
+        let decoded: AgentSession =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!(decoded.stage_invocation, Some(invocation.clone()));
+        assert_eq!(session.list_projection().stage_invocation, Some(invocation));
+    }
+
+    #[test]
     fn issue_description_defaults_for_older_saved_tasks() {
         let task = Task::new("Fix parser", TaskState::Backlog, 0);
         assert!(task.description.is_empty());
@@ -5727,6 +6048,300 @@ mod tests {
         assert_eq!(prompt.turn_id, Some(provider_turn));
         assert_eq!(prompt.role, MessageRole::User);
         assert_eq!(session.status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn issue_review_targets_and_statuses_round_trip_through_serde() {
+        for (target, expected) in [
+            (
+                IssueReviewTarget::UncommittedChanges,
+                serde_json::json!({ "kind": "uncommittedChanges" }),
+            ),
+            (
+                IssueReviewTarget::BaseBranch {
+                    branch: "main".into(),
+                },
+                serde_json::json!({ "kind": "baseBranch", "branch": "main" }),
+            ),
+            (
+                IssueReviewTarget::Commit {
+                    sha: "abc123".into(),
+                },
+                serde_json::json!({ "kind": "commit", "sha": "abc123" }),
+            ),
+            (
+                IssueReviewTarget::CommitRange {
+                    base: "abc123".into(),
+                    head: "def456".into(),
+                },
+                serde_json::json!({ "kind": "commitRange", "base": "abc123", "head": "def456" }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&target).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<IssueReviewTarget>(expected).unwrap(),
+                target
+            );
+        }
+        for (status, expected) in [
+            (IssueReviewStatus::Draft, "draft"),
+            (IssueReviewStatus::Running, "running"),
+            (IssueReviewStatus::Completed, "completed"),
+            (IssueReviewStatus::Interrupted, "interrupted"),
+            (IssueReviewStatus::Failed, "failed"),
+        ] {
+            let value = serde_json::to_value(status).unwrap();
+            assert_eq!(value, expected);
+            assert_eq!(
+                serde_json::from_value::<IssueReviewStatus>(value).unwrap(),
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn issue_review_round_trips_and_legacy_sessions_have_no_review() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        assert!(session.review.is_none());
+        session.review = Some(SessionReview {
+            target: IssueReviewTarget::BaseBranch {
+                branch: "main".into(),
+            },
+            source_session_id: Some(Uuid::new_v4()),
+            status: IssueReviewStatus::Completed,
+            summary: Some("One issue found".into()),
+            result_message_id: Some(Uuid::new_v4()),
+            fix_session_id: Some(Uuid::new_v4()),
+        });
+        let mut value = serde_json::to_value(&session).unwrap();
+        let restored: AgentSession = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored.review, session.review);
+
+        value.as_object_mut().unwrap().remove("review");
+        let legacy: AgentSession = serde_json::from_value(value).unwrap();
+        assert!(legacy.review.is_none());
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("review")
+                .is_none()
+        );
+
+        let minimal: SessionReview = serde_json::from_value(serde_json::json!({
+            "target": { "kind": "uncommittedChanges" },
+            "status": "draft"
+        }))
+        .unwrap();
+        assert_eq!(minimal.status, IssueReviewStatus::Draft);
+        assert!(minimal.source_session_id.is_none());
+        assert!(minimal.summary.is_none());
+        assert!(minimal.result_message_id.is_none());
+        assert!(minimal.fix_session_id.is_none());
+    }
+
+    #[test]
+    fn list_projection_preserves_review_metadata_without_the_full_result() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.begin_turn("Review the issue changes");
+        let result_message_id =
+            session.push_message(MessageRole::Assistant, "Full review findings");
+        session.review = Some(SessionReview {
+            target: IssueReviewTarget::UncommittedChanges,
+            source_session_id: Some(Uuid::new_v4()),
+            status: IssueReviewStatus::Completed,
+            summary: Some("One issue found".into()),
+            result_message_id: Some(result_message_id),
+            fix_session_id: Some(Uuid::new_v4()),
+        });
+        let projection = session.list_projection();
+        assert_eq!(projection.review, session.review);
+        assert!(!projection.detail_loaded);
+        assert!(projection.messages.is_empty());
+        assert!(projection.turns.is_empty());
+        assert!(projection.transcript_blocks.is_empty());
+    }
+
+    fn session_with_review_result() -> AgentSession {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.begin_turn("Discuss the issue");
+        session.finish_active_turn(TurnStatus::Completed);
+        session.begin_turn("Review the issue changes");
+        let result_message_id = session.push_message(MessageRole::Assistant, "Review findings");
+        session.review = Some(SessionReview {
+            target: IssueReviewTarget::BaseBranch {
+                branch: "main".into(),
+            },
+            source_session_id: Some(Uuid::new_v4()),
+            status: IssueReviewStatus::Completed,
+            summary: Some("One issue found".into()),
+            result_message_id: Some(result_message_id),
+            fix_session_id: Some(Uuid::new_v4()),
+        });
+        session
+    }
+
+    #[test]
+    fn truncating_a_review_result_clears_its_output_and_fix_identity() {
+        let mut session = session_with_review_result();
+        let before = session.review.clone().unwrap();
+        session.finish_active_turn(TurnStatus::Completed);
+        session.updated_at = unix_time().saturating_add(60);
+        let revision = session.updated_at;
+        session.truncate_after_turn(1);
+        assert!(session.updated_at > revision);
+        let review = session.review.as_ref().unwrap();
+        assert_eq!(review.target, before.target);
+        assert_eq!(review.source_session_id, before.source_session_id);
+        assert_eq!(review.status, IssueReviewStatus::Interrupted);
+        assert!(review.result_message_id.is_none());
+        assert!(review.summary.is_none());
+        assert!(review.fix_session_id.is_none());
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|message| Some(message.id) == before.result_message_id)
+        );
+    }
+
+    #[test]
+    fn truncating_after_a_retained_review_does_not_invalidate_it() {
+        let mut session = session_with_review_result();
+        let before = session.review.clone();
+        session.finish_active_turn(TurnStatus::Completed);
+        session.begin_turn("Discuss the findings");
+        session.push_message(MessageRole::Assistant, "A later reply");
+        session.finish_active_turn(TurnStatus::Completed);
+        session.truncate_after_turn(2);
+        assert_eq!(session.review, before);
+        session.truncate_after_turn(2);
+        assert_eq!(session.review, before);
+    }
+
+    #[test]
+    fn releasing_review_history_preserves_result_identity_in_the_catalog() {
+        let mut session = session_with_review_result();
+        let before = session.review.clone();
+        session.finish_active_turn(TurnStatus::Completed);
+        session.release_transcript();
+        assert_eq!(session.review, before);
+        assert!(!session.detail_loaded);
+        assert!(session.messages.is_empty());
+        // Missing detail is not evidence that a destructive edit removed the
+        // referenced result. A skeleton must keep its promoted metadata.
+        session.truncate_after_turn(0);
+        assert_eq!(session.review, before);
+    }
+
+    #[test]
+    fn unwinding_an_unstarted_turn_clears_a_removed_review_result() {
+        let mut session = session_with_review_result();
+        let before = session.review.clone().unwrap();
+        let turn_id = session.active_turn_id().unwrap();
+        session.updated_at = unix_time().saturating_add(60);
+        let revision = session.updated_at;
+        session.unwind_unstarted_turn(turn_id);
+        assert!(session.updated_at > revision);
+        let review = session.review.as_ref().unwrap();
+        assert_eq!(review.target, before.target);
+        assert_eq!(review.source_session_id, before.source_session_id);
+        assert_eq!(review.status, IssueReviewStatus::Interrupted);
+        assert!(review.result_message_id.is_none());
+        assert!(review.summary.is_none());
+        assert!(review.fix_session_id.is_none());
+    }
+
+    #[test]
+    fn a_review_draft_only_allows_codex_models() {
+        let mut session = session_with_review_result();
+        session.messages.clear();
+        session.turns.clear();
+        session.review.as_mut().unwrap().status = IssueReviewStatus::Draft;
+        assert!(session.can_choose_model(ProviderKind::Codex));
+        assert!(!session.can_choose_model(ProviderKind::Pi));
+        assert!(!session.can_choose_model(ProviderKind::Claude));
+        session.status = SessionStatus::Working;
+        assert!(!session.can_choose_model(ProviderKind::Codex));
+    }
+
+    #[test]
+    fn correction_provenance_round_trips_and_survives_catalog_projection() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        assert!(session.review_correction_source_id.is_none());
+        let source_id = Uuid::new_v4();
+        session.review_correction_source_id = Some(source_id);
+        let mut value = serde_json::to_value(&session).unwrap();
+        assert_eq!(value["review_correction_source_id"], source_id.to_string());
+        let restored: AgentSession = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored.review_correction_source_id, Some(source_id));
+        assert_eq!(
+            session.list_projection().review_correction_source_id,
+            Some(source_id)
+        );
+        session.release_transcript();
+        assert_eq!(session.review_correction_source_id, Some(source_id));
+
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("review_correction_source_id");
+        let legacy: AgentSession = serde_json::from_value(value).unwrap();
+        assert!(legacy.review_correction_source_id.is_none());
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("review_correction_source_id")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_ordinary_fork_preserves_correction_provenance() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Pi);
+        let source_id = Uuid::new_v4();
+        session.review_correction_source_id = Some(source_id);
+        session.begin_turn("Fix the review findings");
+        session.push_message(MessageRole::Assistant, "The fixes are ready");
+        session.finish_active_turn(TurnStatus::Completed);
+        let fork = session
+            .fork_through_turn(
+                1,
+                ProviderResumeCursor::from_session_id(ProviderKind::Pi, "forked-correction".into()),
+                "Continue the correction",
+            )
+            .unwrap();
+        assert!(fork.review.is_none());
+        assert_eq!(fork.review_correction_source_id, Some(source_id));
+        assert_eq!(session.review_correction_source_id, Some(source_id));
+    }
+
+    #[test]
+    fn an_ordinary_fork_does_not_inherit_native_review_identity() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.begin_turn("Review the issue changes");
+        let result_message_id = session.push_message(MessageRole::Assistant, "Review findings");
+        session.finish_active_turn(TurnStatus::Completed);
+        let review = SessionReview {
+            target: IssueReviewTarget::UncommittedChanges,
+            source_session_id: Some(Uuid::new_v4()),
+            status: IssueReviewStatus::Completed,
+            summary: Some("One issue found".into()),
+            result_message_id: Some(result_message_id),
+            fix_session_id: Some(Uuid::new_v4()),
+        };
+        session.review = Some(review.clone());
+        let fork = session
+            .fork_through_turn(
+                1,
+                ProviderResumeCursor::Codex {
+                    thread_id: "forked-review".into(),
+                },
+                "Discuss findings",
+            )
+            .unwrap();
+        assert!(fork.review.is_none());
+        assert_eq!(session.review, Some(review));
+        assert_eq!(fork.messages[1].content, "Review findings");
     }
 
     #[test]

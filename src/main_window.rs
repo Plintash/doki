@@ -677,6 +677,7 @@ mod tests {
     /// this test paints.
     #[gpui::test]
     fn the_window_paints_before_the_daemon_answers(cx: &mut TestAppContext) {
+        let _locale = crate::test_locale::TestLocale::new(AppLanguage::English);
         let connections = Arc::new(AtomicUsize::new(0));
         let connector: DaemonConnector = {
             let connections = connections.clone();
@@ -733,6 +734,7 @@ mod tests {
     /// leave the window unchanged.
     #[gpui::test]
     fn the_window_paints_the_persisted_preferences_before_it_hydrates(cx: &mut TestAppContext) {
+        let _locale = crate::test_locale::TestLocale::new(AppLanguage::English);
         let preferences = AppSettings {
             theme: ThemePreference::Dark,
             language: AppLanguage::Japanese,
@@ -788,10 +790,8 @@ mod tests {
             window.update(cx, |_, window, _| window.rem_size()).unwrap(),
             px(18.0)
         );
-
-        // The locale is process-global; leave it where the rest of the binary
-        // expects it.
-        crate::i18n::set_language(AppLanguage::English);
+        // Finish the deferred connection attempt before releasing the locale.
+        cx.run_until_parked();
     }
 
     /// A connection request belongs to the application, not to the window that
@@ -801,6 +801,7 @@ mod tests {
     /// of starting a second daemon.
     #[gpui::test]
     fn a_window_opened_while_a_connection_is_in_flight_joins_it(cx: &mut TestAppContext) {
+        let _locale = crate::test_locale::TestLocale::new(AppLanguage::English);
         let connections = Arc::new(AtomicUsize::new(0));
         let connector = |connections: Arc<AtomicUsize>| -> DaemonConnector {
             Arc::new(move || {
@@ -850,6 +851,7 @@ mod tests {
     /// the window that happened to ask for it.
     #[gpui::test]
     fn a_connection_answer_outlives_the_window_that_asked_for_it(cx: &mut TestAppContext) {
+        let _locale = crate::test_locale::TestLocale::new(AppLanguage::English);
         let connections = Arc::new(AtomicUsize::new(0));
         let connector: DaemonConnector = {
             let connections = connections.clone();
@@ -931,6 +933,7 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[gpui::test]
     fn a_window_with_nothing_unsaved_answers_the_close(cx: &mut TestAppContext) {
+        let _locale = crate::test_locale::TestLocale::new(AppLanguage::English);
         let window =
             cx.update(|cx| open_main_window_with(cx, unreachable_daemon(), AppSettings::default()));
         cx.run_until_parked();
@@ -953,6 +956,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[gpui::test]
     fn linux_native_close_waits_for_the_callback_to_return(cx: &mut TestAppContext) {
+        let _locale = crate::test_locale::TestLocale::new(AppLanguage::English);
         let window =
             cx.update(|cx| open_main_window_with(cx, unreachable_daemon(), AppSettings::default()));
         let mut visual = VisualTestContext::from_window(*window, cx);
@@ -982,6 +986,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[gpui::test]
     fn linux_native_close_removes_a_failed_window(cx: &mut TestAppContext) {
+        let _locale = crate::test_locale::TestLocale::new(AppLanguage::English);
         let window =
             cx.update(|cx| open_main_window_with(cx, unreachable_daemon(), AppSettings::default()));
         cx.run_until_parked();
@@ -1002,6 +1007,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[gpui::test]
     fn a_pending_linux_close_cannot_remove_a_replacement_window(cx: &mut TestAppContext) {
+        let _locale = crate::test_locale::TestLocale::new(AppLanguage::English);
         let original =
             cx.update(|cx| open_main_window_with(cx, unreachable_daemon(), AppSettings::default()));
         assert!(!VisualTestContext::from_window(*original, cx).simulate_close());

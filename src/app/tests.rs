@@ -2191,6 +2191,7 @@ fn plain_settled_response_does_not_add_an_empty_work_fold() {
 
 #[test]
 fn worked_duration_uses_readable_units() {
+    let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
     assert_eq!(format_worked_duration(1), "1 second");
     assert_eq!(format_worked_duration(28), "28 seconds");
     assert_eq!(format_worked_duration(60), "1 minute");
@@ -2200,6 +2201,7 @@ fn worked_duration_uses_readable_units() {
 
 #[test]
 fn sidebar_time_labels_prefer_the_live_turn_over_the_last_reply() {
+    let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
     use super::sidebar::{format_time_ago, session_time_label};
 
     assert_eq!(format_time_ago(0), "just now");
@@ -2284,6 +2286,7 @@ fn time_label_wakes_land_exactly_on_label_boundaries() {
 
 #[test]
 fn working_elapsed_stays_compact() {
+    let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
     assert_eq!(format_working_elapsed(0), "0s");
     assert_eq!(format_working_elapsed(9), "9s");
     assert_eq!(format_working_elapsed(59), "59s");
@@ -2398,6 +2401,7 @@ fn model_picker_highlight_wraps_at_both_ends() {
 
 #[test]
 fn settings_search_filters_pages_for_arrow_cycling() {
+    let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
     use super::SettingsPage;
 
     let pages = |query: &str| {

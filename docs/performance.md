@@ -23,7 +23,7 @@ price:
 | --- | --- | --- |
 | `cx.notify(view)` | Re-renders that view and its ancestors; **cached sibling panes replay** | The stream pump (per commit), the pulse and dissolve clocks, user-event handlers |
 | `window.refresh()` | Re-renders everything and **bypasses every cached pane** | Genuine whole-window invalidation only: hover transitions, drags, theme |
-| `request_animation_frame` | Display-rate (120 Hz) re-render of the current view for as long as it re-arms | Nothing during streaming. One mounted repeating `with_animation` pinned the window at 120 Hz for a whole turn (~36% CPU by itself). The one sanctioned transient: the 200 ms panel show/hide slide ([src/app/render.rs](../src/app/render.rs)), which re-arms only while an edge is moving and gates the pane fan-out (below) |
+| `request_animation_frame` | Display-rate (120 Hz) re-render of the current view for as long as it re-arms | Nothing during streaming. One mounted repeating `with_animation` pinned the window at 120 Hz for a whole turn (~36% CPU by itself). The one sanctioned transient: the 200 ms panel show/hide and titlebar-clearance slides ([src/app/render.rs](../src/app/render.rs)), which re-arms only while an edge is moving and gates the pane fan-out (below) |
 
 The root `Waku` view re-renders on every frame regardless of what is dirty, so
 it must stay thin: the sidebar, transcript, and right panel are `WakuPane`
@@ -35,7 +35,7 @@ rebuilds only that island and replays the rest.
 
 The one exception to that fan-out is the 200 ms panel slide: its display-rate
 root notifies would price every tick at a three-island rebuild, so while
-`panels_sliding()` the observer skips the fan-out and the cached-view keys
+`panels_sliding()` or the titlebar-clearance tween is active, the observer skips the fan-out and the cached-view keys
 decide instead — the sliding panel (its clip moves) and the transcript (its
 bounds move) miss their caches and rebuild with fresh state anyway, while the
 island nothing is moving replays. Updates born inside an island still land
@@ -231,6 +231,11 @@ and the boundary with
   ms in the debug build
   (`cargo test --locked -p waku --lib bench_markdown_frame -- --ignored
   --nocapture`).
+- Active sent-message anchors use the
+  [transcript-owned scroll reserve](streaming-scroll-reserve.md): measured
+  growth advances an explicit viewport offset, and upward input consumes
+  retained blank space. The Markdown-only spring below remains the
+  unanchored-session fallback.
 - The live response body **reports a leading container height**
   (`MarkdownView::advance_clip`, [src/md/render.rs](../src/md/render.rs)). Text
   layout grows the row in whole-line steps, and the row's height is what the

@@ -16,11 +16,80 @@ use crate::ui::{icon, tooltip::Tooltip};
 
 const CLIENT_FRAME_INSET: f32 = 10.0;
 const CLIENT_FRAME_ROUNDING: f32 = 10.0;
+pub(super) const TITLEBAR_BUTTON_SIZE: f32 = 26.0;
+pub(super) const HISTORY_MARGIN: f32 = 6.0;
+pub(super) const HISTORY_GAP: f32 = 2.0;
+pub(super) const MACOS_TRAFFIC_LIGHT_CLEARANCE: f32 = 86.0;
+const NAVIGATION_WIDTH: f32 = TITLEBAR_BUTTON_SIZE * 3.0 + HISTORY_MARGIN + HISTORY_GAP;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const CLIENT_CONTROLS_PADDING: f32 = 10.0;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const CLIENT_CONTROLS_GAP: f32 = 8.0;
 
 #[derive(Clone, Copy)]
 pub(super) enum WindowControlSide {
     Left,
     Right,
+}
+
+/// Native traffic lights are AppKit-owned and disappear in fullscreen. Keep
+/// only the ordinary edge inset there; never change their native position.
+pub(super) fn native_titlebar_clearance(macos: bool, fullscreen: bool) -> f32 {
+    if macos && !fullscreen {
+        MACOS_TRAFFIC_LIGHT_CLEARANCE
+    } else {
+        8.0
+    }
+}
+
+/// One short, interruptible transition shared by every titlebar surface.
+#[derive(Default)]
+pub(super) struct TitlebarClearance {
+    target: Option<f32>,
+    width: f32,
+    slide: Option<crate::ui::motion::WidthTween>,
+}
+
+impl TitlebarClearance {
+    pub(super) fn is_sliding(&self) -> bool {
+        self.slide.is_some()
+    }
+
+    pub(super) fn width(&self) -> f32 {
+        self.width
+    }
+
+    pub(super) fn settle(&mut self, target: f32, reduce_motion: bool) -> bool {
+        if self.target != Some(target) {
+            self.slide = self
+                .target
+                .filter(|_| !reduce_motion)
+                .map(|_| crate::ui::motion::WidthTween::new(self.width));
+            self.target = Some(target);
+            if self.slide.is_some() {
+                // Keep the first frame exactly at the last painted position.
+                return true;
+            }
+        }
+        if reduce_motion {
+            self.slide = None;
+        }
+        match self.slide.and_then(|slide| slide.width_toward(target)) {
+            Some(width) => self.width = width,
+            None => {
+                self.slide = None;
+                self.width = target;
+            }
+        }
+        self.slide.is_some()
+    }
+}
+
+/// The navigation group stays anchored to the window while the panel edge
+/// moves underneath it. The content yields only until it has cleared that
+/// group, with no ownership switch at either end of a sidebar transition.
+fn titlebar_content_inset(sidebar_width: f32, navigation_end: f32) -> f32 {
+    (navigation_end + 14.0 - sidebar_width).max(14.0)
 }
 
 /// Draw the frame a Wayland compositor delegates back to the client.
@@ -101,6 +170,39 @@ pub(crate) fn render_window_frame(
 }
 
 impl Waku {
+    pub(super) fn titlebar_navigation_width(&self, window: &Window, cx: &App) -> f32 {
+        self.titlebar_clearance.width()
+            + self.left_client_controls_width(window, cx)
+            + NAVIGATION_WIDTH
+    }
+
+    pub(super) fn titlebar_content_inset(&self, window: &Window, cx: &App) -> f32 {
+        titlebar_content_inset(
+            self.sidebar_rendered_width,
+            self.titlebar_navigation_width(window, cx),
+        )
+    }
+
+    fn left_client_controls_width(&self, window: &Window, cx: &App) -> f32 {
+        #[cfg(target_os = "linux")]
+        if matches!(window.window_decorations(), Decorations::Client { .. }) {
+            let count = cx
+                .button_layout()
+                .unwrap_or_else(WindowButtonLayout::linux_default)
+                .left
+                .into_iter()
+                .flatten()
+                .count();
+            if count > 0 {
+                return CLIENT_CONTROLS_PADDING * 2.0
+                    + count as f32 * TITLEBAR_BUTTON_SIZE
+                    + (count - 1) as f32 * CLIENT_CONTROLS_GAP;
+            }
+        }
+        let _ = (window, cx);
+        0.0
+    }
+
     /// Render the window controls Waku owns: the desktop's configured button
     /// order when GPUI had to fall back from server-side to client-side
     /// decorations, and the platform order on Windows.
@@ -170,10 +272,10 @@ impl Waku {
                     .tab_stop(false)
                     .h_full()
                     .flex_none()
-                    .px(px(10.0))
+                    .px(px(CLIENT_CONTROLS_PADDING))
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(CLIENT_CONTROLS_GAP))
                     .children(controls)
                     .into_any_element(),
             )
@@ -242,7 +344,7 @@ fn client_window_button(
         .track_focus(&focus)
         .tab_index(0)
         .tab_stop(true)
-        .size(px(26.0))
+        .size(px(TITLEBAR_BUTTON_SIZE))
         .flex_none()
         .rounded_full()
         .flex()
@@ -418,4 +520,61 @@ fn client_resize_handle(edge: ResizeEdge, inset: gpui::Pixels) -> AnyElement {
             window.start_window_resize(edge);
         })
         .into_any_element()
+}
+
+#[cfg(test)]
+mod titlebar_layout_tests {
+    use super::*;
+
+    #[test]
+    fn native_clearance_matches_actual_window_mode() {
+        assert_eq!(native_titlebar_clearance(true, false), 86.0);
+        assert_eq!(native_titlebar_clearance(true, true), 8.0);
+        assert_eq!(native_titlebar_clearance(false, false), 8.0);
+        assert_eq!(native_titlebar_clearance(false, true), 8.0);
+    }
+
+    #[test]
+    fn content_clears_navigation_through_the_entire_sidebar_slide() {
+        for clearance in [8.0, 30.0, 86.0] {
+            let end = clearance + 86.0;
+            let mut previous = f32::INFINITY;
+            for width in 0..=300 {
+                let width = width as f32;
+                let inset = titlebar_content_inset(width, end);
+                assert!(width + inset >= end + 14.0);
+                assert!(inset >= 14.0);
+                assert!(inset <= previous);
+                if previous.is_finite() {
+                    assert!(previous - inset <= 1.0);
+                }
+                previous = inset;
+            }
+            assert_eq!(titlebar_content_inset(0.0, end), end + 14.0);
+            assert_eq!(titlebar_content_inset(260.0, end), 14.0);
+        }
+    }
+
+    #[test]
+    fn first_frame_and_reduce_motion_have_no_transition() {
+        let mut clearance = TitlebarClearance::default();
+        assert!(!clearance.settle(86.0, false));
+        assert_eq!(clearance.width(), 86.0);
+        assert!(clearance.settle(8.0, false));
+        assert!(!clearance.settle(8.0, true));
+        assert_eq!(clearance.width(), 8.0);
+        assert!(!clearance.settle(86.0, true));
+        assert_eq!(clearance.width(), 86.0);
+    }
+
+    #[test]
+    fn interrupted_clearance_restarts_from_last_displayed_position() {
+        let mut clearance = TitlebarClearance {
+            target: Some(8.0),
+            width: 30.0,
+            slide: Some(crate::ui::motion::WidthTween::new(86.0)),
+        };
+        assert!(clearance.settle(86.0, false));
+        assert_eq!(clearance.width(), 30.0);
+    }
 }

@@ -82,33 +82,148 @@ impl TaskCompletionStop {
     }
 }
 
-/// Roll back only a rejected Done transition, never the issue's edited content.
+/// Placement snapshots deliberately exclude editable issue content.
+#[derive(Clone, Copy)]
+struct TaskPlacement {
+    project: Option<Uuid>,
+    state: TaskState,
+    position: i64,
+    stage_id: Option<Uuid>,
+    completed_at: Option<u64>,
+}
+impl TaskPlacement {
+    fn of(task: &Task) -> Self {
+        Self {
+            project: task.project_id(),
+            state: task.state,
+            position: task.position,
+            stage_id: task.stage_id,
+            completed_at: task.completed_at,
+        }
+    }
+    fn restore(self, task: &mut Task) {
+        task.state = self.state;
+        task.position = self.position;
+        task.stage_id = self.stage_id;
+        task.completed_at = self.completed_at;
+        task.touch();
+    }
+}
+
+/// One save attempt retains both its acknowledged baseline and sent placement.
 #[derive(Clone, Copy)]
 pub(super) struct TaskCompletionSaveRollback {
     attempt: Uuid,
-    state: TaskState,
-    position: i64,
+    before: TaskPlacement,
+    after: TaskPlacement,
 }
-
 impl TaskCompletionSaveRollback {
     fn begin(task: &mut Task) -> Self {
-        let rollback = Self {
-            attempt: Uuid::new_v4(),
-            state: task.state,
-            position: task.position,
-        };
+        let before = TaskPlacement::of(task);
         task.set_state(TaskState::Done);
-        rollback
+        Self {
+            attempt: Uuid::new_v4(),
+            before,
+            after: TaskPlacement::of(task),
+        }
     }
-
+    pub(super) fn move_to(
+        task: &mut Task,
+        state: TaskState,
+        stage: Option<&crate::model::BoardStage>,
+        position: i64,
+    ) -> Self {
+        let before = TaskPlacement::of(task);
+        if let Some(stage) = stage {
+            task.set_stage(stage, position);
+        } else {
+            task.set_state(state);
+            task.stage_id = task
+                .project_id()
+                .map(|id| crate::model::canonical_stage_id(id, state));
+            task.position = position;
+            task.touch();
+        }
+        Self {
+            attempt: Uuid::new_v4(),
+            before,
+            after: TaskPlacement::of(task),
+        }
+    }
     fn apply(&self, attempt: Uuid, task: &mut Task) -> bool {
-        if self.attempt != attempt || !task.state.is_done() {
+        if self.attempt != attempt
+            || task.project_id() != self.after.project
+            || task.state != self.after.state
+            || task.stage_id != self.after.stage_id
+        {
             return false;
         }
-        task.set_state(self.state);
-        task.position = self.position;
+        self.before.restore(task);
         true
     }
+    fn rebase(&mut self, previous: Self, saved: bool) {
+        // A workspace reassignment owns its own destination; never restore a
+        // previous project's stage into that new owner.
+        if self.before.project == previous.after.project {
+            self.before = if saved {
+                previous.after
+            } else {
+                previous.before
+            };
+        }
+    }
+}
+
+fn register_placement_save(
+    pending: &mut HashMap<Uuid, TaskCompletionSaveRollback>,
+    task_id: Uuid,
+    mut next: TaskCompletionSaveRollback,
+) {
+    if let Some(previous) = pending.get(&task_id) {
+        next.rebase(*previous, false);
+    }
+    pending.insert(task_id, next);
+}
+
+fn reconcile_placement_saves(
+    pending: &mut HashMap<Uuid, TaskCompletionSaveRollback>,
+    local: &[Task],
+    remote: &[Task],
+) {
+    for task in remote {
+        if local
+            .iter()
+            .find(|local| local.id == task.id)
+            .is_none_or(|local| task.updated_at >= local.updated_at)
+        {
+            pending.remove(&task.id);
+        }
+    }
+}
+
+fn settle_placement_saves(
+    pending: &mut HashMap<Uuid, TaskCompletionSaveRollback>,
+    tasks: &mut [Task],
+    attempts: &[(Uuid, TaskCompletionSaveRollback)],
+    saved: bool,
+) -> bool {
+    let mut changed = false;
+    for (task_id, sent) in attempts {
+        let Some(current) = pending.get_mut(task_id) else {
+            continue;
+        };
+        if current.attempt != sent.attempt {
+            // Later moves are coalesced but not sent yet. Their rollback must
+            // follow what this completed save actually acknowledged.
+            current.rebase(*sent, saved);
+            continue;
+        }
+        let rollback = pending.remove(task_id).unwrap();
+        if !saved && let Some(task) = tasks.iter_mut().find(|task| task.id == *task_id) {
+            changed |= rollback.apply(sent.attempt, task);
+        }
+    }
+    changed
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,38 +285,57 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(current) = self
-            .state
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .map(|task| task.state)
-        else {
+        self.move_task_to_stage(task_id, state, None, window, cx);
+    }
+
+    pub(super) fn move_task_to_stage(
+        &mut self,
+        task_id: Uuid,
+        state: TaskState,
+        stage: Option<crate::model::BoardStage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = self.state.tasks.iter().find(|task| task.id == task_id) else {
             return;
         };
+        let current = task.state;
         if state.is_done() {
             if current != state {
                 self.request_task_completion(task_id, window, cx);
             }
             return;
         }
-        self.task_completion_save_rollbacks.remove(&task_id);
+        let target_id = stage.as_ref().map(|s| s.id).or_else(|| {
+            task_details::task_project_id(task)
+                .map(|project| crate::model::canonical_stage_id(project, state))
+        });
+        let unchanged = current == state && task.stage_id == target_id;
         self.task_completion_preflights.remove(&task_id);
-        // Choosing an active state also cancels a pending archive intent. Stops
-        // already sent to a provider cannot be undone, but no later ack archives it.
+        if self
+            .pending_task_completion
+            .as_ref()
+            .is_some_and(|pending| pending.task_id == task_id)
+        {
+            self.pending_task_completion = None;
+        }
+        // Cancels the archive intent; already sent stops remain valid.
         let cancelled = self.task_completion_stops.remove(&task_id).is_some();
-        if current == state {
+        if unchanged {
             if cancelled {
                 cx.notify();
             }
             return;
         }
         let position = self.next_task_position(state);
-        let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) else {
-            return;
-        };
-        task.set_state(state);
-        task.position = position;
+        let task = self
+            .state
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        let rollback = TaskCompletionSaveRollback::move_to(task, state, stage.as_ref(), position);
+        self.register_task_placement_save(task_id, rollback);
         self.sidebar_rows_fingerprint.set(None);
         self.save_task_changes(cx);
         cx.notify();
@@ -702,8 +836,7 @@ impl Waku {
                         continue;
                     };
                     let rollback = TaskCompletionSaveRollback::begin(task);
-                    self.task_completion_save_rollbacks
-                        .insert(task_id, rollback);
+                    self.register_task_placement_save(task_id, rollback);
                     self.unconfirmed_task_closes.remove(&task_id);
                     self.hide_toast();
                     self.sidebar_rows_fingerprint.set(None);
@@ -714,32 +847,42 @@ impl Waku {
         }
     }
 
-    pub(super) fn task_completion_save_attempts(&self) -> Vec<(Uuid, Uuid)> {
+    pub(super) fn register_task_placement_save(
+        &mut self,
+        task_id: Uuid,
+        rollback: TaskCompletionSaveRollback,
+    ) {
+        register_placement_save(&mut self.task_completion_save_rollbacks, task_id, rollback);
+    }
+
+    pub(super) fn reconcile_task_placement_saves(&mut self, remote: &[Task]) {
+        reconcile_placement_saves(
+            &mut self.task_completion_save_rollbacks,
+            &self.state.tasks,
+            remote,
+        );
+    }
+
+    pub(super) fn task_completion_save_attempts(&self) -> Vec<(Uuid, TaskCompletionSaveRollback)> {
         self.task_completion_save_rollbacks
             .iter()
-            .map(|(id, rollback)| (*id, rollback.attempt))
+            .map(|(id, rollback)| (*id, *rollback))
             .collect()
     }
 
-    pub(super) fn settle_task_completion_save(&mut self, attempts: &[(Uuid, Uuid)], saved: bool) {
-        for (task_id, attempt) in attempts {
-            let Some(rollback) = self
-                .task_completion_save_rollbacks
-                .get(task_id)
-                .copied()
-                .filter(|rollback| rollback.attempt == *attempt)
-            else {
-                continue;
-            };
-            self.task_completion_save_rollbacks.remove(task_id);
-            if !saved
-                && let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == *task_id)
-            {
-                if rollback.apply(*attempt, task) {
-                    super::rpa::daemon::model_changed();
-                    self.sidebar_rows_fingerprint.set(None);
-                }
-            }
+    pub(super) fn settle_task_completion_save(
+        &mut self,
+        attempts: &[(Uuid, TaskCompletionSaveRollback)],
+        saved: bool,
+    ) {
+        if settle_placement_saves(
+            &mut self.task_completion_save_rollbacks,
+            &mut self.state.tasks,
+            attempts,
+            saved,
+        ) {
+            super::rpa::daemon::model_changed();
+            self.sidebar_rows_fingerprint.set(None);
         }
     }
 
@@ -780,6 +923,170 @@ mod tests {
     use crate::model::{AgentSession, ProviderKind, SessionStatus, Task, TaskState};
     use std::collections::HashSet;
     use uuid::Uuid;
+
+    #[test]
+    fn moves_coalesced_behind_an_unrelated_save_keep_the_first_baseline() {
+        let project = uuid::Uuid::new_v4();
+        let board = crate::model::ProjectBoard::canonical(project);
+        let mut task = Task::new("Issue", TaskState::Doing, 7);
+        task.workspace = Some(crate::model::TaskWorkspace::Local {
+            project_id: project,
+        });
+        task.stage_id = Some(board.stages[1].id);
+        let id = task.id;
+        let mut pending = std::collections::HashMap::new();
+        for position in [3, 2, 1] {
+            let mut stage = board.stages[1].clone();
+            stage.id = uuid::Uuid::new_v4();
+            let next = TaskCompletionSaveRollback::move_to(
+                &mut task,
+                TaskState::Doing,
+                Some(&stage),
+                position,
+            );
+            super::register_placement_save(&mut pending, id, next);
+        }
+        let sent = pending[&id];
+        let mut tasks = vec![task];
+        super::settle_placement_saves(&mut pending, &mut tasks, &[(id, sent)], false);
+        assert_eq!(tasks[0].stage_id, Some(board.stages[1].id));
+        assert_eq!(tasks[0].position, 7);
+    }
+
+    #[test]
+    fn authoritative_newer_catalog_cannot_be_overwritten_by_failed_local_save() {
+        let project = uuid::Uuid::new_v4();
+        let board = crate::model::ProjectBoard::canonical(project);
+        let mut task = Task::new("Issue", TaskState::Backlog, 7);
+        task.workspace = Some(crate::model::TaskWorkspace::Local {
+            project_id: project,
+        });
+        task.stage_id = Some(board.stages[0].id);
+        let sent = TaskCompletionSaveRollback::move_to(
+            &mut task,
+            TaskState::Doing,
+            Some(&board.stages[1]),
+            3,
+        );
+        let id = task.id;
+        let mut remote = task.clone();
+        remote.position = 1;
+        remote.title = "Remote edit".into();
+        remote.touch();
+        let mut pending = std::collections::HashMap::from([(id, sent)]);
+        super::reconcile_placement_saves(&mut pending, &[task], &[remote.clone()]);
+        let mut tasks = vec![remote];
+        super::settle_placement_saves(&mut pending, &mut tasks, &[(id, sent)], false);
+        assert_eq!(tasks[0].stage_id, Some(board.stages[1].id));
+        assert_eq!(tasks[0].position, 1);
+        assert_eq!(tasks[0].title, "Remote edit");
+    }
+
+    #[test]
+    fn coalesced_moves_roll_back_to_the_last_acknowledged_placement() {
+        for (first_saved, second_saved) in [(false, false), (true, false), (false, true)] {
+            let project = uuid::Uuid::new_v4();
+            let board = crate::model::ProjectBoard::canonical(project);
+            let mut b = board.stages[1].clone();
+            b.id = uuid::Uuid::new_v4();
+            let mut c = b.clone();
+            c.id = uuid::Uuid::new_v4();
+            let mut task = Task::new("Original", TaskState::Doing, 7);
+            task.workspace = Some(crate::model::TaskWorkspace::Local {
+                project_id: project,
+            });
+            task.stage_id = Some(board.stages[1].id);
+            let first =
+                TaskCompletionSaveRollback::move_to(&mut task, TaskState::Doing, Some(&b), 3);
+            let second =
+                TaskCompletionSaveRollback::move_to(&mut task, TaskState::Doing, Some(&c), 1);
+            task.title = "Edited during save".into();
+            task.description = "Keep this edit too".into();
+            let id = task.id;
+            let mut tasks = vec![task];
+            let mut pending = std::collections::HashMap::from([(id, second)]);
+            super::settle_placement_saves(&mut pending, &mut tasks, &[(id, first)], first_saved);
+            let second_sent = pending[&id];
+            super::settle_placement_saves(
+                &mut pending,
+                &mut tasks,
+                &[(id, second_sent)],
+                second_saved,
+            );
+            let expected = if second_saved {
+                c.id
+            } else if first_saved {
+                b.id
+            } else {
+                board.stages[1].id
+            };
+            assert_eq!(tasks[0].stage_id, Some(expected));
+            assert_eq!(
+                tasks[0].position,
+                if second_saved {
+                    1
+                } else if first_saved {
+                    3
+                } else {
+                    7
+                }
+            );
+            assert_eq!(tasks[0].title, "Edited during save");
+            assert_eq!(tasks[0].description, "Keep this edit too");
+        }
+    }
+
+    #[test]
+    fn same_lifecycle_move_and_failed_save_restore_exact_placement() {
+        let project = uuid::Uuid::new_v4();
+        let board = crate::model::ProjectBoard::canonical(project);
+        let mut review = board.stages[1].clone();
+        review.id = uuid::Uuid::new_v4();
+        review.name = "Review".into();
+        let mut task = Task::new("Issue", TaskState::Doing, 7);
+        task.workspace = Some(crate::model::TaskWorkspace::Local {
+            project_id: project,
+        });
+        task.stage_id = Some(board.stages[1].id);
+        let revision = task.updated_at;
+        let rollback =
+            TaskCompletionSaveRollback::move_to(&mut task, TaskState::Doing, Some(&review), -2);
+        assert_eq!(task.stage_id, Some(review.id));
+        assert!(task.updated_at > revision);
+        assert!(rollback.apply(rollback.attempt, &mut task));
+        assert_eq!(task.stage_id, Some(board.stages[1].id));
+        assert_eq!(task.position, 7);
+        assert_eq!(task.completed_at, None);
+        task.set_stage(&review, 3);
+        TaskCompletionSaveRollback::move_to(&mut task, TaskState::Doing, None, -3);
+        assert_eq!(task.stage_id, Some(board.stages[1].id));
+    }
+
+    #[test]
+    fn completion_failure_restores_review_and_reopen_failure_restores_terminal_timestamp() {
+        let project = uuid::Uuid::new_v4();
+        let board = crate::model::ProjectBoard::canonical(project);
+        let mut review = board.stages[1].clone();
+        review.id = uuid::Uuid::new_v4();
+        let mut task = Task::new("Issue", TaskState::Doing, 8);
+        task.workspace = Some(crate::model::TaskWorkspace::Local {
+            project_id: project,
+        });
+        task.set_stage(&review, 8);
+        let rollback = TaskCompletionSaveRollback::begin(&mut task);
+        assert_eq!(task.stage_id, Some(board.stages[2].id));
+        assert!(rollback.apply(rollback.attempt, &mut task));
+        assert_eq!(task.stage_id, Some(review.id));
+        task.set_state(TaskState::Done);
+        let timestamp = task.completed_at;
+        let rollback =
+            TaskCompletionSaveRollback::move_to(&mut task, TaskState::Doing, Some(&review), 2);
+        assert_eq!(task.completed_at, None);
+        assert!(rollback.apply(rollback.attempt, &mut task));
+        assert_eq!(task.state, TaskState::Done);
+        assert_eq!(task.stage_id, Some(board.stages[2].id));
+        assert_eq!(task.completed_at, timestamp);
+    }
 
     #[test]
     fn resident_runtime_with_idle_snapshot_requires_confirmation_before_replay() {

@@ -464,6 +464,12 @@ impl DaemonTerminal {
         bail!("daemon terminals are not supported on this platform")
     }
 
+    /// This stub never opens a shell, so it has no output or sequence to retain.
+    /// Keep the attach API available without claiming terminal support.
+    pub fn retained_snapshot(&self) -> (Vec<u8>, u64) {
+        (Vec::new(), 0)
+    }
+
     pub fn size(&self) -> (u16, u16) {
         (0, 0)
     }

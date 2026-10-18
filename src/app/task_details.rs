@@ -22,10 +22,29 @@ pub(super) struct TaskDetail {
     session_ids: Vec<Uuid>,
     session_indices: Vec<usize>,
     session_focuses: HashMap<Uuid, FocusHandle>,
-    editor_layout: Option<(u64, bool, bool, bool)>,
+    editor_layout: Option<(
+        u64,
+        bool,
+        bool,
+        bool,
+        bool,
+        Option<(Uuid, u64)>,
+        Option<(u64, bool)>,
+    )>,
     attach_picker: Entity<attach_picker::TaskAttachPicker>,
     project_menu: ContextMenuHandle,
     workspace_menu: ContextMenuHandle,
+    pub(super) stage_menu: ContextMenuHandle,
+    pub(super) stage_result_picker: Option<stage_execution::StageResultPicker>,
+    pub(super) review_scope: issue_review::ReviewScope,
+    pub(super) review_view: issue_review::IssueReviewView,
+    pub(super) review_reference: Entity<TextInput>,
+}
+
+impl TaskDetail {
+    pub(super) fn invalidate_review_layout(&mut self) {
+        self.editor_layout = None;
+    }
 }
 
 /// An edited issue may have a debounced write waiting after its editor closes.
@@ -61,7 +80,7 @@ pub(super) fn task_project_id(task: &Task) -> Option<Uuid> {
     })
 }
 
-fn task_session_workspace(task: &Task) -> SessionWorkspace {
+pub(super) fn task_session_workspace(task: &Task) -> SessionWorkspace {
     match &task.workspace {
         Some(TaskWorkspace::Worktree { path, branch, .. }) => SessionWorkspace::Worktree {
             path: path.clone(),
@@ -74,12 +93,87 @@ fn task_session_workspace(task: &Task) -> SessionWorkspace {
     }
 }
 
-fn task_session_prompt(task: &Task) -> String {
+fn task_stage_layout_key(
+    task: &Task,
+    projects: &[Project],
+    enabled: impl Fn(ProviderKind) -> bool,
+) -> Option<(u64, bool)> {
+    let owner = projects
+        .iter()
+        .find(|project| Some(project.id) == task.project_id())?;
+    Some((
+        owner.board.revision,
+        owner
+            .board
+            .stage_for_task(task)
+            .and_then(|stage| stage.provider)
+            .is_some_and(enabled),
+    ))
+}
+
+fn update_task_workspace(task: &mut Task, workspace: TaskWorkspace) -> bool {
+    if task.workspace.as_ref() == Some(&workspace) {
+        return false;
+    }
+    let project_id = match &workspace {
+        TaskWorkspace::Local { project_id }
+        | TaskWorkspace::NewWorktree { project_id }
+        | TaskWorkspace::Worktree { project_id, .. } => *project_id,
+    };
+    if task.project_id() != Some(project_id) {
+        task.stage_id = Some(crate::model::canonical_stage_id(project_id, task.state));
+    }
+    task.workspace = Some(workspace);
+    task.touch();
+    true
+}
+
+fn task_session_uses_default_workspace(task: &Task, session: &AgentSession) -> bool {
+    task_project_id(task) == Some(session.project_id)
+        && task_session_workspace(task) == session.workspace
+}
+
+pub(super) fn task_session_prompt(task: &Task) -> String {
     let description = task.description.trim();
     if description.is_empty() {
         task.title.clone()
     } else {
         format!("{}\n\n{}", task.title.trim(), description)
+    }
+}
+
+fn task_development_draft(task: &Task, sessions: &[AgentSession]) -> Option<Uuid> {
+    let project_id = task_project_id(task)?;
+    let workspace = task_session_workspace(task);
+    sessions
+        .iter()
+        .find(|session| {
+            task_draft_follows_workspace(task.id, session)
+                && session.project_id == project_id
+                && session.workspace == workspace
+                && session.provider == ProviderKind::Pi
+        })
+        .map(|session| session.id)
+}
+
+fn task_draft_follows_workspace(task_id: Uuid, session: &AgentSession) -> bool {
+    session.task_id == Some(task_id)
+        && !session.has_started()
+        && !session.is_busy()
+        && session.review.is_none()
+        && session.stage_invocation.is_none()
+        // The correction owns its reviewed workspace even after the source
+        // review reruns, is rolled back, or leaves the issue/catalog.
+        && session.review_correction_source_id.is_none()
+}
+
+fn task_session_row_title(session: &AgentSession) -> String {
+    if session.has_started() || session.review.is_some() {
+        session.display_title().to_owned()
+    } else if let Some(invocation) = &session.stage_invocation {
+        format!("{} · {}", invocation.stage.name, tr!("board.draft_session"))
+    } else {
+        tr!("board.draft_session")
     }
 }
 
@@ -93,6 +187,27 @@ fn task_session_navigation_index(index: usize, count: usize, key: &str) -> Optio
         "home" => Some(0),
         "end" => Some(count - 1),
         _ => None,
+    }
+}
+
+/// Only live foreground work animates. Persisted review state alone must not
+/// keep an idle issue page requesting frames.
+fn task_session_status_icon(
+    status: SessionStatus,
+    review: Option<IssueReviewStatus>,
+) -> (&'static str, bool) {
+    match status {
+        SessionStatus::Working | SessionStatus::Connecting => ("icons/loader-circle.svg", true),
+        SessionStatus::Background => ("icons/hourglass.svg", false),
+        SessionStatus::Waiting => ("icons/alert.svg", false),
+        SessionStatus::Failed => ("icons/circle-alert.svg", false),
+        SessionStatus::Idle => match review {
+            Some(IssueReviewStatus::Completed) => ("icons/check.svg", false),
+            Some(IssueReviewStatus::Failed) => ("icons/circle-alert.svg", false),
+            Some(IssueReviewStatus::Interrupted) => ("icons/stop.svg", false),
+            Some(IssueReviewStatus::Running) => ("icons/hourglass.svg", false),
+            Some(IssueReviewStatus::Draft) | None => ("icons/compose.svg", false),
+        },
     }
 }
 
@@ -151,8 +266,10 @@ impl Waku {
         let row_focus = detail.session_focuses[&id].clone().tab_stop(true);
         detail.list.scroll_to_reveal_item(index + 1);
         let focus = if menu {
-            self.menu_handle(&format!("task-session-more-{id}"), cx)
-                .trigger_focus_handle()
+            self.transcript_control_focuses
+                .borrow_mut()
+                .entry(format!("issue-session-detach-{id}"))
+                .or_insert_with(|| cx.focus_handle().tab_stop(true))
                 .clone()
         } else {
             row_focus
@@ -245,6 +362,16 @@ impl Waku {
         description.update(cx, |input, cx| {
             input.set_content(task.description.clone(), cx)
         });
+        let review_reference = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .semantic_id("issue-review-reference")
+                .tab_stop(true)
+                .placeholder(tr!("review.reference_placeholder"))
+        });
+        cx.subscribe(&review_reference, |_: &mut Self, _, _: &InputEvent, cx| {
+            cx.notify()
+        })
+        .detach();
         let task_id = task.id;
         cx.subscribe(&title, move |this, input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Edited) {
@@ -310,6 +437,11 @@ impl Waku {
             attach_picker,
             project_menu: ContextMenuHandle::new(cx),
             workspace_menu: ContextMenuHandle::new(cx),
+            stage_menu: ContextMenuHandle::new(cx),
+            stage_result_picker: None,
+            review_scope: issue_review::ReviewScope::Uncommitted,
+            review_view: issue_review::IssueReviewView::default(),
+            review_reference,
         });
         let weak = cx.entity().downgrade();
         window.on_next_frame(move |window, cx| {
@@ -527,6 +659,41 @@ impl Waku {
             }))
     }
 
+    /// Shell-sized actions retain the same semantic IDs and keyboard behavior
+    /// as labeled task buttons. Their names live in tooltips, not page chrome.
+    pub(super) fn task_icon_action(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        path: &'static str,
+        enabled: bool,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let label = label.into();
+        let id = id.into();
+        let theme = Theme::current(cx);
+        let button = self.task_action_button(id.clone(), "", false, enabled, action, cx);
+        let focus = self.transcript_control_focuses.borrow()[id.as_ref()].clone();
+        button
+            .relative()
+            .child(crate::ui::tooltip::FocusHint::new(focus, label.clone()))
+            .aria_label(label.clone())
+            .size(px(28.0))
+            .px_0()
+            .border_color(gpui::transparent_black())
+            .tooltip(Tooltip::text(label))
+            .child(icon(
+                path,
+                14.0,
+                if enabled {
+                    theme.text_secondary
+                } else {
+                    theme.text_ghost
+                },
+            ))
+    }
+
     pub(super) fn start_task_session(
         &mut self,
         task_id: Uuid,
@@ -550,19 +717,14 @@ impl Waku {
             cx.notify();
             return;
         };
-        let draft = self
-            .state
-            .sessions
-            .iter()
-            .find(|session| session.task_id == Some(task_id) && !session.has_started())
-            .map(|session| session.id);
+        let draft = task_development_draft(&task, &self.state.sessions);
         self.reopen_task_for_continued_work(task_id, cx);
         let id = if let Some(id) = draft {
             // Repeated clicks reopen this issue's unsent draft, never a draft
             // that happens to share the same project with a different issue.
             id
         } else {
-            let mut session = self.state.new_session(project_id, self.state.last_provider);
+            let mut session = self.state.new_session(project_id, ProviderKind::Pi);
             session.task_id = Some(task_id);
             session.workspace = task_session_workspace(&task);
             let id = session.id;
@@ -604,27 +766,22 @@ impl Waku {
             .as_mut()
             .filter(|task| task.id == task_id)
         {
-            draft.workspace = Some(workspace);
-            draft.touch();
+            update_task_workspace(draft, workspace);
             cx.notify();
             return;
         }
         let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) else {
             return;
         };
-        if task.workspace.as_ref() == Some(&workspace) {
+        if !update_task_workspace(task, workspace) {
             return;
         }
-        task.workspace = Some(workspace);
-        task.touch();
         let session_workspace = task_session_workspace(task);
         let drafts = self
             .state
             .sessions
             .iter()
-            .filter(|session| {
-                session.task_id == Some(task_id) && !session.has_started() && !session.is_busy()
-            })
+            .filter(|session| task_draft_follows_workspace(task_id, session))
             .map(|session| session.id)
             .collect::<Vec<_>>();
         for id in drafts {
@@ -804,6 +961,19 @@ impl Waku {
             Some(TaskWorkspace::NewWorktree { .. }) => tr!("workspace.new_worktree"),
             _ => tr!("workspace.local"),
         };
+        let workspace_hint = match &task.workspace {
+            Some(TaskWorkspace::Worktree { branch, path, .. }) => {
+                format!("{branch} · {}", path.display())
+            }
+            Some(TaskWorkspace::Local { project_id }) => self
+                .state
+                .projects
+                .iter()
+                .find(|project| project.id == *project_id)
+                .map(|project| project.path.display().to_string())
+                .unwrap_or_else(|| label.clone()),
+            _ => label.clone(),
+        };
         let projectless = self
             .state
             .projects
@@ -820,7 +990,8 @@ impl Waku {
             MenuChip::new("task-detail-workspace")
                 .icon("icons/git-branch.svg", theme.text_tertiary)
                 .label(label)
-                .max_w(px(300.0)),
+                .max_w(px(300.0))
+                .tooltip(Tooltip::text(workspace_hint)),
             "task-detail-workspace-menu",
             &handle,
             MenuAlign::BelowLeft,
@@ -922,10 +1093,19 @@ impl Waku {
             .map(|(index, session)| (session.id, index, session.updated_at))
             .collect::<Vec<_>>();
         sessions.sort_by_key(|(_, _, updated)| std::cmp::Reverse(*updated));
+        let review_view = issue_review::issue_review_view(&task, &sessions, &self.state.sessions);
+        let review_revision = review_view
+            .latest
+            .map(|(id, index)| (id, self.state.sessions[index].updated_at));
+        let is_draft = self.is_task_draft(task_id);
+        let stage_layout = task_stage_layout_key(&task, &self.state.projects, |provider| {
+            self.provider_enabled(provider)
+        });
         let detail = self
             .task_detail
             .as_mut()
             .expect("task detail was initialized");
+        detail.review_view = review_view;
         let ids = sessions.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
         if detail.session_ids != ids {
             let prefix = detail
@@ -956,15 +1136,20 @@ impl Waku {
             detail
                 .list
                 .splice_focusable(prefix + 1..old_count + 1, focuses);
-            detail.list.clone().with_uniform_item_height(px(70.0));
+            detail.list.clone().with_uniform_item_height(px(62.0));
             detail.session_ids = ids;
         }
         detail.session_indices = sessions.into_iter().map(|(_, index, _)| index).collect();
         let editor_layout = (
             task.updated_at,
+            // Create can keep the same timestamp and editor entity, but adds
+            // review and conversation controls that change the row height.
+            is_draft,
             self.task_completion_stops.contains_key(&task_id),
             detail.title.read(cx).content().trim().is_empty(),
             detail.session_ids.is_empty(),
+            review_revision,
+            stage_layout,
         );
         if detail.editor_layout != Some(editor_layout) {
             detail.list.remeasure_items(0..1);
@@ -1016,15 +1201,11 @@ impl Waku {
         let theme = Theme::current(cx);
         let project = task_project_id(&task)
             .and_then(|id| self.state.projects.iter().find(|project| project.id == id));
+        let configured_stage = project
+            .and_then(|project| project.board.stage_for_task(task))
+            .is_some_and(|stage| stage.provider.is_some());
         let can_start = project.is_some();
         let completing = self.task_completion_stops.contains_key(&task_id);
-        let workspace_path = match &task.workspace {
-            Some(TaskWorkspace::Worktree { path, .. }) => Some(path.to_string_lossy().into_owned()),
-            Some(TaskWorkspace::Local { .. }) => {
-                project.map(|project| project.path.to_string_lossy().into_owned())
-            }
-            Some(TaskWorkspace::NewWorktree { .. }) | None => None,
-        };
         let project_picker = self.render_task_project_picker(&task, cx);
         let workspace_picker = self.render_task_workspace_picker(&task, cx);
         let attach = div()
@@ -1037,14 +1218,14 @@ impl Waku {
                 }
             }));
         let start = self
-            .task_action_button(
+            .task_icon_action(
                 "task-detail-new-session",
                 if task.state.is_done() {
-                    tr!("board.reopen_new_session")
+                    tr!("review.reopen_develop_pi")
                 } else {
-                    tr!("board.new_session")
+                    tr!("review.develop_pi")
                 },
-                true,
+                "icons/compose.svg",
                 can_start && !title_empty,
                 move |this, window, cx| this.start_task_session(task_id, window, cx),
                 cx,
@@ -1055,6 +1236,8 @@ impl Waku {
                 }
             }));
 
+        let stage = (!is_draft).then(|| self.render_stage_invocation_controls(task, cx));
+        let review = (!is_draft && !configured_stage).then(|| self.render_issue_review(task, cx));
         let editor = div()
             .track_focus(&editor_focus)
             .w_full()
@@ -1102,8 +1285,9 @@ impl Waku {
                             .border_color(if title_empty && !is_draft {
                                 theme.warning
                             } else {
-                                theme.border
+                                gpui::transparent_black()
                             })
+                            .hover(|style| style.border_color(theme.border))
                             .text_size(sp(20.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme.text)
@@ -1112,6 +1296,7 @@ impl Waku {
                     .when(title_empty && !is_draft, |element| {
                         element.child(
                             div()
+                                .pl(px(11.0))
                                 .text_size(sp(11.0))
                                 .text_color(theme.warning)
                                 .child(tr!("board.title_required")),
@@ -1125,31 +1310,19 @@ impl Waku {
                     .gap(px(6.0))
                     .child(
                         div()
-                            .text_size(sp(12.0))
-                            .text_color(theme.text_tertiary)
-                            .child(tr!("board.project_workspace")),
-                    )
-                    .child(
-                        div()
                             .flex()
                             .flex_wrap()
                             .items_center()
+                            // MenuChip contributes 7px; match the fields' 11px text inset.
+                            .pl(px(4.0))
                             .gap(px(8.0))
                             .child(project_picker)
                             .child(workspace_picker),
                     )
-                    .when_some(workspace_path, |element, path| {
-                        element.child(
-                            div()
-                                .text_size(sp(11.0))
-                                .text_color(theme.text_ghost)
-                                .whitespace_normal()
-                                .child(path),
-                        )
-                    })
                     .when(!can_start, |element| {
                         element.child(
                             div()
+                                .pl(px(11.0))
                                 .text_size(sp(12.0))
                                 .text_color(theme.warning)
                                 .child(tr!("board.choose_project_first")),
@@ -1162,7 +1335,7 @@ impl Waku {
                     .flex_col()
                     .gap(px(6.0))
                     .child(
-                        div().flex().items_center().child(
+                        div().pl(px(11.0)).flex().items_center().child(
                             div()
                                 .text_size(sp(12.0))
                                 .text_color(theme.text_tertiary)
@@ -1171,27 +1344,31 @@ impl Waku {
                     )
                     .child(
                         div()
+                            .mx(px(11.0))
                             .h(px(156.0))
                             .p(px(10.0))
                             .rounded(px(8.0))
                             .border_1()
                             .border_color(theme.border)
-                            .bg(theme.inset)
+                            .bg(gpui::transparent_black())
                             .text_size(sp(13.0))
                             .line_height(sp(21.0))
                             .text_color(theme.text)
                             .child(description),
                     ),
             )
+            .when_some(stage, |element, stage| element.child(stage))
+            .when_some(review, |element, review| element.child(review))
             .when(!is_draft, |element| {
                 element
-                    .child(div().h(px(1.0)).bg(theme.border))
+                    .child(div().mx(px(11.0)).h(px(1.0)).bg(theme.border))
                     .child(
                         div()
                             .flex()
                             .flex_wrap()
                             .items_center()
                             .gap(px(8.0))
+                            .px(px(11.0))
                             .child(
                                 div()
                                     .text_size(sp(14.0))
@@ -1201,38 +1378,55 @@ impl Waku {
                             )
                             .child(div().flex_1())
                             .child(attach)
-                            .child(start),
+                            .when(!configured_stage, |element| element.child(start)),
                     )
                     .when(session_count == 0, |element| {
                         element.child(
                             div()
                                 .py(px(30.0))
                                 .px(px(18.0))
-                                .rounded(px(10.0))
-                                .bg(theme.overlay)
                                 .flex()
                                 .flex_col()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(icon("icons/pencil.svg", 24.0, theme.text_tertiary))
                                 .child(
                                     div()
                                         .text_size(sp(13.0))
                                         .text_color(theme.text_secondary)
                                         .child(tr!("board.no_sessions")),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(sp(12.0))
-                                        .text_color(theme.text_tertiary)
-                                        .text_center()
-                                        .child(tr!("board.session_context_hint")),
                                 ),
                         )
                     })
             })
             .into_any_element();
         editor
+    }
+
+    fn detach_task_detail_session(
+        &mut self,
+        id: Uuid,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.unbind_session_from_task(id, cx);
+        // A draft cannot be detached. Keep its control focused when the
+        // operation was refused, so the user can act on the explanation.
+        if self
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.id == id && session.task_id.is_some())
+        {
+            return;
+        }
+        // The focused unlink control disappears with its row. Move to the
+        // nearest remaining conversation (or the editor).
+        if !self.focus_task_detail_session(index + 1, false, window, cx)
+            && !(index > 0 && self.focus_task_detail_session(index - 1, false, window, cx))
+        {
+            self.focus_task_detail_editor_tail(window, cx);
+        }
     }
 
     fn render_task_detail_session(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -1256,18 +1450,59 @@ impl Waku {
         };
         let focus = detail.session_focuses[&id].clone().tab_stop(true);
         let count = detail.session_ids.len();
-        let title = if session.has_started() {
-            session.display_title().to_owned()
-        } else {
-            tr!("board.draft_session")
-        };
+        let title = task_session_row_title(session);
         let provider = session.provider;
+        let is_draft_session = !session.has_started();
+        let review_state = session.review.as_ref().map(|review| review.status);
         let status =
             if session.status == SessionStatus::Idle && self.session_has_live_background_work(id) {
                 SessionStatus::Background
             } else {
                 session.status
             };
+        let status_label = match status {
+            SessionStatus::Working | SessionStatus::Connecting | SessionStatus::Background => {
+                tr!("board.running")
+            }
+            SessionStatus::Waiting => tr!("board.needs_you_short"),
+            SessionStatus::Failed => tr!("board.session_failed"),
+            SessionStatus::Idle => session
+                .review
+                .as_ref()
+                .map(issue_review::review_status_label)
+                .unwrap_or_else(|| {
+                    if session.has_started() {
+                        tr!("board.session_idle")
+                    } else {
+                        tr!("board.draft_session")
+                    }
+                }),
+        };
+        // Activity metadata, not updated_at: renaming/saving must not invent activity.
+        let activity_at = session
+            .last_reply_at
+            .into_iter()
+            .chain(session.turns.last().map(|turn| turn.started_at))
+            .chain(Some(session.created_at))
+            .max()
+            .unwrap_or(0);
+        let activity_label = i64::try_from(activity_at)
+            .ok()
+            .filter(|value| *value > 0)
+            .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
+            .map(|value| {
+                value
+                    .with_timezone(&Local)
+                    .format("%b %-d · %H:%M")
+                    .to_string()
+            });
+        let row_hint = activity_label.as_ref().map_or_else(
+            || status_label.clone(),
+            |time| format!("{status_label} · {time}"),
+        );
+        let show_workspace = self
+            .task_for_editor(detail.id)
+            .is_none_or(|task| !task_session_uses_default_workspace(task, session));
         let workspace_label = match &session.workspace {
             SessionWorkspace::Local => tr!("workspace.local"),
             SessionWorkspace::NewWorktree { .. } => tr!("workspace.new_worktree"),
@@ -1276,54 +1511,63 @@ impl Waku {
             }
         };
         let theme = Theme::current(cx);
+        let (status_path, animate_status) = task_session_status_icon(status, review_state);
+        let status_tint = if status == SessionStatus::Idle {
+            match review_state {
+                Some(IssueReviewStatus::Completed) => theme.success,
+                Some(IssueReviewStatus::Failed) => theme.danger,
+                Some(IssueReviewStatus::Interrupted) => theme.text_tertiary,
+                _ => theme.text_tertiary,
+            }
+        } else {
+            status_color(&theme, status)
+        };
+        let status_glyph = icon(status_path, 14.0, status_tint);
+        let status_glyph = if animate_status {
+            motion::spin_slow(status_glyph)
+        } else {
+            status_glyph.into_any_element()
+        };
         let menu = self.menu_handle(&format!("task-session-menu-{id}"), cx);
         let keyboard_menu = menu.clone();
         let weak = cx.entity().downgrade();
         let menu_items = move |_: &mut App| {
             let weak = weak.clone();
             vec![
-                MenuItem::new(tr!("board.detach_session"), move |_, cx| {
-                    let _ = weak.update(cx, |this, cx| this.unbind_session_from_task(id, cx));
+                MenuItem::new(tr!("board.detach_session"), move |window, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.detach_task_detail_session(id, index, window, cx)
+                    });
                 })
-                .semantic_id(format!("issue-session-detach-{id}")),
+                .semantic_id(format!("issue-session-detach-menu-{id}")),
             ]
         };
-        let more_handle = self.menu_handle(&format!("task-session-more-{id}"), cx);
-        let more = dropdown_menu(
-            icon_button(
-                SharedString::from(format!("task-session-more-button-{id}")),
-                "icons/ellipsis.svg",
-                theme,
-            )
-            .flex_none()
-            .focus_visible(|style| {
-                style
-                    .bg(theme.overlay_strong)
-                    .border_1()
-                    .border_color(theme.accent)
-            })
-            .on_click(|_, _, cx| cx.stop_propagation()),
-            SharedString::from(format!("task-session-more-menu-{id}")),
-            &more_handle,
-            MenuAlign::BelowRight,
-            menu_items.clone(),
+        let detach = self.task_icon_action(
+            format!("issue-session-detach-{id}"),
+            tr!("board.detach_session"),
+            "icons/unlink.svg",
+            true,
+            move |this, window, cx| this.detach_task_detail_session(id, index, window, cx),
+            cx,
         );
         let next_focus = focus.clone();
         let previous_focus = focus.clone();
         let row = div()
             .id(SharedString::from(format!("task-session-{id}")))
             .semantic_control(gpui::Role::Button, false)
-            .aria_label(title.clone())
+            .aria_label(format!("{title} · {row_hint}"))
+            .relative()
+            .child(crate::ui::tooltip::FocusHint::new(focus.clone(), row_hint))
             .track_focus(&focus)
             .tab_index(0)
             .tab_stop(true)
             .w_full()
-            .px(px(12.0))
-            .py(px(9.0))
-            .rounded(px(8.0))
+            // 10px padding + 1px focus border shares the editor's content baseline.
+            .px(px(10.0))
+            .py(px(8.0))
+            .rounded(px(6.0))
             .border_1()
-            .border_color(theme.border)
-            .bg(theme.raised)
+            .border_color(gpui::transparent_black())
             .flex()
             .flex_col()
             .gap(px(4.0))
@@ -1377,44 +1621,69 @@ impl Waku {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .text_size(sp(13.0))
-                            .line_height(sp(18.0))
-                            .text_color(theme.text)
-                            .child(single_line_label(&title)),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(sp(11.0))
-                            .text_color(status_color(&theme, status))
-                            .child(match status {
-                                SessionStatus::Working
-                                | SessionStatus::Connecting
-                                | SessionStatus::Background => tr!("board.running"),
-                                SessionStatus::Waiting => tr!("board.needs_you_short"),
-                                SessionStatus::Failed => tr!("board.session_failed"),
-                                SessionStatus::Idle => tr!("board.session_idle"),
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(sp(13.0))
+                                    .line_height(sp(18.0))
+                                    .text_color(theme.text)
+                                    .child(single_line_label(&title)),
+                            )
+                            .when_some(activity_label, |element, time| {
+                                element.child(
+                                    div()
+                                        .text_size(sp(11.0))
+                                        .line_height(sp(16.0))
+                                        .text_color(theme.text_tertiary)
+                                        .child(time),
+                                )
                             }),
                     )
-                    .child(more),
+                    .when(
+                        status != SessionStatus::Idle || review_state.is_some() || is_draft_session,
+                        |element| {
+                            element.child(
+                                div()
+                                    .id(SharedString::from(format!("issue-session-status-{id}")))
+                                    .size(px(28.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .tooltip(Tooltip::text(status_label))
+                                    .child(status_glyph),
+                            )
+                        },
+                    )
+                    .child(detach),
             )
-            .child(
-                div()
-                    .pl(px(22.0))
-                    .text_size(sp(11.5))
-                    .line_height(sp(16.0))
-                    .text_color(theme.text_tertiary)
-                    .truncate()
-                    .child(single_line_label(&workspace_label)),
-            );
+            .when(show_workspace, |element| {
+                element.child(
+                    div()
+                        .pl(px(22.0))
+                        .text_size(sp(11.5))
+                        .line_height(sp(16.0))
+                        .text_color(theme.text_tertiary)
+                        .truncate()
+                        .child(single_line_label(&workspace_label)),
+                )
+            });
         let row = context_menu(
             div().w_full().child(row),
             SharedString::from(format!("task-session-context-{id}")),
             &menu,
             menu_items,
         );
-        div().w_full().pb(px(8.0)).child(row).into_any_element()
+        div()
+            .w_full()
+            .child(row)
+            .when(index + 1 < count, |element| {
+                element.child(div().mx(px(11.0)).h(px(1.0)).bg(theme.border))
+            })
+            .into_any_element()
     }
 }
 
@@ -1422,6 +1691,42 @@ impl Waku {
 mod tests {
     use super::*;
     use crate::ui::SemanticControlExt;
+
+    #[test]
+    fn conversation_state_icons_only_animate_live_work() {
+        use IssueReviewStatus as Review;
+        use SessionStatus as Session;
+        for (review, path) in [
+            (Review::Draft, "icons/compose.svg"),
+            (Review::Running, "icons/hourglass.svg"),
+            (Review::Completed, "icons/check.svg"),
+            (Review::Interrupted, "icons/stop.svg"),
+            (Review::Failed, "icons/circle-alert.svg"),
+        ] {
+            assert_eq!(
+                task_session_status_icon(Session::Idle, Some(review)),
+                (path, false)
+            );
+        }
+        for state in [Session::Working, Session::Connecting] {
+            assert_eq!(
+                task_session_status_icon(state, Some(Review::Completed)),
+                ("icons/loader-circle.svg", true)
+            );
+        }
+        assert_eq!(
+            task_session_status_icon(Session::Waiting, Some(Review::Completed)),
+            ("icons/alert.svg", false)
+        );
+        assert_eq!(
+            task_session_status_icon(Session::Background, None),
+            ("icons/hourglass.svg", false)
+        );
+        assert_eq!(
+            task_session_status_icon(Session::Failed, None),
+            ("icons/circle-alert.svg", false)
+        );
+    }
 
     #[test]
     fn leaving_an_unchanged_issue_does_not_create_a_save() {
@@ -1465,6 +1770,162 @@ mod tests {
     }
 
     #[test]
+    fn development_draft_reuse_matches_workspace_and_preserves_review_corrections() {
+        let project_id = Uuid::new_v4();
+        let mut task = Task::new("Fix checkout", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local { project_id });
+        let mut fix = AgentSession::new(project_id, ProviderKind::Pi);
+        fix.task_id = Some(task.id);
+        let mut review = AgentSession::new(project_id, ProviderKind::Codex);
+        review.task_id = Some(task.id);
+        fix.review_correction_source_id = Some(review.id);
+        review.review = Some(SessionReview {
+            target: IssueReviewTarget::UncommittedChanges,
+            source_session_id: None,
+            status: IssueReviewStatus::Completed,
+            summary: None,
+            result_message_id: Some(Uuid::new_v4()),
+            fix_session_id: Some(fix.id),
+        });
+        let mut ordinary = AgentSession::new(project_id, ProviderKind::Pi);
+        ordinary.task_id = Some(task.id);
+        let ordinary_id = ordinary.id;
+        let mut sessions = vec![fix, review, ordinary];
+        assert_eq!(task_development_draft(&task, &sessions), Some(ordinary_id));
+        sessions.pop();
+        assert_eq!(task_development_draft(&task, &sessions), None);
+        assert!(!task_draft_follows_workspace(task.id, &sessions[0]));
+        issue_review::begin_review(&mut sessions[1]);
+        assert!(
+            sessions[1]
+                .review
+                .as_ref()
+                .unwrap()
+                .fix_session_id
+                .is_none()
+        );
+        assert_eq!(task_development_draft(&task, &sessions), None);
+        assert!(!task_draft_follows_workspace(task.id, &sessions[0]));
+        sessions.remove(1);
+        assert_eq!(task_development_draft(&task, &sessions), None);
+        assert!(!task_draft_follows_workspace(task.id, &sessions[0]));
+
+        task.workspace = Some(TaskWorkspace::Worktree {
+            project_id,
+            path: PathBuf::from("/fixture/review-b"),
+            branch: "review-b".into(),
+        });
+        assert_eq!(task_development_draft(&task, &sessions), None);
+        let mut next = AgentSession::new(project_id, ProviderKind::Pi);
+        next.task_id = Some(task.id);
+        next.workspace = task_session_workspace(&task);
+        let next_id = next.id;
+        sessions.push(next);
+        assert_eq!(task_development_draft(&task, &sessions), Some(next_id));
+        sessions.last_mut().unwrap().project_id = Uuid::new_v4();
+        assert_eq!(task_development_draft(&task, &sessions), None);
+    }
+
+    #[test]
+    fn stage_configuration_and_provider_availability_invalidate_editor_measurement() {
+        let mut project = Project::from_path(std::path::PathBuf::from("/fixture"));
+        let mut task = Task::new("Issue", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local {
+            project_id: project.id,
+        });
+        task.stage_id = Some(project.board.stages[1].id);
+        let initial_revision = task.updated_at;
+        let initial = super::task_stage_layout_key(&task, &[project.clone()], |_| false);
+        project.board.revision += 1;
+        project.board.stages[1].provider = Some(ProviderKind::Amp);
+        let configured = super::task_stage_layout_key(&task, &[project.clone()], |_| false);
+        let available = super::task_stage_layout_key(&task, &[project], |_| true);
+        assert_ne!(initial, configured);
+        assert_ne!(configured, available);
+        assert_eq!(task.updated_at, initial_revision);
+    }
+
+    #[test]
+    fn workspace_project_change_resets_current_stage_but_same_owner_keeps_it() {
+        let project = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        let custom_stage = Uuid::new_v4();
+        let mut task = Task::new("Issue", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local {
+            project_id: project,
+        });
+        task.stage_id = Some(custom_stage);
+        let before = task.updated_at;
+        assert!(super::update_task_workspace(
+            &mut task,
+            TaskWorkspace::NewWorktree {
+                project_id: project
+            }
+        ));
+        assert_eq!(task.stage_id, Some(custom_stage));
+        assert!(task.updated_at > before);
+        assert!(super::update_task_workspace(
+            &mut task,
+            TaskWorkspace::Local {
+                project_id: destination
+            }
+        ));
+        assert_eq!(
+            task.stage_id,
+            Some(crate::model::canonical_stage_id(
+                destination,
+                TaskState::Doing
+            ))
+        );
+        assert_eq!(task.state, TaskState::Doing);
+    }
+
+    #[test]
+    fn stage_draft_titles_use_the_persisted_stage_snapshot() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
+        let project = Uuid::new_v4();
+        let mut session = AgentSession::new(project, ProviderKind::Amp);
+        assert_eq!(
+            super::task_session_row_title(&session),
+            tr!("board.draft_session")
+        );
+        let mut stage = crate::model::ProjectBoard::canonical(project).stages[1].clone();
+        stage.name = "Review".into();
+        session.stage_invocation = Some(crate::model::SessionStageInvocation {
+            id: Uuid::new_v4(),
+            stage: stage.clone(),
+            board_revision: 2,
+            source: None,
+        });
+        stage.name = "Quality gate".into();
+        assert_eq!(
+            super::task_session_row_title(&session),
+            format!("Review · {}", tr!("board.draft_session"))
+        );
+        assert_eq!(
+            session.stage_invocation.as_ref().unwrap().stage.name,
+            "Review"
+        );
+    }
+
+    #[test]
+    fn stage_drafts_keep_their_invocation_workspace_and_are_not_legacy_development_drafts() {
+        let project_id = Uuid::new_v4();
+        let mut task = Task::new("Issue", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local { project_id });
+        let mut session = AgentSession::new(project_id, ProviderKind::Pi);
+        session.task_id = Some(task.id);
+        session.stage_invocation = Some(crate::model::SessionStageInvocation {
+            id: Uuid::new_v4(),
+            stage: crate::model::ProjectBoard::canonical(project_id).stages[1].clone(),
+            board_revision: 0,
+            source: None,
+        });
+        assert!(!task_draft_follows_workspace(task.id, &session));
+        assert_eq!(task_development_draft(&task, &[session]), None);
+    }
+
+    #[test]
     fn planned_isolation_and_explicit_local_remain_distinct() {
         let project_id = Uuid::new_v4();
         let mut task = Task::new("Fix checkout", TaskState::Backlog, 0);
@@ -1477,6 +1938,37 @@ mod tests {
 
         task.workspace = Some(TaskWorkspace::Local { project_id });
         assert_eq!(task_session_workspace(&task), SessionWorkspace::Local);
+    }
+
+    #[test]
+    fn session_metadata_is_hidden_only_for_the_same_concrete_default() {
+        let project_id = Uuid::new_v4();
+        let mut task = Task::new("Keep the user's title", TaskState::Doing, 0);
+        task.workspace = Some(TaskWorkspace::Local { project_id });
+        let mut session = AgentSession::new(project_id, ProviderKind::Claude);
+        assert!(task_session_uses_default_workspace(&task, &session));
+        session.project_id = Uuid::new_v4();
+        assert!(!task_session_uses_default_workspace(&task, &session));
+        session.project_id = project_id;
+        let path = std::path::PathBuf::from("/project/worktree");
+        session.workspace = SessionWorkspace::Worktree {
+            path: path.clone(),
+            branch: "feature".into(),
+        };
+        assert!(!task_session_uses_default_workspace(&task, &session));
+        task.workspace = Some(TaskWorkspace::Worktree {
+            project_id,
+            path,
+            branch: "feature".into(),
+        });
+        assert!(task_session_uses_default_workspace(&task, &session));
+        session.workspace = SessionWorkspace::Worktree {
+            path: "/other/worktree".into(),
+            branch: "feature".into(),
+        };
+        assert!(!task_session_uses_default_workspace(&task, &session));
+        task.workspace = Some(TaskWorkspace::NewWorktree { project_id });
+        assert!(!task_session_uses_default_workspace(&task, &session));
     }
 
     #[test]

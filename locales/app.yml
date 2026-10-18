@@ -2398,7 +2398,7 @@ board.continue_session:
 board.open_draft:
   en: "Continue draft"
 board.detach_session:
-  en: "Detach"
+  en: "Detach from issue"
 board.draft_session:
   en: "Unsent draft"
 board.session_failed:
@@ -2449,6 +2449,8 @@ board.retry_save:
   en: "Changes not saved · Retry"
 board.saving:
   en: "Saving…"
+board.stages_changed:
+  en: "Stages changed. Reopen the stage menu to choose again."
 
 # Board scope and live session signals
 board.all_projects:
@@ -2491,3 +2493,57 @@ board.attach_no_matches:
   en: "No matching conversations"
 board.attach_keyboard_hint:
   en: "↑↓ Choose · Enter Attach · Esc Close"
+
+# Issue-centered review
+review.section:
+  en: "Codex review"
+review.start:
+  en: "Review with Codex"
+review.develop_pi:
+  en: "Develop with Pi"
+review.reopen_develop_pi:
+  en: "Reopen & develop with Pi"
+review.uncommitted:
+  en: "Uncommitted changes"
+review.base_branch:
+  en: "Against base branch"
+review.commit:
+  en: "One commit"
+review.commit_range:
+  en: "Commit range"
+review.reference_placeholder:
+  en: "Branch, SHA, or base..head"
+review.against_branch:
+  en: "Against %{reference}"
+review.at_commit:
+  en: "Commit %{reference}"
+review.draft:
+  en: "Codex review · Draft"
+review.running:
+  en: "Codex review · Running"
+review.completed:
+  en: "Codex review · Complete"
+review.interrupted:
+  en: "Codex review · Stopped"
+review.failed:
+  en: "Codex review · Incomplete"
+review.workspace_required:
+  en: "Start development first, or choose an existing workspace to review"
+review.session_title:
+  en: "Review: %{title}"
+review.fix_title:
+  en: "Fix review: %{title}"
+review.open:
+  en: "Open review"
+review.fix_pi:
+  en: "Fix with Pi"
+review.loading_result:
+  en: "Loading the review result…"
+review.invalid_session:
+  en: "Review needs Codex and the original existing workspace"
+review.composer_scope:
+  en: "Codex review · %{scope}"
+review.loading_context:
+  en: "Loading development context…"
+review.context_hint:
+  en: "Uses this issue’s workspace and latest development context"

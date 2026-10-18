@@ -1,0 +1,27 @@
+Doki Apple Silicon preview (macOS 13 or newer)
+
+1. Download the zip from the newest "Main preview" prerelease. For a PR,
+   open Actions > macOS preview > the successful run > Artifacts, then
+   unzip the artifact wrapper to find Doki-macos-arm64-*.zip.
+2. Extract that app zip and move Doki.app into Applications.
+3. This build is ad-hoc signed, NOT Apple-notarized. Gatekeeper may block it.
+   Only if you trust this repository/build, use macOS System Settings >
+   Privacy & Security > Open Anyway after attempting to open the app.
+   Do not disable Gatekeeper or globally change security settings.
+4. Install and authenticate a supported agent CLI separately. The app bundles
+   its daemon, JavaScript REPL and native computer-use helper, not provider
+   CLIs, API credentials, Node/Bun or your provider's runtime requirements.
+
+The JSON manifest identifies the exact source commit and build. SHA256SUMS
+and exact source archive are included under GPL-3.0 (see LICENSE). Checksums
+can be checked with: shasum -a 256 -c SHA256SUMS
+
+This preview uses the normal sh.doki identity and existing Doki data. Quit
+other Doki copies first and back up ~/Library/Application Support/Doki and
+~/.waku before trying
+an unmerged PR. Database migrations can make downgrades incompatible.
+Ad-hoc builds may require granting macOS computer-use permissions again.
+
+There is no automatic updater feed. Download future previews manually.
+Prereleases never replace the stable release or publish to the upstream
+Waku update service. This is a preview, not a signed production installer.

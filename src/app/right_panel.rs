@@ -1767,6 +1767,7 @@ mod tests {
 
     #[test]
     fn files_tab_uses_the_selected_file_name_and_icon() {
+        let _locale = crate::test_locale::TestLocale::new(crate::i18n::AppLanguage::English);
         let files = RightPanelSurface::Files;
         assert_eq!(right_panel_tab_label(&files, None), "Files");
         assert_eq!(
@@ -3019,7 +3020,12 @@ impl Waku {
         // A webview composites above the GPUI scene, so the panel's clip does
         // not apply to it: shown mid-slide it would hang over the transcript
         // at full width. Keep it down until the panel has finished moving.
-        let active_browser = if self.settings_page.is_none()
+        #[cfg(debug_assertions)]
+        let playground_open = self.stream_playground.is_some();
+        #[cfg(not(debug_assertions))]
+        let playground_open = false;
+        let active_browser = if !playground_open
+            && self.settings_page.is_none()
             && !self.board_open
             && self.right_panel_visible
             && self.right_panel_slide.is_none()

@@ -132,8 +132,9 @@ impl LiveService {
 /// tests is that the provider's assumptions get checked against a real service.
 pub(crate) fn binary() -> PathBuf {
     crate::model::provider_binary(ProviderKind::OpenCode).expect(
-        "the live OpenCode tests need the v2 CLI installed: either `opencode`, or `opencode` \
-         2.x. Skip them with `cargo test -p waku-core -- --skip opencode`",
+        "the live OpenCode tests need the v2 CLI installed: CI uses \
+         `bun install --global --trust @opencode/cli@2.0.10`. Ensure `opencode` is on PATH; \
+         see docs/providers.md#opencode-api-tests",
     )
 }
 

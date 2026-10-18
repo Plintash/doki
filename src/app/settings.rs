@@ -304,7 +304,7 @@ impl Waku {
                 self.window_drag_region(
                     div()
                         .id("settings-sidebar-traffic-light-drag-region")
-                        .w(px(TRAFFIC_LIGHT_CLEARANCE))
+                        .w(px(self.titlebar_clearance.width()))
                         .h_full()
                         .flex_none(),
                     cx,
@@ -1894,7 +1894,8 @@ impl Waku {
     /// misplace scroll anchors until the row happened to remeasure. The
     /// sidebar list keeps its uniform row height and needs no reset.
     fn remeasure_font_sized_surfaces(&self) {
-        self.reset_transcript_rows(self.transcript_row_count());
+        self.transcript_buffer.borrow_mut().adopt_position();
+        self.remeasure_transcript_rows(0..self.transcript_row_count());
         let line_count = self
             .right_panel_diff_snapshot
             .as_ref()

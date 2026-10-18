@@ -558,6 +558,32 @@ impl Backend for WakuBackend {
                     projectless_root: crate::projectless::workspace_root(),
                 })
             }
+            Command::SaveProjectBoard {
+                project_id,
+                expected_revision,
+                board,
+            } => {
+                let mut state = self.task_state.lock();
+                let index = state
+                    .projects
+                    .iter()
+                    .position(|project| project.id == project_id)
+                    .ok_or_else(|| anyhow!("Project no longer exists. Reload the board."))?;
+                validate_board_update(
+                    &state.projects[index],
+                    expected_revision,
+                    &board,
+                    &state.tasks,
+                )?;
+                let previous = std::mem::replace(&mut state.projects[index].board, board);
+                if let Err(error) = self.task_store.save(&mut state) {
+                    state.projects[index].board = previous;
+                    return Err(error.into());
+                }
+                Ok(ResponsePayload::ProjectBoardSaved {
+                    project: state.projects[index].clone(),
+                })
+            }
             Command::SaveTaskState {
                 projects,
                 tasks,
@@ -580,17 +606,56 @@ impl Backend for WakuBackend {
                     &active_runtimes,
                     &self.unconfirmed_shutdown_sessions(),
                 )?;
-                for project in projects {
-                    if let Some(existing) = state
-                        .projects
-                        .iter_mut()
-                        .find(|existing| existing.id == project.id)
+                // Validate against a candidate catalog before mutating daemon state.
+                // Whole-board CAS makes reorder and deletion one durable edit.
+                let previous_projects = state.projects.clone();
+                let merged_projects =
+                    merge_project_boards(&previous_projects, projects, &state.tasks)?;
+                let mut tasks = tasks;
+                for task in &mut tasks {
+                    let existing = state.tasks.iter().find(|old| old.id == task.id);
+                    if existing.is_some_and(|old| task.updated_at <= old.updated_at) {
+                        continue;
+                    }
+                    if existing.is_some_and(|old| old.project_id() != task.project_id()) {
+                        task.stage_id = task
+                            .project_id()
+                            .map(|id| crate::model::canonical_stage_id(id, task.state));
+                    }
+                    if let Some(project_id) = task.project_id() {
+                        if task.stage_id.is_none() {
+                            task.stage_id =
+                                Some(crate::model::canonical_stage_id(project_id, task.state));
+                        }
+                        if let Some(project) = merged_projects
+                            .iter()
+                            .find(|project| project.id == project_id)
+                        {
+                            // Existing unknown/foreign assignments remain visible via fallback;
+                            // newly requested assignments must be owned and lifecycle-consistent.
+                            if project.board.stage_for_task(task).is_none()
+                                && !existing.is_some_and(|old| {
+                                    old.stage_id == task.stage_id && old.state == task.state
+                                })
+                            {
+                                bail!(
+                                    "Stage is missing or belongs to another project. Reload the board and choose a destination."
+                                );
+                            }
+                        } else if !existing.is_some_and(|old| {
+                            old.project_id() == task.project_id() && old.stage_id == task.stage_id
+                        }) {
+                            bail!(
+                                "Project no longer exists. Reload the board before moving the issue."
+                            );
+                        }
+                    } else if task.stage_id.is_some()
+                        && !existing.is_some_and(|old| old.stage_id == task.stage_id)
                     {
-                        *existing = project;
-                    } else {
-                        state.projects.push(project);
+                        bail!("Choose a project workspace before assigning a stage.");
                     }
                 }
+                state.projects = merged_projects;
                 // Tasks merge the way projects do: a save is additive, and an
                 // older snapshot never overwrites a newer one. Deleting a task
                 // is an explicit client action, not a side effect of saving.
@@ -648,6 +713,9 @@ impl Backend for WakuBackend {
                         ) {
                             merge_stale_session_metadata(existing, session);
                         } else {
+                            if existing.stage_invocation.is_some() {
+                                session.stage_invocation = existing.stage_invocation.clone();
+                            }
                             preserve_daemon_checkpoints(existing, &mut session);
                             *existing = session;
                         }
@@ -675,6 +743,7 @@ impl Backend for WakuBackend {
                         state.tasks[index] = previous;
                     }
                     state.tasks.truncate(previous_task_count);
+                    state.projects = previous_projects;
                     return Err(error.into());
                 }
                 let sessions = saved_ids
@@ -1237,6 +1306,11 @@ impl Backend for WakuBackend {
                     prompt,
                     turn_id,
                     message_id,
+                }
+                | Command::Review {
+                    prompt,
+                    turn_id,
+                    message_id,
                 } = &command
                 {
                     // Publish the submission into the runtime's event stream
@@ -1274,6 +1348,7 @@ fn command_starts_issue_work(command: &Command) -> bool {
     matches!(
         command,
         Command::Prompt { .. }
+            | Command::Review { .. }
             | Command::Steer { .. }
             | Command::Goal {
                 operation: GoalOperation::Set {
@@ -1282,6 +1357,72 @@ fn command_starts_issue_work(command: &Command) -> bool {
                 }
             }
     )
+}
+
+fn validate_board_update(
+    project: &crate::model::Project,
+    expected_revision: u64,
+    board: &crate::model::ProjectBoard,
+    tasks: &[Task],
+) -> anyhow::Result<()> {
+    // A lost acknowledgment can be retried without inventing another revision.
+    if *board == project.board && board.revision == expected_revision.saturating_add(1) {
+        return Ok(());
+    }
+    if expected_revision != project.board.revision
+        || board.revision != expected_revision.saturating_add(1)
+    {
+        bail!("Board changed in another client. Reload before saving stage settings.");
+    }
+    board.validate(project.id).map_err(anyhow::Error::msg)?;
+    for stage in &board.stages {
+        if project
+            .board
+            .stages
+            .iter()
+            .any(|old| old.id == stage.id && old.state != stage.state)
+        {
+            bail!("A stage's lifecycle category cannot be changed.");
+        }
+    }
+
+    for removed in project
+        .board
+        .stages
+        .iter()
+        .filter(|stage| !board.stages.iter().any(|new| new.id == stage.id))
+    {
+        if removed.state.is_done()
+            || tasks.iter().any(|task| {
+                task.project_id() == Some(project.id) && task.stage_id == Some(removed.id)
+            })
+        {
+            bail!(
+                "Move all issues out of a stage before removing it; the terminal stage cannot be removed."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn merge_project_boards(
+    existing_projects: &[crate::model::Project],
+    projects: Vec<crate::model::Project>,
+    _existing_tasks: &[Task],
+) -> anyhow::Result<Vec<crate::model::Project>> {
+    let mut merged = existing_projects.to_vec();
+    for mut project in projects {
+        if let Some(existing) = merged.iter_mut().find(|old| old.id == project.id) {
+            // Snapshot saves are never configuration edits. Only explicit CAS
+            // can mutate a board; stale task edits still retain their metadata.
+            project.board = existing.board.clone();
+            *existing = project;
+        } else {
+            project.board = crate::model::ProjectBoard::canonical(project.id);
+            merged.push(project);
+        }
+    }
+    Ok(merged)
 }
 
 /// A client may mark Done only after all conversation snapshots in the same
@@ -2205,6 +2346,7 @@ fn handle_driver_command(
 ) -> anyhow::Result<ResponsePayload> {
     match command {
         Command::Prompt { prompt, .. } => driver.prompt(prompt),
+        Command::Review { prompt, .. } => driver.review(prompt)?,
         Command::Steer { prompt } => driver.steer(prompt),
         Command::Cancel => driver.cancel(),
         Command::CancelComputerUse => driver.cancel_computer_use(),
@@ -2282,6 +2424,7 @@ fn handle_driver_command(
         | Command::TrashSkills { .. }
         | Command::LoadTaskState
         | Command::SaveTaskState { .. }
+        | Command::SaveProjectBoard { .. }
         | Command::RemoveSession
         | Command::HydrateSession { .. }
         | Command::ReadTranscript { .. }
@@ -2341,6 +2484,46 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.send(());
         }
+    }
+
+    #[test]
+    fn board_cas_rejects_stale_edits_and_snapshot_saves_preserve_catalog() {
+        let mut project = crate::model::Project::from_path("/tmp/board".into());
+        let mut edited = project.board.clone();
+        edited.revision = 1;
+        edited.stages[0].name = "Plan".into();
+        assert!(validate_board_update(&project, 0, &edited, &[]).is_ok());
+        project.board = edited.clone();
+        assert!(validate_board_update(&project, 0, &edited, &[]).is_ok());
+        project.board.revision = 2;
+        assert!(validate_board_update(&project, 0, &edited, &[]).is_err());
+        let mut stale = project.clone();
+        stale.board = crate::model::ProjectBoard::canonical(project.id);
+        let merged = merge_project_boards(&[project.clone()], vec![stale], &[]).unwrap();
+        assert_eq!(merged[0].board, project.board);
+    }
+
+    #[test]
+    fn board_delete_requires_empty_noncanonical_stage_and_reorder_is_atomic() {
+        let mut project = crate::model::Project::from_path("/tmp/board".into());
+        let mut review = project.board.stages[1].clone();
+        review.id = Uuid::new_v4();
+        review.name = "Review".into();
+        project.board.stages.insert(2, review.clone());
+        let mut task = Task::new("Issue", crate::model::TaskState::Doing, 0);
+        task.workspace = Some(crate::model::TaskWorkspace::Local {
+            project_id: project.id,
+        });
+        task.set_stage(&review, 4);
+        let mut edited = project.board.clone();
+        edited.revision = 1;
+        edited.stages.retain(|stage| stage.id != review.id);
+        assert!(validate_board_update(&project, 0, &edited, &[task]).is_err());
+        assert!(validate_board_update(&project, 0, &edited, &[]).is_ok());
+        edited.stages.swap(0, 1);
+        assert!(validate_board_update(&project, 0, &edited, &[]).is_ok());
+        edited.stages.pop();
+        assert!(validate_board_update(&project, 0, &edited, &[]).is_err());
     }
 
     struct SharedShutdownTestDriver {
@@ -2752,6 +2935,33 @@ mod tests {
         assert!(
             validate_task_completions(&state, &[done], &[stale], &HashMap::new(), &HashSet::new())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn native_review_starts_issue_work() {
+        assert!(command_starts_issue_work(&Command::Review {
+            prompt: "Review the implementation".into(),
+            turn_id: None,
+            message_id: None,
+        }));
+    }
+
+    #[test]
+    fn unsupported_review_returns_a_validation_error_instead_of_a_prompt() {
+        let (dropped, _dropped_rx) = crossbeam_channel::bounded(1);
+        let driver = DriverHandle::from_control(Arc::new(ShutdownTestDriver(dropped)));
+        let result = handle_driver_command(
+            &driver,
+            Command::Review {
+                prompt: "Review the implementation".into(),
+                turn_id: None,
+                message_id: None,
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a transport without native review must reject it"
         );
     }
 

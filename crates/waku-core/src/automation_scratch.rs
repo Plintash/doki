@@ -32,6 +32,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_STARTUP_STDERR_BYTES: usize = 4096;
+const STARTUP_EVIDENCE_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub(crate) struct ScratchManager {
     inner: Arc<Inner>,
@@ -269,16 +270,6 @@ impl StartupStderr {
             Ok(None)
         }
     }
-
-    fn evidence(&self, exited: bool) -> String {
-        // Usually EOF is already observed. Give the reader a bounded chance to
-        // consume an exited child's final crash line before taking the snapshot.
-        let deadline = Instant::now() + Duration::from_millis(100);
-        while exited && !self.finished.load(Ordering::Acquire) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        self.tail.lock().text()
-    }
 }
 
 impl Drop for StartupStderr {
@@ -292,23 +283,59 @@ impl Drop for StartupStderr {
 }
 
 impl OwnedScratch {
-    fn startup_failure(&mut self, message: &str) -> anyhow::Error {
+    fn startup_failure(
+        &mut self,
+        message: &str,
+        cancellation: Option<(&AtomicBool, Instant)>,
+    ) -> anyhow::Error {
+        // Readiness EOF can precede both process exit and the final stderr
+        // write. Give both children one shared, bounded collection window.
+        let deadline = Instant::now() + STARTUP_EVIDENCE_TIMEOUT;
+        let deadline =
+            cancellation.map_or(deadline, |(_, job_deadline)| deadline.min(job_deadline));
+        loop {
+            if let Err(error) = check_program_deadline(cancellation) {
+                return error;
+            }
+            let settled = [
+                (&mut self.daemon, &self.daemon_stderr),
+                (&mut self.app, &self.app_stderr),
+            ]
+            .into_iter()
+            .all(|(child, stderr)| {
+                child
+                    .as_mut()
+                    .is_none_or(|child| !matches!(child.try_wait(), Ok(None)))
+                    && stderr
+                        .as_ref()
+                        .is_none_or(|stderr| stderr.finished.load(Ordering::Acquire))
+            });
+            if settled || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(
+                Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        if let Err(error) = check_program_deadline(cancellation) {
+            return error;
+        }
         let mut evidence = message.to_owned();
         for (name, child, stderr) in [
             ("daemon", &mut self.daemon, &self.daemon_stderr),
             ("app", &mut self.app, &self.app_stderr),
         ] {
-            let (status, exited) = match child {
+            let status = match child {
                 Some(child) => match child.try_wait() {
-                    Ok(Some(status)) => (format!("exited with {status}"), true),
-                    Ok(None) => ("still running".into(), false),
-                    Err(error) => (format!("status unavailable: {error}"), false),
+                    Ok(Some(status)) => format!("exited with {status}"),
+                    Ok(None) => "still running".into(),
+                    Err(error) => format!("status unavailable: {error}"),
                 },
-                None => ("not started".into(), false),
+                None => "not started".into(),
             };
             evidence.push_str(&format!("; {name}: {status}"));
             if let Some(stderr) = stderr {
-                let tail = stderr.evidence(exited);
+                let tail = stderr.tail.lock().text();
                 if !tail.is_empty() {
                     evidence.push_str(&format!("; {name} stderr tail: {tail}"));
                 }
@@ -1437,7 +1464,7 @@ fn launch_mode(
         match ready_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(result) => {
                 break result.map_err(|_| {
-                    owned.startup_failure("scratch daemon did not report readiness")
+                    owned.startup_failure("scratch daemon did not report readiness", cancellation)
                 })?;
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout)
@@ -1445,7 +1472,11 @@ fn launch_mode(
             {
                 continue;
             }
-            Err(_) => return Err(owned.startup_failure("scratch daemon did not become ready")),
+            Err(_) => {
+                return Err(
+                    owned.startup_failure("scratch daemon did not become ready", cancellation)
+                );
+            }
         }
     };
     let address: std::net::SocketAddr = ready
@@ -1466,10 +1497,15 @@ fn launch_mode(
             Ok(control) => break control,
             Err(_) if Instant::now() < connect_deadline => {
                 if owned.daemon.as_mut().unwrap().try_wait()?.is_some() {
-                    return Err(owned.startup_failure("scratch daemon exited during connection"));
+                    return Err(owned
+                        .startup_failure("scratch daemon exited during connection", cancellation));
                 }
             }
-            Err(_) => return Err(owned.startup_failure("scratch control connection timed out")),
+            Err(_) => {
+                return Err(
+                    owned.startup_failure("scratch control connection timed out", cancellation)
+                );
+            }
         }
     };
     if !headless {
@@ -1510,13 +1546,17 @@ fn launch_mode(
             || owned.daemon.as_mut().unwrap().try_wait()?.is_some()
         {
             control.disconnect();
-            return Err(owned.startup_failure("scratch child exited before executor registration"));
+            return Err(owned.startup_failure(
+                "scratch child exited before executor registration",
+                cancellation,
+            ));
         }
         if Instant::now() >= deadline {
             control.disconnect();
-            return Err(
-                owned.startup_failure("scratch app did not register its automation executor")
-            );
+            return Err(owned.startup_failure(
+                "scratch app did not register its automation executor",
+                cancellation,
+            ));
         }
         std::thread::sleep(Duration::from_millis(100));
     };
@@ -1789,7 +1829,13 @@ mod tests {
             std::process::id().to_string(),
         )
         .unwrap();
-        if role == "failed-daemon" || role == "failed-app" {
+        if role == "failed-daemon" || role == "failed-app" || role == "delayed-failed-daemon" {
+            if role == "delayed-failed-daemon" {
+                // Readiness EOF is not process exit: force a gap before the
+                // useful diagnostic and status, as can happen during teardown.
+                unsafe { libc::close(libc::STDOUT_FILENO) };
+                std::thread::sleep(Duration::from_millis(50));
+            }
             std::io::stderr()
                 .write_all(&vec![b'x'; MAX_STARTUP_STDERR_BYTES * 8])
                 .unwrap();
@@ -2042,9 +2088,88 @@ mod tests {
     }
 
     #[test]
+    fn startup_evidence_is_bounded_and_observes_cancellation_and_deadline() {
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt as _;
+
+        for mode in ["bounded", "cancelled", "expired"] {
+            let directory =
+                std::env::temp_dir().join(format!("waku-scratch-evidence-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let child = Command::new("/bin/sh")
+                // Close both output pipes but remain alive until cleanup.
+                .args(["-c", "exec 1>&- 2>&-; read unused"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = child.id() as i32;
+            let mut owned = OwnedScratch {
+                directory: directory.clone(),
+                daemon: Some(child),
+                app: None,
+                daemon_stderr: None,
+                app_stderr: None,
+            };
+            owned.daemon_stderr =
+                StartupStderr::capture(owned.daemon.as_mut().unwrap(), "fixture-capability")
+                    .unwrap();
+            let mut stdout = owned.daemon.as_mut().unwrap().stdout.take().unwrap();
+            assert_eq!(stdout.read(&mut [0]).unwrap(), 0);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let canceller = (mode == "cancelled").then(|| {
+                let cancel = cancel.clone();
+                std::thread::spawn(move || {
+                    // Interrupt the evidence window, not the readiness wait.
+                    std::thread::sleep(Duration::from_millis(25));
+                    cancel.store(true, Ordering::Release);
+                })
+            });
+            let started = Instant::now();
+            let cancellation = (mode != "bounded").then_some((
+                cancel.as_ref(),
+                started
+                    + if mode == "expired" {
+                        Duration::from_millis(25)
+                    } else {
+                        Duration::from_secs(30)
+                    },
+            ));
+            let error = owned.startup_failure("fixture startup failed", cancellation);
+            if mode == "bounded" {
+                assert!(error.to_string().contains("daemon: still running"));
+                assert!(started.elapsed() >= STARTUP_EVIDENCE_TIMEOUT);
+            } else {
+                assert_eq!(
+                    program_error(error).code,
+                    if mode == "cancelled" {
+                        "job_aborted"
+                    } else {
+                        "job_timeout"
+                    }
+                );
+            }
+            drop(owned);
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(!directory.exists(), "failed scratch directory leaked");
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "failed launch child leaked"
+            );
+            if let Some(canceller) = canceller {
+                canceller.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn failed_launch_reports_child_status_and_bounded_stderr_then_cleans_up() {
         for (daemon, app, failed, not_started) in [
             ("failed-daemon", "app", "daemon", true),
+            ("delayed-failed-daemon", "app", "daemon", true),
             ("daemon", "failed-app", "app", false),
         ] {
             let directory =

@@ -46,6 +46,8 @@ mod review_diff;
 mod rpa;
 mod startup_trace;
 mod terminal;
+#[cfg(test)]
+mod test_locale;
 mod theme;
 mod ui;
 mod updater;
