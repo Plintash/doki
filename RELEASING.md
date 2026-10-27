@@ -86,6 +86,19 @@ xcrun notarytool store-credentials NOTARY \
 Override the environment with `--signing-identity`, or change the notary
 profile with `--notary-profile` / `WAKU_NOTARY_PROFILE`.
 
+### Local builds without a certificate
+
+A checkout with no code-signing certificate installed — a fresh machine, or a
+contributor without an Apple developer account — falls back to an ad-hoc
+signature. That signature is pinned to a stable designated requirement,
+`identifier "sh.doki"` for a release bundle and `sh.doki.dev` for the debug
+one, instead of the code hash `codesign` records by default. Without the pin
+every rebuild is a different app to macOS TCC, so Files & Folders,
+Accessibility and Screen Recording have to be granted again each time; with it
+they are granted once per bundle id. Such a build is for local use only:
+`bun run release` still requires a Developer ID identity and a notarization
+profile.
+
 ### 3. Cloudflare R2 bucket + domain  ← **still to do once**
 
 1. Create the bucket **`waku-releases`** (Cloudflare dashboard → R2 → Create
