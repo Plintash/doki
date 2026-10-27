@@ -60,7 +60,13 @@ if [ "$profile" = "debug" ] && [ "$codesign_identity_from_environment" = "0" ] &
   mkdir -p "$(dirname "$debug_identity_cache")"
   printf '%s\n' "$codesign_identity" > "$debug_identity_cache"
 fi
-debug_adhoc_requirement="=designated => identifier \"$bundle_identifier\""
+# A plain ad-hoc signature's designated requirement carries the code hash it
+# just signed, so every rebuild is a different app to macOS TCC and any privacy
+# grant — Files & Folders, Accessibility, Screen Recording — has to be given
+# again. Pinning the requirement to the bundle id keeps one identity across
+# rebuilds. This is only the fallback for a machine with no signing certificate
+# installed; a distributed build always carries its Developer ID.
+adhoc_requirement="=designated => identifier \"$bundle_identifier\""
 if [ "${WAKU_SKIP_CARGO_BUILD:-0}" != "1" ]; then
   if [ "$profile" = "release" ]; then
     cargo build --release --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon
@@ -206,16 +212,9 @@ if [ "$codesign_identity" = "-" ]; then
   if [ "$profile" = "release" ]; then
     codesign --force --identifier "$bundle_identifier.daemon" --sign - "$daemon_executable"
   fi
-  if [ "$profile" = "debug" ]; then
-    # An ordinary ad-hoc signature's designated requirement contains its
-    # changing code hash, so macOS TCC treats every rebuild as a different app
-    # and repeatedly asks for Files & Folders access. The development-only
-    # bundle id is a stable local identity even when no trusted Apple
-    # Development certificate is installed.
-    codesign --force --identifier "$bundle_identifier" --requirements "$debug_adhoc_requirement" --sign - "$bundle"
-  else
-    codesign --force --sign - "$bundle"
-  fi
+  # Local release builds are rebuilt as often as debug ones, and both are
+  # launched from the same place, so both get the stable requirement.
+  codesign --force --identifier "$bundle_identifier" --requirements "$adhoc_requirement" --sign - "$bundle"
 elif [ "$profile" = "release" ]; then
   codesign --force --options runtime --timestamp --sign "$codesign_identity" "$sparkle_framework/Versions/B/Autoupdate"
   codesign --force --options runtime --timestamp --sign "$codesign_identity" "$sparkle_framework/Versions/B/Updater.app"
