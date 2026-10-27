@@ -1830,6 +1830,12 @@ struct PiStreamState {
     message_saw_text: bool,
     message_saw_reasoning: bool,
     failed: bool,
+    /// The provider's reason from a final assistant message that ended in
+    /// `stopReason: "error"`. Pi reports a rejection it will not retry only
+    /// there, so without it the run settles with no cause and no answer.
+    /// Settlement surfaces it; a retry cycle clears it first because its own
+    /// activity already carries the cause.
+    provider_error: Option<String>,
     tools: HashMap<String, (ActivityKind, String)>,
     /// Automatic retries update one activity until recovery or settlement.
     open_retry: Option<ActivityItem>,
@@ -1928,6 +1934,13 @@ fn finish_pi_run(
             let _ = events.send(DriverEvent::QueuedMessagesRetracted {
                 messages: retracted,
             });
+        }
+        // A failure Pi reported only in its final assistant message has no
+        // row of its own, and the turn is settling on it now: say why before
+        // it settles, so the reason is not left in a stream that ended.
+        if let Some(reason) = state.provider_error.take() {
+            state.failed = true;
+            let _ = events.send(DriverEvent::Error(reason));
         }
         let success = !state.failed;
         let _ = events.send(DriverEvent::TurnFinished {
@@ -2336,6 +2349,10 @@ fn handle_pi_message(
                         report_context_tokens(events, tokens);
                     }
                     emit_completed_message_fallback(message, events, state);
+                    // A stream the provider rejected ends on this message. Its
+                    // cause still has to reach the turn, because Pi retries
+                    // through separate frames and does not repeat it here.
+                    note_provider_message_failure(flavor, message, state);
                 }
                 Some("custom") => {
                     if let Some(message) = message {
@@ -2413,6 +2430,10 @@ fn handle_pi_message(
             if !state.run.is_live() {
                 return;
             }
+            // Pi schedules a retry after finalizing the failed message, so the
+            // cause it just reported still sits with that message. From here
+            // the retry row owns it; a recovered turn must not read as failed.
+            state.provider_error = None;
             // A retryable response can contain partial text or reasoning.
             // Updating its earlier row would leave the current retry hidden
             // behind that output. Finish the old activity where it occurred
@@ -2461,6 +2482,10 @@ fn handle_pi_message(
         }
         "auto_retry_end" => {
             state.finish_retry(events);
+            // The end settles the retry cycle, so the failure this message
+            // reported must not also be surfaced at settlement: a recovery
+            // clears it, and an exhaustion reports its own `finalError`.
+            state.provider_error = None;
             if value.get("success").and_then(Value::as_bool) == Some(true) {
                 state.failed = false;
             } else {
@@ -3077,6 +3102,39 @@ fn emit_completed_message_fallback(
             }
             _ => {}
         }
+    }
+}
+
+/// Records the provider's own reason for a stream Pi ended in failure.
+///
+/// Pi finalizes a rejected stream through `message_end`, not
+/// `message_update`: the final assistant message carries `stopReason:
+/// "error"` and the provider's `errorMessage`, and its stream `error` case
+/// emits no update. A rejection Pi does not retry therefore leaves a run with
+/// no content and no cause anywhere — the turn settles as if it completed.
+/// The reason waits here for settlement, because only a run that ends still
+/// holding it failed; whenever a retry cycle takes over, its own frames carry
+/// the cause. A message that produced answer text is that answer, and a later
+/// message that settles successfully supersedes an earlier failure.
+fn note_provider_message_failure(
+    flavor: PiFlavor,
+    message: Option<&Value>,
+    state: &mut PiStreamState,
+) {
+    let failed = message
+        .and_then(|message| message.get("stopReason"))
+        .and_then(Value::as_str)
+        == Some("error");
+    if !failed || state.message_saw_text || state.message_saw_reasoning {
+        state.provider_error = None;
+        return;
+    }
+    let Some(message) = message else {
+        return;
+    };
+    // Only a live run has a turn for settlement to fail.
+    if state.run.is_live() {
+        state.provider_error = Some(pi_error_message(flavor, message));
     }
 }
 
@@ -6263,6 +6321,209 @@ mod tests {
             event_rx.recv().unwrap(),
             DriverEvent::TurnFinished { success: true, .. }
         ));
+    }
+
+    #[test]
+    fn provider_rejection_in_the_final_message_fails_the_turn() {
+        // Pi finalizes a rejected stream through message_end: the stream error
+        // case emits no message_update, and an auth rejection is not retried.
+        // Before this was surfaced the run settled as a completed, answerless
+        // turn, so the app could only show its fallback line.
+        for flavor in [PiFlavor::Pi, PiFlavor::OhMyPi] {
+            let (pending, commands, _command_rx, mut state) = harness();
+            let (events, event_rx) = unbounded();
+            for frame in [
+                json!({"type": "agent_start"}),
+                json!({"type": "message_end", "message": {
+                    "role": "assistant",
+                    "content": [],
+                    "api": "openai-completions",
+                    "provider": "opencode-go",
+                    "model": "deepseek-v4.1-flash",
+                    "usage": {"input": 0, "output": 0, "cacheRead": 0,
+                        "cacheWrite": 0, "totalTokens": 0},
+                    "stopReason": "error",
+                    "durationMs": 1326,
+                    "errorMessage": "401: {\"type\":\"authentication_error\",\
+                        \"code\":\"api_key_expired\",\
+                        \"message\":\"This API key has expired.\"}"
+                }}),
+                json!({"type": flavor.settled_event()}),
+            ] {
+                handle_pi_message(flavor, frame, &pending, &commands, &events, &mut state);
+            }
+            let emitted: Vec<_> = event_rx.try_iter().collect();
+            let errors: Vec<_> = emitted
+                .iter()
+                .filter_map(|event| match event {
+                    DriverEvent::Error(error) => Some(error.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                errors.len(),
+                1,
+                "{flavor:?} must report the provider's reason once: {emitted:?}"
+            );
+            assert!(
+                errors[0].starts_with("401") && errors[0].contains("api_key_expired"),
+                "{flavor:?} must keep the provider's own reason: {:?}",
+                errors[0]
+            );
+            assert!(
+                matches!(
+                    emitted.last(),
+                    Some(DriverEvent::TurnFinished {
+                        success: false,
+                        interrupted: false,
+                        ..
+                    })
+                ),
+                "{flavor:?} must settle failed, not completed: {emitted:?}"
+            );
+            assert!(
+                !emitted.iter().any(|event| matches!(
+                    event,
+                    DriverEvent::TextDelta(_) | DriverEvent::ReasoningDelta(_)
+                )),
+                "a rejected turn has no answer to stream"
+            );
+            assert!(!state.run.is_live());
+        }
+    }
+
+    #[test]
+    fn a_rejection_pi_retries_is_reported_by_the_retry_cycle_once() {
+        // Pi schedules a retry after finalizing the failed message, so both
+        // outcomes below open with the same message_end{stopReason: error}.
+        // That message must not fail the turn on its own: a recovered retry
+        // settles with no error at all, and exhaustion reports its own
+        // finalError exactly once.
+        for recovered in [true, false] {
+            let (pending, commands, _command_rx, mut state) = harness();
+            let (events, event_rx) = unbounded();
+            let mut frames = vec![
+                json!({"type": "agent_start"}),
+                json!({"type": "message_end", "message": {"role": "assistant",
+                    "stopReason": "error", "errorMessage": "ai: 502 Bad Gateway",
+                    "content": []}}),
+                json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3,
+                    "delayMs": 2000, "errorMessage": "ai: 502 Bad Gateway"}),
+            ];
+            if recovered {
+                frames.extend([
+                    json!({"type": "message_end", "message": {"role": "assistant",
+                        "stopReason": "stop",
+                        "content": [{"type": "text", "text": "Recovered"}]}}),
+                    json!({"type": "auto_retry_end", "success": true, "attempt": 1}),
+                ]);
+            } else {
+                frames.extend([
+                    json!({"type": "message_end", "message": {"role": "assistant",
+                        "stopReason": "error", "errorMessage": "ai: 502 Bad Gateway",
+                        "content": []}}),
+                    json!({"type": "auto_retry_end", "success": false, "attempt": 1,
+                        "finalError": "ai: 502 Bad Gateway"}),
+                ]);
+            }
+            frames.push(json!({"type": "agent_settled"}));
+            for frame in frames {
+                handle_pi_message(
+                    PiFlavor::Pi,
+                    frame,
+                    &pending,
+                    &commands,
+                    &events,
+                    &mut state,
+                );
+            }
+            let emitted: Vec<_> = event_rx.try_iter().collect();
+            let errors: Vec<_> = emitted
+                .iter()
+                .filter_map(|event| match event {
+                    DriverEvent::Error(error) => Some(error.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if recovered {
+                assert!(
+                    errors.is_empty(),
+                    "a recovered retry must not fail the turn: {errors:?}"
+                );
+                assert!(matches!(
+                    emitted.last(),
+                    Some(DriverEvent::TurnFinished { success: true, .. })
+                ));
+            } else {
+                assert_eq!(
+                    errors,
+                    ["ai: 502 Bad Gateway"],
+                    "the exhausted retry is the one report of the failure"
+                );
+                assert!(matches!(
+                    emitted.last(),
+                    Some(DriverEvent::TurnFinished { success: false, .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn a_message_that_answered_does_not_fail_the_turn() {
+        // A stream can end in error after producing the turn's answer, either
+        // streamed or in the final content. The answer is what the turn
+        // settles on; the ended stream is not a failure to report.
+        for streamed in [false, true] {
+            let (pending, commands, _command_rx, mut state) = harness();
+            let (events, event_rx) = unbounded();
+            let mut frames = vec![
+                json!({"type": "agent_start"}),
+                json!({"type": "message_start", "message": {"role": "assistant"}}),
+            ];
+            if streamed {
+                frames.push(json!({"type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "Partial answer"}}));
+            }
+            let content = if streamed {
+                json!([])
+            } else {
+                json!([{"type": "text", "text": "Partial answer"}])
+            };
+            frames.extend([
+                json!({"type": "message_end", "message": {"role": "assistant",
+                    "stopReason": "error", "errorMessage": "stream ended early",
+                    "content": content}}),
+                json!({"type": "agent_settled"}),
+            ]);
+            for frame in frames {
+                handle_pi_message(
+                    PiFlavor::Pi,
+                    frame,
+                    &pending,
+                    &commands,
+                    &events,
+                    &mut state,
+                );
+            }
+            let emitted: Vec<_> = event_rx.try_iter().collect();
+            assert!(
+                !emitted
+                    .iter()
+                    .any(|event| matches!(event, DriverEvent::Error(_))),
+                "an answered turn has no failure to report: {emitted:?}"
+            );
+            assert!(
+                emitted.iter().any(|event| matches!(
+                    event,
+                    DriverEvent::TextDelta(text) if text == "Partial answer"
+                )),
+                "the answer must still reach the transcript: {emitted:?}"
+            );
+            assert!(matches!(
+                emitted.last(),
+                Some(DriverEvent::TurnFinished { success: true, .. })
+            ));
+        }
     }
 
     #[test]

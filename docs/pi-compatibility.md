@@ -41,6 +41,16 @@ that wire interface:
    command was superseded, the error remains out-of-band rather than failing
    the newer submission. Ordinary hook errors and uncorrelated idle errors do
    not terminate or create a run.
+4. A request the provider rejects is finalized through `message_end`, not
+   `message_update`: the final assistant message carries `stopReason: "error"`
+   and the provider's `errorMessage`, and the stream's error case emits no
+   `message_update` at all. A rejection Pi does not retry — 401/403, an unknown
+   or disabled model, exhausted quota, an invalid request — therefore ends the
+   run with no content. Doki keeps that reason and fails the turn at
+   settlement, so an answerless "completed" turn cannot be the whole record.
+   A message that still carried answer text settles as the answer it is, and a
+   retry cycle keeps its own reporting: its start clears the held reason, and
+   its end reports recovery or `finalError` exactly once.
 
 State responses are applied by the reader before the writer resumes. A stale
 response cannot finish a newer submission. A timed-out observation reports a
@@ -77,8 +87,9 @@ Covered by `driver/pi/compatibility_tests.rs`:
 
 A separately opt-in server test covers confirmed runtime shutdown and detached
 runtime lookup. Unit fixtures cover both abort formats, stale and late state
-responses, reader/writer acknowledgement ordering, failed observations, and
-queued input surviving custom-startup failure.
+responses, reader/writer acknowledgement ordering, failed observations, queued
+input surviving custom-startup failure, and a provider rejection reported only
+by the final assistant message — on both flavors.
 
 `scripts/test-pi-extension.mjs` loads the actual bundled extension through each
 version's official loader and directly executes its registered tools against
