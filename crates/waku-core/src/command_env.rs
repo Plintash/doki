@@ -391,7 +391,7 @@ fn capture_windows_environment(
     load_profile: bool,
     timeout: Duration,
 ) -> Option<ShellEnvironment> {
-    let capture = ShellEnvironmentCapture::create()?;
+    let capture = ShellEnvironmentCapture::create().ok()?;
     let mut command = Command::new(shell);
     command.arg("-NoLogo").arg("-NonInteractive");
     if !load_profile {
@@ -571,8 +571,7 @@ fn resolve_default_shell_environment(timeout: Duration) -> Option<ShellEnvironme
             } else {
                 remaining
             };
-            if let Some(environment) =
-                capture_shell_environment(&shell, shell_args, attempt_timeout)
+            if let Ok(environment) = capture_shell_environment(&shell, shell_args, attempt_timeout)
             {
                 return Some(environment);
             }
@@ -715,13 +714,52 @@ fn account_default_shell() -> Option<PathBuf> {
     }
 }
 
+// These diagnostics deliberately contain no captured names, values or shell
+// output: profiles may print credentials even when environment capture fails.
+#[cfg(unix)]
+#[derive(Debug)]
+enum ShellEnvironmentCaptureError {
+    Create(io::Error),
+    Spawn(io::Error),
+    Wait(io::Error),
+    Exit(ExitStatus),
+    Read(io::Error),
+    Empty { bytes_read: usize },
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for ShellEnvironmentCaptureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (stage, error) = match self {
+            Self::Create(error) => ("create", error),
+            Self::Spawn(error) => ("spawn", error),
+            Self::Wait(error) => ("wait", error),
+            Self::Read(error) => ("read", error),
+            Self::Exit(status) => return write!(formatter, "shell capture exit: {status}"),
+            Self::Empty { bytes_read } => {
+                return write!(
+                    formatter,
+                    "shell capture parse: no entries in {bytes_read} bytes"
+                );
+            }
+        };
+        write!(
+            formatter,
+            "shell capture {stage}: {:?} (OS error {:?})",
+            error.kind(),
+            error.raw_os_error()
+        )
+    }
+}
+
 #[cfg(unix)]
 fn capture_shell_environment(
     shell: &Path,
     shell_args: &[&str],
     timeout: Duration,
-) -> Option<ShellEnvironment> {
-    let capture = ShellEnvironmentCapture::create()?;
+) -> Result<ShellEnvironment, ShellEnvironmentCaptureError> {
+    let capture =
+        ShellEnvironmentCapture::create().map_err(ShellEnvironmentCaptureError::Create)?;
     let mut command = Command::new(shell);
     command
         .args(shell_args)
@@ -738,11 +776,15 @@ fn capture_shell_environment(
     #[cfg(unix)]
     command.process_group(0);
 
-    let mut child = spawn(&mut command).ok()?;
-    if !wait_for_child(&mut child, timeout).ok()?.success() {
-        return None;
+    let mut child = spawn(&mut command).map_err(ShellEnvironmentCaptureError::Spawn)?;
+    let status = wait_for_child(&mut child, timeout).map_err(ShellEnvironmentCaptureError::Wait)?;
+    if !status.success() {
+        return Err(ShellEnvironmentCaptureError::Exit(status));
     }
-    parse_shell_environment(&fs::read(capture.path()).ok()?)
+    let bytes = fs::read(capture.path()).map_err(ShellEnvironmentCaptureError::Read)?;
+    parse_shell_environment(&bytes).ok_or(ShellEnvironmentCaptureError::Empty {
+        bytes_read: bytes.len(),
+    })
 }
 
 fn parse_shell_environment(bytes: &[u8]) -> Option<ShellEnvironment> {
@@ -829,7 +871,7 @@ fn terminate_shell_capture(child: &mut Child) {
 struct ShellEnvironmentCapture(PathBuf);
 
 impl ShellEnvironmentCapture {
-    fn create() -> Option<Self> {
+    fn create() -> io::Result<Self> {
         for _ in 0..16 {
             let id = SHELL_ENV_CAPTURE_ID.fetch_add(1, Ordering::Relaxed);
             let path =
@@ -839,12 +881,15 @@ impl ShellEnvironmentCapture {
             #[cfg(unix)]
             options.mode(0o600);
             match options.open(&path) {
-                Ok(_) => return Some(Self(path)),
+                Ok(_) => return Ok(Self(path)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(_) => return None,
+                Err(error) => return Err(error),
             }
         }
-        None
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "shell capture file names exhausted",
+        ))
     }
 
     fn path(&self) -> &Path {
@@ -862,7 +907,7 @@ impl Drop for ShellEnvironmentCapture {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
 
     fn command_search_path(command: &Command) -> Vec<PathBuf> {
@@ -1286,25 +1331,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn captures_environment_from_a_shell_process() {
-        let id = SHELL_ENV_CAPTURE_ID.fetch_add(1, Ordering::Relaxed);
-        let directory =
-            std::env::temp_dir().join(format!("waku-command-env-test-{}-{id}", std::process::id()));
-        fs::create_dir(&directory).expect("create shell fixture directory");
-        let shell = directory.join("fake-shell");
-        fs::write(
-            &shell,
-            "#!/bin/sh\n/usr/bin/printf 'PATH=/Users/example/.fnm/current/bin:/usr/bin\\000WAKU_TEST_TOKEN=from-shell\\000' > \"$WAKU_SHELL_ENV_CAPTURE_FILE\"\n",
+        // Execute a fixed interpreter rather than a just-written executable.
+        // On Linux, another concurrent spawn can inherit the fixture's writable
+        // descriptor until exec and make executing that file fail with ETXTBSY.
+        let environment = capture_shell_environment(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "/usr/bin/printf 'PATH=/Users/example/.fnm/current/bin:/usr/bin\\000WAKU_TEST_TOKEN=from-shell\\000' > \"$WAKU_SHELL_ENV_CAPTURE_FILE\"",
+            ],
+            LOGIN_SHELL_ENV_TIMEOUT,
         )
-        .expect("write shell fixture");
-        let mut permissions = fs::metadata(&shell)
-            .expect("read shell fixture")
-            .permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&shell, permissions).expect("make shell fixture executable");
-
-        let environment =
-            capture_shell_environment(&shell, &["-i", "-l", "-c"], LOGIN_SHELL_ENV_TIMEOUT)
-                .expect("capture shell environment");
+        .unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(
             environment,
@@ -1319,7 +1357,99 @@ mod tests {
                 ),
             ]
         );
-        let _ = fs::remove_file(shell);
-        let _ = fs::remove_dir(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_capture_distinguishes_failures_without_reporting_environment_contents() {
+        let missing_shell = ShellEnvironmentCapture::create().expect("reserve missing shell path");
+        let missing_path = missing_shell.path().to_path_buf();
+        drop(missing_shell);
+        let error = capture_shell_environment(&missing_path, &[], LOGIN_SHELL_ENV_TIMEOUT)
+            .expect_err("missing executable should fail at spawn");
+        assert!(
+            matches!(error, ShellEnvironmentCaptureError::Spawn(ref error) if error.kind() == io::ErrorKind::NotFound)
+        );
+
+        let error = capture_shell_environment(
+            Path::new("/bin/sh"),
+            &["-c", "exit 23"],
+            LOGIN_SHELL_ENV_TIMEOUT,
+        )
+        .expect_err("nonzero shell status");
+        assert!(
+            matches!(error, ShellEnvironmentCaptureError::Exit(status) if status.code() == Some(23))
+        );
+
+        let error = capture_shell_environment(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "printf synthetic-sensitive-value > \"$WAKU_SHELL_ENV_CAPTURE_FILE\"",
+            ],
+            LOGIN_SHELL_ENV_TIMEOUT,
+        )
+        .expect_err("capture without environment entries");
+        assert!(matches!(
+            error,
+            ShellEnvironmentCaptureError::Empty { bytes_read: 25 }
+        ));
+        assert!(!format!("{error:?} {error}").contains("synthetic-sensitive-value"));
+
+        let error = capture_shell_environment(
+            Path::new("/bin/sh"),
+            &["-c", "/bin/rm -- \"$WAKU_SHELL_ENV_CAPTURE_FILE\""],
+            LOGIN_SHELL_ENV_TIMEOUT,
+        )
+        .expect_err("removed capture file should fail at read");
+        assert!(
+            matches!(error, ShellEnvironmentCaptureError::Read(ref error) if error.kind() == io::ErrorKind::NotFound)
+        );
+
+        let error = capture_shell_environment(
+            Path::new("/bin/sh"),
+            &["-c", "while :; do :; done"],
+            Duration::ZERO,
+        )
+        .expect_err("hanging shell should time out");
+        assert!(
+            matches!(error, ShellEnvironmentCaptureError::Wait(ref error) if error.kind() == io::ErrorKind::TimedOut)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_capture_reports_a_busy_executable_but_can_interpret_its_script() {
+        let script = ShellEnvironmentCapture::create().expect("create synthetic script");
+        fs::write(script.path(), "#!/bin/sh\nprintf 'WAKU_TEST_TOKEN=from-shell\\000' > \"$WAKU_SHELL_ENV_CAPTURE_FILE\"\n")
+            .expect("write synthetic script");
+        fs::set_permissions(script.path(), fs::Permissions::from_mode(0o700))
+            .expect("make synthetic script executable");
+        // Model a writable descriptor inherited by another concurrent child.
+        // Keeping it open makes the Linux exec failure deterministic.
+        let writer = OpenOptions::new()
+            .write(true)
+            .open(script.path())
+            .expect("hold script writable");
+        let error = capture_shell_environment(script.path(), &[], LOGIN_SHELL_ENV_TIMEOUT)
+            .expect_err("an executable open for writing is busy");
+        assert!(
+            matches!(error, ShellEnvironmentCaptureError::Spawn(ref error) if error.raw_os_error() == Some(libc::ETXTBSY))
+        );
+
+        let environment = capture_shell_environment(
+            Path::new("/bin/sh"),
+            &[script.path().to_str().expect("synthetic script path")],
+            LOGIN_SHELL_ENV_TIMEOUT,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            environment,
+            vec![(
+                OsString::from("WAKU_TEST_TOKEN"),
+                OsString::from("from-shell")
+            )]
+        );
+        drop(writer);
     }
 }
