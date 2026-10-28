@@ -34,6 +34,9 @@ use waku_protocol::subagent::{SubagentChild, SubagentFleet, SubagentRun, Subagen
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
+// A fork can require eleven control RPCs across its fork and source legs.
+const SESSION_REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The handshake races the agent's own startup, so it needs more headroom than
 /// a request against the already-running process. Pi loads extensions and
 /// resources and, when model networking is on, refreshes its model catalog
@@ -737,6 +740,7 @@ impl PiDriver {
                 // an RPC on the live session rather than a restart.
                 let mut current_model = model;
                 let mut current_effort = reasoning_effort;
+                let mut session_usable = true;
                 while let Ok(message) = command_rx.recv() {
                     match message {
                         CommandMessage::Prompt(prompt) => {
@@ -882,6 +886,9 @@ impl PiDriver {
                                 &cursor,
                                 turns,
                                 false,
+                                current_model.as_deref(),
+                                current_effort.as_deref(),
+                                &mut session_usable,
                             );
                             if let Ok(next_cursor) = &result {
                                 cursor = next_cursor.clone();
@@ -902,10 +909,19 @@ impl PiDriver {
                                 &cursor,
                                 turns_to_remove,
                                 true,
+                                current_model.as_deref(),
+                                current_effort.as_deref(),
+                                &mut session_usable,
                             );
                             let _ = response.send(result);
                         }
                         CommandMessage::Shutdown => break,
+                    }
+                    // A failed native replacement can leave both the cursor
+                    // and selection uncertain. Dropping stdin retires this
+                    // process before any queued prompt or steer can reach it.
+                    if !session_usable {
+                        break;
                     }
                 }
             })?;
@@ -1039,7 +1055,7 @@ impl DriverControl for PiDriver {
                 )
             })?;
         response_rx
-            .recv_timeout(Duration::from_secs(60))
+            .recv_timeout(SESSION_REPLACEMENT_TIMEOUT)
             .with_context(|| {
                 format!(
                     "timed out waiting for {} conversation rollback",
@@ -1064,7 +1080,7 @@ impl DriverControl for PiDriver {
                 )
             })?;
         response_rx
-            .recv_timeout(Duration::from_secs(60))
+            .recv_timeout(SESSION_REPLACEMENT_TIMEOUT)
             .with_context(|| {
                 format!(
                     "timed out waiting for {} conversation fork",
@@ -1620,6 +1636,9 @@ fn fork_pi_session(
     original_cursor: &ProviderResumeCursor,
     turns_to_remove: usize,
     restore_original: bool,
+    selected_model: Option<&str>,
+    selected_effort: Option<&str>,
+    session_usable: &mut bool,
 ) -> Result<ProviderResumeCursor, String> {
     let name = flavor.display_name();
     let messages = send_request(
@@ -1644,53 +1663,162 @@ fn fork_pi_session(
     }
 
     let request = pi_fork_request(flavor, messages, turns_to_remove)?;
-    let fork = send_request(stdin, pending, next_request_id, request)?;
-    if fork.pointer("/data/cancelled").and_then(Value::as_bool) == Some(true) {
-        return Err(format!("{name} session fork was cancelled"));
-    }
-    let fork_state = send_request(
-        stdin,
-        pending,
-        next_request_id,
-        json!({"type": "get_state"}),
-    )?;
-    let fork_cursor = cursor_from_state(flavor, &fork_state)
-        .ok_or_else(|| format!("{name} did not report the forked session cursor"))?;
-
-    if restore_original {
-        let session_file = flavor
-            .session_file_from_cursor(original_cursor)
-            .ok_or_else(|| format!("{name}'s original session file is unavailable"))?;
-        let switched = send_request(
-            stdin,
-            pending,
-            next_request_id,
-            json!({
-                "type": "switch_session",
-                "sessionPath": session_file
-            }),
-        )?;
-        if switched.pointer("/data/cancelled").and_then(Value::as_bool) == Some(true) {
-            return Err(format!(
-                "{name} could not return to the source session after forking"
-            ));
-        }
-        let restored_state = send_request(
+    // Even an RPC failure can follow a partially completed replacement.
+    // Only a verified cursor and selection make this writer safe to reuse.
+    *session_usable = false;
+    let mut confirmed_cancellation = false;
+    let fork_result = (|| {
+        let fork = send_request(stdin, pending, next_request_id, request)?;
+        let cancelled = fork.pointer("/data/cancelled").and_then(Value::as_bool) == Some(true);
+        let fork_state = send_request(
             stdin,
             pending,
             next_request_id,
             json!({"type": "get_state"}),
         )?;
-        let restored_cursor = cursor_from_state(flavor, &restored_state)
-            .ok_or_else(|| format!("{name} did not report the restored source session"))?;
-        if restored_cursor.native_id() != original_cursor.native_id() {
+        let fork_cursor = cursor_from_state(flavor, &fork_state)
+            .ok_or_else(|| format!("{name} did not report the forked session cursor"))?;
+        if cancelled && fork_cursor.native_id() != original_cursor.native_id() {
             return Err(format!(
                 "{name} returned to the wrong source session after forking"
             ));
         }
-    }
+        restore_pi_selection(
+            stdin,
+            pending,
+            next_request_id,
+            &fork_state,
+            selected_model,
+            selected_effort,
+        )?;
+        if cancelled {
+            // A confirmed cancellation left the original session usable.
+            confirmed_cancellation = true;
+            return Err(format!("{name} session fork was cancelled"));
+        }
+        Ok(fork_cursor)
+    })();
 
+    // Returning to the source also restores its recorded model. Attempt it
+    // even if selecting the fork failed, but still report that fork failure.
+    let restore_result: Result<(), String> = (|| {
+        if restore_original && !confirmed_cancellation {
+            let session_file = flavor
+                .session_file_from_cursor(original_cursor)
+                .ok_or_else(|| format!("{name}'s original session file is unavailable"))?;
+            let switched = send_request(
+                stdin,
+                pending,
+                next_request_id,
+                json!({
+                    "type": "switch_session",
+                    "sessionPath": session_file
+                }),
+            )?;
+            if switched.pointer("/data/cancelled").and_then(Value::as_bool) == Some(true) {
+                return Err(format!(
+                    "{name} could not return to the source session after forking"
+                ));
+            }
+            let restored_state = send_request(
+                stdin,
+                pending,
+                next_request_id,
+                json!({"type": "get_state"}),
+            )?;
+            let restored_cursor = cursor_from_state(flavor, &restored_state)
+                .ok_or_else(|| format!("{name} did not report the restored source session"))?;
+            if restored_cursor.native_id() != original_cursor.native_id() {
+                return Err(format!(
+                    "{name} returned to the wrong source session after forking"
+                ));
+            }
+            restore_pi_selection(
+                stdin,
+                pending,
+                next_request_id,
+                &restored_state,
+                selected_model,
+                selected_effort,
+            )?;
+        }
+
+        Ok(())
+    })();
+    if confirmed_cancellation {
+        *session_usable = true;
+    }
+    let fork_cursor = fork_result?;
+    restore_result?;
+    *session_usable = true;
     Ok(fork_cursor)
+}
+
+/// A native branch replaces the live model and thinking level from history.
+/// Reconcile the app's selection, then verify the setters actually took effect
+/// before allowing a prompt (or the source session's next command) through.
+fn restore_pi_selection(
+    stdin: &mut impl Write,
+    pending: &PendingResponses,
+    next_request_id: &mut u64,
+    state: &Value,
+    selected_model: Option<&str>,
+    selected_effort: Option<&str>,
+) -> Result<(), String> {
+    let model = selected_model
+        .map(parse_model_slug)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let model_matches = |state: &Value| {
+        model.is_none_or(|(provider, model_id)| {
+            state
+                .pointer("/data/model/provider")
+                .and_then(Value::as_str)
+                == Some(provider)
+                && state.pointer("/data/model/id").and_then(Value::as_str) == Some(model_id)
+        })
+    };
+    let effort_matches = |state: &Value| {
+        selected_effort.is_none_or(|level| {
+            state.pointer("/data/thinkingLevel").and_then(Value::as_str) == Some(level)
+        })
+    };
+    let model_changed = !model_matches(state);
+    let effort_changed = !effort_matches(state);
+    if !model_changed && !effort_changed {
+        return Ok(());
+    }
+    if model_changed && let Some((provider, model_id)) = model {
+        send_request(
+            stdin,
+            pending,
+            next_request_id,
+            json!({
+                "type": "set_model", "provider": provider, "modelId": model_id
+            }),
+        )?;
+    }
+    // A model setter may itself change the supported thinking level.
+    if (model_changed || effort_changed)
+        && let Some(level) = selected_effort
+    {
+        send_request(
+            stdin,
+            pending,
+            next_request_id,
+            json!({"type": "set_thinking_level", "level": level}),
+        )?;
+    }
+    let verified = send_request(
+        stdin,
+        pending,
+        next_request_id,
+        json!({"type": "get_state"}),
+    )?;
+    if !model_matches(&verified) || !effort_matches(&verified) {
+        return Err("provider did not restore the selected model and thinking level".into());
+    }
+    Ok(())
 }
 
 fn pi_fork_request(
@@ -3172,6 +3300,8 @@ fn tool_title(name: &str) -> String {
 
 #[cfg(all(test, unix))]
 mod compatibility_tests;
+#[cfg(all(test, unix))]
+mod selection_tests;
 
 #[cfg(test)]
 mod tests {
