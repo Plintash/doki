@@ -375,6 +375,16 @@ fn configure_pi_automation_repl_command(
     command.env(super::automation_repl::ENV_FILE, &config.env_file);
 }
 
+// Test scripts are read by a stable interpreter rather than exec'd after a
+// write, which avoids Linux ETXTBSY under concurrent child-process launches.
+fn pi_command(binary: &Path) -> std::process::Command {
+    #[cfg(all(test, unix))]
+    if let Some(command) = selection_tests::command(binary) {
+        return command;
+    }
+    crate::command_env::command(binary)
+}
+
 impl PiDriver {
     pub fn start(
         flavor: PiFlavor,
@@ -459,7 +469,7 @@ impl PiDriver {
         } else {
             None
         };
-        let mut command = crate::command_env::command(&binary);
+        let mut command = pi_command(&binary);
         command.args(["--mode", "rpc", flavor.full_access_arg()]);
         for extension in extensions {
             command.arg("--extension").arg(extension);
@@ -1855,7 +1865,7 @@ fn clone_ohmypi_session(
     cwd: &Path,
     session_file: &Path,
 ) -> Result<ProviderResumeCursor, String> {
-    let mut command = crate::command_env::command(binary);
+    let mut command = pi_command(binary);
     let command = command
         .args(["--mode", "rpc"])
         .arg(PiFlavor::OhMyPi.full_access_arg())

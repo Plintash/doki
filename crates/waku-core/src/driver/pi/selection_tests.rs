@@ -1,7 +1,16 @@
 //! Provider-free process fixtures for selection restoration after native forks.
 use super::*;
-use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
+
+pub(super) fn command(binary: &Path) -> Option<std::process::Command> {
+    if binary.file_name()? != "fakePi.cjs" {
+        return None;
+    }
+    let node = crate::command_env::find_executable("node").expect("fakePi requires Node.js");
+    let mut command = crate::command_env::command(node);
+    command.arg(binary);
+    Some(command)
+}
 
 struct FakePi {
     root: PathBuf,
@@ -12,18 +21,17 @@ impl FakePi {
     fn new(failure: &str, fail_leg: &str, reset_selection: bool) -> Self {
         let root = std::env::temp_dir().join(format!("doki-pi-selection-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        let binary = root.join("fakePi");
+        let binary = root.join("fakePi.cjs");
         let config = json!({"log": root.join("wire.jsonl"), "failure": failure,
             "failLeg": fail_leg, "resetSelection": reset_selection});
         std::fs::write(
             &binary,
             format!(
-                "#!/usr/bin/env node\nconst config = {config};\n{}",
+                "const config = {config};\n{}",
                 include_str!("../fixtures/pi_selection.js")
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         Self { root, binary }
     }
 
