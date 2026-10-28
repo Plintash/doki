@@ -20,6 +20,10 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     }
     case "get_fork_messages": case "get_branch_messages": reply({ messages: [{ entryId: "turn-1" }, { entryId: "turn-2" }] }); break;
     case "get_commands": reply({ commands: [] }); break;
+    case "get_session_stats":
+      reply();
+      if (config.failLeg === "options") leg = "options";
+      break;
     case "fork": case "branch": case "clone": case "switch_session":
       if (config.failure === "cancel_fork" && request.type !== "switch_session") { reply({ cancelled: true }); break; }
       session = request.type === "switch_session" ? "source" : "forked";

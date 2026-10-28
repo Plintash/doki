@@ -795,6 +795,9 @@ impl PiDriver {
                             }
                         }
                         CommandMessage::Options(options) => {
+                            // Only acknowledged setters update the cache. A
+                            // rejected selection retires stdin before queued
+                            // prompts can use the previous configuration.
                             if options.model != current_model {
                                 match options.model.as_deref().map(parse_model_slug).transpose() {
                                     Ok(Some((provider, model_id))) => {
@@ -809,6 +812,7 @@ impl PiDriver {
                                             }),
                                         ) {
                                             Ok(response) => {
+                                                current_model = options.model;
                                                 if let Some(window) = response
                                                     .pointer("/data/contextWindow")
                                                     .and_then(Value::as_u64)
@@ -829,33 +833,39 @@ impl PiDriver {
                                                         provider = flavor.display_name(),
                                                         error = error
                                                     )));
+                                                break;
                                             }
                                         }
                                     }
-                                    Ok(None) => {}
+                                    Ok(None) => current_model = None,
                                     Err(error) => {
                                         let _ = writer_events
                                             .send(DriverEvent::Error(error.to_string()));
+                                        break;
                                     }
                                 }
-                                current_model = options.model;
                             }
                             if options.reasoning_effort != current_effort {
-                                if let Some(level) = options.reasoning_effort.as_deref()
-                                    && let Err(error) = send_request(
+                                if let Some(level) = options.reasoning_effort.as_deref() {
+                                    match send_request(
                                         &mut stdin,
                                         &writer_pending,
                                         &mut next_request_id,
                                         json!({"type": "set_thinking_level", "level": level}),
-                                    )
-                                {
-                                    let _ = writer_events.send(DriverEvent::Error(tr!(
-                                        "errors.change_provider_thinking",
-                                        provider = flavor.display_name(),
-                                        error = error
-                                    )));
+                                    ) {
+                                        Ok(_) => current_effort = options.reasoning_effort,
+                                        Err(error) => {
+                                            let _ = writer_events.send(DriverEvent::Error(tr!(
+                                                "errors.change_provider_thinking",
+                                                provider = flavor.display_name(),
+                                                error = error
+                                            )));
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    current_effort = None;
                                 }
-                                current_effort = options.reasoning_effort;
                             }
                         }
                         CommandMessage::RetractQueuedMessages => {

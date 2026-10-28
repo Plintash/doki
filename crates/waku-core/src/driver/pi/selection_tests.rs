@@ -278,3 +278,78 @@ fn confirmed_cancelled_fork_keeps_source_usable() {
         }
     }
 }
+
+fn changed_selection_options() -> SessionOptions {
+    SessionOptions {
+        model: Some("changed/auto/model-c".into()),
+        reasoning_effort: Some("low".into()),
+        ..selection_options()
+    }
+}
+
+fn assert_failed_option_cannot_prompt(setter: &str) {
+    for flavor in [PiFlavor::Pi, PiFlavor::OhMyPi] {
+        let fixture = FakePi::new(setter, "options", false);
+        let (driver, receiver) = fixture.launch(flavor, false);
+        assert!(driver.apply_options(changed_selection_options()));
+        let deadline = Instant::now() + Duration::from_secs(35);
+        loop {
+            match receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                DriverEvent::Error(error) => {
+                    assert!(
+                        error.contains(&format!("fixture rejected {setter}")),
+                        "{error}"
+                    );
+                    break;
+                }
+                DriverEvent::ProcessExited => panic!("setter failure must be reported"),
+                _ => {}
+            }
+        }
+        // The old cache incorrectly treated the failed selection as applied,
+        // so reapplying these same options skipped the rejected setter.
+        let _ = driver.apply_options(changed_selection_options());
+        driver.prompt("must not use previous options".into());
+        fixture.shutdown(driver, &receiver);
+        let wire = fixture.wire();
+        assert_eq!(
+            wire.iter().filter(|frame| frame["type"] == setter).count(),
+            2,
+            "initialization and the failed change, without an automatic retry"
+        );
+        assert!(
+            !wire.iter().any(|frame| frame["type"] == "prompt"),
+            "{flavor:?} {setter}: failed selection reached prompt: {wire:?}"
+        );
+    }
+}
+
+#[test]
+fn failed_model_options_never_prompt_with_the_previous_model() {
+    assert_failed_option_cannot_prompt("set_model");
+}
+
+#[test]
+fn failed_effort_options_never_prompt_with_the_previous_effort() {
+    assert_failed_option_cannot_prompt("set_thinking_level");
+}
+
+#[test]
+fn successful_options_are_restored_after_fork() {
+    for flavor in [PiFlavor::Pi, PiFlavor::OhMyPi] {
+        let fixture = FakePi::new("", "", true);
+        let (driver, receiver) = fixture.launch(flavor, false);
+        assert!(driver.apply_options(changed_selection_options()));
+        driver.fork(1).unwrap();
+        driver.prompt("changed selection".into());
+        fixture.shutdown(driver, &receiver);
+        let wire = fixture.wire();
+        let prompt = wire.iter().find(|frame| frame["type"] == "prompt").unwrap();
+        assert_eq!(prompt["activeSession"], "source");
+        assert_eq!(prompt["activeModel"], "changed/auto/model-c");
+        assert_eq!(prompt["activeEffort"], "low");
+    }
+}
